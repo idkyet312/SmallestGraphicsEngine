@@ -35,17 +35,17 @@
     {
       "id": 1,
       "type": "player_spawn",
-      "name": "Base Entrance",
+      "name": "Base Interior",
       "enabled": true,
       "transform": {
         "position": [
-          0.0,
-          0.0,
-          25.0
+          5.0,
+          5.0,
+          0.0
         ],
         "rotation": [
           0.0,
-          180.0,
+          90.0,
           0.0
         ],
         "scale": [
@@ -70,6 +70,54 @@
         "rotation": [
           0.0,
           0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "type": "prefab",
+      "prefab": "props/armory_shop",
+      "name": "Armory Shop",
+      "enabled": true,
+      "transform": {
+        "position": [
+          12.355,
+          3.715,
+          7.641
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "type": "prefab",
+      "prefab": "props/newblackhawk",
+      "name": "Transport Black Hawk",
+      "enabled": true,
+      "transform": {
+        "position": [
+          22.0,
+          0.0,
+          -14.0
+        ],
+        "rotation": [
+          0.0,
+          -90.0,
           0.0
         ],
         "scale": [

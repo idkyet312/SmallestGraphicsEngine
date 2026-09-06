@@ -1309,13 +1309,21 @@ inline bool ViewmodelEyeDistanceRange(const Scene& scene, const SceneMesh& mesh,
     const float S = scene.GunModelScale();
     const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
     const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
+    // Per-weapon fit scale included, and per axis, exactly as the renderer
+    // composes it. It was missing here entirely, which made the measured span
+    // describe an unscaled weapon -- wrong for every gun whose fit is not 1,
+    // and the M9 at 0.35 was out by a factor of three.
+    const XMFLOAT3& weaponFit = GunModel::PlayerFitScale();
+    const float sx = S * weaponFit.x;
+    const float sy = S * weaponFit.y;
+    const float sz = S * weaponFit.z;
     const XMMATRIX weaponPlacement =
         XMMatrixRotationRollPitchYaw(XMConvertToRadians(weaponFitRot.x),
                                      XMConvertToRadians(weaponFitRot.y),
                                      XMConvertToRadians(weaponFitRot.z)) *
-        XMMatrixScaling(S, S, S) *
-        XMMatrixTranslation(weaponOffset.x * S, weaponOffset.y * S,
-                            weaponOffset.z * S);
+        XMMatrixScaling(sx, sy, sz) *
+        XMMatrixTranslation(weaponOffset.x * sx, weaponOffset.y * sy,
+                            weaponOffset.z * sz);
     const XMMATRIX gunBase = scene.GetGunBaseMatrix();
     XMMATRIX handFollow;
     const XMMATRIX xf = ArmsModel::WeaponFollowTransform(handFollow, S)
@@ -3037,9 +3045,35 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // full-length rifle arrive the same size; this is where that is put
         // right without touching any other weapon. Clamped above zero because
         // a zero or negative scale collapses or inverts the mesh.
-        ImGui::DragFloat("Weapon Fit Scale",
-                         &GunModel::PlayerFitScale(), 0.005f, 0.05f, 5.0f,
-                         "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        //
+        // Per axis in gun-local space -- x across the receiver, y up through
+        // it, z down the barrel -- because what is being corrected is itself
+        // one-dimensional: the import fits the barrel and lets width and depth
+        // fall where they may, so a gun can be the right length and still too
+        // slab-sided to read.
+        ImGui::DragFloat3("Weapon Fit Scale",
+                          &GunModel::PlayerFitScale().x, 0.005f, 0.05f, 5.0f,
+                          "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Gun-local axes: X across the receiver,\n"
+                              "Y up through it, Z down the barrel.");
+        // The axes are independent, but tuning usually starts by getting the
+        // overall size right and only then stretching one. This drives all
+        // three together so that first pass does not mean dragging three
+        // sliders in step and watching them drift apart.
+        {
+            XMFLOAT3& fit = GunModel::PlayerFitScale();
+            // Uniform only while the axes actually agree; once they differ
+            // there is no single number that describes the fit, so the widget
+            // shows the largest rather than inventing one.
+            float uniform = (std::max)(fit.x, (std::max)(fit.y, fit.z));
+            if (ImGui::DragFloat("Weapon Fit Scale (all)", &uniform, 0.005f,
+                                 0.05f, 5.0f, "%.3f",
+                                 ImGuiSliderFlags_AlwaysClamp))
+                fit = { uniform, uniform, uniform };
+        }
+        if (ImGui::Button("Reset Fit Scale"))
+            GunModel::PlayerFitScale() = { 1.0f, 1.0f, 1.0f };
 
         // Attachment placement. These are gun-local like the fit offsets above,
         // not screen-relative: they walk the sight along the receiver rail, and

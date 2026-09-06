@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "name": "Shotgun Repro",
+  "insertionMode": "helicopter",
+  "patrolBoatEnabled": false,
+  "terrain": {
+    "flat": true,
+    "heightScale": 0.0,
+    "tilesX": 8,
+    "tilesZ": 8,
+    "islandScaleX": 1.0,
+    "islandScaleZ": 1.0,
+    "originTileX": 0,
+    "originTileZ": 0,
+    "sculpt": []
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Spawn",
+      "enabled": true,
+      "transform": {
+        "position": [0.0, 2.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 2,
+      "type": "prefab",
+      "prefab": "props/helipad",
+      "name": "Helideck",
+      "enabled": true,
+      "transform": {
+        "position": [6.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 3,
+      "type": "prefab",
+      "prefab": "props/newblackhawk",
+      "name": "Transport Black Hawk",
+      "enabled": true,
+      "transform": {
+        "position": [16.0, 0.0, 0.0],
+        "rotation": [0.0, -90.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    }
+  ]
+}

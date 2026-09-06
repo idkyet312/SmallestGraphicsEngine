@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 2,
+  "id": "props/newblackhawk",
+  "name": "Black Hawk (Transport)",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/NewBlackHawk/NewBlackHawk.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0,
+      "forceDoubleSided": true
+    },
+    "collision": {
+      "shape": "mesh"
+    },
+    "travel": {
+      "radius": 6.0,
+      "displayName": "BOARD HELICOPTER"
+    }
+  }
+}

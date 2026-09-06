@@ -315,35 +315,54 @@ public:
     // weapon really is -- a carbine and a full-length rifle both come out
     // 1.25 units long. This is the correction for that, kept separate from the
     // global Scale so tuning one weapon cannot resize the whole rack.
-    static float& WeaponFitScale(int weapon) {
-        static std::array<float, kMaxWeapon + 1> scales = {{
-            1.00f, // AK47
+    //
+    // Per axis in GUN-LOCAL space, not screen space: x is across the receiver,
+    // y is up through it, z runs down the barrel. The axes are separate because
+    // the normalisation this corrects is itself one-dimensional -- Orient fits
+    // the barrel length and lets the other two follow, so a weapon that reads
+    // right end-on can still be too slab-sided or too deep. A uniform
+    // multiplier cannot express that; it can only make the whole gun bigger.
+    //
+    // Kept as XMFLOAT3 rather than three arrays so a weapon's fit is one value
+    // to pass around. Most weapons default uniform, which is what the single
+    // multiplier used to give them; the M9 does not, and is the reason the axes
+    // were split in the first place.
+    static XMFLOAT3& WeaponFitScale(int weapon) {
+        static std::array<XMFLOAT3, kMaxWeapon + 1> scales = {{
+            { 1.00f, 1.00f, 1.00f }, // AK47
             // Orient normalises every gun to one barrel length, which leaves
             // this pump-action reading small beside the rifles. Sized up to
             // match them in hand.
-            1.35f, // Remington 870
-            1.00f, // RPG
-            1.00f, // SVD
-            1.00f, // laser
-            1.00f, // C4
-            1.00f, // flamethrower
-            1.00f, // harpoon
-            1.00f, // SVD suppressed
-            1.00f, // M4A1
-            1.00f, // AK-74
+            { 1.35f, 1.35f, 1.35f }, // Remington 870
+            { 1.00f, 1.00f, 1.00f }, // RPG
+            { 1.00f, 1.00f, 1.00f }, // SVD
+            { 1.00f, 1.00f, 1.00f }, // laser
+            { 1.00f, 1.00f, 1.00f }, // C4
+            { 1.00f, 1.00f, 1.00f }, // flamethrower
+            { 1.00f, 1.00f, 1.00f }, // harpoon
+            { 1.00f, 1.00f, 1.00f }, // SVD suppressed
+            { 1.00f, 1.00f, 1.00f }, // M4A1
+            { 1.00f, 1.00f, 1.00f }, // AK-74
             // Orient normalises every gun to the same 1.25-unit barrel, which
             // would render this pistol the length of a rifle. The real 217mm
             // against the AK's 870mm gives 0.25, but that is the ratio of the
             // whole weapons, and what is normalised here is the barrel: a
             // pistol carries far more of its length in the grip and slide, so
             // matching barrels leaves the body too small. Tuned up against the
-            // render to 0.35, where it reads as an M9 in the hand.
-            0.350f, // M9
+            // render to 0.35 down the barrel, where it reads as an M9 in hand.
+            //
+            // Width and depth come in under that. Matching the barrel is what
+            // sets the length, and holding the other two axes to the same
+            // number then carries the pistol's proportionally larger grip and
+            // slide up with it, leaving the weapon reading thick. Tuned back to
+            // 0.28/0.285 against the render, which is where the slide stops
+            // looking slab-sided without the barrel going thin.
+            { 0.280f, 0.285f, 0.350f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
     }
-    static float& PlayerFitScale() {
+    static XMFLOAT3& PlayerFitScale() {
         return WeaponFitScale(SelectedWeapon());
     }
 

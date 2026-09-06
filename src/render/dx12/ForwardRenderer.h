@@ -1284,13 +1284,23 @@ inline R700ScopeFrameDX12 g_r700ScopeFrame;
 
 inline XMMATRIX PlayerWeaponTransform(const Scene& scene, FXMMATRIX view,
                                       bool alignSight = true) {
-    const float scale = scene.GunModelScale() * GunModel::PlayerFitScale();
+    // The global viewmodel scale is uniform; the per-weapon fit is not, so the
+    // two combine per axis. The offset is carried in the same scaled space, so
+    // each component takes ITS OWN axis' scale rather than one shared factor --
+    // using a single factor there would slide the weapon off the hands the
+    // moment the axes stopped agreeing.
+    const XMFLOAT3& fit = GunModel::PlayerFitScale();
+    const float scaleX = scene.GunModelScale() * fit.x;
+    const float scaleY = scene.GunModelScale() * fit.y;
+    const float scaleZ = scene.GunModelScale() * fit.z;
     const XMFLOAT3& offset = GunModel::PlayerOffset();
     const XMFLOAT3& rotation = GunModel::PlayerFitRotation();
     XMMATRIX placement = XMMatrixRotationRollPitchYaw(
         XMConvertToRadians(rotation.x), XMConvertToRadians(rotation.y),
-        XMConvertToRadians(rotation.z)) * XMMatrixScaling(scale, scale, scale) *
-        XMMatrixTranslation(offset.x * scale, offset.y * scale, offset.z * scale);
+        XMConvertToRadians(rotation.z)) *
+        XMMatrixScaling(scaleX, scaleY, scaleZ) *
+        XMMatrixTranslation(offset.x * scaleX, offset.y * scaleY,
+                            offset.z * scaleZ);
     XMMATRIX follow;
     if (ArmsModel::WeaponFollowTransform(follow, scene.GunModelScale()))
         placement = placement * follow;

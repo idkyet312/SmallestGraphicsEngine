@@ -230,6 +230,10 @@ static std::vector<PrefabAudioEmitter>& g_prefabAudioEmitters =
     g_game.world.Prefabs().audioEmitters;
 static std::vector<PrefabSpawnPoint>& g_prefabSpawnPoints =
     g_game.world.Prefabs().spawnPoints;
+static std::vector<PrefabArmoryShop>& g_prefabArmoryShops =
+    g_game.world.Prefabs().armoryShops;
+static std::vector<PrefabTravelPoint>& g_prefabTravelPoints =
+    g_game.world.Prefabs().travelPoints;
 static std::vector<PrefabDestructibleInstance>& g_prefabDestructibles =
     g_game.world.Prefabs().destructibles;
 static std::unordered_map<uint64_t, float>& g_prefabHealth =
@@ -418,6 +422,23 @@ static bool                 g_prefabRuntimeSmokeChecked = false;
 static bool                 g_collisionSmokeEnabled = false;
 static bool                 g_collisionSmokeChecked = false;
 static UINT                 g_collisionBudgetFrames = 0;
+// SGE_TRAVEL_TEST: load the Base, walk the player onto the transport Black
+// Hawk's boarding point, and drive the destination board through the same
+// functions the E key does -- proximity, open, select, level swap. The point is
+// that a screenshot cannot say whether the prompt logic and the departure
+// actually fire, so each stage logs its own answer and the exit code carries
+// the verdict.
+static bool                 g_travelSmokeEnabled = false;
+static int                  g_travelSmokeStage = 0;
+static UINT                 g_travelSmokeFrames = 0;
+// SGE_SHOTGUN_TEST: fire buckshot into the helideck, the terrain and the
+// transport helicopter from the frame loop. The shotgun is the only weapon that
+// puts eight projectiles in the air per trigger pull, so it is the one that
+// exercises many simultaneous hits resolving against the same geometry in a
+// single frame -- which is what the crash report describes.
+static bool                 g_shotgunSmokeEnabled = false;
+static UINT                 g_shotgunSmokeFrames = 0;
+static UINT                 g_shotgunSmokeShots = 0;
 static bool                 g_ddgiCornellTestMode = false;
 static bool                 g_ddgiCornellPreviousTemporalEffects = false;
 static bool                 g_ddgiCornellPreviousAnimateDemoLights = true;
@@ -2186,6 +2207,23 @@ static uint32_t g_ownedGrenades = 0;
 static uint32_t g_ownedGear = 0;
 static std::unordered_set<std::string> g_ownedAttachments;
 
+// Kit bought at the home base counter, held across the flight out. The base is
+// where a run is outfitted, so its purchases are for the mission the player is
+// about to fly to -- not the hub they bought them in. Without this the rental
+// clear that runs as the destination's deploy screen opens would strip the kit
+// between paying for it and landing with it, which reads as the shop taking the
+// money and issuing nothing.
+static bool g_baseKitPending = false;
+static MissionLoadout g_baseKitLoadout{};
+static uint32_t g_baseKitWeapons = 0;
+static uint32_t g_baseKitGrenades = 0;
+static uint32_t g_baseKitGear = 0;
+static std::unordered_set<std::string> g_baseKitAttachments;
+// The rails as the counter left them: (weapon, attachment id) pairs actually
+// fitted, which is not the same question as what is owned -- see the restore in
+// ClearMissionRentals.
+static std::vector<std::pair<int, std::string>> g_baseKitFitted;
+
 // These masks are what the player has hired FOR THIS MISSION, not what they own
 // -- see ClearMissionRentals. "Owned" is kept as the name only because the
 // storefront reads it on every row and the meaning at the point of use is the
@@ -2245,6 +2283,25 @@ static void ClearMissionRentals() {
              slot < static_cast<uint8_t>(SGE::AttachmentSlot::Count); ++slot)
             scene.player.weapons.RemoveAttachment(
                 weapon, static_cast<SGE::AttachmentSlot>(slot));
+
+    // Kit hired at the base was bought FOR this deployment, so it survives the
+    // reset above and comes back paid for. Restored after the wipe rather than
+    // guarded around it so a slot the player never outfitted at the counter
+    // still falls back to standard issue.
+    if (!g_baseKitPending) return;
+    g_baseKitPending = false;
+    loadout = g_baseKitLoadout;
+    g_ownedWeapons = g_baseKitWeapons;
+    g_ownedGrenades = g_baseKitGrenades;
+    g_ownedGear = g_baseKitGear;
+    g_ownedAttachments = g_baseKitAttachments;
+    // Re-fit the rails as they were left at the counter. The loop above
+    // stripped every weapon, so the parts have to be put back on. Driven by
+    // what was actually FITTED rather than by the owned set: a part bought and
+    // then taken off again is still owned, and re-fitting from ownership would
+    // put it back on a rail the player deliberately cleared.
+    for (const auto& [weapon, id] : g_baseKitFitted)
+        scene.player.weapons.EquipAttachment(weapon, id);
 }
 
 // Saves the wallet. Rentals are deliberately NOT persisted: kit is hired for one
@@ -8550,11 +8607,20 @@ static bool CreateThumbnailGpuResources(PrefabThumbnailRuntime& entry) {
     if (!createUploadBuffer(vertexBytes, entry.vertexBuffer) ||
         !createUploadBuffer(indexBytes, entry.indexBuffer) ||
         !createUploadBuffer(256, entry.constantBuffer)) return false;
+    // Map can fail -- most often when the upload heap is exhausted, which is
+    // exactly the state a level full of large uncooked art leaves the device
+    // in. Ignoring the result left `mapped` null and handed it straight to
+    // memcpy, so the write landed on address 0 and took the process down with
+    // no log line: a crash that read as "shooting the base kills it" because
+    // the armory thumbnail happened to be built while standing there.
     void* mapped = nullptr;
-    entry.vertexBuffer->Map(0, nullptr, &mapped);
+    if (FAILED(entry.vertexBuffer->Map(0, nullptr, &mapped)) || !mapped)
+        return false;
     memcpy(mapped, entry.mesh->vertices.data(), static_cast<size_t>(vertexBytes));
     entry.vertexBuffer->Unmap(0, nullptr);
-    entry.indexBuffer->Map(0, nullptr, &mapped);
+    mapped = nullptr;
+    if (FAILED(entry.indexBuffer->Map(0, nullptr, &mapped)) || !mapped)
+        return false;
     memcpy(mapped, entry.mesh->indices.data(), static_cast<size_t>(indexBytes));
     entry.indexBuffer->Unmap(0, nullptr);
 
@@ -8635,8 +8701,11 @@ static bool RenderThumbnailToTexture(PrefabThumbnailRuntime& entry) {
         XMConvertToRadians(32.0f), 1.0f, 0.1f, 20.0f);
     XMFLOAT4X4 constants;
     XMStoreFloat4x4(&constants, XMMatrixTranspose(world * view * projection));
+    // Same unchecked-Map hazard as the vertex and index uploads above: a failed
+    // map here wrote the transform through a null pointer.
     void* mapped = nullptr;
-    entry.constantBuffer->Map(0, nullptr, &mapped);
+    if (FAILED(entry.constantBuffer->Map(0, nullptr, &mapped)) || !mapped)
+        return false;
     memcpy(mapped, &constants, sizeof(constants));
     entry.constantBuffer->Unmap(0, nullptr);
 
@@ -10046,6 +10115,12 @@ static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
     dropById(g_prefabLightInstances);
     dropById(g_prefabDestructibles);
     dropById(g_prefabSpawnPoints);
+    dropById(g_prefabArmoryShops);
+    // Boarding points go with the entity for the same reason the counters do:
+    // the open travel board holds an index into this list, so a point left
+    // behind after its aircraft is gone is both a prompt on empty air and a
+    // stale index the panel would read.
+    dropById(g_prefabTravelPoints);
     g_meshCollisionEntities.erase(entityId);
     g_prefabHealth.erase(entityId);
 
@@ -10673,6 +10748,61 @@ static void RebuildPrefabRenderBatches() {
                 std::atan2(spawnWorldX.z, spawnWorldX.x),
                 spawner.value("enemyType", "bandit"),
                 spawner.value("count", 1u) });
+        }
+        // The shop counter. Its reach is authored in metres on the prefab, so a
+        // designer who scales a placement up in the editor gets a proportionally
+        // larger counter to walk up to rather than the same fixed bubble.
+        if (components.contains("armory")) {
+            const auto& armory = components.at("armory");
+            XMFLOAT3 armoryWorldX;
+            XMStoreFloat3(&armoryWorldX, XMVector3TransformNormal(
+                XMVectorSet(1, 0, 0, 0), world));
+            const float armoryScale = XMVectorGetX(
+                XMVector3Length(XMLoadFloat3(&armoryWorldX)));
+            PrefabArmoryShop shop;
+            shop.entityId = entityId;
+            shop.position = origin;
+            shop.yawRadians = std::atan2(armoryWorldX.z, armoryWorldX.x);
+            shop.radius = armory.value("radius", 3.5f) *
+                (armoryScale > 1e-4f ? armoryScale : 1.0f);
+            shop.displayName = armory.value("displayName", "ARMORY");
+            // One line per counter, so a headless run can confirm the shops
+            // exist and stand where the level put them rather than leaving the
+            // question to a screenshot.
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Armory shop: " + prefabId + " \"" + shop.displayName +
+                "\" at " + std::to_string(shop.position.x) + ", " +
+                std::to_string(shop.position.y) + ", " +
+                std::to_string(shop.position.z) + ", reach " +
+                std::to_string(shop.radius) + "m");
+            g_prefabArmoryShops.push_back(std::move(shop));
+        }
+        // The boarding point. Same scale handling as the counter above: reach
+        // is authored in metres, so scaling the aircraft up in the editor grows
+        // the area the player can board it from rather than leaving a fixed
+        // bubble buried inside a larger hull.
+        if (components.contains("travel")) {
+            const auto& travel = components.at("travel");
+            XMFLOAT3 travelWorldX;
+            XMStoreFloat3(&travelWorldX, XMVector3TransformNormal(
+                XMVectorSet(1, 0, 0, 0), world));
+            const float travelScale = XMVectorGetX(
+                XMVector3Length(XMLoadFloat3(&travelWorldX)));
+            PrefabTravelPoint point;
+            point.entityId = entityId;
+            point.position = origin;
+            point.yawRadians = std::atan2(travelWorldX.z, travelWorldX.x);
+            point.radius = travel.value("radius", 6.0f) *
+                (travelScale > 1e-4f ? travelScale : 1.0f);
+            point.displayName =
+                travel.value("displayName", "BOARD HELICOPTER");
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Travel point: " + prefabId + " \"" + point.displayName +
+                "\" at " + std::to_string(point.position.x) + ", " +
+                std::to_string(point.position.y) + ", " +
+                std::to_string(point.position.z) + ", reach " +
+                std::to_string(point.radius) + "m");
+            g_prefabTravelPoints.push_back(std::move(point));
         }
         for (const PrefabChildAsset& child : prefab->children) {
             const XMMATRIX childLocal = XMMatrixScaling(child.scale[0], child.scale[1],
@@ -14361,6 +14491,85 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::End();
 }
 
+// One product row. Returns true when the row was activated, which the caller
+// turns into a purchase and/or an equip.
+//
+// `owned` and `equipped` are passed in rather than derived here because the
+// departments store their selection differently -- weapons in two slots,
+// grenade and gear as a single enum each -- and pushing that back to the caller
+// keeps this drawing code identical for all of them. It is shared by the deploy
+// screen and the in-world armory counter so a rifle is presented and priced the
+// same way in both.
+static bool DrawArmoryRow(const char* name, const char* blurb, int price,
+                          bool owned, bool equipped,
+                          const char* equippedNote) {
+    ImGui::PushID(name);
+    const bool affordable = owned || g_game.money.Balance() >= price;
+    // The row is one selectable spanning the full width with the text drawn
+    // over it, so the whole card is the click target rather than a button
+    // tucked at one end.
+    constexpr float kRowHeight = 46.0f;
+    const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+    const float rowWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::PushStyleColor(ImGuiCol_Header,
+                          equipped ? UITheme::kAccentDim
+                                   : UITheme::kControlHeld);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UITheme::kControlHover);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, UITheme::kAccentDim);
+    // Equipped rows stay highlighted; unaffordable ones are inert so the
+    // player cannot commit to something the balance will refuse.
+    ImGui::BeginDisabled(!affordable);
+    const bool pressed = ImGui::Selectable("##row", equipped,
+                                           ImGuiSelectableFlags_None,
+                                           ImVec2(0.0f, kRowHeight));
+    ImGui::EndDisabled();
+    ImGui::PopStyleColor(3);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float textX = rowStart.x + 10.0f;
+    // Dim the whole card when it is out of reach, so "cannot afford" reads
+    // at a glance instead of only from the price.
+    const ImVec4& nameColor = !affordable ? UITheme::kTextDim
+                            : equipped    ? UITheme::kAccent
+                                          : UITheme::kText;
+    draw->AddText(ImVec2(textX, rowStart.y + 6.0f),
+                  ImGui::GetColorU32(nameColor), name);
+
+    // Price, right-aligned. Owned items show their status rather than a
+    // number -- the money is already spent, and repeating the price would
+    // read as a charge that is about to happen again.
+    char priceText[32];
+    const char* rightText = priceText;
+    ImVec4 rightColor = UITheme::kWarning;
+    if (equipped) {
+        rightText = "EQUIPPED";
+        rightColor = UITheme::kAccent;
+    } else if (owned) {
+        rightText = price > 0 ? "OWNED" : "ISSUED";
+        rightColor = UITheme::kTextDim;
+    } else {
+        MoneySystem::Format(priceText, sizeof(priceText), price);
+        if (!affordable) rightColor = ImVec4(0.75f, 0.32f, 0.28f, 1.0f);
+    }
+    const float rightWidth = ImGui::CalcTextSize(rightText).x;
+    draw->AddText(
+        ImVec2(rowStart.x + rowWidth - rightWidth - 10.0f,
+               rowStart.y + 6.0f),
+        ImGui::GetColorU32(rightColor), rightText);
+
+    // Second line: the shop copy, or why the row cannot be taken. The
+    // reason displaces the blurb rather than joining it, because a player
+    // who cannot afford a row does not need to be sold on it.
+    const char* subText = blurb;
+    if (equipped && equippedNote) subText = equippedNote;
+    else if (!affordable) subText = "Insufficient funds.";
+    draw->AddText(ImVec2(textX, rowStart.y + 25.0f),
+                  ImGui::GetColorU32(UITheme::kTextDim), subText);
+
+    ImGui::PopID();
+    return pressed && affordable;
+}
+
 // Deployment fly-through owns every decision that changes the run. Nothing is
 // applied until DEPLOY, so restarting always returns to one authoritative plan.
 static void RenderInsertionChoiceScreen(HWND hwnd) {
@@ -14884,81 +15093,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::PopStyleColor();
     }
 
-    // One product row. Returns true when the row was activated, which the
-    // caller turns into a purchase and/or an equip.
-    //
-    // `owned` and `equipped` are passed in rather than derived here because the
-    // three departments store their selection differently -- weapons in two
-    // slots, grenade and gear as a single enum each -- and pushing that back to
-    // the caller keeps this drawing code identical for all of them.
     const auto armoryRow = [&](const char* name, const char* blurb, int price,
                                bool owned, bool equipped,
                                const char* equippedNote) {
-        ImGui::PushID(name);
-        const bool affordable = owned || g_game.money.Balance() >= price;
-        // The row is one selectable spanning the full width with the text drawn
-        // over it, so the whole card is the click target rather than a button
-        // tucked at one end.
-        constexpr float kRowHeight = 46.0f;
-        const ImVec2 rowStart = ImGui::GetCursorScreenPos();
-        const float rowWidth = ImGui::GetContentRegionAvail().x;
-        ImGui::PushStyleColor(ImGuiCol_Header,
-                              equipped ? UITheme::kAccentDim
-                                       : UITheme::kControlHeld);
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UITheme::kControlHover);
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, UITheme::kAccentDim);
-        // Equipped rows stay highlighted; unaffordable ones are inert so the
-        // player cannot commit to something the balance will refuse.
-        ImGui::BeginDisabled(!affordable);
-        const bool pressed = ImGui::Selectable("##row", equipped,
-                                               ImGuiSelectableFlags_None,
-                                               ImVec2(0.0f, kRowHeight));
-        ImGui::EndDisabled();
-        ImGui::PopStyleColor(3);
-
-        ImDrawList* draw = ImGui::GetWindowDrawList();
-        const float textX = rowStart.x + 10.0f;
-        // Dim the whole card when it is out of reach, so "cannot afford" reads
-        // at a glance instead of only from the price.
-        const ImVec4& nameColor = !affordable ? UITheme::kTextDim
-                                : equipped    ? UITheme::kAccent
-                                              : UITheme::kText;
-        draw->AddText(ImVec2(textX, rowStart.y + 6.0f),
-                      ImGui::GetColorU32(nameColor), name);
-
-        // Price, right-aligned. Owned items show their status rather than a
-        // number -- the money is already spent, and repeating the price would
-        // read as a charge that is about to happen again.
-        char priceText[32];
-        const char* rightText = priceText;
-        ImVec4 rightColor = UITheme::kWarning;
-        if (equipped) {
-            rightText = "EQUIPPED";
-            rightColor = UITheme::kAccent;
-        } else if (owned) {
-            rightText = price > 0 ? "OWNED" : "ISSUED";
-            rightColor = UITheme::kTextDim;
-        } else {
-            MoneySystem::Format(priceText, sizeof(priceText), price);
-            if (!affordable) rightColor = ImVec4(0.75f, 0.32f, 0.28f, 1.0f);
-        }
-        const float rightWidth = ImGui::CalcTextSize(rightText).x;
-        draw->AddText(
-            ImVec2(rowStart.x + rowWidth - rightWidth - 10.0f,
-                   rowStart.y + 6.0f),
-            ImGui::GetColorU32(rightColor), rightText);
-
-        // Second line: the shop copy, or why the row cannot be taken. The
-        // reason displaces the blurb rather than joining it, because a player
-        // who cannot afford a row does not need to be sold on it.
-        const char* subText = blurb;
-        if (equipped && equippedNote) subText = equippedNote;
-        else if (!affordable) subText = "Insufficient funds.";
-        draw->AddText(ImVec2(textX, rowStart.y + 25.0f),
-                      ImGui::GetColorU32(UITheme::kTextDim), subText);
-
-        ImGui::PopID();
-        return pressed && affordable;
+        return DrawArmoryRow(name, blurb, price, owned, equipped, equippedNote);
     };
 
     // ---- Weapons -----------------------------------------------------------
@@ -18561,6 +18699,73 @@ static bool CollectNearbyWeaponPickup() {
     return true;
 }
 
+// ---- Armory shop ----------------------------------------------------------
+// A placed armory counter opens a storefront in the middle of a mission. It
+// sells the same catalogue the deploy screen does and charges through the same
+// ArmoryPurchase, so a rifle costs what it costs whether it was bought before
+// the drop or halfway through one.
+//
+// Open state is a single index rather than a pointer: the shop list is rebuilt
+// whenever a prefab is edited during a playtest, and a pointer into it would
+// dangle the moment that happened.
+static bool g_armoryShopOpen = false;
+static size_t g_armoryShopIndex = 0;
+static bool g_armoryShopCursorReleased = false;
+// Which of the two carried slots a purchase racks into. Kept across opens so a
+// player working through a shopping list does not reset to slot 1 every time.
+static int g_armoryShopSlot = 0;
+
+// The counter the player is standing at, or null. Nearest wins, so the prompt
+// and the E handler can never disagree about which one is being offered.
+static const PrefabArmoryShop* NearbyArmoryShop(size_t* outIndex = nullptr) {
+    if (g_prefabArmoryShops.empty() || g_drivingHumvee) return nullptr;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return nullptr;
+
+    const XMFLOAT3& camera = scene.camera.Position;
+    const PrefabArmoryShop* best = nullptr;
+    float bestDistanceSq = FLT_MAX;
+    for (size_t index = 0; index < g_prefabArmoryShops.size(); ++index) {
+        const PrefabArmoryShop& shop = g_prefabArmoryShops[index];
+        const float dx = camera.x - shop.position.x;
+        const float dz = camera.z - shop.position.z;
+        const float dy = camera.y - shop.position.y;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq > shop.radius * shop.radius) continue;
+        if (std::abs(dy) > shop.verticalRange) continue;
+        if (distanceSq >= bestDistanceSq) continue;
+        bestDistanceSq = distanceSq;
+        best = &shop;
+        if (outIndex) *outIndex = index;
+    }
+    return best;
+}
+
+static void CloseArmoryShop(HWND hwnd) {
+    if (!g_armoryShopOpen) return;
+    g_armoryShopOpen = false;
+    g_armoryShopCursorReleased = false;
+    // Hand mouse-look back exactly the way the deployment screen does on DEPLOY,
+    // or the player leaves the counter unable to turn.
+    cameraLocked = false;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    ignoreNextMouseMove = true;
+    firstMouse = true;
+}
+
+// Opens the counter the player is standing at on E. Returns false when there is
+// none, so the E handler can fall through to its other jobs.
+static bool OpenNearbyArmoryShop() {
+    if (g_armoryShopOpen) return false;
+    size_t index = 0;
+    if (!NearbyArmoryShop(&index)) return false;
+    g_armoryShopOpen = true;
+    g_armoryShopIndex = index;
+    g_armoryShopCursorReleased = false;
+    return true;
+}
+
 // "[E] TAKE <weapon>" over the pickup the player is standing at. Driven by the
 // same NearbyWeaponPickup query the E handler uses, so the prompt appears
 // exactly when the key will work.
@@ -18587,12 +18792,612 @@ static void DrawWeaponPickupPrompt(CXMMATRIX view, CXMMATRIX projection) {
                   GunModel::WeaponName(pickup->weapon.legacyWeaponId));
     const ImVec2 size = ImGui::CalcTextSize(label);
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    const ImU32 amber = IM_COL32(255, 205, 105, 245);
+    const ImU32 promptText = IM_COL32(255, 255, 255, 245);
     draw->AddRectFilled(
         ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
         ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
         IM_COL32(14, 12, 6, 185), 3.0f);
-    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y), amber, label);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y), promptText, label);
+}
+
+// "[E] ARMORY" over the counter the player is standing at. Shares the same
+// NearbyArmoryShop query the E handler uses, so the prompt appears exactly when
+// the key will work. Suppressed while the shop is open -- the panel is already
+// on screen and the prompt would sit behind it saying to open what is open.
+static void DrawArmoryShopPrompt(CXMMATRIX view, CXMMATRIX projection) {
+    if (g_armoryShopOpen) return;
+    const PrefabArmoryShop* shop = NearbyArmoryShop();
+    if (!shop) return;
+
+    const XMFLOAT3 anchor{ shop->position.x,
+                           shop->position.y + 1.35f,
+                           shop->position.z };
+    const XMVECTOR clip = XMVector3Transform(
+        XMLoadFloat3(&anchor), view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    char label[128];
+    std::snprintf(label, sizeof(label), "[E] %s", shop->displayName.c_str());
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const ImU32 promptText = IM_COL32(255, 255, 255, 245);
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
+        ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
+        IM_COL32(14, 12, 6, 185), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y), promptText, label);
+}
+
+// The counter itself: every weapon on the table, and under each rail the
+// attachments that fit it. Purchases go through ArmoryPurchase and the same
+// rental masks the deploy screen uses, so a part bought here is a part the
+// deploy screen already considers paid for on this mission.
+// Banks what the counter just sold so it survives the flight out. Only the base
+// does this: a counter placed in the middle of a mission is outfitting the run
+// already underway, and that kit is spent when the run ends. Called after every
+// change the panel makes rather than on leaving it, so walking away from the
+// counter without pressing anything still keeps what was bought.
+//
+// The mission loadout is written here rather than left to GunModel alone: the
+// deploy screen and the mission state read MissionLoadout, GunModel only holds
+// what is in the player's hands, and a purchase that updates one but not the
+// other arrives at the destination as a weapon the deploy screen never issued.
+static void RecordBaseArmoryKit() {
+    if (!g_baseMode) return;
+    const auto& carried = GunModel::LoadoutWeapons();
+    MissionLoadout& loadout = g_game.mission.Loadout();
+    loadout.weapons = { carried[0], carried[1] };
+    loadout.grenade = scene.selectedGrenade;
+    g_baseKitPending = true;
+    g_baseKitLoadout = loadout;
+    g_baseKitWeapons = g_ownedWeapons;
+    g_baseKitGrenades = g_ownedGrenades;
+    g_baseKitGear = g_ownedGear;
+    g_baseKitAttachments = g_ownedAttachments;
+    // Snapshot the rails of the two weapons actually being carried. Parts on a
+    // weapon left behind on the rack do not travel, so recording them would
+    // re-fit a gun the player is not bringing.
+    g_baseKitFitted.clear();
+    for (size_t slot = 0; slot < MissionLoadout::kWeaponSlotCount; ++slot) {
+        const int weapon = loadout.weapons[slot];
+        for (const SGE::AttachmentDefinition& attachment :
+             scene.player.weapons.Attachments()) {
+            if (!scene.player.weapons.AttachmentInstalled(weapon,
+                                                          attachment.id))
+                continue;
+            g_baseKitFitted.emplace_back(weapon, attachment.id);
+        }
+    }
+}
+
+static void RenderArmoryShopPanel(HWND hwnd) {
+    if (!g_armoryShopOpen) return;
+    // A shop whose prefab was deleted mid-playtest, or a player who walked away
+    // while it was open. Either way the counter is gone and the panel closes
+    // rather than selling from a position the player is no longer standing at.
+    if (g_armoryShopIndex >= g_prefabArmoryShops.size() || !NearbyArmoryShop()) {
+        CloseArmoryShop(hwnd);
+        return;
+    }
+    const PrefabArmoryShop& shop = g_prefabArmoryShops[g_armoryShopIndex];
+
+    // Free the pointer the way the deployment screen does, so the rows can be
+    // clicked. Mouse-look is handed back in CloseArmoryShop.
+    if (!g_armoryShopCursorReleased) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        g_armoryShopCursorReleased = true;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 620.0f), ImGuiCond_Always);
+    ImGui::Begin("##armory_shop", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::TextColored(UITheme::kAccent, "%s", shop.displayName.c_str());
+    ImGui::SameLine();
+    char balanceText[32];
+    MoneySystem::Format(balanceText, sizeof(balanceText),
+                        g_game.money.Balance());
+    const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
+    ImGui::TextColored(UITheme::kWarning, "%s", balanceText);
+    ImGui::Separator();
+
+    // Which carried slot a purchase racks into. Same idea as the deploy
+    // screen's slot tabs: a row cannot know whether the player means it as a
+    // primary or a secondary, so the slot is a mode set first.
+    auto& carried = GunModel::LoadoutWeapons();
+    for (int slot = 0; slot < 2; ++slot) {
+        const bool active = g_armoryShopSlot == slot;
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+        }
+        char tabText[96];
+        std::snprintf(tabText, sizeof(tabText), "SLOT %d: %s", slot + 1,
+                      GunModel::WeaponName(carried[static_cast<size_t>(slot)]));
+        if (ImGui::Button(tabText, ImVec2(258.0f, 0.0f)))
+            g_armoryShopSlot = slot;
+        if (active) ImGui::PopStyleColor(2);
+        if (slot == 0) ImGui::SameLine();
+    }
+    const size_t slotIndex = static_cast<size_t>(g_armoryShopSlot);
+    const size_t otherIndex = slotIndex == 0 ? 1 : 0;
+
+    ImGui::BeginChild("##armory_stock", ImVec2(0.0f, 480.0f));
+    ImGui::TextColored(UITheme::kTextDim, "SMALL ARMS");
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
+        // Same gate the deploy screen uses: hidden and debug weapons are not
+        // stock unless the debug toggle put them there.
+        if (!GunModel::WeaponLoaded(weapon)) continue;
+        const int price = ArmoryCatalog::WeaponPrice(weapon);
+        const bool owned = ArmoryWeaponOwned(weapon);
+        const bool equipped = carried[slotIndex] == weapon;
+        const char* note =
+            (carried[otherIndex] == weapon && !equipped)
+                ? "Racked in the other slot."
+                : ArmoryCatalog::WeaponBlurb(weapon);
+        if (DrawArmoryRow(GunModel::WeaponName(weapon), note, price, owned,
+                          equipped, "Racked in this slot.")) {
+            // Taking the weapon already in the other slot would leave the
+            // player holding two of the same gun, which stalls the weapon
+            // cycle between duplicates. Swap the two instead.
+            if (carried[otherIndex] == weapon) {
+                carried[otherIndex] = carried[slotIndex];
+                carried[slotIndex] = weapon;
+                GunModel::SelectedWeapon() = weapon;
+                RecordBaseArmoryKit();
+            } else if (owned || ArmoryPurchase(price)) {
+                g_ownedWeapons |= (1u << static_cast<uint32_t>(weapon));
+                carried[slotIndex] = weapon;
+                GunModel::LoadoutRestricted() = true;
+                GunModel::SelectedWeapon() = weapon;
+                // A weapon actually bought here is issued full, the way the
+                // deploy screen issues one. `owned` is the pre-purchase flag,
+                // so this seeds a fresh magazine only on the trip that paid for
+                // the weapon -- re-racking a rifle already carried keeps the
+                // ammo it has rather than being a free reload.
+                if (!owned)
+                    scene.player.weapons.SetInstance(
+                        scene.player.weapons.CreateInstance(weapon));
+                // A reload in flight belonged to the weapon just racked out;
+                // letting it finish would top up a gun no longer carried.
+                scene.player.reloadTimer = 0.0f;
+                scene.player.reloadingSlot = -1;
+                g_reloadAudio.Play(0.9f, 0.85f);
+                RecordBaseArmoryKit();
+            }
+        }
+
+        // The parts that fit this weapon, indented under it. Listing them on
+        // the rifle they belong to is what makes the table readable: the
+        // alternative is one flat parts bin the player has to cross-reference.
+        ImGui::Indent(18.0f);
+        for (const SGE::AttachmentDefinition& attachment :
+             scene.player.weapons.Attachments()) {
+            if (!attachment.CompatibleWith(weapon)) continue;
+            const int partPrice = ArmoryCatalog::AttachmentPrice(
+                attachment.suppressesWeapon, attachment.providesRedDot,
+                attachment.providesLaser);
+            const bool partOwned = ArmoryAttachmentOwned(attachment.id);
+            const bool installed = scene.player.weapons.AttachmentInstalled(
+                weapon, attachment.id);
+            const char* blurb =
+                attachment.suppressesWeapon
+                    ? "Quieter report, smaller flash, slightly less recoil."
+                : attachment.providesRedDot
+                    ? "Clear red aiming point and a tighter sight picture."
+                : attachment.providesLaser
+                    ? "Visible designator and tighter hip-fire spread."
+                    : "Fitted accessory.";
+            // The id is unique per attachment but the display name repeats
+            // across weapons, and DrawArmoryRow keys its ImGui id off the
+            // name -- so scope the row to this weapon or every rifle's
+            // suppressor row would share one id and one click state.
+            ImGui::PushID(weapon);
+            if (DrawArmoryRow(attachment.displayName.c_str(), blurb, partPrice,
+                              partOwned, installed, "Fitted. Select to remove.")) {
+                if (installed) {
+                    // Removal is free and does not refund: the part is owned,
+                    // and taking it off a rail is not selling it back.
+                    scene.player.weapons.RemoveAttachment(weapon,
+                                                          attachment.slot);
+                    RecordBaseArmoryKit();
+                } else if (partOwned || ArmoryPurchase(partPrice)) {
+                    g_ownedAttachments.insert(attachment.id);
+                    scene.player.weapons.EquipAttachment(weapon, attachment.id);
+                    RecordBaseArmoryKit();
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::Unindent(18.0f);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    }
+    ImGui::EndChild();
+
+    ImGui::Separator();
+    if (ImGui::Button("LEAVE COUNTER  [E]", ImVec2(-1.0f, 32.0f)))
+        CloseArmoryShop(hwnd);
+    ImGui::End();
+}
+
+// ---- Island travel --------------------------------------------------------
+// A boarding point flies the player to another map. The destinations are the
+// same levels the main menu offers, resolved through the same candidate walk,
+// so one list serves the menu and the helicopter and neither can drift from
+// what actually ships.
+//
+// Each destination names a preview image. The art is optional on purpose: a
+// missing file draws a labelled placeholder card instead of failing, so the
+// screen works today and dropping a PNG into Content/Textures/Islands is the
+// only step needed to illustrate it later.
+struct TravelDestination {
+    const char* name;
+    const char* subtitle;
+    // Searched in order, exactly like the main menu's level buttons: the repo
+    // layout, the packaged flat levels/ copy, and a build/ run each resolve.
+    std::array<const char*, 3> levelCandidates;
+    const char* imagePath;
+};
+
+static const std::array<TravelDestination, 3> kTravelDestinations = { {
+    { "ISLAND 1", "Campaign - hostile territory",
+      { "Content/Levels/Islandv10.json",
+        "levels/Islandv10.json",
+        "build/Content/Levels/Islandv10.json" },
+      "Content/Textures/Islands/island1.png" },
+    { "TRAINING RANGE", "Live fire - no hostiles",
+      { "Content/Levels/TrainingRange.json",
+        "levels/TrainingRange.json",
+        "build/Content/Levels/TrainingRange.json" },
+      "Content/Textures/Islands/training_range.png" },
+    { "HOME BASE", "Armory and staging",
+      { "Content/Levels/Base.json",
+        "levels/Base.json",
+        "build/Content/Levels/Base.json" },
+      "Content/Textures/Islands/base.png" },
+} };
+
+// Resolved preview images, keyed by path. Uploading a texture costs a
+// descriptor slot out of the ImGui heap, so each image is loaded once and the
+// result -- including the failure -- is cached: a missing PNG must not retry
+// its file open every frame the screen is up.
+struct TravelImage {
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> uploads;
+    UINT descriptorSlot = ~0u;
+    bool attempted = false;
+};
+static std::unordered_map<std::string, TravelImage> g_travelImages;
+
+// Returns an ImGui texture handle for a destination's preview, or 0 when there
+// is no art yet. Zero is a normal answer, not an error -- the caller draws a
+// placeholder card for it.
+static uint64_t TravelDestinationImage(const char* imagePath) {
+    if (!imagePath || !imguiSrvHeap || !g_dx12.device) return 0;
+    TravelImage& entry = g_travelImages[imagePath];
+    if (!entry.attempted) {
+        entry.attempted = true;
+        std::error_code error;
+        if (std::filesystem::exists(imagePath, error) &&
+            g_nextImGuiTextureSlot < kImGuiDescriptorCount) {
+            entry.texture = GLBImporter::LoadTextureSingleMip(imagePath,
+                g_dx12.device, g_dx12.commandList, entry.uploads);
+            if (entry.texture) {
+                entry.descriptorSlot = g_nextImGuiTextureSlot++;
+                const UINT stride =
+                    g_dx12.device->GetDescriptorHandleIncrementSize(
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+                    imguiSrvHeap->GetCPUDescriptorHandleForHeapStart();
+                cpu.ptr += static_cast<SIZE_T>(entry.descriptorSlot) * stride;
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                g_dx12.device->CreateShaderResourceView(
+                    entry.texture.Get(), &srv, cpu);
+            }
+        }
+    }
+    if (entry.descriptorSlot == ~0u) return 0;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+        imguiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(entry.descriptorSlot) *
+        g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return gpu.ptr;
+}
+
+// Open state mirrors the armory counter: an index rather than a pointer,
+// because the travel point list is rebuilt whenever a prefab is edited during a
+// playtest and a pointer into it would dangle the moment that happened.
+static bool g_travelScreenOpen = false;
+static size_t g_travelPointIndex = 0;
+static bool g_travelCursorReleased = false;
+static std::string g_travelStatus;
+// True from the moment the player boards until the destination level takes
+// over. Boarding is a real ride, not a menu over a parked aircraft: the bird
+// lifts off the pad carrying them and the destination board is chosen in the
+// air. Because the aircraft flies the player away from the pad, this also has
+// to suspend the proximity checks that opened the screen -- they would close it
+// the moment the helicopter cleared the boarding radius.
+static bool g_travelAirborne = false;
+// Where the flight started, so the player can be set back down there if they
+// decide not to go. Banked because the pad is out of reach by then: the travel
+// point list is rebuilt on prefab edits and the aircraft has moved kilometres.
+static XMFLOAT3 g_travelReturnPosition{};
+
+// The boarding point the player is standing at, or null. Nearest wins, so the
+// prompt and the E handler can never disagree about which one is on offer.
+static const PrefabTravelPoint* NearbyTravelPoint(size_t* outIndex = nullptr) {
+    if (g_prefabTravelPoints.empty() || g_drivingHumvee) return nullptr;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return nullptr;
+
+    const XMFLOAT3& camera = scene.camera.Position;
+    const PrefabTravelPoint* best = nullptr;
+    float bestDistanceSq = FLT_MAX;
+    for (size_t index = 0; index < g_prefabTravelPoints.size(); ++index) {
+        const PrefabTravelPoint& point = g_prefabTravelPoints[index];
+        const float dx = camera.x - point.position.x;
+        const float dz = camera.z - point.position.z;
+        const float dy = camera.y - point.position.y;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq > point.radius * point.radius) continue;
+        if (std::abs(dy) > point.verticalRange) continue;
+        if (distanceSq >= bestDistanceSq) continue;
+        bestDistanceSq = distanceSq;
+        best = &point;
+        if (outIndex) *outIndex = index;
+    }
+    return best;
+}
+
+// `depart` is true when the level is about to change under us: the flight is
+// handing off to StartCustomLevel, which stands the aircraft down and places
+// the player itself, so putting them back on the pad first would be undone a
+// moment later. Every other close is the player backing out, and that has to
+// set them down where they boarded.
+static void CloseTravelScreen(HWND hwnd, bool depart = false) {
+    if (!g_travelScreenOpen) return;
+    g_travelScreenOpen = false;
+    g_travelCursorReleased = false;
+    g_travelStatus.clear();
+    if (g_travelAirborne) {
+        g_travelAirborne = false;
+        if (!depart) {
+            // Backed out: the ride is cancelled and the player is returned to
+            // the pad rather than being released at altitude, which would drop
+            // them to their death for changing their mind.
+            g_game.vehicles.DisableBlackHawkInsertion();
+            scene.camera.Position = g_travelReturnPosition;
+            scene.camera.VerticalVelocity = 0.0f;
+            scene.camera.IsGrounded = true;
+            scene.camera.FloorY =
+                g_travelReturnPosition.y - scene.camera.PlayerHeight;
+            g_blackHawkCabinLocalValid = false;
+        }
+    }
+    // Hand mouse-look back the way the armory counter does, or the player
+    // steps away from the helicopter unable to turn.
+    cameraLocked = false;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    ignoreNextMouseMove = true;
+    firstMouse = true;
+}
+
+// Opens the boarding point the player is standing at on E. Returns false when
+// there is none, so the E handler can fall through to its other jobs.
+static bool OpenNearbyTravelScreen() {
+    if (g_travelScreenOpen) return false;
+    size_t index = 0;
+    const PrefabTravelPoint* point = NearbyTravelPoint(&index);
+    if (!point) return false;
+    g_travelScreenOpen = true;
+    g_travelPointIndex = index;
+    g_travelCursorReleased = false;
+    g_travelStatus.clear();
+
+    // Get in and go. The player is strapped into the cabin and the aircraft
+    // lifts off the pad it was parked on, so the destination board is picked
+    // from the air rather than while standing next to a helicopter that never
+    // moves. RidePlayerInBlackHawk already owns the camera for a carried
+    // passenger, so pinning them is a matter of arming the ride, not of moving
+    // the camera here.
+    g_travelReturnPosition = scene.camera.Position;
+    g_travelAirborne = true;
+    // Depart along the pad's own facing, which is the direction the aircraft is
+    // modelled pointing -- so it flies out its nose instead of sliding sideways.
+    g_game.vehicles.BeginBlackHawkDeparture(
+        point->position, point->position.y, point->yawRadians);
+    // The cabin walk seeds from the authored seat on the first frame aboard;
+    // clearing it here means boarding at the base starts in the door rather
+    // than wherever the last insertion left the player standing.
+    g_blackHawkCabinLocalValid = false;
+    return true;
+}
+
+// "[E] BOARD HELICOPTER" over the aircraft the player is standing at. Driven by
+// the same NearbyTravelPoint query the E handler uses, so the prompt appears
+// exactly when the key will work.
+static void DrawTravelPrompt(CXMMATRIX view, CXMMATRIX projection) {
+    if (g_travelScreenOpen) return;
+    const PrefabTravelPoint* point = NearbyTravelPoint();
+    if (!point) return;
+
+    const XMFLOAT3 anchor{ point->position.x,
+                           point->position.y + 2.2f,
+                           point->position.z };
+    const XMVECTOR clip = XMVector3Transform(
+        XMLoadFloat3(&anchor), view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    char label[128];
+    std::snprintf(label, sizeof(label), "[E] %s", point->displayName.c_str());
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const ImU32 promptText = IM_COL32(255, 255, 255, 245);
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
+        ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
+        IM_COL32(14, 12, 6, 185), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y), promptText, label);
+}
+
+// Flies to a destination: resolves the level the same way the menu buttons do
+// and hands off to StartCustomLevel. The screen is closed first so mouse-look
+// is already restored when the new level takes over the cursor.
+static void TravelToDestination(HWND hwnd,
+                                const TravelDestination& destination) {
+    std::error_code error;
+    for (const char* candidate : destination.levelCandidates) {
+        if (!std::filesystem::exists(candidate, error)) continue;
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            std::string("Travel: departing for ") + destination.name +
+            " (" + candidate + ")");
+        CloseTravelScreen(hwnd, /*depart=*/true);
+        StartCustomLevel(hwnd, std::filesystem::path(candidate));
+        return;
+    }
+    // Say which map is missing rather than failing silently, the same way the
+    // menu buttons do: a card that does nothing when clicked leaves the player
+    // with nothing to act on.
+    g_travelStatus = std::string(destination.name) +
+        " is unavailable (level file missing).";
+}
+
+// The destination board: one card per island, each with its preview image above
+// the name. Cards are clickable in full, so the image is as much a target as
+// the text under it.
+static void RenderTravelPanel(HWND hwnd) {
+    if (!g_travelScreenOpen) return;
+    // A boarding point whose prefab was deleted mid-playtest, or a player who
+    // walked away while the board was open. Either way the aircraft is gone and
+    // the screen closes rather than flying from somewhere the player is not.
+    // The proximity half of this check is skipped once airborne: the aircraft
+    // has flown the player off the pad by design, so being far from it is the
+    // expected state rather than a reason to close. The index check still
+    // stands -- a deleted prefab leaves nothing to fly from either way.
+    if (g_travelPointIndex >= g_prefabTravelPoints.size() ||
+        (!g_travelAirborne && !NearbyTravelPoint())) {
+        CloseTravelScreen(hwnd);
+        return;
+    }
+    const PrefabTravelPoint& point = g_prefabTravelPoints[g_travelPointIndex];
+
+    // Free the pointer the way the armory counter does, so the cards can be
+    // clicked. Mouse-look is handed back in CloseTravelScreen.
+    if (!g_travelCursorReleased) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        g_travelCursorReleased = true;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Always);
+    ImGui::Begin("##island_travel", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::TextColored(UITheme::kAccent, "%s", point.displayName.c_str());
+    ImGui::SameLine();
+    const char* subtitle = "SELECT DESTINATION";
+    const float subtitleWidth = ImGui::CalcTextSize(subtitle).x;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - subtitleWidth);
+    ImGui::TextColored(UITheme::kTextDim, "%s", subtitle);
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    ImGui::BeginChild("##destinations", ImVec2(0.0f, -44.0f), false);
+    // Three across at the panel's width. Cards keep a 16:9 image so a real
+    // screenshot drops in without the layout shifting around it.
+    constexpr float kCardWidth = 214.0f;
+    constexpr float kImageHeight = kCardWidth * 9.0f / 16.0f;
+    const TravelDestination* chosen = nullptr;
+    for (size_t index = 0; index < kTravelDestinations.size(); ++index) {
+        const TravelDestination& destination = kTravelDestinations[index];
+        ImGui::PushID(static_cast<int>(index));
+        ImGui::BeginGroup();
+
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        // One invisible button spans image and caption, so the whole card is
+        // the click target rather than just the words.
+        const bool clicked = ImGui::InvisibleButton("##card",
+            ImVec2(kCardWidth, kImageHeight + 46.0f));
+        const bool hovered = ImGui::IsItemHovered();
+
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 imageMin = origin;
+        const ImVec2 imageMax(origin.x + kCardWidth, origin.y + kImageHeight);
+        const uint64_t image = TravelDestinationImage(destination.imagePath);
+        if (image) {
+            draw->AddImage((ImTextureID)(intptr_t)image, imageMin, imageMax);
+        } else {
+            // No art yet: a flat card carrying the name still tells the player
+            // what they are choosing, which is the job the image would do.
+            draw->AddRectFilled(imageMin, imageMax, IM_COL32(28, 38, 32, 255));
+            const ImVec2 textSize = ImGui::CalcTextSize(destination.name);
+            draw->AddText(ImVec2(
+                imageMin.x + (kCardWidth - textSize.x) * 0.5f,
+                imageMin.y + (kImageHeight - textSize.y) * 0.5f),
+                IM_COL32(120, 140, 125, 255), destination.name);
+        }
+        draw->AddRect(imageMin, imageMax,
+            hovered ? IM_COL32(38, 178, 82, 255) : IM_COL32(70, 78, 72, 255),
+            0.0f, 0, hovered ? 2.0f : 1.0f);
+
+        draw->AddText(ImVec2(origin.x, imageMax.y + 6.0f),
+            hovered ? IM_COL32(120, 220, 150, 255)
+                    : IM_COL32(230, 235, 230, 255), destination.name);
+        draw->AddText(ImVec2(origin.x, imageMax.y + 24.0f),
+            IM_COL32(131, 146, 135, 255), destination.subtitle);
+
+        ImGui::EndGroup();
+        ImGui::PopID();
+        if (clicked) chosen = &destination;
+        if (index + 1 < kTravelDestinations.size()) ImGui::SameLine(0.0f, 18.0f);
+    }
+    ImGui::EndChild();
+
+    if (!g_travelStatus.empty())
+        ImGui::TextColored(UITheme::kWarning, "%s", g_travelStatus.c_str());
+
+    ImGui::Separator();
+    if (ImGui::Button("STAY HERE  [E]", ImVec2(-1.0f, 32.0f)))
+        CloseTravelScreen(hwnd);
+    ImGui::End();
+
+    // Departure happens after End(), never mid-window: loading a level rebuilds
+    // the travel point list this function is reading, and StartCustomLevel also
+    // takes the cursor back, which ImGui must not see inside an open window.
+    if (chosen) TravelToDestination(hwnd, *chosen);
 }
 
 static void UpdateHumveeChaseCamera(float dt) {
@@ -19407,9 +20212,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // beside the Humvee, and reaching for it should not put the player
             // in the driver's seat. Otherwise E keeps its usual job of getting
             // in/out of the Humvee.
-            if (!g_game.vehicles.BailOutOfBlackHawk() &&
+            //
+            // An open armory counter takes the key back to close itself, so E
+            // is symmetric: the same key that opened the shop leaves it.
+            //
+            // The travel board behaves the same way: E opens it and E leaves
+            // it, and it sits after the armory in the chain so a counter placed
+            // beside a helicopter still wins the key at its own range.
+            if (g_armoryShopOpen) CloseArmoryShop(hwnd);
+            else if (g_travelScreenOpen) CloseTravelScreen(hwnd);
+            else if (!g_game.vehicles.BailOutOfBlackHawk() &&
                 !g_game.vehicles.BailOutOfInsertionBoat() &&
-                !CollectNearbyWeaponPickup())
+                !CollectNearbyWeaponPickup() &&
+                !OpenNearbyArmoryShop() &&
+                !OpenNearbyTravelScreen())
                 ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
@@ -20307,6 +21123,55 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             SGE_LOG("LogPrefab", EngineLog::Level::Display,
                 "Collision smoke test started (Training Range)");
         }
+    }
+    // SGE_SHOTGUN_TEST=1 loads the repro level and fires buckshot from the
+    // frame loop.
+    if (GetEnvironmentVariableA("SGE_SHOTGUN_TEST", nullptr, 0) > 0) {
+        g_shotgunSmokeEnabled = true;
+        // SGE_SHOTGUN_TEST_WEAPON overrides the weapon index so the same loop
+        // can empty a rifle magazine rather than only firing buckshot.
+        char smokeWeapon[32] = {};
+        GunModel::SelectedWeapon() =
+            GetEnvironmentVariableA("SGE_SHOTGUN_TEST_WEAPON", smokeWeapon,
+                                    sizeof(smokeWeapon)) > 0
+                ? std::atoi(smokeWeapon)
+                : 1;   // shotgun
+        // SGE_SHOTGUN_TEST_LEVEL names a level to load instead of the repro
+        // one, so the same volley logic can be pointed at real shipping
+        // geometry (the Base's NATO shelter) rather than only the synthetic
+        // helideck. Same override shape SGE_COLLISION_TEST_LEVEL already uses.
+        char shotgunLevel[MAX_PATH] = {};
+        std::error_code shotgunError;
+        if (GetEnvironmentVariableA("SGE_SHOTGUN_TEST_LEVEL", shotgunLevel,
+                                    sizeof(shotgunLevel)) > 0) {
+            const std::filesystem::path named(shotgunLevel);
+            if (std::filesystem::exists(named, shotgunError))
+                StartCustomLevel(hwnd, named);
+            else
+                SGE_LOG("LogGameplay", EngineLog::Level::Error,
+                    std::string("Shotgun smoke level not found: ") + shotgunLevel);
+        } else {
+        static constexpr const char* kCandidates[] = {
+            "Content/Levels/ShotgunRepro.json",
+            "levels/ShotgunRepro.json",
+            "build/Content/Levels/ShotgunRepro.json",
+        };
+        for (const char* candidate : kCandidates) {
+            if (!std::filesystem::exists(candidate, shotgunError)) continue;
+            StartCustomLevel(hwnd, std::filesystem::path(candidate));
+            break;
+        }
+        }
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Shotgun smoke test started");
+    }
+    // SGE_TRAVEL_TEST=1 starts the Base, which places the transport Black Hawk,
+    // and hands the frame loop the staged checks below.
+    if (GetEnvironmentVariableA("SGE_TRAVEL_TEST", nullptr, 0) > 0) {
+        g_travelSmokeEnabled = true;
+        StartBase(hwnd);
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Travel smoke test started (Base)");
     }
     if (GetEnvironmentVariableA("SGE_PREFAB_EDITOR_TEST", nullptr, 0) > 0) {
         g_prefabEditorSmokeEnabled = true;
@@ -24959,6 +25824,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) {
                 RenderPlayerHUD(scene);
+                DrawArmoryShopPrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                RenderArmoryShopPanel(hwnd);
+                DrawTravelPrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                RenderTravelPanel(hwnd);
                 DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
         } else {
@@ -24972,6 +25843,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawWeaponPickupPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawArmoryShopPrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                RenderArmoryShopPanel(hwnd);
+                DrawTravelPrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                RenderTravelPanel(hwnd);
                 DrawEnemyVisionCones(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
@@ -25265,6 +26142,235 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // (materials, descriptors) can be read from a real frame.
             if (GetEnvironmentVariableA("SGE_COLLISION_TEST_STAY", nullptr, 0) == 0)
                 PostQuitMessage(passed ? 0 : 4);
+        }
+        // Shotgun repro. Deliberately not gated on the prefab rebuild: a
+        // destroyed prop requests one, and waiting for it to settle is what
+        // stops the firing before the interesting frames.
+        //
+        // Each trigger pull is logged with the aim point and the live collider
+        // counts, so a crash names the shot and the geometry state it died on
+        // rather than leaving the log ending at a startup line.
+        // SGE_SHOTGUN_TEST_INTERVAL/_SHOTS/_WEAPON reshape the volley loop into
+        // the pattern the crash report actually describes: a player standing
+        // still and emptying a rifle magazine into one wall, rather than three
+        // spaced buckshot volleys from rotating positions. Sustained same-spot
+        // fire is what accumulates impacts, so it is what has to be measured.
+        static const UINT kSmokeInterval = []() -> UINT {
+            char value[32] = {};
+            if (GetEnvironmentVariableA("SGE_SHOTGUN_TEST_INTERVAL", value,
+                                        sizeof(value)) == 0) return 90;
+            const int parsed = std::atoi(value);
+            return parsed > 0 ? static_cast<UINT>(parsed) : 90;
+        }();
+        static const UINT kSmokeShotCap = []() -> UINT {
+            char value[32] = {};
+            if (GetEnvironmentVariableA("SGE_SHOTGUN_TEST_SHOTS", value,
+                                        sizeof(value)) == 0) return 24;
+            const int parsed = std::atoi(value);
+            return parsed > 0 ? static_cast<UINT>(parsed) : 24;
+        }();
+        // Nothing is fired until the level has actually finished loading and the
+        // prefab rebuild has settled. A short interval otherwise starts the
+        // volleys during [LevelLoad] stage 8, so the test measures a load race
+        // rather than the shooting path it is meant to cover -- and the mesh
+        // colliders it aims at may not be compiled yet.
+        const bool shotgunSmokeReady =
+            (fullLevelAssetsLoaded || emptyLevelAssetsLoaded) &&
+            !g_prefabRebuildRequested;
+        if (g_shotgunSmokeEnabled && shotgunSmokeReady &&
+            ++g_shotgunSmokeFrames > kSmokeInterval) {
+            g_shotgunSmokeFrames = 0;
+            if (g_shotgunSmokeShots >= kSmokeShotCap) {
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Shotgun smoke passed: " + std::to_string(kSmokeShotCap) +
+                    " buckshot volleys resolved");
+                PostQuitMessage(0);
+            } else {
+                ++g_shotgunSmokeShots;
+                // Rotate through the three surfaces named in the report: the
+                // helideck's mesh collider, the flat terrain, and the new
+                // helicopter's mesh collider.
+                const char* aimedAt = "terrain";
+                XMFLOAT3 eye{ 0.0f, 2.0f, 0.0f };
+                XMFLOAT3 front{ 0.0f, -1.0f, 0.0f };
+                // When a level is supplied (SGE_SHOTGUN_TEST_LEVEL), the fixed
+                // coordinates above are meaningless -- they were measured
+                // against the repro level's helideck. Walk the mesh colliders
+                // that actually loaded instead and shoot each one from outside
+                // its own bounds, so every triangle mesh in the level is fired
+                // into rather than whatever happens to sit at (6,3,0).
+                if (!g_prefabMeshColliders.empty()) {
+                    // SGE_SHOTGUN_TEST_FIXED=1 pins every shot on the first
+                    // mesh collider instead of rotating, so the rounds pile
+                    // into one wall the way a held trigger does.
+                    static const bool fixedTarget =
+                        GetEnvironmentVariableA("SGE_SHOTGUN_TEST_FIXED",
+                                                nullptr, 0) > 0;
+                    const CollisionMeshInstance& target =
+                        g_prefabMeshColliders[fixedTarget ? 0
+                            : (g_shotgunSmokeShots - 1) %
+                              g_prefabMeshColliders.size()];
+                    const XMFLOAT3 centre{
+                        (target.worldBoundsMin.x + target.worldBoundsMax.x) * 0.5f,
+                        (target.worldBoundsMin.y + target.worldBoundsMax.y) * 0.5f,
+                        (target.worldBoundsMin.z + target.worldBoundsMax.z) * 0.5f };
+                    // Shoot from the player spawn at the collider's centre
+                    // rather than from a synthetic standoff aimed down -X. The
+                    // standoff missed the geometry entirely on the Base (every
+                    // round flew past and the projectile list only grew), which
+                    // made the test look like it was resolving hits when it was
+                    // resolving nothing at all. Aiming at a point known to be
+                    // inside the mesh is what guarantees the segment crosses a
+                    // surface.
+                    aimedAt = "mesh collider";
+                    // Stand a little outside the collider's own bounds on the
+                    // shortest axis and look straight in, so the muzzle is
+                    // clear of the geometry but the segment still crosses it.
+                    const float halfX =
+                        (target.worldBoundsMax.x - target.worldBoundsMin.x) * 0.5f;
+                    const float halfZ =
+                        (target.worldBoundsMax.z - target.worldBoundsMin.z) * 0.5f;
+                    if (halfX <= halfZ) {
+                        eye = XMFLOAT3(centre.x + halfX + 2.0f, centre.y, centre.z);
+                    } else {
+                        eye = XMFLOAT3(centre.x, centre.y, centre.z + halfZ + 2.0f);
+                    }
+                    const XMVECTOR toTarget = XMVector3Normalize(
+                        XMLoadFloat3(&centre) - XMLoadFloat3(&eye));
+                    XMStoreFloat3(&front, toTarget);
+                } else {
+                switch (g_shotgunSmokeShots % 3) {
+                case 1:
+                    aimedAt = "helideck";
+                    eye = XMFLOAT3(6.0f, 3.0f, 0.0f);
+                    front = XMFLOAT3(0.0f, -1.0f, 0.0f);
+                    break;
+                case 2:
+                    aimedAt = "helicopter";
+                    eye = XMFLOAT3(26.0f, 2.0f, 0.0f);
+                    front = XMFLOAT3(-1.0f, 0.0f, 0.0f);
+                    break;
+                default:
+                    break;
+                }
+                }
+                scene.camera.Position = eye;
+                scene.camera.Front = front;
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Shotgun smoke: volley " +
+                    std::to_string(g_shotgunSmokeShots) + " at " + aimedAt +
+                    ", boxes=" + std::to_string(g_prefabColliders.size()) +
+                    ", meshes=" + std::to_string(g_prefabMeshColliders.size()) +
+                    ", projectiles=" +
+                    std::to_string(scene.projectiles.size()));
+                ShootPlayerWeapon();
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Shotgun smoke: volley " +
+                    std::to_string(g_shotgunSmokeShots) + " fired, projectiles=" +
+                    std::to_string(scene.projectiles.size()));
+            }
+        }
+        // Travel smoke stages. Each waits for the prefab rebuild to settle and
+        // then exercises the real entry points rather than a copy of them, so a
+        // regression in the shipping path is what this fails on.
+        if (g_travelSmokeEnabled && !g_prefabRebuildRequested &&
+            ++g_travelSmokeFrames > 8) {
+            if (g_travelSmokeStage == 0) {
+                // Stage 1: the placement compiled into a boarding point at all.
+                if (g_prefabTravelPoints.empty()) {
+                    SGE_LOG("LogGameplay", EngineLog::Level::Error,
+                        "Travel smoke failed: no travel points compiled");
+                    PostQuitMessage(5);
+                } else {
+                    const PrefabTravelPoint& point = g_prefabTravelPoints[0];
+                    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                        "Travel smoke stage 1: " +
+                        std::to_string(g_prefabTravelPoints.size()) +
+                        " travel point(s), first \"" + point.displayName +
+                        "\" reach " + std::to_string(point.radius) + "m");
+                    // Stand the camera just inside the boarding reach. Standing
+                    // outside it is the control the next stage checks against.
+                    scene.camera.Position = XMFLOAT3(
+                        point.position.x + point.radius * 0.5f,
+                        point.position.y + 1.7f,
+                        point.position.z);
+                    g_travelSmokeStage = 1;
+                }
+            } else if (g_travelSmokeStage == 1) {
+                // Stage 2: proximity resolves, and E opens the board. Both go
+                // through the functions the key handler calls.
+                // Not named "near": windef.h still defines that as a macro.
+                const bool inReach = NearbyTravelPoint() != nullptr;
+                const bool opened = OpenNearbyTravelScreen();
+                SGE_LOG("LogGameplay",
+                    (inReach && opened) ? EngineLog::Level::Display
+                                        : EngineLog::Level::Error,
+                    std::string("Travel smoke stage 2: nearby=") +
+                    (inReach ? "yes" : "no") + " opened=" +
+                    (opened ? "yes" : "no"));
+                if (!inReach || !opened) PostQuitMessage(6);
+                else g_travelSmokeStage = 2;
+            } else if (g_travelSmokeStage == 2) {
+                // Stage 3: every destination resolves to a level file on disk.
+                // A card that cannot find its map is the failure this catches,
+                // and it is checked for all of them rather than the one flown.
+                bool allResolved = true;
+                for (const TravelDestination& destination :
+                        kTravelDestinations) {
+                    std::error_code error;
+                    bool found = false;
+                    for (const char* candidate : destination.levelCandidates)
+                        found = found ||
+                            std::filesystem::exists(candidate, error);
+                    if (!found) allResolved = false;
+                    SGE_LOG("LogGameplay", found ? EngineLog::Level::Display
+                                                 : EngineLog::Level::Error,
+                        std::string("Travel smoke stage 3: destination \"") +
+                        destination.name + (found ? "\" resolved"
+                                                  : "\" MISSING level file"));
+                }
+                if (!allResolved) PostQuitMessage(7);
+                else g_travelSmokeStage = 3;
+            } else if (g_travelSmokeStage == 3) {
+                // Stage 4: fly. Training Range is the cheapest destination to
+                // load and is not the map already running, so a successful swap
+                // is unambiguous.
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Travel smoke stage 4: departing");
+                TravelToDestination(hwnd, kTravelDestinations[1]);
+                g_travelSmokeStage = 4;
+                g_travelSmokeFrames = 0;
+            } else if (g_travelSmokeStage == 4 && g_travelSmokeFrames > 30) {
+                // Stage 5: the swap landed. The board must be closed and the new
+                // level's own prefabs compiled -- the Training Range has no
+                // boarding point, so the list emptying is the proof the level
+                // actually changed.
+                //
+                // The cursor is deliberately not asserted free here. The
+                // Training Range is a player_choice map, so StartLevelOne hands
+                // it to the deployment screen on arrival; whether mouse-look is
+                // live on landing belongs to the destination level's insertion
+                // mode, not to this feature. What travel owes is that the board
+                // itself released its own hold, which is g_travelCursorReleased
+                // going back down.
+                const bool closed = !g_travelScreenOpen;
+                const bool boardReleased = !g_travelCursorReleased;
+                const bool swapped = g_prefabTravelPoints.empty();
+                const bool passed = closed && boardReleased && swapped;
+                SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display
+                                              : EngineLog::Level::Error,
+                    std::string("Travel smoke stage 5: boardClosed=") +
+                    (closed ? "yes" : "no") + " boardCursorReleased=" +
+                    (boardReleased ? "yes" : "no") + " levelSwapped=" +
+                    (swapped ? "yes" : "no"));
+                SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display
+                                              : EngineLog::Level::Error,
+                    passed ? "Travel smoke passed: boarding point opens, "
+                             "destinations resolve, and departure loads"
+                           : "Travel smoke failed");
+                g_travelSmokeStage = 5;
+                PostQuitMessage(passed ? 0 : 8);
+            }
         }
         if (g_prefabEditorSmokeEnabled && !g_prefabEditorSmokeFinished) {
             for (auto& [id, thumbnail] : g_prefabThumbnails) {

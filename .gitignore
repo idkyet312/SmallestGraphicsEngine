@@ -117,3 +117,8 @@ dist-test/
 # returns empty and the Stamp tool reports "No stamps found"). Supply your own
 # copy under this path to author with them.
 Content/Textures/Stamps/
+
+# Career save the game writes at runtime (MoneySystem::MoneySavePath). It is
+# one player's balance and armory unlocks, not source -- committing it would
+# hand every clone the same wallet and conflict on every play session.
+wallet.ini

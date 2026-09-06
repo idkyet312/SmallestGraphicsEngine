@@ -1012,6 +1012,13 @@ public:
     // True while the player is riding in the cabin, before the drop-off.
     bool blackHawkCarryingPlayer = false;
     bool blackHawkFastRappel = false;
+    // Holds a departure at cruise instead of letting it reach Gone. Set for the
+    // flight OUT of the home base, where the climb is a backdrop the player
+    // picks a destination against rather than an exit: the aircraft must still
+    // be there, carrying them, when they choose. Cleared by
+    // DisableBlackHawkInsertion along with the rest of the route, so the level
+    // it flies to cannot inherit the hold.
+    bool blackHawkDepartureHold = false;
 
     // The ride-along attach point in the helicopter's local frame: side
     // (positive is starboard, since right is (cos, -sin)), forward from the
@@ -1167,6 +1174,45 @@ public:
             dropOff.z - std::cos(approachHeading) * BlackHawkApproachDistance };
     }
 
+    // Lifts off FROM a pad with the player aboard, and keeps flying. The mirror
+    // image of BeginBlackHawkInsertion: that one arrives and unloads, this one
+    // starts on the ground already loaded and climbs out. Used for the flight
+    // out of the home base, where the ride is what the player watches while
+    // choosing a destination -- so the climb is held at cruise (see
+    // blackHawkDepartureHold) instead of ending in Gone.
+    void BeginBlackHawkDeparture(const DirectX::XMFLOAT3& pad,
+                                 float groundY, float departHeading) {
+        blackHawkDropOff = pad;
+        blackHawkGroundY = groundY;
+        blackHawkApproachHeading = departHeading;
+        blackHawkRouteValid = true;
+        blackHawkYaw = departHeading;
+        blackHawkPitch = 0.0f;
+        blackHawkRoll = 0.0f;
+        blackHawkPhase = BlackHawkPhase::Departing;
+        blackHawkDepartureHold = true;
+        blackHawkLanded = false;
+        blackHawkDroppedPlayer = false;
+        blackHawkBailedOut = false;
+        blackHawkJustCrashed = false;
+        blackHawkVisible = true;
+        blackHawkCarryingPlayer = true;
+        blackHawkFastRappel = false;
+        blackHawkHealth = BlackHawkMaxHealth;
+        blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
+        blackHawkVelocity = { 0.0f, 0.0f, 0.0f };
+        blackHawkUnloadTimer = 0.0f;
+        blackHawkRappelProgress = 0.0f;
+        // No rope on a departure: nobody is going down one.
+        blackHawkRopeSpawnRequested = false;
+        blackHawkRopeReleaseRequested = true;
+        blackHawkRopeCut = false;
+        blackHawkRopeCutProgress = 0.0f;
+        // Sitting on the pad, not backed off down an approach: the climb starts
+        // from where the aircraft actually is.
+        blackHawkPosition = { pad.x, groundY, pad.z };
+    }
+
     // Advances the insertion: closes on the drop-off, descends with a flare,
     // holds while the player gets out, then climbs away.
     void UpdateBlackHawk(float deltaTime) {
@@ -1304,6 +1350,16 @@ public:
             // climb settles.
             blackHawkPitch = -0.16f * noseOver * (1.0f - 0.45f * eased);
             blackHawkRoll = 0.10f * noseOver;
+            // A held departure levels off and keeps flying rather than
+            // disappearing at altitude: the player is still aboard choosing
+            // where to go, and vanishing the aircraft would drop them out of
+            // the sky mid-decision.
+            if (blackHawkDepartureHold) {
+                if (climbed >= BlackHawkDepartHeight)
+                    blackHawkPosition.y = blackHawkGroundY +
+                                          BlackHawkDepartHeight;
+                break;
+            }
             if (climbed >= BlackHawkDepartHeight) {
                 blackHawkPhase = BlackHawkPhase::Gone;
                 blackHawkVisible = false;
@@ -1371,6 +1427,7 @@ public:
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkPhase = BlackHawkPhase::Gone;
+        blackHawkDepartureHold = false;
         // Never leak a box3d world across a level reset.
         blackHawkRopeSpawnRequested = false;
         blackHawkRopeReleaseRequested = true;

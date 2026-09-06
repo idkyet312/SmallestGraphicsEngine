@@ -81,6 +81,10 @@ int main() {
         { 17, { 13.0f, 0.0f, 0.0f }, 0.0f, "bandit", 1 });
     transformed.destructibles.push_back(
         { 17, { 14.0f, 0.0f, 0.0f }, 100.0f });
+    // Boarding points ride the entity transform like the shop counters do, so
+    // moving a placed helicopter has to carry the point the player walks up to.
+    transformed.travelPoints.push_back(
+        { 17, { 15.0f, 0.0f, 0.0f }, 0.0f, 6.0f, 4.0f, "BOARD" });
     const PrefabTransformUpdateResult moved = ApplyPrefabEntityTransformDelta(
         transformed, 17, DirectX::XMMatrixTranslation(10.0f, 0.0f, 0.0f));
     DirectX::XMFLOAT4X4 rootMatrix;
@@ -97,9 +101,23 @@ int main() {
     CHECK(std::abs(transformed.audioEmitters[0].position.x - 21.0f) < 1e-5f);
     CHECK(std::abs(transformed.spawnPoints[0].position.x - 23.0f) < 1e-5f);
     CHECK(std::abs(transformed.destructibles[0].position.x - 24.0f) < 1e-5f);
+    CHECK(std::abs(transformed.travelPoints[0].position.x - 25.0f) < 1e-5f);
     CHECK(moved.renderInstances == 2);
     CHECK(moved.colliders == 1);
     CHECK(moved.lights == 1);
+    CHECK(moved.travelPoints == 1);
+
+    // ClearDerived has to take the boarding points with everything else. One
+    // left behind is a prompt on empty air and a stale index for the open
+    // travel board to read.
+    PrefabRuntimeState cleared;
+    cleared.travelPoints.push_back(
+        { 5, { 1.0f, 0.0f, 0.0f }, 0.0f, 6.0f, 4.0f, "BOARD" });
+    cleared.armoryShops.push_back(
+        { 5, { 1.0f, 0.0f, 0.0f }, 0.0f, 3.5f, 3.0f, "ARMORY" });
+    cleared.ClearDerived();
+    CHECK(cleared.travelPoints.empty());
+    CHECK(cleared.armoryShops.empty());
 
     PrefabRuntimeState visualOnly;
     visualOnly.renderBatches = transformed.renderBatches;

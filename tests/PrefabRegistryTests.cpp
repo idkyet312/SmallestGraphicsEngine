@@ -197,6 +197,156 @@ int main() {
         CHECK(stillStatic != nullptr);
         if (stillStatic) CHECK(!stillStatic->rigidBody.enabled);
 
+        // Armory counters. Like rigidBody the component is optional and off by
+        // default; an omitted radius falls back to a reach that clears a
+        // table's own depth rather than to zero, which would be a shop the
+        // player can stand inside and still never open.
+        WriteText("prefabs/shop.json", R"({
+          "schemaVersion":2,"id":"test/shop","name":"Shop",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "armory":{"radius":6.0,"displayName":"QUARTERMASTER"}}
+        })");
+        WriteText("prefabs/defaultshop.json", R"({
+          "schemaVersion":2,"id":"test/defaultshop","name":"Default Shop",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "armory":{}}
+        })");
+        // A non-positive reach can never be entered, so the counter would draw
+        // as an ordinary prop with no way to discover it is broken.
+        WriteText("prefabs/unreachable.json", R"({
+          "schemaVersion":2,"id":"test/unreachable","name":"Unreachable",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "armory":{"radius":0.0}}
+        })");
+        CHECK(registry.Refresh());
+        const PrefabAsset* shop = registry.Find("test/shop");
+        CHECK(shop != nullptr);
+        if (shop) {
+            CHECK(shop->error.empty());
+            CHECK(shop->armory.enabled);
+            CHECK(shop->armory.radius == 6.0f);
+            CHECK(shop->armory.displayName == "QUARTERMASTER");
+        }
+        const PrefabAsset* defaultShop = registry.Find("test/defaultshop");
+        CHECK(defaultShop != nullptr);
+        if (defaultShop) {
+            CHECK(defaultShop->error.empty());
+            CHECK(defaultShop->armory.enabled);
+            CHECK(defaultShop->armory.radius == 3.5f);
+            CHECK(defaultShop->armory.displayName == "ARMORY");
+        }
+        bool sawUnreachableError = false;
+        for (const PrefabAsset& asset : registry.Assets())
+            sawUnreachableError = sawUnreachableError ||
+                (!asset.error.empty() &&
+                 asset.definitionPath.filename() == "unreachable.json");
+        CHECK(sawUnreachableError);
+        // A prop that never asked to be a shop must not become one.
+        if (stillStatic) CHECK(!stillStatic->armory.enabled);
+
+        // Editor round-trip: the component has to survive a save, and turning
+        // it off has to erase it rather than leave a disabled shop behind that
+        // the loader would read back as enabled.
+        if (shop) {
+            PrefabAsset editedShop = *shop;
+            editedShop.armory.radius = 9.0f;
+            editedShop.armory.displayName = "FIELD DEPOT";
+            CHECK(PrefabRegistry::Save(editedShop, "prefabs/shop.json").ok);
+            CHECK(registry.Refresh());
+            const PrefabAsset* savedShop = registry.Find("test/shop");
+            CHECK(savedShop != nullptr);
+            if (savedShop) {
+                CHECK(savedShop->armory.enabled);
+                CHECK(savedShop->armory.radius == 9.0f);
+                CHECK(savedShop->armory.displayName == "FIELD DEPOT");
+
+                PrefabAsset closedShop = *savedShop;
+                closedShop.armory.enabled = false;
+                CHECK(PrefabRegistry::Save(closedShop, "prefabs/shop.json").ok);
+                CHECK(registry.Refresh());
+                const PrefabAsset* reopened = registry.Find("test/shop");
+                CHECK(reopened != nullptr);
+                if (reopened) CHECK(!reopened->armory.enabled);
+            }
+        }
+
+        // Travel boarding points. Same contract as the armory counter: optional,
+        // off by default, and a non-positive reach is rejected rather than
+        // shipped as an aircraft the player can never board.
+        WriteText("prefabs/heli.json", R"({
+          "schemaVersion":2,"id":"test/heli","name":"Heli",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "travel":{"radius":9.0,"displayName":"BOARD BIRD"}}
+        })");
+        WriteText("prefabs/defaultheli.json", R"({
+          "schemaVersion":2,"id":"test/defaultheli","name":"Default Heli",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "travel":{}}
+        })");
+        WriteText("prefabs/unboardable.json", R"({
+          "schemaVersion":2,"id":"test/unboardable","name":"Unboardable",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "travel":{"radius":-1.0}}
+        })");
+        CHECK(registry.Refresh());
+        const PrefabAsset* heli = registry.Find("test/heli");
+        CHECK(heli != nullptr);
+        if (heli) {
+            CHECK(heli->error.empty());
+            CHECK(heli->travel.enabled);
+            CHECK(heli->travel.radius == 9.0f);
+            CHECK(heli->travel.displayName == "BOARD BIRD");
+        }
+        const PrefabAsset* defaultHeli = registry.Find("test/defaultheli");
+        CHECK(defaultHeli != nullptr);
+        if (defaultHeli) {
+            CHECK(defaultHeli->error.empty());
+            CHECK(defaultHeli->travel.enabled);
+            CHECK(defaultHeli->travel.radius == 6.0f);
+            CHECK(defaultHeli->travel.displayName == "BOARD HELICOPTER");
+        }
+        bool sawUnboardableError = false;
+        for (const PrefabAsset& asset : registry.Assets())
+            sawUnboardableError = sawUnboardableError ||
+                (!asset.error.empty() &&
+                 asset.definitionPath.filename() == "unboardable.json");
+        CHECK(sawUnboardableError);
+        // A prop that never asked to be a boarding point must not become one,
+        // and a shop must not pick the component up from its neighbour either.
+        // Both are re-queried rather than reused from above: Refresh() rebuilds
+        // the asset vector, so any pointer taken before it dangles.
+        const PrefabAsset* staticAfterTravel = registry.Find("test/crate");
+        if (staticAfterTravel) CHECK(!staticAfterTravel->travel.enabled);
+        const PrefabAsset* shopAfterTravel = registry.Find("test/shop");
+        if (shopAfterTravel) CHECK(!shopAfterTravel->travel.enabled);
+
+        // Editor round-trip, same as the counter above: the component survives a
+        // save, and switching it off erases it rather than leaving a disabled
+        // boarding point the loader would read back as enabled.
+        const PrefabAsset* heliToEdit = registry.Find("test/heli");
+        if (heliToEdit) {
+            PrefabAsset editedHeli = *heliToEdit;
+            editedHeli.travel.radius = 12.0f;
+            editedHeli.travel.displayName = "BOARD TRANSPORT";
+            CHECK(PrefabRegistry::Save(editedHeli, "prefabs/heli.json").ok);
+            CHECK(registry.Refresh());
+            const PrefabAsset* savedHeli = registry.Find("test/heli");
+            CHECK(savedHeli != nullptr);
+            if (savedHeli) {
+                CHECK(savedHeli->travel.enabled);
+                CHECK(savedHeli->travel.radius == 12.0f);
+                CHECK(savedHeli->travel.displayName == "BOARD TRANSPORT");
+
+                PrefabAsset groundedHeli = *savedHeli;
+                groundedHeli.travel.enabled = false;
+                CHECK(PrefabRegistry::Save(groundedHeli, "prefabs/heli.json").ok);
+                CHECK(registry.Refresh());
+                const PrefabAsset* reopenedHeli = registry.Find("test/heli");
+                CHECK(reopenedHeli != nullptr);
+                if (reopenedHeli) CHECK(!reopenedHeli->travel.enabled);
+            }
+        }
+
         WriteText("prefabs/variant.json", R"({
           "schemaVersion":2,"id":"test/variant","name":"Crate Variant",
           "extends":"test/crate","components":{"collision":{"shape":"mesh"}},
@@ -276,6 +426,42 @@ int main() {
             CHECK(tower->destructible.health > 0.0f);
             CHECK(tower->targetSize > 0.0f);
             CHECK(std::filesystem::exists(tower->modelPath));
+        }
+
+        // The armory counter the player buys from mid-mission. Its reach has to
+        // clear the table's own half depth, or the prompt could never be
+        // reached from outside the prop; collision keeps the player from
+        // walking through the counter to get at it.
+        //
+        // Like the transport below, it keeps real-world scale (targetSize 0):
+        // the racks are modelled as a room's worth of furniture, and
+        // normalising them to a couple of metres would shrink a wall of weapons
+        // down to a side table. The reach is therefore checked as an absolute
+        // distance rather than against targetSize, which carries no size here.
+        const PrefabAsset* armoryShop = shipped.Find("props/armory_shop");
+        CHECK(armoryShop != nullptr);
+        if (armoryShop) {
+            CHECK(armoryShop->error.empty());
+            CHECK(armoryShop->armory.enabled);
+            CHECK(armoryShop->collision == "box");
+            CHECK(armoryShop->armory.radius > 0.0f);
+            CHECK(!armoryShop->armory.displayName.empty());
+            CHECK(std::filesystem::exists(armoryShop->modelPath));
+        }
+
+        // The transport Black Hawk the player boards to change islands. It keeps
+        // real-world scale (targetSize 0) because an aircraft normalised to a
+        // couple of metres would read as a toy beside the shelter, and mesh
+        // collision so the player walks around the hull rather than through it.
+        const PrefabAsset* transportHeli = shipped.Find("props/newblackhawk");
+        CHECK(transportHeli != nullptr);
+        if (transportHeli) {
+            CHECK(transportHeli->error.empty());
+            CHECK(transportHeli->travel.enabled);
+            CHECK(transportHeli->travel.radius > 0.0f);
+            CHECK(!transportHeli->travel.displayName.empty());
+            CHECK(transportHeli->collision == "mesh");
+            CHECK(std::filesystem::exists(transportHeli->modelPath));
         }
 
         // The chain-link fence is the spline tool default. It keeps real-world

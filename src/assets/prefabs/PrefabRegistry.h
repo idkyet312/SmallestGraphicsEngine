@@ -38,6 +38,30 @@ struct PrefabRigidBodyComponent {
     float density = 64.0f;
 };
 
+// Turns a placement into a shop counter the player can browse with E. The stock
+// is the live weapon and attachment tables rather than a list authored here, so
+// the only thing a level designer chooses is where the counter stands, how
+// close the player has to get, and what the prompt calls it.
+struct PrefabArmoryComponent {
+    bool enabled = false;
+    float radius = 3.5f;
+    std::string displayName = "ARMORY";
+};
+
+// Turns a placement into a boarding point the player opens with E to pick a
+// destination. Like the armory, the destination list is not authored here: it
+// is the shipped island table, so adding a map to that table puts it on every
+// helicopter in the game without touching a prefab.
+struct PrefabTravelComponent {
+    bool enabled = false;
+    // Wider than the armory's counter reach by default. The player walks up to
+    // an aircraft from any side rather than to one face of a table, and the
+    // hull itself is several metres across, so a counter-sized bubble would sit
+    // entirely inside the mesh and never trigger.
+    float radius = 6.0f;
+    std::string displayName = "BOARD HELICOPTER";
+};
+
 struct PrefabSpawnerComponent {
     bool enabled = false;
     std::string enemyType = "bandit";
@@ -110,6 +134,8 @@ struct PrefabAsset {
     PrefabDestructibleComponent destructible;
     PrefabRigidBodyComponent rigidBody;
     PrefabSpawnerComponent spawner;
+    PrefabArmoryComponent armory;
+    PrefabTravelComponent travel;
     // Original component object. Unknown component fields survive load/save and
     // provide data for generic editor overrides.
     nlohmann::json components = nlohmann::json::object();

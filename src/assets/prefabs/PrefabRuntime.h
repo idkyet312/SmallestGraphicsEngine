@@ -56,6 +56,40 @@ struct PrefabSpawnPoint {
     uint32_t count = 1;
 };
 
+// A placed armory counter. The stock is not stored here: the shop always sells
+// the live WeaponCustomization tables, so a weapon or attachment added to that
+// data appears on the counter without anyone editing a prefab. What a placement
+// carries is where it stands and how close the player has to be to browse it.
+struct PrefabArmoryShop {
+    uint64_t entityId = 0;
+    DirectX::XMFLOAT3 position{};
+    float yawRadians = 0.0f;
+    // Counter-depth reach, measured from the prefab origin. The player browses
+    // from the customer side rather than walking into the table, so this has to
+    // clear the table's own half depth or the shop can never be opened.
+    float radius = 3.5f;
+    // Same vertical band the weapon pickups use: the origin sits on the floor
+    // while the camera is at eye height, so the two never share a Y.
+    float verticalRange = 3.0f;
+    std::string displayName = "ARMORY";
+};
+
+// A placed boarding point: walk up, press E, pick an island to fly to. Like the
+// armory counter this stores only where it stands and how close the player has
+// to be -- the destination list is the shipped island table, so a map added
+// there appears on every helicopter without a prefab edit.
+struct PrefabTravelPoint {
+    uint64_t entityId = 0;
+    DirectX::XMFLOAT3 position{};
+    float yawRadians = 0.0f;
+    float radius = 6.0f;
+    // Aircraft are tall, and the prefab origin sits at the skids while the
+    // camera is at eye height. A taller band than the armory's keeps the prompt
+    // alive when the player stands beside a helicopter on raised ground.
+    float verticalRange = 4.0f;
+    std::string displayName = "BOARD HELICOPTER";
+};
+
 struct PrefabDestructibleInstance {
     uint64_t entityId = 0;
     DirectX::XMFLOAT3 position{};
@@ -76,6 +110,8 @@ struct PrefabRuntimeState {
     std::vector<PrefabLightInstance> lights;
     std::vector<PrefabAudioEmitter> audioEmitters;
     std::vector<PrefabSpawnPoint> spawnPoints;
+    std::vector<PrefabArmoryShop> armoryShops;
+    std::vector<PrefabTravelPoint> travelPoints;
     std::vector<PrefabDestructibleInstance> destructibles;
     std::unordered_map<uint64_t, float> health;
 
@@ -86,6 +122,8 @@ struct PrefabRuntimeState {
         lights.clear();
         audioEmitters.clear();
         spawnPoints.clear();
+        armoryShops.clear();
+        travelPoints.clear();
         destructibles.clear();
     }
 
@@ -100,6 +138,8 @@ struct PrefabTransformUpdateResult {
     size_t lights = 0;
     size_t audioEmitters = 0;
     size_t spawnPoints = 0;
+    size_t armoryShops = 0;
+    size_t travelPoints = 0;
     size_t destructibles = 0;
 };
 
@@ -182,6 +222,18 @@ inline PrefabTransformUpdateResult ApplyPrefabEntityTransformDelta(
         transformPoint(spawn.position);
         transformYaw(spawn.yawRadians);
         ++result.spawnPoints;
+    }
+    for (PrefabArmoryShop& shop : state.armoryShops) {
+        if (shop.entityId != entityId) continue;
+        transformPoint(shop.position);
+        transformYaw(shop.yawRadians);
+        ++result.armoryShops;
+    }
+    for (PrefabTravelPoint& travel : state.travelPoints) {
+        if (travel.entityId != entityId) continue;
+        transformPoint(travel.position);
+        transformYaw(travel.yawRadians);
+        ++result.travelPoints;
     }
     for (PrefabDestructibleInstance& destructible : state.destructibles) {
         if (destructible.entityId != entityId) continue;

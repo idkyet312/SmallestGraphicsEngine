@@ -339,6 +339,31 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
                 prefab.spawner.count > 1024)
                 throw std::runtime_error("spawner values are invalid");
         }
+        if (components.contains("armory")) {
+            const json& armory = components.at("armory");
+            prefab.armory.enabled = true;
+            prefab.armory.radius = armory.value("radius", 3.5f);
+            prefab.armory.displayName = armory.value("displayName", "ARMORY");
+            // A zero or negative reach is a counter that can never be opened,
+            // which reads in-game as a broken prop rather than a bad number --
+            // so it is rejected here where the file name is still in hand.
+            if (prefab.armory.radius <= 0.0f ||
+                !std::isfinite(prefab.armory.radius))
+                throw std::runtime_error("armory.radius must be positive");
+        }
+        if (components.contains("travel")) {
+            const json& travel = components.at("travel");
+            prefab.travel.enabled = true;
+            prefab.travel.radius = travel.value("radius", 6.0f);
+            prefab.travel.displayName =
+                travel.value("displayName", "BOARD HELICOPTER");
+            // Same reasoning as the armory reach: a boarding point the player
+            // can never stand inside is a broken prop, and it is cheaper to
+            // reject it here, with the file name still in hand, than in-game.
+            if (prefab.travel.radius <= 0.0f ||
+                !std::isfinite(prefab.travel.radius))
+                throw std::runtime_error("travel.radius must be positive");
+        }
         if (components.contains("script"))
             prefab.scriptPath = components.at("script").value("path", "");
         if (prefab.id.empty()) throw std::runtime_error("id is empty");
@@ -396,7 +421,11 @@ const std::vector<PrefabPropertyDescriptor>& PrefabPropertyMetadata() {
         {"destructible", "health", PrefabPropertyType::Number, 0.01f, 1000000.0f},
         {"rigidBody", "density", PrefabPropertyType::Number, 0.01f, 100000.0f},
         {"spawner", "enemyType", PrefabPropertyType::String},
-        {"spawner", "count", PrefabPropertyType::Integer, 1.0f, 1024.0f}
+        {"spawner", "count", PrefabPropertyType::Integer, 1.0f, 1024.0f},
+        {"armory", "radius", PrefabPropertyType::Number, 0.5f, 100.0f},
+        {"armory", "displayName", PrefabPropertyType::String},
+        {"travel", "radius", PrefabPropertyType::Number, 0.5f, 100.0f},
+        {"travel", "displayName", PrefabPropertyType::String}
     };
     return properties;
 }
@@ -533,6 +562,8 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             if (local.components.contains("rigidBody"))
                 merged.rigidBody = local.rigidBody;
             if (local.components.contains("spawner")) merged.spawner = local.spawner;
+            if (local.components.contains("armory")) merged.armory = local.armory;
+            if (local.components.contains("travel")) merged.travel = local.travel;
             if (local.components.contains("script"))
                 merged.scriptPath = local.scriptPath;
             found[index] = std::move(merged);
@@ -752,6 +783,20 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             spawner["count"] = prefab.spawner.count;
         }
         else components.erase("spawner");
+        if (prefab.armory.enabled) {
+            json& armory = components["armory"];
+            if (!armory.is_object()) armory = json::object();
+            armory["radius"] = prefab.armory.radius;
+            armory["displayName"] = prefab.armory.displayName;
+        }
+        else components.erase("armory");
+        if (prefab.travel.enabled) {
+            json& travel = components["travel"];
+            if (!travel.is_object()) travel = json::object();
+            travel["radius"] = prefab.travel.radius;
+            travel["displayName"] = prefab.travel.displayName;
+        }
+        else components.erase("travel");
         json root = prefab.document.is_object()
             ? prefab.document : json::object();
         root["schemaVersion"] = 2;
