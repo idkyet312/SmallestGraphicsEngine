@@ -14927,8 +14927,28 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         g_menuMusicRestartRequested = true;
     }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0, 0), ImVec2(display.x, 64.0f), IM_COL32(4, 12, 20, 175));
+    // Unplated columns and fading scrims carry the main menu's identity over
+    // the live map while keeping the briefing readable as the island rotates.
+    ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
+    const float scrimWidth = (std::min)(display.x * 0.48f, 680.0f);
+    const float solidWidth = (std::min)(display.x * 0.32f, 454.0f);
+    backdrop->AddRectFilled(ImVec2(0, 0), ImVec2(solidWidth, display.y),
+        IM_COL32(5, 10, 12, 250));
+    backdrop->AddRectFilled(ImVec2(display.x - solidWidth, 0), display,
+        IM_COL32(5, 10, 12, 250));
+    backdrop->AddRectFilledMultiColor(ImVec2(solidWidth, 0), ImVec2(scrimWidth, display.y),
+        IM_COL32(5, 10, 12, 250), IM_COL32(5, 10, 12, 0),
+        IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 250));
+    backdrop->AddRectFilledMultiColor(ImVec2(display.x - scrimWidth, 0),
+        ImVec2(display.x - solidWidth, display.y),
+        IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 250),
+        IM_COL32(5, 10, 12, 250), IM_COL32(5, 10, 12, 0));
+    backdrop->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(display.x, 100),
+        IM_COL32(0, 0, 0, 190), IM_COL32(0, 0, 0, 190),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    backdrop->AddRectFilledMultiColor(ImVec2(0, display.y * 0.82f), display,
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
 
     const XMMATRIX viewProjection =
         scene.GetViewMatrix() * scene.GetProjectionMatrix();
@@ -15256,7 +15276,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         "SELECT A ZONE, TWO WEAPONS, A GRENADE, AND YOUR INSERTION";
     foreground->AddText(
         ImVec2((display.x - ImGui::CalcTextSize(instruction).x) * 0.5f, 23.0f),
-        IM_COL32(190, 255, 205, 255), instruction);
+        IM_COL32(226, 232, 228, 236), instruction);
 
     // Mission briefing. Left-hand side, where the zone markers already refuse to
     // take clicks past display.x - 430, so it never fights the planning panel.
@@ -15264,29 +15284,28 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // there is no objective to brief, and a hardcoded dossier would be a lie.
     const uint32_t standingTowers = CountStandingCommTowers();
     if (standingTowers > 0) {
-        ImGui::SetNextWindowPos(ImVec2(24.0f, display.y * 0.5f),
-                                ImGuiCond_Always, ImVec2(0.0f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_Always);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.03f, 0.05f, 0.04f, 0.90f));
+        ImGui::SetNextWindowPos(ImVec2(24.0f, 110.0f),
+                                ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(430.0f, (std::max)(180.0f, display.y - 146.0f)), ImGuiCond_Always);
         ImGui::Begin("Mission Briefing", nullptr, ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
 
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         ImGui::TextColored(ImVec4(0.45f, 0.52f, 0.48f, 1.0f),
                            "CLASSIFIED // EYES ONLY");
-        ImGui::SetWindowFontScale(1.6f);
-        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.22f, 1.0f), "OPERATION BLACKOUT");
         ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextColored(UITheme::kText, "OPERATION BLACKOUT");
+        ImGui::Separator();
         ImGui::Dummy(ImVec2(0.0f, 4.0f));
-        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "SITUATION");
+        ImGui::TextColored(UITheme::kText, "SITUATION");
         ImGui::TextWrapped(
             "The garrison on this island is not fighting alone. A hardened relay "
             "mast on the ridge ties their patrols to the mainland battery. "
             "Every movement we make is called in the moment it is seen, and the "
             "guns answer within the minute.");
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.30f, 1.0f), "PRIMARY OBJECTIVE");
+        ImGui::TextColored(UITheme::kText, "PRIMARY OBJECTIVE");
         if (standingTowers == 1) {
             ImGui::TextWrapped("Destroy the communications tower.");
         } else {
@@ -15294,47 +15313,59 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                                standingTowers);
         }
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXECUTION");
+        ImGui::TextColored(UITheme::kText, "EXECUTION");
         ImGui::TextWrapped(
             "The lattice shrugs off small arms. Plant remote C4 on the mast and "
             "clear the base before you trigger it. Nothing lighter will bring "
             "the structure down.");
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXFIL");
+        ImGui::TextColored(UITheme::kText, "EXFIL");
         ImGui::TextWrapped(
             "Hold the island once the mast is down. Without the relay the "
             "battery is firing blind.");
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::Separator();
-        ImGui::TextDisabled("Mission grade weights this objective at %d of 100.",
+        ImGui::TextWrapped("Mission grade weights this objective at %d of 100.",
                             MissionSystem::kPrimaryObjectiveScore);
         ImGui::Dummy(ImVec2(0.0f, 4.0f));
         ImGui::End();
-        ImGui::PopStyleColor();
     }
 
-    ImGui::SetNextWindowPos(ImVec2(display.x - 20.0f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(1.0f, 0.5f));
-    const float panelHeight = (std::min)(650.0f, display.y - 20.0f);
+    ImGui::SetNextWindowPos(ImVec2(display.x - 24.0f, 110.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    const float panelHeight = (std::max)(180.0f, display.y - 146.0f);
     ImGui::SetNextWindowSize(ImVec2(430.0f, panelHeight), ImGuiCond_Always);
     ImGui::Begin("Deployment Planning", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse);
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     const char* title = "DEPLOYMENT PLAN";
-    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(title).x) * 0.5f);
-    ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", title);
+    ImGui::TextColored(UITheme::kTextDim, "MISSION PREPARATION // 01");
+    ImGui::TextColored(UITheme::kText, "%s", title);
+    ImGui::Separator();
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
     if (g_selectedDeploymentZone >= 0)
-        ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+        ImGui::TextColored(UITheme::kText,
             "Zone %d selected", g_selectedDeploymentZone + 1);
     else
-        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
+        ImGui::TextColored(UITheme::kText,
             "Click a zone marker on the map");
     ImGui::Dummy(ImVec2(0.0f, 7.0f));
 
-    if (ImGui::CollapsingHeader(
-            "RENDER DIAGNOSTICS", ImGuiTreeNodeFlags_DefaultOpen)) {
+    // Every section below is a dropdown. The panel carries the armory, the
+    // conditions, the insertion and the intel on one 430 px column, which is far
+    // more than fits on screen at once -- collapsing them means the player opens
+    // the one department they are actually shopping in instead of scrolling past
+    // the other four. Armory and insertion default open because a plan is not
+    // valid without them; the rest start closed.
+    const auto deploySection = [&](const char* label, bool defaultOpen = false) {
+        return ImGui::CollapsingHeader(
+            label, defaultOpen ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    };
+
+    // Render diagnostics. Drawn from the DEBUG section at the foot of the panel
+    // rather than above the armory, where it was the first thing the player met.
+    const auto drawRenderDiagnostics = [&]() {
         ImGui::Checkbox("Hide water", &g_deploymentDebugHideWater);
         ImGui::Checkbox("Hide fog and clouds",
                         &g_deploymentDebugHideAtmosphere);
@@ -15387,7 +15418,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "Cyan: full-depth seabed (88 m reference)");
         ImGui::TextColored(ImVec4(1.0f, 0.32f, 0.86f, 1.0f),
                            "Pink: actual terrain grid edge");
-    }
+    };
 
     MissionLoadout& loadout = g_game.mission.Loadout();
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
@@ -15408,7 +15439,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // place for the loadout to disagree with what was paid for; here a row is
     // either owned-and-equippable or a price you can afford, and pressing it
     // does whichever applies.
-    ImGui::SeparatorText("ARMORY");
+    if (deploySection("ARMORY", true)) {
 
     {
         char balanceText[32];
@@ -15486,17 +15517,6 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             }
         }
     }
-
-    // The toggle itself. Sits with the weapon department because that is where
-    // its effect shows up: flipping it repopulates the rows above next frame.
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    bool debugWeapons = GunModel::DebugWeaponsEnabled();
-    if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower, harpoon)",
-                        &debugWeapons))
-        GunModel::SetDebugWeaponsEnabled(debugWeapons);
-    ImGui::TextDisabled(debugWeapons
-        ? "Laser cutter, flamethrower and harpoon gun are stocked."
-        : "Development weapons are hidden from the armory and weapon cycle.");
 
     // ---- Attachments -------------------------------------------------------
     // Priced per part and owned by attachment id: buying a suppressor once
@@ -15605,6 +15625,24 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::TextDisabled("Remote C4 is issued free on every mission.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    }
+
+    // Stocking the development weapons is a debug switch, not a purchase, so it
+    // is drawn from the DEBUG section. Flipping it repopulates the armory rows
+    // next frame.
+    const auto drawDebugWeaponToggle = [&]() {
+        bool debugWeapons = GunModel::DebugWeaponsEnabled();
+        if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower, harpoon)",
+                            &debugWeapons))
+            GunModel::SetDebugWeaponsEnabled(debugWeapons);
+        ImGui::TextDisabled(debugWeapons
+            ? "Laser cutter, flamethrower and harpoon gun are stocked."
+            : "Development weapons are hidden from the armory and weapon cycle.");
+    };
+    // Difficulty cheats. God mode and the enemy damage scale are debug switches
+    // rather than plan choices, so they are drawn from the DEBUG section at the
+    // bottom of the panel instead of inline here.
+    const auto drawDifficultyControls = [&]() {
     ImGui::SeparatorText("DIFFICULTY");
     // Per-run choice rather than a launcher-level mode. Applied straight to the
     // live player state because StartLevelOne has already run by the time this
@@ -15649,6 +15687,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 perShot, shots);
     }
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    };
 
     // Time of day. Applied live as it is picked rather than waiting for DEPLOY,
     // so the planning fly-through shows the light the run will actually be
@@ -15658,7 +15697,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // enemy layout. Sits above them so it reads as covering the whole section,
     // and the controls it drives stay editable afterwards -- a roll is a
     // starting point, not a lock.
-    ImGui::SeparatorText("RANDOMIZE");
+    if (deploySection("RANDOMIZE")) {
     ImGui::SetCursorPosX(45.0f);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.28f, 0.10f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
@@ -15672,8 +15711,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     else
         ImGui::TextDisabled("Rolls time, weather, fog and enemy positions.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    }
 
-    ImGui::SeparatorText("TIME OF DAY");
+    if (deploySection("TIME OF DAY")) {
     const auto timeButton = [&](TimeOfDay time, float width) {
         const bool selected = g_selectedTimeOfDay == time;
         if (selected) {
@@ -15700,8 +15740,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::SameLine();
     timeButton(TimeOfDay::Night, kTimeButtonWidth);
     ImGui::TextWrapped("%s", TimeOfDayBriefing(g_selectedTimeOfDay));
+    }
 
-    ImGui::SeparatorText("WEATHER");
+    if (deploySection("WEATHER")) {
     static constexpr const char* kWeatherNames[] = {
         "Clear", "Cloudy", "Dense Fog", "Rain", "Storm", "Custom"
     };
@@ -15732,10 +15773,14 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ImGui::TextDisabled(
                 "They still hear gunfire at full range.");
     }
+    }
+
     // Volumetric fog for the selected time. Edits apply live for the same reason
     // the time buttons do: this is the one screen that previews the run's light,
-    // so the fog has to be tunable against what is actually on screen.
-    {
+    // so the fog has to be tunable against what is actually on screen. Kept as a
+    // lambda so it can be drawn down in the debug section, where per-parameter
+    // scattering sliders belong, rather than in the middle of the weather pick.
+    const auto drawVolumetricFogControls = [&]() {
         char fogHeader[64];
         std::snprintf(fogHeader, sizeof(fogHeader), "VOLUMETRIC FOG (%s)",
                       TimeOfDayName(g_selectedTimeOfDay));
@@ -15780,9 +15825,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ApplyVolumetricFogSettings(fog);
             ApplyLiveWeatherState(WeatherState::Custom);
         }
-    }
+    };
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    ImGui::SeparatorText("INSERTION");
+    if (deploySection("INSERTION", true)) {
 
     const auto modeButton = [&](const char* label, LevelInsertionMode mode) {
         const bool selected = g_playerInsertionChoice == mode;
@@ -15916,27 +15961,29 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "Lost with the transport if it goes down");
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-
-    if (standingTowers > 0) {
-        ImGui::SeparatorText("PRIMARY OBJECTIVE");
-        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.30f, 1.0f),
-            standingTowers == 1 ? "Destroy the communications tower"
-                                : "Destroy all communications towers");
-        ImGui::Dummy(ImVec2(0.0f, 5.0f));
     }
 
-    ImGui::SeparatorText("OPTIONAL OBJECTIVES");
-    ImGui::TextDisabled("Use both selected weapons");
-    ImGui::TextDisabled("Throw your selected grenade");
-    ImGui::TextDisabled("Cause at least %u destruction events",
-                        MissionSystem::kDemolitionObjectiveEvents);
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    if (deploySection("OBJECTIVES")) {
+        if (standingTowers > 0) {
+            ImGui::TextColored(UITheme::kTextDim, "PRIMARY");
+            ImGui::TextColored(UITheme::kText,
+                standingTowers == 1 ? "Destroy the communications tower"
+                                    : "Destroy all communications towers");
+            ImGui::Dummy(ImVec2(0.0f, 5.0f));
+        }
+        ImGui::TextColored(UITheme::kTextDim, "OPTIONAL");
+        ImGui::TextDisabled("Use both selected weapons");
+        ImGui::TextDisabled("Throw your selected grenade");
+        ImGui::TextDisabled("Cause at least %u destruction events",
+                            MissionSystem::kDemolitionObjectiveEvents);
+        ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    }
 
     // Enemy intel + the scatter control. Lives on the planning screen rather
     // than only in the debug panel because this is the one moment where seeing
     // the layout and re-rolling it actually changes a decision -- once DEPLOY is
     // pressed the run has started.
-    ImGui::SeparatorText("ENEMY INTEL");
+    if (deploySection("ENEMY INTEL")) {
     uint32_t liveBandits = 0;
     for (const auto& bandit : g_bandits)
         if (bandit && !bandit->Dead() && bandit->faction == Faction::Bandit)
@@ -15977,6 +16024,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
                            "Navmesh unavailable, cannot randomise");
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    }
 
     const bool weaponsReady = loadout.Valid() &&
         GunModel::WeaponLoaded(loadout.weapons[0]) &&
@@ -15987,6 +16035,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // Fire support. Outside the DEPLOY disable block on purpose: calling in a
     // strike does not need a landing zone picked or a valid loadout, and
     // greying it out with DEPLOY would read as though the two were one action.
+    if (deploySection("FIRE SUPPORT")) {
     ImGui::SetCursorPosX(45.0f);
     if (g_missileStrikeArmed) {
         ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(150, 45, 30, 255));
@@ -16030,6 +16079,23 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "%.1f m lethal radius", lethalRadius);
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
+
+    // Everything that is a development switch rather than a plan choice, in one
+    // place at the foot of the panel: render diagnostics, the difficulty cheats,
+    // the fog tuning sliders and the development weapon stock. Closed by default,
+    // and last so it never sits between the player and the DEPLOY button.
+    if (deploySection("DEBUG")) {
+        if (ImGui::CollapsingHeader("Render diagnostics"))
+            drawRenderDiagnostics();
+        if (ImGui::CollapsingHeader("Difficulty"))
+            drawDifficultyControls();
+        if (ImGui::CollapsingHeader("Volumetric fog"))
+            drawVolumetricFogControls();
+        if (ImGui::CollapsingHeader("Weapon stock"))
+            drawDebugWeaponToggle();
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
 
     ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
     ImGui::SetCursorPosX(45.0f);
