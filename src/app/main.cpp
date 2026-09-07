@@ -14297,30 +14297,26 @@ static void RenderMainMenu(HWND hwnd) {
         return;
     }
 
-    // Island1 is the game; Custom Game opens any other authored level through a
-    // file browser. The remaining dev entry points (god mode, Cornell box,
-    // empty, stress test) are still reachable -- the editor loads any level and
-    // --level=<path> starts one directly -- but they are not what this menu is
-    // for.
+    // The base is the way in: every run now starts by walking out to the
+    // helicopter and picking a destination there, so the island is reached
+    // through the hub rather than from a menu button beside it. Custom Game
+    // stays, because a hand-authored level has no travel card at the base.
+    //
+    // Island 1 and the Training Range are still reachable -- the travel board
+    // flies to the island, the editor loads any level, and --level=<path>
+    // starts one directly -- they are just no longer this menu's job.
+    UISectionLabel("BASE");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (UIPrimaryButton("ENTER BASE"))
+        StartBase(hwnd);
+
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
     UISectionLabel("DEPLOY");
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIPrimaryButton("ISLAND 1"))
-        StartIsland1(hwnd);
-    if (UIMenuButton("TRAINING RANGE"))
-        StartTrainingRange(hwnd);
     if (UIMenuButton("CUSTOM GAME"))
         BrowseAndStartCustomLevel(hwnd);
     if (!g_mainMenuLevelStatus.empty())
         ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
-
-    // The hub, in its own section rather than under DEPLOY: walking into the
-    // base is not starting a mission, and grouping it with the maps would read
-    // as a third place to be shot at.
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    UISectionLabel("BASE");
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIMenuButton("ENTER BASE"))
-        StartBase(hwnd);
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     UISectionLabel("TOOLS");
