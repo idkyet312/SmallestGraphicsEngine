@@ -13776,14 +13776,21 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_prefabRebuildReason = "level start";
 }
 
-static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
+// godMode defaults on because every other caller is a direct "load this map"
+// action -- a menu button, a startup path, the level browser -- and those have
+// always dropped the player in invulnerable to look around. Travel passes
+// false: flying out of the hub is the point the player commits to a run, and
+// the boarding press already turned god mode off, so re-arming it here would
+// undo that a moment before the deploy screen renders the toggle.
+static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
+                             bool godMode = true) {
     LevelLoadResult loaded = LoadLevel(path);
     if (!loaded.ok) {
         g_mainMenuLevelStatus = "Load failed: " + loaded.error;
         return;
     }
     g_mainMenuLevelStatus.clear();
-    StartLevelOne(hwnd, true, false, false, &loaded.level);
+    StartLevelOne(hwnd, godMode, false, false, &loaded.level);
 }
 
 // Island 1 -- the campaign map, authored as Islandv10.json. The menu name and
@@ -19313,7 +19320,11 @@ static void TravelToDestination(HWND hwnd,
             std::string("Travel: departing for ") + destination.name +
             " (" + candidate + ")");
         CloseTravelScreen(hwnd, /*depart=*/true);
-        StartCustomLevel(hwnd, std::filesystem::path(candidate));
+        // Not invulnerable: see StartCustomLevel. The player gave up god mode
+        // when they climbed in, and the deploy screen at the far end has to
+        // open showing it already off.
+        StartCustomLevel(hwnd, std::filesystem::path(candidate),
+                         /*godMode=*/false);
         return;
     }
     // Say which map is missing rather than failing silently, the same way the
