@@ -14355,7 +14355,9 @@ static void RenderMainMenu(HWND hwnd) {
         MoneySystem::Format(balanceText, sizeof(balanceText),
                             g_game.money.Balance());
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
-        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s  ", balanceText);
+        // The HUD accent green rather than a money amber, so the balance reads
+        // as part of the same palette as everything else on the screen.
+        ImGui::TextColored(UITheme::kAccent, "%s  ", balanceText);
         ImGui::SameLine(0.0f, 6.0f);
         ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f), "FUNDS");
     }
