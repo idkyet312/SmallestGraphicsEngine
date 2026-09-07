@@ -1924,13 +1924,20 @@ public:
                 sizeof(VBDrawCallData);
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            drawCallUpload[frameSlot]->Map(0, &readRange, &mapped);
-            memcpy(static_cast<uint8_t*>(mapped) + offset,
-                cpuDrawCalls.data() + drawCallDirtyMin, size);
-            drawCallUpload[frameSlot]->Unmap(0, nullptr);
+            // Map fails under memory pressure and leaves `mapped` null; the
+            // memcpy would then write straight to address 0. Skip just this
+            // upload rather than returning -- the geometry barriers below still
+            // have to run, and the dirty range is not cleared here, so the
+            // draw calls missed this frame are re-sent on the next one.
+            if (SUCCEEDED(drawCallUpload[frameSlot]->Map(0, &readRange,
+                                                         &mapped)) && mapped) {
+                memcpy(static_cast<uint8_t*>(mapped) + offset,
+                    cpuDrawCalls.data() + drawCallDirtyMin, size);
+                drawCallUpload[frameSlot]->Unmap(0, nullptr);
 
-            cmdList->CopyBufferRegion(drawCallBuffer.Get(), offset,
-                drawCallUpload[frameSlot].Get(), offset, size);
+                cmdList->CopyBufferRegion(drawCallBuffer.Get(), offset,
+                    drawCallUpload[frameSlot].Get(), offset, size);
+            }
         }
 
         // Geometry changes only when a mesh is added. DEFAULT buffers stay SRVs
@@ -1956,50 +1963,74 @@ public:
         {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            clusterDataUpload[frameSlot]->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuClusters.data(),
-                   cpuClusters.size() * sizeof(VBClusterData));
-            clusterDataUpload[frameSlot]->Unmap(0, nullptr);
-            cmdList->CopyBufferRegion(clusterDataBuffer.Get(), 0,
-                clusterDataUpload[frameSlot].Get(), 0,
-                cpuClusters.size() * sizeof(VBClusterData));
+            if (SUCCEEDED(clusterDataUpload[frameSlot]->Map(0, &readRange,
+                                                            &mapped)) &&
+                mapped) {
+                memcpy(mapped, cpuClusters.data(),
+                       cpuClusters.size() * sizeof(VBClusterData));
+                clusterDataUpload[frameSlot]->Unmap(0, nullptr);
+                cmdList->CopyBufferRegion(clusterDataBuffer.Get(), 0,
+                    clusterDataUpload[frameSlot].Get(), 0,
+                    cpuClusters.size() * sizeof(VBClusterData));
+            }
         }
+
+        // A geometry upload that could not be mapped leaves its DEFAULT buffer
+        // holding the previous frame's contents and, more importantly, never
+        // transitioned into COPY_DEST. The barrier block below is keyed off
+        // geometryDirty, so this flag keeps the pass dirty: the transitions are
+        // skipped for a frame and the whole geometry upload is retried on the
+        // next one, rather than promoting buffers that were never written.
+        bool geometryUploadFailed = false;
 
         if (geometryDirty && persistentVertexCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            vertexDataUpload[frameSlot]->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuVertices.data(), persistentVertexCount * sizeof(VBPackedVertex));
-            vertexDataUpload[frameSlot]->Unmap(0, nullptr);
+            if (SUCCEEDED(vertexDataUpload[frameSlot]->Map(0, &readRange,
+                                                           &mapped)) && mapped) {
+                memcpy(mapped, cpuVertices.data(), persistentVertexCount * sizeof(VBPackedVertex));
+                vertexDataUpload[frameSlot]->Unmap(0, nullptr);
 
-            cmdList->CopyBufferRegion(vertexDataBuffer.Get(), 0,
-                vertexDataUpload[frameSlot].Get(), 0,
-                persistentVertexCount * sizeof(VBPackedVertex));
+                cmdList->CopyBufferRegion(vertexDataBuffer.Get(), 0,
+                    vertexDataUpload[frameSlot].Get(), 0,
+                    persistentVertexCount * sizeof(VBPackedVertex));
+            } else {
+                geometryUploadFailed = true;
+            }
         }
 
         if (geometryDirty && persistentIndexCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            indexDataUpload[frameSlot]->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuIndices.data(), persistentIndexCount * sizeof(UINT));
-            indexDataUpload[frameSlot]->Unmap(0, nullptr);
+            if (SUCCEEDED(indexDataUpload[frameSlot]->Map(0, &readRange,
+                                                          &mapped)) && mapped) {
+                memcpy(mapped, cpuIndices.data(), persistentIndexCount * sizeof(UINT));
+                indexDataUpload[frameSlot]->Unmap(0, nullptr);
 
-            cmdList->CopyBufferRegion(indexDataBuffer.Get(), 0,
-                indexDataUpload[frameSlot].Get(), 0,
-                persistentIndexCount * sizeof(UINT));
+                cmdList->CopyBufferRegion(indexDataBuffer.Get(), 0,
+                    indexDataUpload[frameSlot].Get(), 0,
+                    persistentIndexCount * sizeof(UINT));
+            } else {
+                geometryUploadFailed = true;
+            }
         }
 
         if (geometryDirty && persistentTriangleCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            stableTriangleDataUpload[frameSlot]->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuStableTriangleIDs.data(),
-                persistentTriangleCount * sizeof(UINT));
-            stableTriangleDataUpload[frameSlot]->Unmap(0, nullptr);
+            if (SUCCEEDED(stableTriangleDataUpload[frameSlot]->Map(0, &readRange,
+                                                                   &mapped)) &&
+                mapped) {
+                memcpy(mapped, cpuStableTriangleIDs.data(),
+                    persistentTriangleCount * sizeof(UINT));
+                stableTriangleDataUpload[frameSlot]->Unmap(0, nullptr);
 
-            cmdList->CopyBufferRegion(stableTriangleDataBuffer.Get(), 0,
-                stableTriangleDataUpload[frameSlot].Get(), 0,
-                persistentTriangleCount * sizeof(UINT));
+                cmdList->CopyBufferRegion(stableTriangleDataBuffer.Get(), 0,
+                    stableTriangleDataUpload[frameSlot].Get(), 0,
+                    persistentTriangleCount * sizeof(UINT));
+            } else {
+                geometryUploadFailed = true;
+            }
         }
 
         // Barriers: transition structured buffers from copy dest to SRV
@@ -2014,7 +2045,7 @@ public:
         barriers[1].Transition.pResource = clusterDataBuffer.Get();
 
         UINT barrierCount = 2;
-        if (geometryDirty) {
+        if (geometryDirty && !geometryUploadFailed) {
             barriers[2] = barriers[0];
             barriers[2].Transition.pResource = vertexDataBuffer.Get();
             barriers[3] = barriers[0];
