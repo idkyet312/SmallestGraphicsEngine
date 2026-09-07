@@ -46,6 +46,14 @@ struct GameSettings {
     // without giving up the clearer sight picture entirely.
     float seeThroughWeaponStrength = 1.0f;
 
+    // Show the full load trace -- stage timings, upload counts, DX12 resource
+    // state -- on the loading screen. Off is the shipping presentation: a
+    // player waiting for a level wants to know it is loading, not read a
+    // renderer diagnostic. On is what is needed when a load stalls, and those
+    // numbers are useless if turning them on means a recompile.
+    bool debugLoadingScreen = false;
+
+    static constexpr bool  kDefaultDebugLoadingScreen = false;
     static constexpr bool  kDefaultSeeThroughWeapon = false;
     static constexpr float kDefaultSeeThroughStrength = 1.0f;
     static constexpr float kMinSeeThroughStrength = 0.0f;
@@ -63,6 +71,7 @@ struct GameSettings {
         mouseSensitivity = kDefaultSensitivity;
         seeThroughWeaponWhenAiming = kDefaultSeeThroughWeapon;
         seeThroughWeaponStrength = kDefaultSeeThroughStrength;
+        debugLoadingScreen = kDefaultDebugLoadingScreen;
     }
 };
 
@@ -113,6 +122,10 @@ inline bool LoadGameSettings(GameSettings& out) {
         else if (key == "SeeThroughWeaponStrength") {
             out.seeThroughWeaponStrength = std::strtof(value.c_str(), nullptr);
         }
+        else if (key == "DebugLoadingScreen") {
+            out.debugLoadingScreen =
+                value == "1" || value == "true" || value == "yes";
+        }
     }
 
     // Whatever the file said, the result has to be usable.
@@ -131,6 +144,9 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "SeeThroughWeaponWhenAiming="
          << (settings.seeThroughWeaponWhenAiming ? 1 : 0) << "\n"
          << "SeeThroughWeaponStrength="
-         << settings.seeThroughWeaponStrength << "\n";
+         << settings.seeThroughWeaponStrength << "\n"
+         << "[Debug]\n"
+         << "DebugLoadingScreen="
+         << (settings.debugLoadingScreen ? 1 : 0) << "\n";
     return file.good();
 }

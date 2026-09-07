@@ -14241,6 +14241,20 @@ static void RenderSettingsMenu() {
                        GameSettings::kDefaultSeeThroughStrength);
     ImGui::EndDisabled();
 
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    UISectionLabel("DEBUG");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    if (ImGui::Checkbox("Detailed loading screen",
+                        &g_settings.debugLoadingScreen)) {
+        // No ApplyGameSettings: the loading screen reads the flag directly
+        // every frame it draws, so there is nothing to push anywhere.
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Off shows just LOADING. On shows stage timings, "
+                       "uploads and GPU state.");
+
     ImGui::Dummy(ImVec2(0.0f, 16.0f));
     if (UIMenuButton("RESET TO DEFAULTS", 38.0f)) {
         g_settings.ResetToDefaults();
@@ -14638,7 +14652,42 @@ static void RenderMainMenu(HWND hwnd) {
     if (g_game.loading.Active()) RenderLoadingScreen();
 }
 
+// The player-facing loading screen: the word LOADING, an animated ellipsis so
+// a long stage still looks alive, and nothing else. Everything the debug screen
+// shows -- stage index, upload byte counts, D3D12 resource states -- is
+// diagnostic, and a player waiting on a level has no use for any of it.
+static void RenderPlainLoadingScreen() {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(4, 8, 12, 255));
+
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    // Drawn straight onto the background list rather than into a window: with
+    // no readout to lay out there is nothing for a window to hold, and a
+    // centred string wants the screen's centre, not a panel's.
+    const bool bigFont = g_menuTitleFont != nullptr;
+    if (bigFont) ImGui::PushFont(g_menuTitleFont);
+
+    // Dots driven by wall clock, not frame count -- a load that hitches would
+    // otherwise freeze the one element telling the player it is still working.
+    const int dots = static_cast<int>(ImGui::GetTime() * 2.0) % 4;
+    char text[16] = "LOADING";
+    for (int i = 0; i < dots; ++i) text[7 + i] = '.';
+    text[7 + dots] = '\0';
+    // Measured without the dots so the word stays put as they come and go.
+    const float wordWidth = ImGui::CalcTextSize("LOADING").x;
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 pos((display.x - wordWidth) * 0.5f,
+                     (display.y - size.y) * 0.5f);
+    draw->AddText(pos, IM_COL32(236, 240, 236, 255), text);
+    if (bigFont) ImGui::PopFont();
+}
+
 static void RenderLoadingScreen() {
+    if (!g_settings.debugLoadingScreen) {
+        RenderPlainLoadingScreen();
+        return;
+    }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
         ImVec2(0, 0), display, IM_COL32(4, 8, 12, 238));

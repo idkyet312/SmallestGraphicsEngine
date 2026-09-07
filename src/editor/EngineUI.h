@@ -699,6 +699,22 @@ inline void RenderPlayerHUD(const Scene& scene) {
     constexpr float kBarHeight = 7.0f;
     const float baseline = io.DisplaySize.y - 34.0f;
 
+    // The right-hand block -- weapon, ammo, equipment row, money -- is drawn
+    // below the default font size. ImDrawList::AddText only honours a size when
+    // one is passed explicitly, and CalcTextSize always measures at the default,
+    // so every string in that corner goes through these two rather than the
+    // plain calls; mixing the two would right-align text against a width
+    // measured for a different size.
+    constexpr float kHudTextScale = 0.78f;
+    const float hudFontSize = ImGui::GetFontSize() * kHudTextScale;
+    auto hudTextSize = [&](const char* text) {
+        const ImVec2 base = ImGui::CalcTextSize(text);
+        return ImVec2(base.x * kHudTextScale, base.y * kHudTextScale);
+    };
+    auto hudText = [&](ImVec2 pos, ImU32 color, const char* text) {
+        draw->AddText(ImGui::GetFont(), hudFontSize, pos, color, text);
+    };
+
     const float maxHealth = (std::max)(1.0f, scene.player.maxHealth);
     const float fraction = (std::max)(
         0.0f, (std::min)(1.0f, scene.player.health / maxHealth));
@@ -856,9 +872,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
 
         // --- Weapon name, above everything, right-aligned ---
         const char* weaponName = GunModel::WeaponName(slot);
-        const ImVec2 nameSize = ImGui::CalcTextSize(weaponName);
-        draw->AddText(ImVec2(right - nameSize.x, rowY - 18.0f),
-                      IM_COL32(226, 234, 238, 240), weaponName);
+        const ImVec2 nameSize = hudTextSize(weaponName);
+        hudText(ImVec2(right - nameSize.x, rowY - 18.0f),
+                IM_COL32(226, 234, 238, 240), weaponName);
 
         if (scene.AmmoEnforced()) {
             const int inMag = scene.player.Magazine(slot);
@@ -874,7 +890,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // the reserve column has to stay put while it does.
             char spareText[24];
             snprintf(spareText, sizeof(spareText), "%d", spare);
-            const ImVec2 spareSize = ImGui::CalcTextSize(spareText);
+            const ImVec2 spareSize = hudTextSize(spareText);
             const float spareX = right - spareSize.x;
 
             // Thin divider between magazine and reserve, standing in for the
@@ -883,7 +899,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
 
             char magText[16];
             snprintf(magText, sizeof(magText), "%d", inMag);
-            constexpr float kMagFontScale = 2.6f;
+            // Relative to the block's own scale, not the raw font, so the big
+            // number keeps its ratio to the labels around it.
+            constexpr float kMagFontScale = 2.6f * kHudTextScale;
             const float magFontSize = ImGui::GetFontSize() * kMagFontScale;
             const ImVec2 magBase = ImGui::CalcTextSize(magText);
             const float magWidth = magBase.x * kMagFontScale;
@@ -896,9 +914,8 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddLine(ImVec2(dividerX, magY + magHeight * 0.30f),
                           ImVec2(dividerX, magY + magHeight * 0.78f),
                           IM_COL32(150, 164, 170, 160), 1.2f);
-            draw->AddText(
-                ImVec2(spareX, magY + magHeight * 0.44f),
-                IM_COL32(160, 172, 178, 235), spareText);
+            hudText(ImVec2(spareX, magY + magHeight * 0.44f),
+                    IM_COL32(160, 172, 178, 235), spareText);
 
             // Reload sweeps a rule directly under the figures. Kept off the
             // numbers themselves so the counts never disappear mid-reload.
@@ -933,10 +950,10 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // an equipment entry rather than a weapon. Lit when it is in hand.
             const bool c4Held = slot == GunModel::kRemoteChargeWeapon;
             const char* c4Label = "C4";
-            const ImVec2 c4Size = ImGui::CalcTextSize(c4Label);
+            const ImVec2 c4Size = hudTextSize(c4Label);
             cursorX -= c4Size.x;
-            draw->AddText(ImVec2(cursorX, statusY),
-                          c4Held ? statusLit : statusDim, c4Label);
+            hudText(ImVec2(cursorX, statusY),
+                    c4Held ? statusLit : statusDim, c4Label);
             // Marker dot, filled when held.
             cursorX -= 12.0f;
             draw->AddCircleFilled(ImVec2(cursorX + 3.0f, statusY + 7.0f), 2.6f,
@@ -949,10 +966,10 @@ inline void RenderPlayerHUD(const Scene& scene) {
                 scene.selectedGrenade == GrenadeType::Molotov ? "MOLOTOV" :
                 scene.selectedGrenade == GrenadeType::Vortex ? "VORTEX" : "FRAG";
             const bool grenadeReady = scene.grenadeCooldown <= 0.0f;
-            const ImVec2 grenadeSize = ImGui::CalcTextSize(grenadeLabel);
+            const ImVec2 grenadeSize = hudTextSize(grenadeLabel);
             cursorX -= grenadeSize.x + 10.0f;
-            draw->AddText(ImVec2(cursorX, statusY),
-                          grenadeReady ? statusLit : statusDim, grenadeLabel);
+            hudText(ImVec2(cursorX, statusY),
+                    grenadeReady ? statusLit : statusDim, grenadeLabel);
             cursorX -= 12.0f;
             draw->AddCircleFilled(ImVec2(cursorX + 3.0f, statusY + 7.0f), 2.6f,
                                   grenadeReady ? statusLit : statusDim, 10);
@@ -960,9 +977,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // Fire mode, furthest left. Only the AK is automatic; everything
             // else in the rack fires one round per pull.
             const char* fireMode = (slot == 0 || slot == 6) ? "AUTO" : "SEMI";
-            const ImVec2 modeSize = ImGui::CalcTextSize(fireMode);
+            const ImVec2 modeSize = hudTextSize(fireMode);
             cursorX -= modeSize.x + 12.0f;
-            draw->AddText(ImVec2(cursorX, statusY), statusDim, fireMode);
+            hudText(ImVec2(cursorX, statusY), statusDim, fireMode);
         }
     }
 
@@ -1010,9 +1027,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
 
         char balanceText[32];
         MoneySystem::Format(balanceText, sizeof(balanceText), money.Balance());
-        const ImVec2 balanceSize = ImGui::CalcTextSize(balanceText);
-        draw->AddText(ImVec2(moneyRight - balanceSize.x, moneyY),
-                      IM_COL32(255, 209, 61, 240), balanceText);
+        const ImVec2 balanceSize = hudTextSize(balanceText);
+        hudText(ImVec2(moneyRight - balanceSize.x, moneyY),
+                IM_COL32(255, 209, 61, 240), balanceText);
 
         // Each payout rises and fades from just under the balance. Stacked by
         // index so two awards in the same frame do not draw on top of each
@@ -1032,15 +1049,17 @@ inline void RenderPlayerHUD(const Scene& scene) {
             char line[64];
             snprintf(line, sizeof(line), "%s%s  %s",
                      entry.amount > 0 ? "+" : "", amountText, entry.label);
-            const ImVec2 lineSize = ImGui::CalcTextSize(line);
-            const float lineY =
-                moneyY + 18.0f + static_cast<float>(slotIndex) * 15.0f - rise;
+            const ImVec2 lineSize = hudTextSize(line);
+            // Row pitch follows the text: at a fixed 15px the smaller lines
+            // drifted apart and stopped reading as one stack.
+            const float lineY = moneyY + 18.0f * kHudTextScale +
+                static_cast<float>(slotIndex) * 15.0f * kHudTextScale - rise;
             // Green for income, red for the marine-lost debit: the sign alone is
             // easy to miss on a number that is only on screen for two seconds.
             const ImU32 tint = entry.amount > 0
                 ? IM_COL32(122, 226, 132, alpha)
                 : IM_COL32(232, 96, 78, alpha);
-            draw->AddText(ImVec2(moneyRight - lineSize.x, lineY), tint, line);
+            hudText(ImVec2(moneyRight - lineSize.x, lineY), tint, line);
             ++slotIndex;
         }
     }
