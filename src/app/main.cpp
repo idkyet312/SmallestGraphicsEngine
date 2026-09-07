@@ -14138,6 +14138,39 @@ static bool UIPrimaryButton(const char* label, float height = 52.0f) {
     return pressed;
 }
 
+// BF3-style menu entry: no button chrome, just the label. The selected row
+// inverts -- a light bar with dark text -- which is what carries the highlight
+// on a photographic background where a dark plate would disappear against the
+// dark half of the image and glow against the bright half.
+//
+// Hover is the selection: these menus are a single column with no keyboard
+// focus of their own, so whatever the mouse is over is what Enter would take.
+static bool UIMenuRow(const char* label, float height = 34.0f) {
+    const float width = ImGui::GetContentRegionAvail().x;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    // InvisibleButton takes the input so the row stays one hit target the full
+    // width of the column, rather than only where the glyphs happen to fall.
+    const bool pressed = ImGui::InvisibleButton(label, ImVec2(width, height));
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (hovered) {
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height),
+                            IM_COL32(228, 234, 230, 232));
+    }
+    // Trim the label at the first '#' so ImGui's ##id suffix stays out of the
+    // drawn text while still giving each row a unique id.
+    const char* labelEnd = label;
+    while (*labelEnd && !(labelEnd[0] == '#' && labelEnd[1] == '#')) ++labelEnd;
+    const ImVec2 textSize = ImGui::CalcTextSize(label, labelEnd);
+    draw->AddText(ImVec2(origin.x + 14.0f,
+                         origin.y + (height - textSize.y) * 0.5f),
+                  hovered ? IM_COL32(12, 16, 14, 255)
+                          : IM_COL32(226, 232, 228, 236),
+                  label, labelEnd);
+    return pressed;
+}
+
 // Settings panel. Drawn instead of the menu body rather than as a popup over
 // it, so the one column of controls stays the whole screen's subject.
 //
@@ -14228,42 +14261,89 @@ static void RenderSettingsMenu() {
 
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    const float menuHeight = (std::min)(700.0f, display.y - 24.0f);
-    ImGui::SetNextWindowSize(ImVec2(400.0f, menuHeight), ImGuiCond_Always);
+    ImDrawList* background = ImGui::GetBackgroundDrawList();
+    background->AddRectFilledMultiColor(ImVec2(0, 0), display,
+        IM_COL32(10, 18, 21, 255), IM_COL32(25, 40, 40, 255),
+        IM_COL32(8, 15, 18, 255), IM_COL32(7, 12, 15, 255));
+    // Contours give the front end an identity without loading a game scene.
+    const ImVec2 center(display.x * 0.76f, display.y * 0.48f);
+    const float radius = (std::min)(display.x * 0.32f, display.y * 0.48f);
+    for (float x = 0; x < display.x; x += 64.0f)
+        background->AddLine(ImVec2(x, 0), ImVec2(x, display.y), IM_COL32(130, 170, 150, 10));
+    for (float y = 0; y < display.y; y += 64.0f)
+        background->AddLine(ImVec2(0, y), ImVec2(display.x, y), IM_COL32(130, 170, 150, 10));
+    for (int ring = 0; ring < 15; ++ring) {
+        for (int point = 0; point <= 128; ++point) {
+            const float angle = point * 6.2831853f / 128.0f;
+            const float r = radius * (0.22f + ring * 0.058f) *
+                (1.0f + 0.10f * std::sin(angle * 3 + ring * 0.16f) +
+                 0.06f * std::cos(angle * 7 - ring * 0.12f));
+            background->PathLineTo(ImVec2(center.x + std::cos(angle) * r,
+                                         center.y + std::sin(angle) * r * 0.78f));
+        }
+        background->PathStroke(IM_COL32(123, 166, 149, 32), 0, 1.0f);
+    }
+    background->AddCircle(center, radius * 0.55f, IM_COL32(165, 193, 147, 50), 96);
+    background->AddLine(ImVec2(center.x - 18, center.y), ImVec2(center.x + 18, center.y), IM_COL32(187, 211, 164, 100));
+    background->AddLine(ImVec2(center.x, center.y - 18), ImVec2(center.x, center.y + 18), IM_COL32(187, 211, 164, 100));
+
+    // Left-to-right scrim under the menu column. The rows are unplated now, so
+    // this is what keeps them readable -- and it holds up if the flat backdrop
+    // is ever swapped for a screenshot, where the left third is whatever the
+    // image happens to be. Fades out well before the column ends so it reads as
+    // shading on the art rather than as a panel with an edge.
+    const float scrimWidth = (std::min)(display.x * 0.62f, 900.0f);
+    background->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(scrimWidth, display.y),
+        IM_COL32(0, 0, 0, 205), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 205));  // UL, UR, LR, LL
+    // A vignette top and bottom, the other half of the film look.
+    background->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(display.x, display.y * 0.16f),
+        IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    background->AddRectFilledMultiColor(ImVec2(0, display.y * 0.82f), ImVec2(display.x, display.y),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+    // The menu sits in the left third over the art, with no panel behind it --
+    // the background is the screen, and a plate floating on top of it would be
+    // the thing the eye lands on instead of the image.
+    const float margin = (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
+    const float menuHeight = (std::min)(860.0f, display.y - 32.0f);
+    ImGui::SetNextWindowPos(ImVec2(margin, (display.y - menuHeight) * 0.5f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2((std::min)(460.0f, display.x - margin * 2), menuHeight), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse;
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 24));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
     ImGui::Begin("Main Menu", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    ImGui::SetWindowFontScale(1.3f);
 
-    // Title block. The accent rule under the wordmark is the one piece of colour
-    // on the screen, which is what makes the primary action below read as
-    // belonging to it.
+    // Title block. Wordmark, then a hairline rule marking the left edge and
+    // the width the rows below occupy.
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
     const float contentWidth = ImGui::GetContentRegionAvail().x;
-    const char* title = "SMALLEST";
-    const char* titleTail = "GRAPHICS ENGINE";
-    const ImVec2 titleSize = ImGui::CalcTextSize(title);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (contentWidth - titleSize.x) * 0.5f);
-    ImGui::TextColored(UITheme::kAccent, "%s", title);
-    const ImVec2 tailSize = ImGui::CalcTextSize(titleTail);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (contentWidth - tailSize.x) * 0.5f);
-    ImGui::TextUnformatted(titleTail);
+    const char* title = "MILBOX";
+    // Flat white wordmark, hard against the left margin. No centring: the
+    // column is a left edge the title, the rows and the rule all share.
+    ImGui::SetWindowFontScale(5.2f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", title);
+    // Back to body scale for everything under the wordmark.
+    ImGui::SetWindowFontScale(1.15f);
 
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
     {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 cursor = ImGui::GetCursorScreenPos();
-        constexpr float ruleWidth = 56.0f;
-        const float ruleX = cursor.x + (contentWidth - ruleWidth) * 0.5f;
+        // Runs the width of the column, under the wordmark, marking the left
+        // edge the rows below line up on.
+        const float ruleX = cursor.x + 14.0f;
         draw->AddRectFilled(ImVec2(ruleX, cursor.y),
-                            ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
-                            ImGui::GetColorU32(UITheme::kAccent), 1.0f);
+                            ImVec2(cursor.x + contentWidth, cursor.y + 1.0f),
+                            IM_COL32(255, 255, 255, 60));
     }
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
 
@@ -14274,15 +14354,10 @@ static void RenderMainMenu(HWND hwnd) {
         char balanceText[32];
         MoneySystem::Format(balanceText, sizeof(balanceText),
                             g_game.money.Balance());
-        const ImVec2 balanceSize = ImGui::CalcTextSize(balanceText);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (contentWidth - balanceSize.x) * 0.5f);
-        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s", balanceText);
-        const char* fundsLabel = "FUNDS";
-        const ImVec2 fundsSize = ImGui::CalcTextSize(fundsLabel);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (contentWidth - fundsSize.x) * 0.5f);
-        ImGui::TextColored(UITheme::kTextDim, "%s", fundsLabel);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s  ", balanceText);
+        ImGui::SameLine(0.0f, 6.0f);
+        ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f), "FUNDS");
     }
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
@@ -14305,35 +14380,38 @@ static void RenderMainMenu(HWND hwnd) {
     // Island 1 and the Training Range are still reachable -- the travel board
     // flies to the island, the editor loads any level, and --level=<path>
     // starts one directly -- they are just no longer this menu's job.
-    UISectionLabel("BASE");
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIPrimaryButton("ENTER BASE"))
+    // One unbroken column, in the order the player uses it. The section rules
+    // are gone with the buttons: a divider every two entries was structure the
+    // list is short enough not to need, and it fought the wordmark rule above.
+    ImGui::SetWindowFontScale(1.7f);
+    if (UIMenuRow("ENTER BASE"))
         StartBase(hwnd);
-
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    UISectionLabel("DEPLOY");
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIMenuButton("CUSTOM GAME"))
+    if (UIMenuRow("CUSTOM GAME"))
         BrowseAndStartCustomLevel(hwnd);
-    if (!g_mainMenuLevelStatus.empty())
-        ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
-
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    UISectionLabel("TOOLS");
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIMenuButton("LEVEL EDITOR"))
+    if (UIMenuRow("LEVEL EDITOR"))
         ImGui::OpenPopup("Level Editor");
     // Empty terrain with no gameplay actors, foliage, houses or ocean clutter.
     // Renderer work is what is left, so a graphics change can be looked at
     // without a full island's content confusing what is being measured.
-    if (UIMenuButton("TEST LEVEL"))
+    if (UIMenuRow("TEST LEVEL"))
         StartLevelOne(hwnd, true, false, true, nullptr, true);
-    if (UIMenuButton("SETTINGS"))
+    if (UIMenuRow("SETTINGS"))
         g_showSettingsMenu = true;
-
-    ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    if (UIMenuButton("EXIT", 36.0f))
+    if (UIMenuRow("QUIT"))
         PostQuitMessage(0);
+    ImGui::SetWindowFontScale(1.15f);
+
+    // Kept below the list rather than beside Custom Game: it reports a level
+    // that failed to load, and the browser is the only row that can produce
+    // one, but it needs the full column width to wrap in.
+    if (!g_mainMenuLevelStatus.empty()) {
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                           g_mainMenuLevelStatus.c_str());
+        ImGui::PopTextWrapPos();
+    }
 
     // Ask before entering the editor rather than always opening the Level 1
     // template: loading was previously only reachable from inside the editor,
