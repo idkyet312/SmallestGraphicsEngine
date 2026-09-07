@@ -14259,39 +14259,121 @@ static void RenderSettingsMenu() {
     ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
 }
 
+// Resolved UI images, keyed by path. Uploading a texture costs a
+// descriptor slot out of the ImGui heap, so each image is loaded once and the
+// result -- including the failure -- is cached: a missing PNG must not retry
+// its file open every frame the screen is up.
+struct UIImage {
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> uploads;
+    UINT descriptorSlot = ~0u;
+    bool attempted = false;
+};
+static std::unordered_map<std::string, UIImage> g_uiImages;
+
+// Returns an ImGui texture handle for a UI image, or 0 when there is no art.
+// Zero is a normal answer, not an error -- a travel card draws a placeholder
+// for it, and the menu simply keeps its drawn backdrop.
+static uint64_t UITextureFromFile(const char* imagePath) {
+    if (!imagePath || !imguiSrvHeap || !g_dx12.device) return 0;
+    UIImage& entry = g_uiImages[imagePath];
+    if (!entry.attempted) {
+        entry.attempted = true;
+        std::error_code error;
+        if (std::filesystem::exists(imagePath, error) &&
+            g_nextImGuiTextureSlot < kImGuiDescriptorCount) {
+            entry.texture = GLBImporter::LoadTextureSingleMip(imagePath,
+                g_dx12.device, g_dx12.commandList, entry.uploads);
+            if (entry.texture) {
+                entry.descriptorSlot = g_nextImGuiTextureSlot++;
+                const UINT stride =
+                    g_dx12.device->GetDescriptorHandleIncrementSize(
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+                    imguiSrvHeap->GetCPUDescriptorHandleForHeapStart();
+                cpu.ptr += static_cast<SIZE_T>(entry.descriptorSlot) * stride;
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                g_dx12.device->CreateShaderResourceView(
+                    entry.texture.Get(), &srv, cpu);
+            }
+        }
+    }
+    if (entry.descriptorSlot == ~0u) return 0;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+        imguiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(entry.descriptorSlot) *
+        g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return gpu.ptr;
+}
+
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImDrawList* background = ImGui::GetBackgroundDrawList();
     background->AddRectFilledMultiColor(ImVec2(0, 0), display,
         IM_COL32(10, 18, 21, 255), IM_COL32(25, 40, 40, 255),
         IM_COL32(8, 15, 18, 255), IM_COL32(7, 12, 15, 255));
-    // Contours give the front end an identity without loading a game scene.
-    const ImVec2 center(display.x * 0.76f, display.y * 0.48f);
-    const float radius = (std::min)(display.x * 0.32f, display.y * 0.48f);
-    for (float x = 0; x < display.x; x += 64.0f)
-        background->AddLine(ImVec2(x, 0), ImVec2(x, display.y), IM_COL32(130, 170, 150, 10));
-    for (float y = 0; y < display.y; y += 64.0f)
-        background->AddLine(ImVec2(0, y), ImVec2(display.x, y), IM_COL32(130, 170, 150, 10));
-    for (int ring = 0; ring < 15; ++ring) {
-        for (int point = 0; point <= 128; ++point) {
-            const float angle = point * 6.2831853f / 128.0f;
-            const float r = radius * (0.22f + ring * 0.058f) *
-                (1.0f + 0.10f * std::sin(angle * 3 + ring * 0.16f) +
-                 0.06f * std::cos(angle * 7 - ring * 0.12f));
-            background->PathLineTo(ImVec2(center.x + std::cos(angle) * r,
-                                         center.y + std::sin(angle) * r * 0.78f));
-        }
-        background->PathStroke(IM_COL32(123, 166, 149, 32), 0, 1.0f);
-    }
-    background->AddCircle(center, radius * 0.55f, IM_COL32(165, 193, 147, 50), 96);
-    background->AddLine(ImVec2(center.x - 18, center.y), ImVec2(center.x + 18, center.y), IM_COL32(187, 211, 164, 100));
-    background->AddLine(ImVec2(center.x, center.y - 18), ImVec2(center.x, center.y + 18), IM_COL32(187, 211, 164, 100));
 
-    // Left-to-right scrim under the menu column. The rows are unplated now, so
-    // this is what keeps them readable -- and it holds up if the flat backdrop
-    // is ever swapped for a screenshot, where the left third is whatever the
-    // image happens to be. Fades out well before the column ends so it reads as
-    // shading on the art rather than as a panel with an edge.
+    // Optional photographic backdrop. Missing art is not a failure: the drawn
+    // contours below are the fallback, so the menu still has a background on a
+    // build that ships without the image.
+    const uint64_t menuImage =
+        UITextureFromFile("Content/Textures/UI/menu_background.jpg");
+    if (menuImage) {
+        // Cover, not stretch: scale by whichever axis needs more and centre the
+        // overflow, so a 16:9 photo on a 16:10 window crops rather than
+        // distorting the horizon.
+        // Read the aspect off the texture rather than hardcoding it, so
+        // swapping the file for one of a different shape needs no code change.
+        const D3D12_RESOURCE_DESC desc =
+            g_uiImages["Content/Textures/UI/menu_background.jpg"].texture->GetDesc();
+        const float imageAspect = static_cast<float>(desc.Width) /
+            (std::max)(1.0f, static_cast<float>(desc.Height));
+        const float screenAspect = display.x / (std::max)(display.y, 1.0f);
+        ImVec2 size = screenAspect > imageAspect
+            ? ImVec2(display.x, display.x / imageAspect)
+            : ImVec2(display.y * imageAspect, display.y);
+        const ImVec2 origin((display.x - size.x) * 0.5f,
+                            (display.y - size.y) * 0.5f);
+        background->AddImage((ImTextureID)menuImage, origin,
+                             ImVec2(origin.x + size.x, origin.y + size.y));
+    }
+
+    // Contours give the front end an identity without loading a game scene.
+    // Skipped when the photo loaded -- they were the backdrop, not an overlay.
+    if (!menuImage) {
+        const ImVec2 center(display.x * 0.76f, display.y * 0.48f);
+        const float radius = (std::min)(display.x * 0.32f, display.y * 0.48f);
+        for (float x = 0; x < display.x; x += 64.0f)
+            background->AddLine(ImVec2(x, 0), ImVec2(x, display.y), IM_COL32(130, 170, 150, 10));
+        for (float y = 0; y < display.y; y += 64.0f)
+            background->AddLine(ImVec2(0, y), ImVec2(display.x, y), IM_COL32(130, 170, 150, 10));
+        for (int ring = 0; ring < 15; ++ring) {
+            for (int point = 0; point <= 128; ++point) {
+                const float angle = point * 6.2831853f / 128.0f;
+                const float r = radius * (0.22f + ring * 0.058f) *
+                    (1.0f + 0.10f * std::sin(angle * 3 + ring * 0.16f) +
+                     0.06f * std::cos(angle * 7 - ring * 0.12f));
+                background->PathLineTo(ImVec2(center.x + std::cos(angle) * r,
+                                             center.y + std::sin(angle) * r * 0.78f));
+            }
+            background->PathStroke(IM_COL32(123, 166, 149, 32), 0, 1.0f);
+        }
+        background->AddCircle(center, radius * 0.55f, IM_COL32(165, 193, 147, 50), 96);
+        background->AddLine(ImVec2(center.x - 18, center.y), ImVec2(center.x + 18, center.y), IM_COL32(187, 211, 164, 100));
+        background->AddLine(ImVec2(center.x, center.y - 18), ImVec2(center.x, center.y + 18), IM_COL32(187, 211, 164, 100));
+    }
+
+    // Left-to-right scrim under the menu column. The rows are unplated, so this
+    // is what keeps them readable over whatever the left third of the backdrop
+    // happens to be -- which is the whole reason a photo can be dropped in
+    // behind them. Fades out well before the column ends so it reads as shading
+    // on the art rather than as a panel with an edge.
     const float scrimWidth = (std::min)(display.x * 0.62f, 900.0f);
     background->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(scrimWidth, display.y),
         IM_COL32(0, 0, 0, 205), IM_COL32(0, 0, 0, 0),
@@ -19177,58 +19259,6 @@ static const std::array<TravelDestination, 3> kTravelDestinations = { {
       "Content/Textures/Islands/base.png" },
 } };
 
-// Resolved preview images, keyed by path. Uploading a texture costs a
-// descriptor slot out of the ImGui heap, so each image is loaded once and the
-// result -- including the failure -- is cached: a missing PNG must not retry
-// its file open every frame the screen is up.
-struct TravelImage {
-    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> uploads;
-    UINT descriptorSlot = ~0u;
-    bool attempted = false;
-};
-static std::unordered_map<std::string, TravelImage> g_travelImages;
-
-// Returns an ImGui texture handle for a destination's preview, or 0 when there
-// is no art yet. Zero is a normal answer, not an error -- the caller draws a
-// placeholder card for it.
-static uint64_t TravelDestinationImage(const char* imagePath) {
-    if (!imagePath || !imguiSrvHeap || !g_dx12.device) return 0;
-    TravelImage& entry = g_travelImages[imagePath];
-    if (!entry.attempted) {
-        entry.attempted = true;
-        std::error_code error;
-        if (std::filesystem::exists(imagePath, error) &&
-            g_nextImGuiTextureSlot < kImGuiDescriptorCount) {
-            entry.texture = GLBImporter::LoadTextureSingleMip(imagePath,
-                g_dx12.device, g_dx12.commandList, entry.uploads);
-            if (entry.texture) {
-                entry.descriptorSlot = g_nextImGuiTextureSlot++;
-                const UINT stride =
-                    g_dx12.device->GetDescriptorHandleIncrementSize(
-                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                D3D12_CPU_DESCRIPTOR_HANDLE cpu =
-                    imguiSrvHeap->GetCPUDescriptorHandleForHeapStart();
-                cpu.ptr += static_cast<SIZE_T>(entry.descriptorSlot) * stride;
-                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                srv.Shader4ComponentMapping =
-                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                srv.Texture2D.MipLevels = 1;
-                g_dx12.device->CreateShaderResourceView(
-                    entry.texture.Get(), &srv, cpu);
-            }
-        }
-    }
-    if (entry.descriptorSlot == ~0u) return 0;
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
-        imguiSrvHeap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += static_cast<UINT64>(entry.descriptorSlot) *
-        g_dx12.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    return gpu.ptr;
-}
 
 // Open state mirrors the armory counter: an index rather than a pointer,
 // because the travel point list is rebuilt whenever a prefab is edited during a
@@ -19480,7 +19510,7 @@ static void RenderTravelPanel(HWND hwnd) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 imageMin = origin;
         const ImVec2 imageMax(origin.x + kCardWidth, origin.y + kImageHeight);
-        const uint64_t image = TravelDestinationImage(destination.imagePath);
+        const uint64_t image = UITextureFromFile(destination.imagePath);
         if (image) {
             draw->AddImage((ImTextureID)(intptr_t)image, imageMin, imageMax);
         } else {
