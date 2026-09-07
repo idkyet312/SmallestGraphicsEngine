@@ -2834,6 +2834,13 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
 
 // The deployment screen always resolves PlayerChoice before either run arms.
 static LevelInsertionMode ResolvedInsertionMode() {
+    // The level has the final say when it authors Spawn. The choice below is the
+    // loadout's, carried over from the last deployment screen, and a hub never
+    // opens one to clear it -- so without this a run flown to the island leaves
+    // Helicopter behind and the hub reads it as "fly the player in".
+    if (g_customLevelMode &&
+        g_game.world.Level().insertionMode == LevelInsertionMode::Spawn)
+        return LevelInsertionMode::Spawn;
     return g_playerInsertionChoice;
 }
 
@@ -2894,7 +2901,13 @@ static void BeginDeploymentPlanning() {
     LevelInsertionMode authored = g_customLevelMode
         ? g_game.world.Level().insertionMode
         : LevelInsertionMode::Helicopter;
-    if (authored == LevelInsertionMode::PlayerChoice)
+    // Both of these mean "no single craft is named here", and this screen has to
+    // open on one: PlayerChoice defers to the player, and Spawn belongs to a map
+    // that is never planned for at all. Reaching here with Spawn means a level
+    // set it and still ran the planning screen, so fall back rather than arm an
+    // insertion the mode does not describe.
+    if (authored == LevelInsertionMode::PlayerChoice ||
+        authored == LevelInsertionMode::Spawn)
         authored = LevelInsertionMode::Helicopter;
     g_playerInsertionChoice = authored;
     scene.selectedGrenade = g_game.mission.Loadout().grenade;
@@ -13655,9 +13668,16 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
     g_trainingRangeMode = g_activeCustomLevelName == "Training Range";
-    // Keyed off the level name like the range above, so the hub needs no new
-    // field in the level schema to identify itself.
-    g_baseMode = g_activeCustomLevelName == "Base";
+    // A level nobody is delivered to: the player starts on its PlayerSpawn and
+    // there is no transport or planning screen. Read from the level's own
+    // insertion mode rather than matched on the name as the range above is --
+    // "not a run" is a property of the map, and keying it to the string "Base"
+    // meant a renamed hub, or a second one, quietly went back to being flown
+    // into. The name match stays as a fallback so an existing Base.json that
+    // predates the mode still behaves as the hub.
+    g_baseMode = g_customLevelMode &&
+        (g_game.world.Level().insertionMode == LevelInsertionMode::Spawn ||
+         g_activeCustomLevelName == "Base");
     // Re-arm the callout so a restart of the range plays it again.
     g_plantC4Played = false;
     g_impactDecals.clear();
@@ -19215,6 +19235,20 @@ static bool OpenNearbyTravelScreen() {
     g_travelCursorReleased = false;
     g_travelStatus.clear();
 
+    // Boarding ends god mode. The base is where the player wanders and tinkers,
+    // and god mode is part of that; getting into the aircraft is the point they
+    // commit to a run, and a run flown invulnerable is not one. Done here at the
+    // boarding press rather than at level load so the switch is visibly tied to
+    // the act of getting in -- and so the deploy screen at the far end opens
+    // showing it already off rather than silently flipping underneath them.
+    if (scene.player.godMode) {
+        scene.player.godMode = false;
+        // God mode also disables ammo enforcement (PlayerState::AmmoEnforced),
+        // so leaving it drops the player back onto magazines that were never
+        // tracked. Restock the same way the deploy screen's toggle does.
+        scene.player.RestoreAmmo();
+    }
+
     // Get in and go. The player is strapped into the cabin and the aircraft
     // lifts off the pad it was parked on, so the destination board is picked
     // from the air rather than while standing next to a helicopter that never
@@ -24565,7 +24599,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 ConfigureBoatMaterials(g_insertionBoatModel);
                 g_insertionBoatShadowModel = GLBImporter::MergeSceneForDepth(
                     g_insertionBoatModel, g_dx12.device);
-                g_insertionBoatRestartPending = !g_emptyLevelMode;
+                // Same exclusion as the level-start arming: a hub is walked
+                // into, so no transport is armed for it. This runs after
+                // StartLevelOne on a cold load, so without g_baseMode here the
+                // asset load would re-arm the run that level start stood down.
+                g_insertionBoatRestartPending = !g_emptyLevelMode && !g_baseMode;
                 std::cout << "Insertion boat GLB ready\n";
             } else {
                 std::cerr << "Insertion boat GLB failed to load\n";
@@ -24601,8 +24639,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // The run itself is armed by the pending flag once loading
                 // finishes, so the drop-off is taken from the settled spawn.
                 // Starting it here would aim at whatever the camera was mid-load.
-                g_blackHawkInsertionRestartPending = true;
-                std::cout << "BlackHawk GLB ready, inbound to player spawn\n";
+                // Not on the hub: it has no insertion, and this stage lands
+                // after StartLevelOne stood the run down on a cold load.
+                g_blackHawkInsertionRestartPending = !g_baseMode;
+                if (g_baseMode)
+                    std::cout << "BlackHawk GLB ready, parked (no insertion)\n";
+                else
+                    std::cout << "BlackHawk GLB ready, inbound to player spawn\n";
             } else {
                 std::cerr << "BlackHawk GLB failed to load\n";
             }

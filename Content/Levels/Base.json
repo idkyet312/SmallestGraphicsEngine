@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "Base",
-  "insertionMode": "helicopter",
+  "insertionMode": "spawn",
   "patrolBoatEnabled": false,
   "terrain": {
     "flat": true,

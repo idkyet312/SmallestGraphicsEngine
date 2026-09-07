@@ -561,6 +561,22 @@ if(BUILD_TESTING)
     target_link_libraries(RuntimeCutPlaneTests PRIVATE SGEProjectHeaders)
     add_test(NAME RuntimeCutPlaneTests COMMAND RuntimeCutPlaneTests)
 
+    add_executable(DestructionCollisionQueriesTests tests/DestructionCollisionQueriesTests.cpp)
+    target_link_libraries(DestructionCollisionQueriesTests PRIVATE SGEProjectHeaders)
+    add_test(NAME DestructionCollisionQueriesTests COMMAND DestructionCollisionQueriesTests)
+
+    add_executable(DestructionBodyMassTests tests/DestructionBodyMassTests.cpp)
+    target_link_libraries(DestructionBodyMassTests PRIVATE SGEProjectHeaders box3d)
+    add_test(NAME DestructionBodyMassTests COMMAND DestructionBodyMassTests)
+
+    add_executable(DestructionBondIndexTests tests/DestructionBondIndexTests.cpp)
+    target_link_libraries(DestructionBondIndexTests PRIVATE SGEProjectHeaders)
+    add_test(NAME DestructionBondIndexTests COMMAND DestructionBondIndexTests)
+
+    add_executable(DestructionRenderCacheTests tests/DestructionRenderCacheTests.cpp)
+    target_link_libraries(DestructionRenderCacheTests PRIVATE SGEProjectHeaders)
+    add_test(NAME DestructionRenderCacheTests COMMAND DestructionRenderCacheTests)
+
     # Runtime sphere boolean, split out for the same reason: a grenade blowing a
     # hole in a wall is arithmetic, so the crater can be checked without a
     # device or any game content.

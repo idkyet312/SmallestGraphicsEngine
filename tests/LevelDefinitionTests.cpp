@@ -139,6 +139,15 @@ int main() {
     CHECK(!ParseLevelInsertionMode("submarine", insertion));
     // Unchanged by the failed parse.
     CHECK(insertion == LevelInsertionMode::FastRappel);
+    // The hub mode, and the last enumerator: ParseLevelInsertionMode walks the
+    // range by value, so a mode added at the end is silently unparseable --
+    // loading as Helicopter rather than failing -- until that loop's bound
+    // moves with it. This is the case that catches that. Kept after the
+    // failed-parse check above, which asserts against the value left by the
+    // parse before it.
+    CHECK(ParseLevelInsertionMode("spawn", insertion));
+    CHECK(insertion == LevelInsertionMode::Spawn);
+    CHECK(std::string(LevelInsertionModeName(insertion)) == "spawn");
 
     LevelDefinition duplicate = level;
     duplicate.entities[1].id = duplicate.entities[0].id;

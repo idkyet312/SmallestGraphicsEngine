@@ -193,7 +193,13 @@ enum class LevelInsertionMode : uint32_t {
     FastRappel = 2,
     // The player picks between both helicopter runs and the boat before the
     // level starts. Only maps that set this offer the choice.
-    PlayerChoice = 3
+    PlayerChoice = 3,
+    // No insertion at all: the player simply starts standing at the authored
+    // PlayerSpawn. For maps that are not a run -- the home base hub above all,
+    // which is walked around rather than deployed into, so there is no
+    // transport to arrive on and no deployment screen to plan. Every other mode
+    // answers "what delivers the player here"; this one answers "nothing does".
+    Spawn = 4
 };
 
 inline constexpr float kDefaultDeploymentRadius = 34.0f;

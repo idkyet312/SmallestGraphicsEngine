@@ -13,6 +13,7 @@
 
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
+#include "../../core/EngineLogger.h"
 #include "ProfilerDX12.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
@@ -1029,6 +1030,22 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
                 ? drawItems[i].primitive->vbv
                 : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
+            // A null vertex address is a GPU page fault at VA 0 on the draw
+            // below, which surfaces only as DXGI_ERROR_DEVICE_HUNG with a DRED
+            // breadcrumb -- no CPU stack, no D3D debug error. Name the offender
+            // on the CPU side and skip it rather than losing the device.
+            if (vbv.BufferLocation == 0 || vbv.SizeInBytes == 0) {
+                static int loggedNullVBV = 0;
+                if (loggedNullVBV < 8) {
+                    ++loggedNullVBV;
+                    SGE_LOG("LogRender", EngineLog::Level::Warning,
+                        "VB direct draw skipped: null vertex buffer (item " +
+                        std::to_string(i) + ", primitive=" +
+                        (drawItems[i].primitive ? "yes" : "no") + ", isCube=" +
+                        (drawItems[i].isCube ? "yes" : "no") + ")");
+                }
+                continue;
+            }
             g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
             vb.SetVisPassDraw(g_dx12.commandList.Get(), dcIDs[i],
                 drawItems[i].materialId, drawItems[i].doubleSided,

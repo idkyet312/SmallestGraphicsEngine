@@ -2754,10 +2754,16 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     TrackItemEdit(terrainBefore, terrainChanged);
     {
         // How the player arrives. "Player choice" offers both BlackHawk runs
-        // and the boat when the level starts.
+        // and the boat when the level starts. "Spawn in place" is the hub
+        // answer: no transport and no planning screen, the player just starts
+        // standing on the PlayerSpawn.
+        //
+        // Index-mapped straight onto LevelInsertionMode, so this list has to
+        // stay in enum order and gain an entry whenever the enum does.
         const LevelDefinition insertionBefore = level_;
         const char* modes[] = {
-            "Helicopter", "Boat", "Fast helicopter rappel", "Player choice" };
+            "Helicopter", "Boat", "Fast helicopter rappel", "Player choice",
+            "Spawn in place (no insertion)" };
         int mode = static_cast<int>(level_.insertionMode);
         const bool insertionChanged =
             ImGui::Combo("Insertion", &mode, modes, IM_ARRAYSIZE(modes));

@@ -292,13 +292,17 @@ const char* LevelInsertionModeName(LevelInsertionMode mode) {
     case LevelInsertionMode::Boat: return "boat";
     case LevelInsertionMode::FastRappel: return "fast_rappel";
     case LevelInsertionMode::PlayerChoice: return "player_choice";
+    case LevelInsertionMode::Spawn: return "spawn";
     }
     return "helicopter";
 }
 
 bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode) {
+    // Bounded by the last enumerator, not by PlayerChoice: a mode added after
+    // it is unparseable until this bound moves with it, and the failure is a
+    // level that silently loads as Helicopter rather than an error.
     for (uint32_t i = static_cast<uint32_t>(LevelInsertionMode::Helicopter);
-         i <= static_cast<uint32_t>(LevelInsertionMode::PlayerChoice); ++i) {
+         i <= static_cast<uint32_t>(LevelInsertionMode::Spawn); ++i) {
         const auto candidate = static_cast<LevelInsertionMode>(i);
         if (text == LevelInsertionModeName(candidate)) {
             mode = candidate;
