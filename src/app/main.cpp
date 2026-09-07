@@ -14312,6 +14312,47 @@ static uint64_t UITextureFromFile(const char* imagePath) {
     return gpu.ptr;
 }
 
+// The menu's typefaces, rasterized at the sizes they are actually drawn at.
+// Both stay null when no font file is found, and every use falls back to the
+// built-in font -- the menu is then exactly what it was before.
+static ImFont* g_menuTitleFont = nullptr;
+static ImFont* g_menuBodyFont = nullptr;
+
+// Rasterizing at the display size is the whole point: the wordmark used to be
+// the 13px built-in bitmap blown up 5.2x, which is why its edges were soft and
+// its stems uneven. A glyph baked at ~68px has real curves at that size.
+static void LoadMenuFonts() {
+    ImGuiIO& io = ImGui::GetIO();
+    // Monospace faces, in preference order, matching the terminal look the
+    // menu already had. Cascadia ships with Windows Terminal and VS; Consolas
+    // is on every Windows install, so the last entry effectively always hits.
+    const char* candidates[] = {
+        "C:/Windows/Fonts/CascadiaMono.ttf",
+        "C:/Windows/Fonts/CascadiaCode.ttf",
+        "C:/Windows/Fonts/consola.ttf",
+    };
+    const char* path = nullptr;
+    for (const char* candidate : candidates) {
+        if (std::filesystem::exists(candidate)) { path = candidate; break; }
+    }
+    if (!path) return;
+
+    // Oversampled horizontally: these are thin, wide-tracked letterforms, and
+    // the extra horizontal samples are what keep the vertical stems from
+    // picking up the ragged edges visible before.
+    ImFontConfig cfg;
+    cfg.OversampleH = 3;
+    cfg.OversampleV = 2;
+    cfg.PixelSnapH = false;
+
+    // Body first so it becomes the default font for every other ImGui window;
+    // the previous default was the 13px built-in, so this sharpens the rows,
+    // the editor and the HUD panels alike.
+    g_menuBodyFont = io.Fonts->AddFontFromFileTTF(path, 18.0f, &cfg);
+    g_menuTitleFont = io.Fonts->AddFontFromFileTTF(path, 68.0f, &cfg);
+    if (g_menuBodyFont) io.FontDefault = g_menuBodyFont;
+}
+
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImDrawList* background = ImGui::GetBackgroundDrawList();
@@ -14319,15 +14360,26 @@ static void RenderMainMenu(HWND hwnd) {
         IM_COL32(10, 18, 21, 255), IM_COL32(25, 40, 40, 255),
         IM_COL32(8, 15, 18, 255), IM_COL32(7, 12, 15, 255));
 
+    // The menu column's geometry, needed up here because the backdrop is
+    // positioned against it -- the photo starts where the text ends.
+    const float kMenuBaseMargin =
+        (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
+    const float kMenuWidth = (std::min)(460.0f, display.x - kMenuBaseMargin * 2);
+    // Nudged right of the base margin so the column clears the dark left edge
+    // of the backdrop. Scales with width, and is clamped so a narrow window
+    // cannot push the column off the right.
+    const float kMenuMargin = (std::max)(0.0f, (std::min)(
+        kMenuBaseMargin + display.x * 0.019f, display.x - kMenuWidth));
+
     // Optional photographic backdrop. Missing art is not a failure: the drawn
     // contours below are the fallback, so the menu still has a background on a
     // build that ships without the image.
     const uint64_t menuImage =
         UITextureFromFile("Content/Textures/UI/menu_background.jpg");
     if (menuImage) {
-        // Cover, not stretch: scale by whichever axis needs more and centre the
-        // overflow, so a 16:9 photo on a 16:10 window crops rather than
-        // distorting the horizon.
+        // Contain, not cover: scale by whichever axis runs out first, so the
+        // whole photo is on screen whatever the window shape -- nothing of the
+        // island gets cropped away. Placement is handled below.
         // Read the aspect off the texture rather than hardcoding it, so
         // swapping the file for one of a different shape needs no code change.
         const D3D12_RESOURCE_DESC desc =
@@ -14336,10 +14388,31 @@ static void RenderMainMenu(HWND hwnd) {
             (std::max)(1.0f, static_cast<float>(desc.Height));
         const float screenAspect = display.x / (std::max)(display.y, 1.0f);
         ImVec2 size = screenAspect > imageAspect
-            ? ImVec2(display.x, display.x / imageAspect)
-            : ImVec2(display.y * imageAspect, display.y);
+            ? ImVec2(display.y * imageAspect, display.y)
+            : ImVec2(display.x, display.x / imageAspect);
+        // Centred. The menu column is what moves against it, not the photo.
         const ImVec2 origin((display.x - size.x) * 0.5f,
                             (display.y - size.y) * 0.5f);
+
+        // Fill whatever the contained image leaves over with the image itself
+        // rather than the gradient: a stretched, darkened copy behind it covers
+        // the bars edge to edge, so the screen reads as one photograph with a
+        // sharp centre instead of art floating on a plate.
+        const ImVec2 fillSize = screenAspect > imageAspect
+            ? ImVec2(display.x, display.x / imageAspect)
+            : ImVec2(display.y * imageAspect, display.y);
+        // Centred on the same point as the sharp copy, so the two line up and
+        // the filler reads as an extension of the photo rather than a second,
+        // offset picture.
+        const ImVec2 fillOrigin((display.x - fillSize.x) * 0.5f,
+                                (display.y - fillSize.y) * 0.5f);
+        background->AddImage((ImTextureID)menuImage, fillOrigin,
+                             ImVec2(fillOrigin.x + fillSize.x,
+                                    fillOrigin.y + fillSize.y),
+                             ImVec2(0, 0), ImVec2(1, 1),
+                             IM_COL32(70, 78, 80, 255));
+        // Sits under the sharp copy, so the seam between them is a step in
+        // brightness on continuous content, not a hard edge against a panel.
         background->AddImage((ImTextureID)menuImage, origin,
                              ImVec2(origin.x + size.x, origin.y + size.y));
     }
@@ -14374,10 +14447,21 @@ static void RenderMainMenu(HWND hwnd) {
     // happens to be -- which is the whole reason a photo can be dropped in
     // behind them. Fades out well before the column ends so it reads as shading
     // on the art rather than as a panel with an edge.
+    // Offset with the column so its solid end stays under the text and the
+    // fade always begins past it, rather than the column sliding out from
+    // under the only thing keeping it readable.
     const float scrimWidth = (std::min)(display.x * 0.62f, 900.0f);
-    background->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(scrimWidth, display.y),
+    const float scrimStart = kMenuMargin - kMenuBaseMargin;
+    background->AddRectFilledMultiColor(
+        ImVec2(scrimStart, 0), ImVec2(scrimStart + scrimWidth, display.y),
         IM_COL32(0, 0, 0, 205), IM_COL32(0, 0, 0, 0),
         IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 205));  // UL, UR, LR, LL
+    // The offset leaves the scrim starting inside the screen, so hold its
+    // solid tone across the strip to its left; without it the edge of the
+    // shading reads as a visible vertical seam.
+    if (scrimStart > 0.0f)
+        background->AddRectFilled(ImVec2(0, 0), ImVec2(scrimStart, display.y),
+                                  IM_COL32(0, 0, 0, 205));
     // A vignette top and bottom, the other half of the film look.
     background->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(display.x, display.y * 0.16f),
         IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150),
@@ -14388,10 +14472,9 @@ static void RenderMainMenu(HWND hwnd) {
     // The menu sits in the left third over the art, with no panel behind it --
     // the background is the screen, and a plate floating on top of it would be
     // the thing the eye lands on instead of the image.
-    const float margin = (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
     const float menuHeight = (std::min)(860.0f, display.y - 32.0f);
-    ImGui::SetNextWindowPos(ImVec2(margin, (display.y - menuHeight) * 0.5f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2((std::min)(460.0f, display.x - margin * 2), menuHeight), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(kMenuMargin, (display.y - menuHeight) * 0.5f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(kMenuWidth, menuHeight), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
@@ -14401,7 +14484,9 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
     ImGui::Begin("Main Menu", nullptr, flags);
     ImGui::PopStyleVar(3);
-    ImGui::SetWindowFontScale(1.3f);
+    // Scaling a baked font is what softened the text before, so the real fonts
+    // are drawn at 1.0 and only the built-in fallback is scaled up.
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.3f);
 
     // Title block. Wordmark, then a hairline rule marking the left edge and
     // the width the rows below occupy.
@@ -14410,11 +14495,28 @@ static void RenderMainMenu(HWND hwnd) {
     const char* title = "MILBOX";
     // Flat white wordmark, hard against the left margin. No centring: the
     // column is a left edge the title, the rows and the rule all share.
-    ImGui::SetWindowFontScale(5.2f);
+    if (g_menuTitleFont) ImGui::PushFont(g_menuTitleFont);
+    else ImGui::SetWindowFontScale(5.2f);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", title);
+    // Letter-spaced by hand: a wordmark wants tracking the font itself does
+    // not carry, and one glyph at a time is the only way ImGui offers it.
+    {
+        ImVec2 pen = ImGui::GetCursorScreenPos();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float tracking = ImGui::GetFontSize() * 0.14f;
+        float x = pen.x;
+        for (const char* c = title; *c; ++c) {
+            const char glyph[2] = { *c, '\0' };
+            draw->AddText(ImVec2(x, pen.y), IM_COL32(255, 255, 255, 255), glyph);
+            x += ImGui::CalcTextSize(glyph).x + tracking;
+        }
+        // Reserve the space the hand-drawn text occupies so the rule and rows
+        // below lay out under it rather than on top of it.
+        ImGui::Dummy(ImVec2(x - pen.x, ImGui::GetTextLineHeight()));
+    }
+    if (g_menuTitleFont) ImGui::PopFont();
     // Back to body scale for everything under the wordmark.
-    ImGui::SetWindowFontScale(1.15f);
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
 
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
     {
@@ -14483,7 +14585,7 @@ static void RenderMainMenu(HWND hwnd) {
         g_showSettingsMenu = true;
     if (UIMenuRow("QUIT"))
         PostQuitMessage(0);
-    ImGui::SetWindowFontScale(1.15f);
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
 
     // Kept below the list rather than beside Custom Game: it reports a level
     // that failed to load, and the browser is the only row that can produce
@@ -20760,6 +20862,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // so there is no ownership to carry in. A wallet written by an older build
     // still has its item section; LoadMoney simply ignores it now.
     LoadMoney(g_game.money);
+    LoadMenuFonts();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),
