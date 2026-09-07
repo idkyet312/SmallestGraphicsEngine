@@ -15994,8 +15994,11 @@ static void RenderWinScreen(HWND hwnd) {
         ImGui::PopStyleColor(3);
         if (replay) RestartActiveLevel(hwnd);
         ImGui::SameLine();
-        if (ImGui::Button("MAIN MENU", ImVec2(halfWidth, 44.0f)))
-            OpenMainMenu();
+        // A finished run ends by flying home, not by dropping out to the menu.
+        // The base is where the payout above is actually spent, so send the
+        // player straight there; the menu is still one Escape away from it.
+        if (ImGui::Button("RETURN TO BASE", ImVec2(halfWidth, 44.0f)))
+            StartBase(hwnd);
     }
     ImGui::End();
 }
