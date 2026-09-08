@@ -14,11 +14,11 @@
 // Poly Haven "Qwantani Dawn (Pure Sky)", CC0. Temporary daylight test sky.
 inline constexpr const char* kSkyEnvironmentPath =
     "Content/Textures/Sky/qwantani_dawn_puresky_4k.exr";
-// Poly Haven "Qwantani Night (Pure Sky)", CC0. Swapped in for the Night
-// time-of-day preset -- a night sun direction alone cannot produce a starfield,
-// so the environment map has to change with it.
-inline constexpr const char* kSkyNightEnvironmentPath =
-    "Content/Textures/Sky/qwantani_night_puresky_4k.exr";
+// The Night preset used to swap in a second 70 MB EXR here. Decoding it and
+// re-prefiltering the IBL stalled every switch into and out of Night, and the
+// file had to ship purely for that one preset, so the night environment map is
+// gone: Night now keeps the daylight environment and is carried by its own sun
+// direction and lighting values alone.
 inline constexpr float kSkyEnvironmentRotationRadians = XM_PIDIV2;
 
 struct alignas(256) SkyBufferDX12 {

@@ -6871,75 +6871,22 @@ static bool g_skyEnvironmentSwapPending = false;
 static float g_skyEnvironmentSwapDelay = 0.0f;
 static constexpr float kSkyEnvironmentSwapDelaySeconds = 1.0f;
 
-static void RequestTimeOfDaySkyEnvironment(TimeOfDay time) {
-    const char* environment = TimeOfDayIsDark(time) ? kSkyNightEnvironmentPath
-                                                    : kSkyEnvironmentPath;
-    if (!skyRenderer.initialized) return;
-    if (skyRenderer.EnvironmentPath() == environment) {
-        // Already showing the sky this preset wants. Cancels a queued swap too:
-        // picking Night then Afternoon inside the delay window would otherwise
-        // fire a swap that has nothing left to change.
-        g_skyEnvironmentSwapPending = false;
-        g_skyEnvironmentSwapDelay = 0.0f;
-        return;
-    }
-    g_skyEnvironmentSwapPending = true;
-    g_skyEnvironmentSwapDelay = kSkyEnvironmentSwapDelaySeconds;
+static void RequestTimeOfDaySkyEnvironment(TimeOfDay) {
+    // Every preset now shares the daylight environment map, so there is never a
+    // swap to queue. Kept as a no-op rather than deleted: the time-of-day code
+    // calls this from several places, and a preset that wants its own sky again
+    // only has to fill this back in.
+    g_skyEnvironmentSwapPending = false;
+    g_skyEnvironmentSwapDelay = 0.0f;
 }
 
 // Runs between frames only. See g_skyEnvironmentSwapPending.
-static void ApplyTimeOfDaySkyEnvironment(TimeOfDay time) {
-    const char* environment = TimeOfDayIsDark(time) ? kSkyNightEnvironmentPath
-                                                    : kSkyEnvironmentPath;
-    if (!skyRenderer.initialized) return;
-    if (skyRenderer.EnvironmentPath() == environment) return;
-
-    // One recording session on the sky renderer's *private* direct list covers
-    // the whole swap: the texture upload and the IBL prefilter share a single
-    // reset/close/execute.
-    //
-    // Nothing here touches g_dx12.commandAllocators or the frame fence. Earlier
-    // versions reset the frame allocator and drained with WaitForGPUAllFrames,
-    // which leaves fenceValues[] holding values it never signalled -- safe only
-    // when a frame's MoveToNextFrame() follows to re-sync it. Run between
-    // frames, twice, it deadlocked the next frame's wait. See
-    // SkyRendererDX12::BeginEnvironmentSwap.
-    ID3D12GraphicsCommandList* list = skyRenderer.BeginEnvironmentSwap();
-    if (!list) {
-        SGE_LOG("LogRender", EngineLog::Level::Warning,
-            "Sky swap command list unavailable; keeping current environment");
-        return;
-    }
-
-    if (!skyRenderer.SetEnvironment(environment, list)) {
-        // Keep the current sky rather than failing the run: the preset's
-        // lighting still applies, the map just does not change. The list was
-        // reset above, so it still has to be closed and submitted.
-        skyRenderer.EndEnvironmentSwap();
-        SGE_LOG("LogRender", EngineLog::Level::Warning,
-            std::string("Failed to load sky environment ") + environment +
-            "; keeping " + skyRenderer.EnvironmentPath());
-        return;
-    }
-
-    // Do not rebuild the GGX prefilter here. At 4K that dispatch performs
-    // hundreds of millions of samples and can exceed Windows' TDR timeout; the
-    // following fence then never retires after device removal and the deployment
-    // screen appears to hang. The uploaded HDRI already has a full box-filtered
-    // mip chain, which is a safe runtime approximation and, unlike retaining the
-    // boot prefilter, still gives night reflections the correct environment.
-    g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
-    skyRenderer.EndEnvironmentSwap();
-
-    // CPU-side, so it runs after the GPU work rather than racing it.
-    const auto skySH = GLBImporter::ComputeSkyIrradianceSH(
-        environment, kSkyEnvironmentRotationRadians);
-    mainShader.SetSkyIrradiance(skySH, 1.0f);
-
-    g_specularEnvironmentResource = g_skyEnvironmentResource;
-
-    SGE_LOG("LogRender", EngineLog::Level::Display,
-        std::string("Sky environment swapped to ") + environment);
+static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
+    // No-op for the same reason as RequestTimeOfDaySkyEnvironment above: with
+    // one environment map there is nothing to upload and no IBL to re-derive.
+    // Dropping the night EXR removed this function's cost entirely -- it used
+    // to decode a 70 MB file and recompute the irradiance SH mid-run, which is
+    // what made switching into Night hitch.
 }
 ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
 ID3D12Resource*             g_spotShadowAtlasResource = nullptr;
@@ -13604,10 +13551,185 @@ static void ResetSprintStamina() {
     g_staminaExhausted = false;
     g_breathingCooldown = 0.0f;
 }
+// Terrain texture arrays, the HDRI sky with its IBL prefilter, and the CPU sky
+// analyses. Deferred out of boot: together they measured ~8.6 s of a ~13.4 s
+// startup, and the main menu is pure ImGui -- IsSceneScreen() excludes it, so
+// nothing on the front end samples terrain, sky or IBL. Boot now reaches the
+// menu without paying for them, and the first level start calls this before
+// BeginLevelLoading, which is where the wait belongs and where a progress bar
+// is already on screen.
+//
+// Runs at most once. Everything below keeps the ordering the boot path relied
+// on: the terrain upload is submitted and waited before the sky work resets the
+// same command list, and the HDRI upload, IBL prefilter and cloud-noise bake
+// share one recording session (see the comments inside).
+static bool g_sceneRenderAssetsReady = false;
+// Set by a level start, consumed in the frame loop before BeginFrame opens the
+// frame's command list. The build below resets that list and its allocator, so
+// running it from the menu button -- which is called from inside the ImGui
+// frame, with the list already recording -- reset the allocator out from under
+// the frame and failed with E_FAIL (0x80004005). Same hazard, and same fix, as
+// the sky swap and the AO resize that share that pre-BeginFrame slot.
+static bool g_sceneRenderAssetsPending = false;
+static void RequestSceneRenderAssets() {
+    if (!g_sceneRenderAssetsReady) g_sceneRenderAssetsPending = true;
+}
+static void EnsureSceneRenderAssets() {
+    g_sceneRenderAssetsPending = false;
+    if (g_sceneRenderAssetsReady) return;
+    g_sceneRenderAssetsReady = true;
+
+    // At boot this ran with the command list closed and nothing in flight. It
+    // now runs from StartLevelOne/StartLevelEditor, after the menu has been
+    // presenting frames, so the current allocator still owns commands the GPU
+    // is executing and Reset() on it returns E_FAIL. Drain the queue first.
+    //
+    // Isolated rather than WaitForGPUAllFrames: that leaves every frame slot
+    // holding an unsignalled value and requires an immediate MoveToNextFrame
+    // handoff, which does not follow here -- the loading screen keeps rendering
+    // for many more frames and would eventually wait forever on one of them.
+    WaitForDirectQueueIdleIsolated();
+
+    bool terrainReady = false;
+    if (g_useMeshShader) {
+        // Terrain initialization uploads its PBR texture arrays. Record and
+        // submit those copies explicitly; otherwise the following sky reset
+        // discards them and every terrain SRV samples zero.
+        ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+        ThrowIfFailed(g_dx12.commandList->Reset(
+            g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+        terrainReady = g_terrain.Init(mainShader);
+        ThrowIfFailed(g_dx12.commandList->Close());
+        {
+            ID3D12CommandList* terrainLists[] = { g_dx12.commandList.Get() };
+            g_dx12.commandQueue->ExecuteCommandLists(1, terrainLists);
+        }
+        WaitForGPU();
+        DumpDX12DebugMessages();
+    }
+    if (!terrainReady) {
+        scene.useMeshTerrain = false;
+        std::cerr << "Mesh shader terrain unavailable; keeping flat floor\n";
+    }
+    scene.grenadeGroundHeight = [](float x, float z) {
+        if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+        auto params = CurrentTerrainParams();
+        params.heightScale = scene.terrainHeightScale;
+        return TerrainRendererDX12::HeightAt(params, x, z);
+    };
+
+    // Mip generator (compute shader) for imported GLB textures
+    SGE_LOG("LogRender", EngineLog::Level::Display, "Scene assets: mip generator");
+    if (!g_mipGen.Init()) {
+        std::cerr << "Mip generator init failed (non-fatal, textures will have no mips)\n";
+    }
+
+    // The command list is closed after InitDX12 and stays closed until the first
+    // BeginFrame(). skyRenderer.Init() records a CopyTextureRegion for the HDRI
+    // upload, so the list must be open while it runs and its work must be flushed
+    // (executed + waited) before the list is closed again - otherwise the copy
+    // never reaches the GPU and the sky texture stays black.
+    // Keep this as one recording session: HDRI upload, IBL prefilter, and
+    // cloud-noise generation all record onto the command list opened below.
+    // Nothing that presents a frame may run between here and the submit -- it
+    // would reset this same list and invalidate the active recording.
+    SGE_LOG("LogRender", EngineLog::Level::Display, "Scene assets: HDRI, IBL prefilter, cloud noise");
+    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    if (!skyRenderer.Init()) {
+        std::cerr << "HDRI sky init failed (non-fatal)\n";
+    }
+    g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
+    if (environmentIBL.Init(
+            g_skyEnvironmentResource, kSkyEnvironmentRotationRadians)) {
+        g_specularEnvironmentResource =
+            environmentIBL.prefilteredEnvironment.Get();
+        g_brdfIntegrationResource = environmentIBL.brdfIntegrationLUT.Get();
+        std::cout << "GGX HDRI prefilter and BRDF integration LUT ready\n";
+    } else {
+        g_specularEnvironmentResource = g_skyEnvironmentResource;
+        std::cerr << "Specular IBL prefilter failed (using raw HDRI fallback)\n";
+    }
+    // Bake the cloud noise onto this same list. It is pure compute into two
+    // textures nothing else touches, and the flush below already waits, so it
+    // costs one dispatch pair at boot rather than a second submit.
+    if (g_cloudNoise.Init()) {
+        g_cloudNoise.Generate(g_dx12.commandList.Get());
+    } else {
+        std::cerr << "Cloud noise generation failed; clouds stay on the 2D path\n";
+    }
+    ThrowIfFailed(g_dx12.commandList->Close());
+    {
+        ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, skyLists);
+    }
+    WaitForGPU();
+    // Only point the sky at the volumes once the dispatches have actually
+    // completed -- sampling a volume still being written gives noise that
+    // changes under the camera on the first frames.
+    if (g_cloudNoise.Generated()) {
+        skyRenderer.SetCloudVolumes(
+            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
+    }
+    g_mipGen.FlushPending();
+    DumpDX12DebugMessages();
+    SGE_LOG("LogRender", EngineLog::Level::Display, "Scene assets: sky irradiance");
+    {
+        auto skySH = GLBImporter::ComputeSkyIrradianceSH(
+            kSkyEnvironmentPath, kSkyEnvironmentRotationRadians);
+        mainShader.SetSkyIrradiance(skySH, 1.0f);
+        const HDRISunLight hdriSun =
+            GLBImporter::ExtractHDRISunLight(
+                kSkyEnvironmentPath, 2.1f,
+                kSkyEnvironmentRotationRadians);
+        if (hdriSun.valid) {
+            std::cout << "HDRI sun analyzed (scene defaults retained): direction=("
+                      << hdriSun.direction.x << ", "
+                      << hdriSun.direction.y << ", "
+                      << hdriSun.direction.z << ") color=("
+                      << hdriSun.color.x << ", "
+                      << hdriSun.color.y << ", "
+                      << hdriSun.color.z << ") sourceLuminance="
+                      << hdriSun.sourceLuminance << '\n';
+        } else {
+            std::cerr << "HDRI sun extraction failed; using scene fallback light\n";
+        }
+    }
+
+    // The visibility buffer is still initialized at boot, so it bound these two
+    // when they were null. Re-point it now that the prefilter and the LUT
+    // actually exist, or every VB-resolved surface samples a null environment.
+    if (scene.useVisibilityBuffer)
+        visBuffer.UpdateEnvironmentMap(
+            g_specularEnvironmentResource, g_brdfIntegrationResource);
+
+    // Volumetric fog initialized before the noise was baked; hand it the
+    // volumes now.
+    if (scene.enableVolumetricFog && g_cloudNoise.Generated())
+        volumetricFog.SetCloudVolumes(
+            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
+
+    // Second half of the boot MSAA test: terrain and sky exist only now, and a
+    // pipeline of theirs without an MSAA variant has to turn MSAA off for the
+    // whole scene.
+    if (scene.enableMSAA &&
+        ((g_terrain.supported && !g_terrain.msaaSupported) ||
+         (skyRenderer.initialized && !skyRenderer.msaaSupported))) {
+        std::cerr << "4x MSAA unavailable for terrain or sky (non-fatal)\n";
+        scene.enableMSAA = false;
+    }
+}
+
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
                           bool startWithUIAndMobileControls = false) {
+    // Terrain textures, the HDRI sky and its IBL are no longer built at boot.
+    // Queue them rather than building them here: this runs from the menu button
+    // inside the ImGui frame, and the build needs the frame's command list
+    // closed. The frame loop picks this up before its next BeginFrame, which is
+    // still ahead of the loading screen's first level-load stage.
+    RequestSceneRenderAssets();
     if (bindlessHeap.Initialized()) {
         WaitForGPUAllFrames();
         bindlessHeap.ResetForNewScene();
@@ -18212,6 +18334,10 @@ static void SynchronizeEditorRuntime(bool play) {
 // built from the level the user actually chose, not from the template it would
 // otherwise have to reconcile away a frame later.
 static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) {
+    // The editor is a scene screen, so it needs the same terrain and sky the
+    // boot path used to build. StartLevelOne is not on this route. Queued for
+    // the same reason as there: this can be reached from inside an ImGui frame.
+    RequestSceneRenderAssets();
     const bool loaded = !levelPath.empty() && g_levelEditor.LoadFrom(levelPath);
     if (!levelPath.empty() && !loaded) {
         // Falling back to the template silently would look like the chosen file
@@ -21036,113 +21162,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ? "Mesh shader path enabled\n"
         : "Mesh shader path unavailable; using raster fallback\n");
 
-    bool terrainReady = false;
-    BootStep("Loading terrain textures...");
-    if (g_useMeshShader) {
-        // Terrain initialization uploads its PBR texture arrays. InitDX12 leaves
-        // the command list closed, so record and submit those copies explicitly;
-        // otherwise the following sky reset discards them and every terrain SRV
-        // samples zero.
-        ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
-        ThrowIfFailed(g_dx12.commandList->Reset(
-            g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
-        terrainReady = g_terrain.Init(mainShader);
-        ThrowIfFailed(g_dx12.commandList->Close());
-        {
-            ID3D12CommandList* terrainLists[] = { g_dx12.commandList.Get() };
-            g_dx12.commandQueue->ExecuteCommandLists(1, terrainLists);
-        }
-        WaitForGPU();
-        DumpDX12DebugMessages();
-    }
-    if (!terrainReady) {
-        scene.useMeshTerrain = false;
-        std::cerr << "Mesh shader terrain unavailable; keeping flat floor\n";
-    }
-    scene.grenadeGroundHeight = [](float x, float z) {
-        if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
-        auto params = CurrentTerrainParams();
-        params.heightScale = scene.terrainHeightScale;
-        return TerrainRendererDX12::HeightAt(params, x, z);
-    };
-
-    // Mip generator (compute shader) for imported GLB textures
-    BootStep("Initializing mip generator...");
-    if (!g_mipGen.Init()) {
-        std::cerr << "Mip generator init failed (non-fatal, textures will have no mips)\n";
-    }
-
-    // The command list is closed after InitDX12 and stays closed until the first
-    // BeginFrame(). skyRenderer.Init() records a CopyTextureRegion for the HDRI
-    // upload, so the list must be open while it runs and its work must be flushed
-    // (executed + waited) before the list is closed again - otherwise the copy
-    // never reaches the GPU and the sky texture stays black.
-    // Keep this as one boot frame: HDRI upload, IBL prefilter, and cloud-noise
-    // generation all record onto the command list opened below. BootStep()
-    // starts a frame and resets that same list, so calling it again before the
-    // batch is submitted invalidates the active recording and Close() fails.
-    BootStep("Loading HDRI, prefiltering IBL, and baking cloud noise...");
-    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
-    ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
-    if (!skyRenderer.Init()) {
-        std::cerr << "HDRI sky init failed (non-fatal)\n";
-    }
-    g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
-    if (environmentIBL.Init(
-            g_skyEnvironmentResource, kSkyEnvironmentRotationRadians)) {
-        g_specularEnvironmentResource =
-            environmentIBL.prefilteredEnvironment.Get();
-        g_brdfIntegrationResource = environmentIBL.brdfIntegrationLUT.Get();
-        std::cout << "GGX HDRI prefilter and BRDF integration LUT ready\n";
-    } else {
-        g_specularEnvironmentResource = g_skyEnvironmentResource;
-        std::cerr << "Specular IBL prefilter failed (using raw HDRI fallback)\n";
-    }
-    // Bake the cloud noise onto this same list. It is pure compute into two
-    // textures nothing else touches, and the flush below already waits, so it
-    // costs one dispatch pair at boot rather than a second submit.
-    if (g_cloudNoise.Init()) {
-        g_cloudNoise.Generate(g_dx12.commandList.Get());
-    } else {
-        std::cerr << "Cloud noise generation failed; clouds stay on the 2D path\n";
-    }
-    ThrowIfFailed(g_dx12.commandList->Close());
-    {
-        ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
-        g_dx12.commandQueue->ExecuteCommandLists(1, skyLists);
-    }
-    WaitForGPU();
-    // Only point the sky at the volumes once the dispatches have actually
-    // completed -- sampling a volume still being written gives noise that
-    // changes under the camera on the first frames.
-    if (g_cloudNoise.Generated()) {
-        skyRenderer.SetCloudVolumes(
-            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
-    }
-    g_mipGen.FlushPending();
-    DumpDX12DebugMessages();
-    BootStep("Computing sky irradiance...");
-    {
-        auto skySH = GLBImporter::ComputeSkyIrradianceSH(
-            kSkyEnvironmentPath, kSkyEnvironmentRotationRadians);
-        mainShader.SetSkyIrradiance(skySH, 1.0f);
-        const HDRISunLight hdriSun =
-            GLBImporter::ExtractHDRISunLight(
-                kSkyEnvironmentPath, 2.1f,
-                kSkyEnvironmentRotationRadians);
-        if (hdriSun.valid) {
-            std::cout << "HDRI sun analyzed (scene defaults retained): direction=("
-                      << hdriSun.direction.x << ", "
-                      << hdriSun.direction.y << ", "
-                      << hdriSun.direction.z << ") color=("
-                      << hdriSun.color.x << ", "
-                      << hdriSun.color.y << ", "
-                      << hdriSun.color.z << ") sourceLuminance="
-                      << hdriSun.sourceLuminance << '\n';
-        } else {
-            std::cerr << "HDRI sun extraction failed; using scene fallback light\n";
-        }
-    }
     BootStep("Initializing occlusion depth...");
     if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
@@ -21162,10 +21181,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     if (!volumetricFog.Init()) {
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
-    } else if (g_cloudNoise.Generated()) {
-        volumetricFog.SetCloudVolumes(
-            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
     }
+    // The cloud volumes are baked in EnsureSceneRenderAssets, which now runs
+    // after this, so the fog is pointed at them there rather than here.
     BootStep("Initializing ambient occlusion...");
     if (!screenSpaceAO.Init()) {
         std::cerr << "Screen-space AO init failed (non-fatal)\n";
@@ -21191,11 +21209,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         waterRenderer.SetUltraDiagnosticMode(
             static_cast<UINT>(std::strtoul(ultraWaterDebug, nullptr, 10)));
     BootStep("Initializing MSAA...");
+    // Only the boot-time pipelines can be judged here. Terrain and sky are not
+    // built yet, so their MSAA support is re-checked in EnsureSceneRenderAssets
+    // once they exist -- testing them now would read a default-false "supported"
+    // and leave MSAA on over a pipeline that cannot do it.
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
-        (!g_useMeshShader || g_meshShader.msaaSupported) &&
-        (!g_terrain.supported || g_terrain.msaaSupported) &&
-        (!skyRenderer.initialized || skyRenderer.msaaSupported);
+        (!g_useMeshShader || g_meshShader.msaaSupported);
     if (!msaa.Init(SCR_WIDTH, SCR_HEIGHT) || !msaaPipelinesReady) {
         std::cerr << "4x MSAA unavailable (non-fatal)\n";
         scene.enableMSAA = false;
@@ -24136,6 +24156,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             screenSpaceAO.ApplyTraceResolutionChange();
         }
 
+        // Terrain, sky and IBL for a level start requested from the menu. Must
+        // land here, before BeginFrame opens the frame's command list, for the
+        // same reason as the two blocks above: the build resets that list and
+        // its allocator. It runs before the loading screen's first stage, so
+        // nothing samples these while they are still missing.
+        if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
+
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) {
@@ -24840,28 +24867,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_explosiveBarrelModel != nullptr);
             }
         } else if (g_game.loading.Stage() == LevelLoadStage::Humvee) {
-            g_humveeModel = FBXImporter::Load(
-                "Content/Models/Humvee/humvee.fbx",
-                g_dx12.device, g_dx12.commandList, 1.0f, false, true);
-            if (g_humveeModel) {
-                for (const auto& child : g_humveeModel->children)
-                    if (child && child->name == "HumveeTurret") {
-                        g_humveeTurretNode = child;
-                        break;
+            // The base is a loadout hub, not a playable map: no combat vehicles
+            // are placed and no squad is spawned there. Importing the Humvee
+            // anyway cost roughly a second of the base's load for a model that
+            // is never drawn, so skip it. Every consumer already null-checks
+            // g_humveeModel, so leaving it empty is the same state as a failed
+            // import, which the level has always tolerated.
+            if (!g_baseMode) {
+                g_humveeModel = FBXImporter::Load(
+                    "Content/Models/Humvee/humvee.fbx",
+                    g_dx12.device, g_dx12.commandList, 1.0f, false, true);
+                if (g_humveeModel) {
+                    for (const auto& child : g_humveeModel->children)
+                        if (child && child->name == "HumveeTurret") {
+                            g_humveeTurretNode = child;
+                            break;
+                    }
+                    ConfigureHumveeBounds();
+                    g_humveeShadowModel = GLBImporter::MergeSceneForDepth(
+                        g_humveeModel, g_dx12.device);
+                    std::cout << "Humvee FBX ready at center\n";
+                } else {
+                    std::cerr << "Humvee FBX failed to load\n";
                 }
-                ConfigureHumveeBounds();
-                g_humveeShadowModel = GLBImporter::MergeSceneForDepth(
-                    g_humveeModel, g_dx12.device);
-                std::cout << "Humvee FBX ready at center\n";
-            } else {
-                std::cerr << "Humvee FBX failed to load\n";
             }
 
             AdvanceLevelLoading(LevelLoadStage::Helicopter,
                 "OH-1 import, geometry LOD and rotor setup",
-                "Content/Models/OH-1_fbx/OH-1.fbx", g_humveeModel != nullptr);
+                "Content/Models/OH-1_fbx/OH-1.fbx",
+                g_baseMode || g_humveeModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::Helicopter) {
-
+          // Same reasoning as the Humvee stage above: the base parks no OH-1,
+          // and this stage carries the geometry LOD reduction, which was the
+          // single most expensive step in the base's load.
+          if (!g_baseMode) {
             const std::string helicopterModelPath =
                 ResolveTexturePath("Content/Models/OH-1_fbx/OH-1.fbx");
             std::cout << "OH-1 asset: " << helicopterModelPath << "\n";
@@ -24901,11 +24940,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::cout << "Humvee dark green fallback applied to untextured materials\n";
             else
                 std::cout << "Humvee using embedded base colour texture\n";
+          }
 
             AdvanceLevelLoading(LevelLoadStage::Boat,
                 "Military boat import, bounds and patrol setup",
                 kBoatModelPath,
-                g_helicopterModel != nullptr);
+                g_baseMode || g_helicopterModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::Boat) {
             g_boatModel.reset();
             g_boatShadowModel.reset();
@@ -24996,7 +25036,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
             // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
             // ride the same command list flushed just below.
-            {
+            //
+            // The base spawns neither enemies nor allies, so both skinned
+            // imports (mesh, skeleton, three clips and a physics asset each)
+            // were the largest single cost in its load. BanditSpawn below
+            // already no-ops on an invalid model, so skipping the import needs
+            // no further guarding.
+            if (!g_baseMode) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
                 std::vector<std::string> clips = {
@@ -25035,7 +25081,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Spawn squad and turret gunners",
                 g_stressTestMode ? "stress squad: enemies + 2 gunners"
                                  : "level squad: enemies + Humvee gunners",
-                g_banditModel.valid);
+                g_baseMode || g_banditModel.valid);
         } else if (g_game.loading.Stage() == LevelLoadStage::BanditSpawn) {
             if (g_banditModel.valid) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
@@ -25188,6 +25234,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // First Level 1 load is complete. Start timing after load/GPU
                 // waits and staging cleanup, not from the menu click.
                 if (g_emptyLevelMode) {
+                    emptyLevelAssetsLoaded = true;
+                } else if (g_baseMode) {
+                    // The base deliberately skips the Humvee, the OH-1 and the
+                    // bandit/marine skinned meshes, so its load leaves the full
+                    // set incomplete. Latching fullLevelAssetsLoaded here would
+                    // tell the next level those imports had already happened and
+                    // StartLevelOne would skip BeginLevelLoading entirely --
+                    // the player would fly out of the hub into a map with no
+                    // vehicles and no enemies.
                     emptyLevelAssetsLoaded = true;
                 } else {
                     fullLevelAssetsLoaded = true;
