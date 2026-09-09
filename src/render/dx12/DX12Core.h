@@ -10,6 +10,7 @@
 #include <DirectXMath.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
@@ -26,6 +27,24 @@ using namespace DirectX;
 
 // Number of frames in flight
 static const UINT FRAME_COUNT = 2;
+
+// Nanoseconds the CPU spent this frame blocked in Present() and on the frame
+// fence -- time the thread is asleep, not time it is working.
+//
+// It lives here rather than in the profiler because the blocking calls are in
+// this header, and ProfilerDX12.h includes this one (not the other way round).
+// The profiler drains it at frame end; nothing else writes it. A plain
+// long long, because it is only ever touched from the render thread.
+inline long long g_dx12PresentWaitNs = 0;
+
+// Charges the elapsed span of a blocking call to the counter above.
+struct DX12BlockingWaitTimer {
+    std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+    ~DX12BlockingWaitTimer() {
+        g_dx12PresentWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+    }
+};
 
 // Descriptor heap sizes.
 // CBV_SRV_UAV: slots 0..63 are reserved for global resources (shadow map, DDGI);
@@ -313,6 +332,9 @@ inline void MoveToNextFrame() {
     
     if (g_dx12.fence->GetCompletedValue() < g_dx12.fenceValues[g_dx12.frameIndex]) {
         ThrowIfFailed(g_dx12.fence->SetEventOnCompletion(g_dx12.fenceValues[g_dx12.frameIndex], g_dx12.fenceEvent));
+        // Blocked on the GPU finishing an earlier frame. Charged to the wait
+        // counter so the profiler's CPU row stays a measure of CPU work.
+        DX12BlockingWaitTimer waitTimer;
         WaitForSingleObjectEx(g_dx12.fenceEvent, INFINITE, FALSE);
     }
     
@@ -926,8 +948,15 @@ inline void EndFrame() {
     const UINT syncInterval = g_dx12.syncInterval;
     const UINT presentFlags =
         (syncInterval == 0 && g_dx12.tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    ThrowIfFailed(g_dx12.swapChain->Present(syncInterval, presentFlags));
-    
+    {
+        // Present blocks for the vsync interval when one is set. That is the
+        // display pacing the frame, not the CPU doing work, so it is charged to
+        // the wait counter too -- otherwise every vsynced frame reports a CPU
+        // cost equal to the refresh period no matter how little work it did.
+        DX12BlockingWaitTimer presentTimer;
+        ThrowIfFailed(g_dx12.swapChain->Present(syncInterval, presentFlags));
+    }
+
     MoveToNextFrame();
 }
 

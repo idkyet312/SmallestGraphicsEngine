@@ -71,6 +71,11 @@ public:
         timestampFrequency = 0;
         cpuSamples.clear();
         currentCpuSamples.clear();
+        recordingSamples.clear();
+        currentRecordingSamples.clear();
+        presentWaitMs = 0.0;
+        cpuFrameWaitMs = 0.0;
+        cpuFrameWallMs = 0.0;
         gpuSamples.clear();
         for (auto& slot : slots) slot = {};
     }
@@ -78,13 +83,31 @@ public:
     void BeginCpuFrame() {
         cpuFrameStart = Clock::now();
         currentCpuSamples.clear();
+        currentRecordingSamples.clear();
+        // Blocking waits are charged to this counter as they happen, from
+        // inside DX12Core's present path; zero it so the frame only ever
+        // subtracts its own stalls.
+        g_dx12PresentWaitNs = 0;
+        presentWaitMs = 0.0;
         cpuFrameActive = true;
     }
 
     void EndCpuFrame() {
         if (!cpuFrameActive) return;
-        cpuFrameMs = Milliseconds(cpuFrameStart, Clock::now());
+        // Wall-clock span of the frame, minus the time the CPU spent doing
+        // nothing but waiting for the GPU and for vsync. Without the
+        // subtraction this reads as the frame's bottleneck rather than as CPU
+        // work: Present() blocks on the vsync interval and MoveToNextFrame()
+        // blocks INFINITE on the frame fence, both inside this span, so a
+        // GPU-bound frame made the CPU row converge on the GPU row and the two
+        // stopped being independent measurements.
+        const double wallMs = Milliseconds(cpuFrameStart, Clock::now());
+        presentWaitMs = double(g_dx12PresentWaitNs) / 1e6;
+        cpuFrameWallMs = wallMs;
+        cpuFrameWaitMs = presentWaitMs;
+        cpuFrameMs = (std::max)(0.0, wallMs - presentWaitMs);
         cpuSamples = currentCpuSamples;
+        recordingSamples = currentRecordingSamples;
         cpuFrameActive = false;
     }
 
@@ -141,7 +164,23 @@ public:
             currentCpuSamples.push_back({ name ? name : "CPU", Milliseconds(begin, end) });
     }
 
+    // Command-list recording cost for a render scope. Kept in its own list so
+    // it never mixes with the real CPU work above: these names also appear in
+    // the GPU list, with a different meaning and a different magnitude.
+    void AddRecordingSample(const char* name, Clock::time_point begin,
+                            Clock::time_point end) {
+        if (cpuFrameActive)
+            currentRecordingSamples.push_back(
+                { name ? name : "Record", Milliseconds(begin, end) });
+    }
+
     const std::vector<ProfilerSampleDX12>& CpuSamples() const { return cpuSamples; }
+    // Per-pass command recording cost, the CPU-side companion to GpuSamples().
+    const std::vector<ProfilerSampleDX12>& RecordingSamples() const {
+        return recordingSamples;
+    }
+    // Deliberately no "total recording ms" accessor: render scopes nest, so
+    // summing this list double-counts every parent. Read the entries, not a sum.
     const std::vector<ProfilerSampleDX12>& GpuSamples() const { return gpuSamples; }
     // GPU milliseconds for one named scope, or 0 when it did not run this
     // frame. Linear scan: the sample list is short and this is UI-rate.
@@ -151,7 +190,15 @@ public:
             if (sample.name == name) return sample.milliseconds;
         return 0.0;
     }
+    // CPU work only -- the GPU/vsync wait is excluded, so this is independent
+    // of GpuFrameMs() and the two can be compared to find the limiter.
     double CpuFrameMs() const { return cpuFrameMs; }
+    // The same frame including the blocked time, for when the question is
+    // "where did the wall clock go" rather than "how much CPU work is there".
+    double CpuFrameWallMs() const { return cpuFrameWallMs; }
+    // How long the CPU sat blocked on the GPU or vsync. Large here alongside a
+    // small CpuFrameMs is the signature of a GPU-bound or vsync-capped frame.
+    double CpuFrameWaitMs() const { return cpuFrameWaitMs; }
     double GpuFrameMs() const { return gpuFrameMs; }
     double GpuFrameP95Ms() const {
         if (gpuFrameHistory.empty()) return 0.0;
@@ -189,7 +236,12 @@ public:
         ~Scope() {
             if (commandList && label) commandList->EndEvent();
             profiler.EndGpuEvent(eventIndex, commandList);
-            profiler.AddCpuSample(label, begin, Clock::now());
+            // A render scope's CPU time is the cost of *recording* the commands,
+            // which is a different quantity from the GPU time under the same
+            // name -- and from the real CPU work that CpuScope measures. Tagged
+            // so the CPU list cannot be read as if these were GPU costs, or
+            // summed together with the genuine CPU scopes beside them.
+            profiler.AddRecordingSample(label, begin, Clock::now());
         }
     private:
         ProfilerDX12& profiler;
@@ -259,9 +311,14 @@ private:
     bool cpuFrameActive = false;
     Clock::time_point cpuFrameStart = {};
     double cpuFrameMs = 0.0;
+    double cpuFrameWallMs = 0.0;
+    double cpuFrameWaitMs = 0.0;
+    double presentWaitMs = 0.0;
     double gpuFrameMs = 0.0;
     std::vector<ProfilerSampleDX12> currentCpuSamples;
     std::vector<ProfilerSampleDX12> cpuSamples;
+    std::vector<ProfilerSampleDX12> currentRecordingSamples;
+    std::vector<ProfilerSampleDX12> recordingSamples;
     std::vector<ProfilerSampleDX12> gpuSamples;
     std::deque<double> gpuFrameHistory;
 };

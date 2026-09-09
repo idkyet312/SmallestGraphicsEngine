@@ -5388,6 +5388,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::ofstream dump("profile_dump.log", std::ios::trunc);
                 dump << "GPU frame: " << g_profiler.GpuFrameMs()
                      << " ms\nCPU frame: " << g_profiler.CpuFrameMs()
+                     << " ms\nCPU wait: " << g_profiler.CpuFrameWaitMs()
+                     << " ms (present + fence)\nCPU wall: "
+                     << g_profiler.CpuFrameWallMs()
                      << " ms\n--- GPU passes ---\n";
                 double total = 0.0;
                 for (const auto& sample : g_profiler.GpuSamples()) {
@@ -6118,7 +6121,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (visibilitySmokeEnabled && ++visibilityCpuReportFrames >= 300) {
             visibilityCpuReportFrames = 0;
             std::ofstream cpuLog("visibility_cpu.log", std::ios::trunc);
-            cpuLog << "cpu_frame_ms=" << g_profiler.CpuFrameMs() << '\n';
+            // CPU work, the blocked time, and the wall clock they add back up
+            // to -- logged together so the split can be checked rather than
+            // trusted.
+            cpuLog << "cpu_frame_ms=" << g_profiler.CpuFrameMs() << '\n'
+                   << "cpu_wait_ms=" << g_profiler.CpuFrameWaitMs() << '\n'
+                   << "cpu_wall_ms=" << g_profiler.CpuFrameWallMs() << '\n'
+                   << "gpu_frame_ms=" << g_profiler.GpuFrameMs() << '\n';
             for (const ProfilerSampleDX12& sample : g_profiler.CpuSamples())
                 cpuLog << sample.name << '=' << sample.milliseconds << '\n';
             cpuLog << "visibility_draws=" << g_visibilityDrawCalls << '\n'

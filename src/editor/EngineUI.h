@@ -1159,16 +1159,21 @@ inline bool g_showProfilerWindow = false;
 // either inline in Scene Controls or as a standalone window -- comparing pass
 // timings while changing settings is hard when both fight for the same panel.
 inline void ProfilerPanelBody() {
-    // The four numbers you actually read first, before any per-pass detail:
-    // how fast the frame is, how long it took wall-clock, and how that splits
-    // across the two timelines. Frame ms is ImGui's own delta rather than
-    // CPU+GPU: the two overlap by design (the GPU works a frame behind), so
-    // adding them would overstate the frame, and neither alone accounts for
-    // present or vsync wait. Which of CPU/GPU sits nearest the frame total is
-    // what tells you which side is the limiter.
+    // The numbers you read first, before any per-pass detail: how fast the
+    // frame is, how long it took wall-clock, and how that splits across the two
+    // timelines. Frame ms is ImGui's own delta rather than CPU+GPU: the two
+    // overlap by design (the GPU works a frame behind), so adding them would
+    // overstate the frame.
+    //
+    // CPU and GPU are measured independently and each means only its own side.
+    // CPU excludes the time the thread sits blocked in Present and on the frame
+    // fence -- that is broken out as Wait. Before the split, both rows included
+    // that stall, so a GPU-bound or vsynced frame made them converge on the same
+    // number and neither told you which side was actually the limiter.
     {
         const ImGuiIO& io = ImGui::GetIO();
         const double cpuMs = g_profiler.CpuFrameMs();
+        const double waitMs = g_profiler.CpuFrameWaitMs();
         const double gpuMs = g_profiler.IsInitialized()
             ? g_profiler.GpuFrameMs() : 0.0;
 
@@ -1186,6 +1191,38 @@ inline void ProfilerPanelBody() {
             ImGui::Text("GPU      %6.2f ms", gpuMs);
         else
             ImGui::TextDisabled("GPU         -- ms");
+        // The stall that used to be hidden inside the CPU row. Most of the
+        // frame sitting here means the CPU is ahead and something else -- the
+        // GPU, or the vsync interval -- is setting the pace.
+        ImGui::TextDisabled("Wait     %6.2f ms  (present + fence)", waitMs);
+
+        // Name the limiter outright rather than leaving it to be inferred from
+        // two numbers that are now deliberately not comparable to the frame
+        // total. Only meaningful once the GPU side is actually measured.
+        if (g_profiler.IsInitialized()) {
+            const double frameMs =
+                io.Framerate > 0.0f ? 1000.0 / double(io.Framerate) : 0.0;
+            // Vsync first: a capped frame can leave both sides idle, and
+            // calling that "GPU bound" sends you optimising a frame that is
+            // already waiting on the display.
+            const bool vsyncCapped =
+                g_dx12.syncInterval > 0 && waitMs > 0.25 * frameMs &&
+                gpuMs < 0.9 * frameMs && cpuMs < 0.9 * frameMs;
+            if (vsyncCapped)
+                ImGui::TextColored(ImVec4(0.60f, 0.75f, 1.0f, 1.0f),
+                                   "Limiter: vsync");
+            else if (gpuMs > cpuMs * 1.15)
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                                   "Limiter: GPU  (%.2f vs %.2f ms)",
+                                   gpuMs, cpuMs);
+            else if (cpuMs > gpuMs * 1.15)
+                ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                                   "Limiter: CPU  (%.2f vs %.2f ms)",
+                                   cpuMs, gpuMs);
+            else
+                ImGui::TextColored(ImVec4(0.65f, 0.70f, 0.67f, 1.0f),
+                                   "Limiter: balanced");
+        }
 
         // VRAM sits with the frame numbers because it fails the same way they
         // do: over budget, allocations spill to system memory and the frame
@@ -1219,6 +1256,14 @@ inline void ProfilerPanelBody() {
                 ImGui::TextDisabled("  card: %.0f MB",
                     static_cast<double>(memory.dedicatedBytes) / kMiB);
             }
+
+            // Engine-owned geometry, for scale against the total above. Covers
+            // static vertex/index buffers only -- not textures, not render
+            // targets -- so a small figure here next to a large total says the
+            // memory is in images and attachments rather than meshes.
+            const StaticBufferStatsDX12 buffers = GetStaticBufferStatsDX12();
+            ImGui::TextDisabled("  geometry: %.0f MB in %u buffers",
+                static_cast<double>(buffers.bytes) / kMiB, buffers.resources);
         } else {
             ImGui::TextDisabled("VRAM        -- MB");
         }
@@ -1246,6 +1291,23 @@ inline void ProfilerPanelBody() {
                 g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
     for (const auto& sample : g_profiler.CpuSamples())
         ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
+
+    // Command recording, kept apart from the CPU scopes above and from the GPU
+    // scopes below. These names match the GPU passes but measure a different
+    // thing -- how long the CPU took to build the command list, not how long
+    // the GPU took to run it -- so showing them in one flat list invited
+    // reading a cheap pass as expensive, or comparing the two side by side as
+    // if they were the same measurement. Collapsed: it is long, and it only
+    // matters when the limiter above says CPU.
+    if (!g_profiler.RecordingSamples().empty() &&
+        ImGui::TreeNode("CPU: command recording")) {
+        ImGui::TextDisabled("Time building command lists, not GPU execution.");
+        ImGui::TextDisabled("Scopes nest -- do not add these up.");
+        for (const auto& sample : g_profiler.RecordingSamples())
+            ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
+                              sample.milliseconds);
+        ImGui::TreePop();
+    }
     ImGui::Separator();
     if (g_profiler.IsInitialized()) {
         // GPU frame total is in the header block above; p95 stays here next
