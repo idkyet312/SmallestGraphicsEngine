@@ -88,6 +88,8 @@ inline uint64_t IncludeHash() {
             L"shaders/foliage_brdf.hlsli",
             L"shaders/palm_wind.hlsli",
             L"shaders/terrain_pbr.hlsli",
+            L"shaders/virtual_shadow_types.hlsli",
+            L"shaders/virtual_shadow_sample.hlsli",
         };
         const std::wstring base = ExecutableDirectory();
         uint64_t combined = 1469598103934665603ull;

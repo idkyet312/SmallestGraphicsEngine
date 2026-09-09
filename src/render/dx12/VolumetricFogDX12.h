@@ -158,7 +158,7 @@ private:
     static constexpr UINT MaxLights = ClusteredRendererDX12::MAX_LIGHTS;
     // 768, not 512: the spot shadow matrices pushed FogConstants to 672 bytes.
     // Must stay a multiple of the 256-byte CBV alignment.
-    static constexpr UINT ConstantsSize = 768;
+    static constexpr UINT ConstantsSize = 4096;
 
     struct GPUCluster {
         UINT lightCount;
@@ -215,6 +215,7 @@ private:
         // x = live slice count; yzw unused. A float4 rather than a bare int so
         // the following data stays on a 16-byte boundary.
         XMUINT4 spotShadowCount;
+        VirtualShadows::Constants virtualShadows;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
 
@@ -224,8 +225,8 @@ private:
                  UINT flags, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& errors,
                  const D3D_SHADER_MACRO* defines = nullptr) {
         errors.Reset();
-        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "volumetric_fog.hlsl",
-            defines, nullptr, entry, target, flags, 0, &blob, &errors);
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "shaders/volumetric_fog.hlsl",
+            defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, target, flags, 0, &blob, &errors);
         if (FAILED(hr)) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());
             return false;
@@ -478,6 +479,7 @@ private:
             scene.volumetricFogTint.z,
             fogTime_ };
         constants.shadowCascadeSplits = g_shadowCascadeSplits;
+        constants.virtualShadows = g_virtualShadowConstants;
         // Transposed like every other matrix crossing into HLSL.
         for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
             XMStoreFloat4x4(&constants.spotShadowMatrices[s],
@@ -571,7 +573,8 @@ private:
         shadowSrv.Format = DXGI_FORMAT_R32_FLOAT;
         shadowSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         shadowSrv.Texture2DArray.MipLevels = 1;
-        shadowSrv.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
+        shadowSrv.Texture2DArray.ArraySize = shadowResource
+            ? shadowResource->GetDesc().DepthOrArraySize : SHADOW_CASCADE_COUNT;
         g_dx12.device->CreateShaderResourceView(shadowResource, &shadowSrv, CpuHandle(0));
         // [7] t8 spot shadow atlas. Rewritten each frame alongside the cascade
         // view; a null resource still gets a valid view, since the root

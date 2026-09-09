@@ -1,3 +1,6 @@
+#include "virtual_shadow_types.hlsli"
+#include "virtual_shadow_sample.hlsli"
+
 struct FogCluster
 {
     uint lightCount;
@@ -50,6 +53,7 @@ cbuffer FogConstants : register(b0)
     // Spot shadow atlas transforms; see FogConstants in VolumetricFogDX12.h.
     float4x4 spotShadowMatrices[3];
     uint4 spotShadowCount;        // x = live slices, yzw unused
+    VirtualShadowConstants virtualShadows;
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
@@ -125,6 +129,8 @@ float SunVisibility(float3 worldPosition, float rotation)
     // Kept narrow deliberately: widening this to 3 texels softened the occluder
     // edge enough that sun-facing views bled a bright veil over the hillside in
     // front of the sun -- the same failure the phase clamp below guards against.
+    if (VirtualShadowAvailable(shadowMap, virtualShadows))
+        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows, cascade, uv, projected.z - 0.0025);
     float radius = 1.6 / 2048.0;
     float visibility = shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(uv, cascade), projected.z - 0.0025);

@@ -200,6 +200,157 @@ static void DrawDestructionDebug(Scene& scene) {
     ImGui::End();
 }
 
+// Virtual shadow page view, in the spirit of Unreal's r.Shadow.Virtual.Visualize:
+// the pages are drawn where they actually land in the world, not as an atlas
+// thumbnail, so it is obvious which part of the view each page is paying for.
+//
+// Green: the page survived from an earlier frame and was reused this frame.
+// Red:   the page was invalidated and re-rasterised this frame.
+//
+// A page footprint is a quad in light space, so it is unprojected back to world
+// space through the inverse cascade matrix and re-projected through the camera.
+// Pages sit on the light's near plane; they are drawn as flat quads rather than
+// frusta, which is what makes the grid readable while the camera moves.
+static void DrawVirtualShadowPageDebug(Scene& scene) {
+    if (!scene.showVirtualShadowPages || !scene.virtualShadowMaps) return;
+    if (!g_virtualShadowConstants.config[0]) return;   // no pages published
+
+    const XMMATRIX viewProj = scene.GetViewMatrix() * scene.GetProjectionMatrix();
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+
+    // A page is a shaft of light, not a surface, so it has no single world
+    // position -- it covers whatever the sun hits through that cell. Drawing it
+    // at a fixed light-space depth put the quads up near the light itself. The
+    // useful place to draw it is where its shadows actually land: unproject the
+    // cell corner along the light ray and drop it onto the terrain.
+    //
+    // Depth is [0,1] here, not [-1,1]: the cascades are built with
+    // XMMatrixOrthographicOffCenterLH (see ComputeCascadeMatrices).
+    TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
+    terrainParams.heightScale = scene.terrainHeightScale;
+
+    auto project = [&](const XMMATRIX& inverseLight, float lx, float ly,
+                       ImVec2& screen) {
+        // Two points down the same light ray give its direction in world space.
+        const XMVECTOR nearPoint = XMVector3TransformCoord(
+            XMVectorSet(lx, ly, 0.0f, 1.0f), inverseLight);
+        const XMVECTOR farPoint = XMVector3TransformCoord(
+            XMVectorSet(lx, ly, 1.0f, 1.0f), inverseLight);
+        const XMVECTOR ray = XMVectorSubtract(farPoint, nearPoint);
+        if (XMVectorGetY(ray) >= -0.0001f) return false;   // not pointing down
+
+        // March the ray to the terrain. A straight solve would do for a plane,
+        // but the heightfield is not one, so step and refine on the crossing.
+        XMFLOAT3 start, direction;
+        XMStoreFloat3(&start, nearPoint);
+        XMStoreFloat3(&direction, ray);
+        float hit = -1.0f, previous = 0.0f;
+        constexpr int steps = 24;
+        for (int step = 1; step <= steps; ++step) {
+            const float t = static_cast<float>(step) / static_cast<float>(steps);
+            const float x = start.x + direction.x * t;
+            const float y = start.y + direction.y * t;
+            const float z = start.z + direction.z * t;
+            if (y <= TerrainRendererDX12::HeightAt(terrainParams, x, z)) {
+                float lo = previous, hi = t;
+                for (int refine = 0; refine < 12; ++refine) {
+                    const float mid = (lo + hi) * 0.5f;
+                    const float my = start.y + direction.y * mid;
+                    const float mx = start.x + direction.x * mid;
+                    const float mz = start.z + direction.z * mid;
+                    if (my <= TerrainRendererDX12::HeightAt(terrainParams, mx, mz))
+                        hi = mid;
+                    else
+                        lo = mid;
+                }
+                hit = (lo + hi) * 0.5f;
+                break;
+            }
+            previous = t;
+        }
+        if (hit < 0.0f) return false;                      // ray missed the ground
+
+        const XMVECTOR world = XMVectorAdd(nearPoint, XMVectorScale(ray, hit));
+        const XMVECTOR clip = XMVector3Transform(world, viewProj);
+        const float clipW = XMVectorGetW(clip);
+        if (clipW <= 0.0001f) return false;                // behind the camera
+        screen = { (XMVectorGetX(clip) / clipW * 0.5f + 0.5f) * display.x,
+                   (1.0f - (XMVectorGetY(clip) / clipW * 0.5f + 0.5f)) * display.y };
+        return true;
+    };
+
+    uint32_t drawn = 0;
+    for (uint32_t slot = 0; slot < VirtualShadows::Capacity; ++slot) {
+        const uint8_t state = g_vsmSlotStates[slot];
+        if (state == 0 || g_vsmSlotKeys[slot] == VirtualShadows::Invalid) continue;
+
+        // Unpack the virtual page key: cascade * Grid * Grid + y * Grid + x.
+        const uint32_t key = g_vsmSlotKeys[slot];
+        const uint32_t cascade = key / (VirtualShadows::Grid * VirtualShadows::Grid);
+        const uint32_t x = key % VirtualShadows::Grid;
+        const uint32_t y = (key / VirtualShadows::Grid) % VirtualShadows::Grid;
+        if (cascade >= SHADOW_CASCADE_COUNT) continue;
+
+        XMVECTOR determinant;
+        const XMMATRIX inverseLight =
+            XMMatrixInverse(&determinant, g_shadowCascadeMatrices[cascade]);
+        if (XMVectorGetX(XMVectorAbs(determinant)) < 1e-12f) continue;
+
+        // Page cell -> light-space NDC. The grid runs left-to-right in x and
+        // top-to-bottom in y, matching the shader's uv * Grid page lookup.
+        const float step = 2.0f / static_cast<float>(VirtualShadows::Grid);
+        const float x0 = -1.0f + step * x,        x1 = x0 + step;
+        const float y0 =  1.0f - step * y,        y1 = y0 - step;
+
+        ImVec2 corners[4];
+        if (!project(inverseLight, x0, y0, corners[0]) ||
+            !project(inverseLight, x1, y0, corners[1]) ||
+            !project(inverseLight, x1, y1, corners[2]) ||
+            !project(inverseLight, x0, y1, corners[3])) continue;
+
+        const bool reused = state == 1;
+        const ImU32 fill = reused ? IM_COL32(46, 160, 67, 46)
+                                  : IM_COL32(206, 52, 42, 62);
+        const ImU32 edge = reused ? IM_COL32(86, 220, 110, 226)
+                                  : IM_COL32(255, 92, 78, 236);
+        draw->AddConvexPolyFilled(corners, 4, fill);
+        draw->AddPolyline(corners, 4, edge, ImDrawFlags_Closed, 2.0f);
+
+        // Label at the centroid: cascade, then the page's grid coordinate.
+        ImVec2 centre(0, 0);
+        for (const ImVec2& corner : corners) {
+            centre.x += corner.x * 0.25f;
+            centre.y += corner.y * 0.25f;
+        }
+        char label[32];
+        std::snprintf(label, sizeof(label), "C%u %u,%u", cascade, x, y);
+        const ImVec2 size = ImGui::CalcTextSize(label);
+        const ImVec2 at(centre.x - size.x * 0.5f, centre.y - size.y * 0.5f);
+        draw->AddRectFilled(ImVec2(at.x - 4, at.y - 2),
+                            ImVec2(at.x + size.x + 4, at.y + size.y + 2),
+                            IM_COL32(0, 0, 0, 168), 3.0f);
+        draw->AddText(at, edge, label);
+        ++drawn;
+    }
+
+    // Legend, pinned top-left clear of the profiler panel on the right.
+    const ImVec2 origin(18.0f, 118.0f);
+    char summary[128];
+    std::snprintf(summary, sizeof(summary),
+        "VIRTUAL SHADOW PAGES   %u resident  %u reused  %u redrawn  (%u on screen)",
+        g_vsmResident, g_vsmReused, g_vsmRefreshed, drawn);
+    const ImVec2 size = ImGui::CalcTextSize(summary);
+    draw->AddRectFilled(ImVec2(origin.x - 8, origin.y - 6),
+                        ImVec2(origin.x + size.x + 8, origin.y + size.y + 40),
+                        IM_COL32(6, 10, 14, 208), 4.0f);
+    draw->AddText(origin, IM_COL32(236, 240, 236, 255), summary);
+    draw->AddText(ImVec2(origin.x, origin.y + size.y + 6),
+                  IM_COL32(86, 220, 110, 235), "green = cached (reused)");
+    draw->AddText(ImVec2(origin.x, origin.y + size.y + 22),
+                  IM_COL32(255, 92, 78, 235), "red = invalidated (redrawn this frame)");
+}
+
 // X-ray wire overlay of exact authored Box3D primitives. Drawn through ImGui so
 // colliders remain visible inside the skinned corpse and behind nearby foliage.
 static void DrawRagdollPhysicsDebug(Scene& scene) {

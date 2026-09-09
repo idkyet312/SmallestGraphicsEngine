@@ -62,11 +62,15 @@ cbuffer SHBuffer : register(b7) {
     float3 shPadding;
 };
 
+#include "virtual_shadow_types.hlsli"
+#include "virtual_shadow_sample.hlsli"
+
 cbuffer ShadowCascadeBuffer : register(b8) {
     matrix shadowCascadeMatrices[3];
     float4 shadowCascadeSplits;
     float4 shadowCascadeTexelWorld;
     float4 shadowCascadeDepthRange;
+    VirtualShadowConstants virtualShadows;
 };
 
 Texture2DArray<float> shadowMap : register(t0);
@@ -106,6 +110,8 @@ float SampleShadowCascadeCheap(float3 worldPos, float3 normal,
     float slope = clamp(sqrt(1.0 - ndotl * ndotl) / max(ndotl, 0.1), 0.0, 8.0);
     float bias = texelWorld * (1.0 + 2.0 * slope) /
                  max(shadowCascadeDepthRange[cascade], 1e-3);
+    if (VirtualShadowAvailable(shadowMap, virtualShadows))
+        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows, cascade, shadowUV, projCoords.z - bias);
     return shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(shadowUV, cascade), projCoords.z - bias);
 }

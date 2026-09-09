@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstring>
+#include "VirtualShadowMapDX12.h"
 
 // 4096 rather than 2048: at 2048 a cascade-1/2 texel covered enough wall that
 // building edges rasterised as visible stair-steps. Doubling the axis quarters
@@ -574,6 +575,10 @@ public:
     ComPtr<ID3D12Resource> spotShadowMap;
     ComPtr<ID3D12DescriptorHeap> spotDsvHeap;
     DepthOnlyShaderDX12 depthShader;
+    DepthOnlyShaderDX12 virtualDepthShader;
+    VirtualShadowMapDX12 virtualMaps;
+    bool virtualDepthAttempted = false;
+    bool drawingVirtualPages = false;
     UINT size = SHADOW_MAP_SIZE;
     bool initialized = false;
     UINT cachedCascadesThisFrame = 0;
@@ -582,6 +587,7 @@ public:
     UINT refreshedSpotSlicesThisFrame = 0;
 
     void InvalidateCachedCascades() {
+        virtualMaps.pages.Invalidate();
         farCacheValid.fill(false);
         cacheViewValid = false;
         spotCacheValid.fill(false);
@@ -606,6 +612,7 @@ public:
     // whole refresh back into one frame. The camera projection has not changed
     // here -- only the terrain under it -- so the cached view stays valid.
     void InvalidateCachedCascadesStaggered() {
+        virtualMaps.pages.Invalidate();
         staggeredInvalidationPending = true;
         staggeredInvalidationNext = 0;
     }
@@ -621,7 +628,7 @@ public:
     }
 
     ID3D12Resource* GetResource() const {
-        return shadowMap.Get();
+        return virtualMaps.Output() ? virtualMaps.Output() : shadowMap.Get();
     }
 
     ID3D12Resource* GetSpotResource() const {
@@ -798,6 +805,9 @@ public:
             const float depthRange =
                 (std::max)(scene.shadowFarPlane, distance + ortho) - 0.1f;
             const auto inLightBox = [&](const XMFLOAT3& c, float r) {
+                // The legacy radius approximation describes a whole cascade,
+                // not a cropped virtual page. Let raster clipping handle pages.
+                if (drawingVirtualPages) return true;
                 if (r <= 0.0f) return true;
                 XMFLOAT4 ndc;
                 XMStoreFloat4(&ndc, XMVector4Transform(
@@ -1204,6 +1214,12 @@ public:
                     const std::shared_ptr<SceneNode>& crateModel,
                     const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr,
                     ShaderDX12* terrainShader = nullptr) {
+        g_virtualShadowConstants = {};
+        g_vsmResident = g_vsmRefreshed = g_vsmReused = 0;
+        g_vsmSlotStates.fill(0);
+        g_vsmSlotKeys.fill(VirtualShadows::Invalid);
+        if (!scene.virtualShadowMaps || !scene.enableShadows || scene.lightType != 0)
+            virtualMaps.Disable();
         const auto candidateMatrices = ComputeCascadeMatrices(scene);
         const XMFLOAT4 candidateTexelWorld = g_shadowCascadeTexelWorld;
         const XMFLOAT4 candidateDepthRange = g_shadowCascadeDepthRange;
@@ -1450,6 +1466,40 @@ public:
                     SHADOW_SHADER_READ_STATE, cascade);
         }
         lightSpace = cascadeMatrices[0];
+        if (scene.virtualShadowMaps && scene.enableShadows) {
+            if (!virtualDepthAttempted) {
+                virtualDepthAttempted = true;
+                virtualDepthShader.Load("shaders/depth_vs.hlsl");
+            }
+            if (virtualDepthShader.loaded) {
+                UpdateSpotStaticInputs(scene, geo, prefabRenderBatches, crateModel);
+                // Separate uploads keep page draws from exhausting or reusing
+                // the cascade/spot constants referenced earlier in the list.
+                std::swap(depthShader, virtualDepthShader);
+                depthShader.BeginFrame();
+                depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
+                drawingVirtualPages = true;
+                virtualMaps.Render(scene, shadowMap.Get(), cascadeMatrices,
+                    [&](const XMMATRIX& matrix, bool live) {
+                        DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                            bandits, matrix, false, terrainShader,
+                            live ? ShadowScenePart::SpotLive : ShadowScenePart::SpotStatic);
+                        return depthShader.currentDrawCall < SHADOW_MAX_DRAWS - 1;
+                    });
+                drawingVirtualPages = false;
+                std::swap(depthShader, virtualDepthShader);
+                g_virtualShadowConstants = virtualMaps.constants;
+                g_vsmResident = virtualMaps.resident;
+                g_vsmRefreshed = virtualMaps.refreshed;
+                g_vsmReused = virtualMaps.reused;
+                for (size_t slot = 0; slot < g_vsmSlotStates.size(); ++slot) {
+                    g_vsmSlotStates[slot] =
+                        static_cast<uint8_t>(virtualMaps.slotStates[slot]);
+                    g_vsmSlotKeys[slot] = virtualMaps.slotKeys[slot];
+                }
+            }
+            g_vsmUnavailable = !virtualDepthShader.loaded || virtualMaps.failed;
+        }
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
             g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
@@ -1540,7 +1590,10 @@ private:
         // Compare actual inputs rather than a hash: LOD swaps, material edits,
         // and transforms must invalidate even when batch counts stay constant.
         // In-place GPU asset edits use InvalidateCachedCascades, as for the sun.
-        if (spotStaticInputs != previousSpotStaticInputs) spotCacheValid.fill(false);
+        if (spotStaticInputs != previousSpotStaticInputs) {
+            spotCacheValid.fill(false);
+            virtualMaps.pages.Invalidate();
+        }
         spotStaticInputs.swap(previousSpotStaticInputs);
     }
 

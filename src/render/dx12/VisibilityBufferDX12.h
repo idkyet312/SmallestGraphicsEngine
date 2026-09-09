@@ -161,6 +161,7 @@ struct alignas(256) VBFrameConstants {
     // after the matrix so its 16-byte alignment is preserved.
     XMFLOAT2 terrainSplatInvExtent;
     XMFLOAT2 terrainSplatPad;
+    VirtualShadows::Constants virtualShadows;
 };
 
 struct alignas(256) VBPostConstants {
@@ -346,6 +347,7 @@ public:
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
     ComPtr<ID3D12PipelineState> resolvePSO;
+    ComPtr<ID3D12PipelineState> virtualShadowResolvePSO;
     // Terrain-enabled twin of resolvePSO: the same source compiled by the same
     // compiler with SGE_TERRAIN_VISIBILITY defined, sharing resolveRootSig. A
     // separate PSO rather than a branch in the default shader, so the default
@@ -2361,6 +2363,7 @@ public:
             fc.shadowCascadeMatrices[i] = XMMatrixTranspose(g_shadowCascadeMatrices[i]);
         fc.previousViewProj = XMMatrixTranspose(previousViewProj);
         fc.shadowCascadeSplits = g_shadowCascadeSplits;
+        fc.virtualShadows = g_virtualShadowConstants;
         fc.cameraPos = cameraPos;
         fc.screenWidth = (float)width;
         fc.screenHeight = (float)height;
@@ -2513,7 +2516,9 @@ public:
         ID3D12PipelineState* selectedPSO = useBindless
             ? (useEnhanced ? bindlessEnhancedResolvePSO.Get()
                            : bindlessResolvePSO.Get())
-            : (useEnhanced ? enhancedResolvePSO.Get() : resolvePSO.Get());
+            : (useEnhanced ? enhancedResolvePSO.Get() :
+                (g_virtualShadowConstants.config[0] && virtualShadowResolvePSO
+                    ? virtualShadowResolvePSO.Get() : resolvePSO.Get()));
         // Each tier has a terrain twin sharing its root signature and heap, so
         // terrain resolves on whichever variant the frame actually selected.
         // TerrainVisibilityReady() applies the same tier lookup, so the draw
@@ -6858,6 +6863,22 @@ private:
             return false;
         }
 
+        // Preserve the default FXC blob; optional variants carry the appended
+        // page table and branch only when the current frame publishes pages.
+        csCode = "#define SGE_VIRTUAL_SHADOWS 1\n" + csCode;
+        ComPtr<ID3DBlob> vsmBlob, vsmErrors;
+        if (SUCCEEDED(ShaderCacheDX12::CompileCached(csCode.c_str(), csCode.size(),
+                "shaders/visbuf_resolve_cs.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                "main", "cs_5_1", compileFlags, 0, &vsmBlob, &vsmErrors))) {
+            auto vsmDesc = cpsoDesc;
+            vsmDesc.CS = {vsmBlob->GetBufferPointer(), vsmBlob->GetBufferSize()};
+            if (FAILED(g_dx12.device->CreateComputePipelineState(&vsmDesc,
+                    IID_PPV_ARGS(&virtualShadowResolvePSO)))) return false;
+        } else {
+            if (vsmErrors) std::cerr << (const char*)vsmErrors->GetBufferPointer();
+            return false;
+        }
+
         // ---- Terrain-enabled resolve variant ----
         //
         // Same source, same compiler, same flags, same root signature -- only
@@ -8326,7 +8347,8 @@ public:
         srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvDesc.Texture2DArray.MipLevels = 1;
-        srvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
+        srvDesc.Texture2DArray.ArraySize = shadowMapResource
+            ? shadowMapResource->GetDesc().DepthOrArraySize : SHADOW_CASCADE_COUNT;
 
         if (shadowMapResource) {
             g_dx12.device->CreateShaderResourceView(shadowMapResource, &srvDesc, cpuHandle);

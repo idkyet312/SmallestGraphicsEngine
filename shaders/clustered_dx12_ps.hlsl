@@ -178,11 +178,15 @@ cbuffer SHBuffer : register(b7) {
     float3 shPadding;
 };
 
+#include "virtual_shadow_types.hlsli"
+#include "virtual_shadow_sample.hlsli"
+
 cbuffer ShadowCascadeBuffer : register(b8) {
     matrix shadowCascadeMatrices[3];
     float4 shadowCascadeSplits;
     float4 shadowCascadeTexelWorld;
     float4 shadowCascadeDepthRange;
+    VirtualShadowConstants virtualShadows;
 };
 
 #ifdef SGE_TERRAIN_PBR
@@ -355,6 +359,8 @@ float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
     float bias = texelWorld * (1.0 + 2.0 * slope) /
                  max(shadowCascadeDepthRange[cascade], 1e-3);
     float depth = projCoords.z - bias;
+    if (VirtualShadowAvailable(shadowMap, virtualShadows))
+        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows, cascade, shadowUV, depth);
 
     float visibility = 0.0;
     [unroll]

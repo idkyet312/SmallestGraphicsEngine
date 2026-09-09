@@ -2,6 +2,17 @@
 #define SHADER_DX12_H
 
 #include "RenderViewDX12.h"
+#include "VirtualShadowPages.h"
+inline VirtualShadows::Constants g_virtualShadowConstants{};
+inline uint32_t g_vsmResident = 0, g_vsmRefreshed = 0, g_vsmReused = 0;
+inline bool g_vsmUnavailable = false;
+// Per-slot page state for the debug overlay: 0 unused, 1 reused (cached),
+// 2 refreshed (redrawn this frame). A plain uint8_t rather than the
+// VirtualShadowMapDX12::SlotState enum it mirrors, because that class is
+// defined further down the include order than this header.
+inline std::array<uint8_t, VirtualShadows::Capacity> g_vsmSlotStates{};
+inline std::array<uint32_t, VirtualShadows::Capacity> g_vsmSlotKeys{};
+inline bool g_vsmShowPageOverlay = false;
 
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
@@ -343,7 +354,9 @@ struct alignas(256) ShadowCascadeBufferDX12 {
     XMFLOAT4 splitDepths;
     XMFLOAT4 texelWorld;
     XMFLOAT4 depthRange;
+    VirtualShadows::Constants virtualShadows;
 };
+static_assert(offsetof(ShadowCascadeBufferDX12, virtualShadows) == 240, "VSM b8 layout");
 
 // Transforms consumed directly by the amplification and mesh shaders. Unlike a
 // CBV array these records are tightly packed in one root SRV.
@@ -1853,7 +1866,7 @@ public:
         shadowDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         shadowDesc.Format = DXGI_FORMAT_R32_FLOAT;
         shadowDesc.Texture2DArray.MipLevels = 1;
-        shadowDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
+        shadowDesc.Texture2DArray.ArraySize = shadowMap ? shadowMap->GetDesc().DepthOrArraySize : SHADOW_CASCADE_COUNT;
         g_dx12.device->CreateShaderResourceView(shadowMap, &shadowDesc, cpuHandle);
         cpuHandle.ptr += descriptorSize;
 
@@ -2104,6 +2117,7 @@ public:
         cascades.splitDepths = g_shadowCascadeSplits;
         cascades.texelWorld = g_shadowCascadeTexelWorld;
         cascades.depthRange = g_shadowCascadeDepthRange;
+        cascades.virtualShadows = g_virtualShadowConstants;
         shadowCascadeBuffer.CopyData(ViewFrameIndex(), cascades);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(ViewFrameIndex()));

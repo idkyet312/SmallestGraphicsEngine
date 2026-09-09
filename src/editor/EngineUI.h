@@ -1470,6 +1470,53 @@ inline bool ViewmodelEyeDistanceRange(const Scene& scene, const SceneMesh& mesh,
     return true;
 }
 
+// The 16 physical atlas slots, laid out as the 4x4 grid VirtualShadowMapDX12
+// rasterises into. Green means the page survived from an earlier frame and was
+// reused; red means it was invalidated and redrawn this frame. A wall of red
+// while standing still is the interesting failure: it means something is
+// invalidating the cache every frame and the pages are paying full cost.
+inline void DrawVirtualShadowPageGrid() {
+    const float cell = 34.0f;
+    const float pad = 3.0f;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+
+    for (uint32_t slot = 0; slot < VirtualShadows::Capacity; ++slot) {
+        // Slot -> atlas cell, matching VirtualShadowMapDX12::Rect().
+        const uint32_t column = slot % 4, row = slot / 4;
+        const ImVec2 min(origin.x + column * (cell + pad),
+                         origin.y + row * (cell + pad));
+        const ImVec2 max(min.x + cell, min.y + cell);
+
+        const uint8_t state = g_vsmSlotStates[slot];
+        const ImU32 fill = state == 1 ? IM_COL32(46, 160, 67, 210)    // reused
+                         : state == 2 ? IM_COL32(196, 52, 42, 210)    // refreshed
+                                      : IM_COL32(38, 42, 48, 140);    // unused
+        draw->AddRectFilled(min, max, fill, 3.0f);
+        draw->AddRect(min, max, IM_COL32(0, 0, 0, 120), 3.0f);
+
+        // Cascade index, so a page's depth range is readable at a glance. The
+        // key packs cascade * Grid * Grid + y * Grid + x; see VirtualShadows::Key.
+        if (state != 0 && g_vsmSlotKeys[slot] != VirtualShadows::Invalid) {
+            char label[8];
+            std::snprintf(label, sizeof(label), "%u",
+                g_vsmSlotKeys[slot] / (VirtualShadows::Grid * VirtualShadows::Grid));
+            const ImVec2 size = ImGui::CalcTextSize(label);
+            draw->AddText(ImVec2(min.x + (cell - size.x) * 0.5f,
+                                 min.y + (cell - size.y) * 0.5f),
+                          IM_COL32(255, 255, 255, 235), label);
+        }
+    }
+
+    // Reserve the space the draw list painted into, so ImGui lays out the rest
+    // of the panel below the grid rather than on top of it.
+    const float extent = 4 * cell + 3 * pad;
+    ImGui::Dummy(ImVec2(extent, extent));
+
+    ImGui::TextDisabled("Green: cached  Red: redrawn  Grey: unused");
+    ImGui::TextDisabled("Number is the cascade the page belongs to.");
+}
+
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     struct RTDebugSettings {
         bool active = false;
@@ -2029,6 +2076,25 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Off (default): it lights surfaces only.");
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
+            ImGui::Checkbox("Virtual Shadow Maps", &scene.virtualShadowMaps);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Paged 16K sun shadows around the camera view; cascades cover missing pages.");
+            if (scene.virtualShadowMaps) {
+                ImGui::SliderInt("VSM Page Budget", &scene.virtualShadowPageBudget, 1, 16);
+                ImGui::Text("Pages: %u resident, %u refreshed, %u reused",
+                    g_vsmResident, g_vsmRefreshed, g_vsmReused);
+                if (g_vsmUnavailable)
+                    ImGui::TextUnformatted("VSM unavailable: using cascade shadows");
+                ImGui::Checkbox("Visualize Pages In World", &scene.showVirtualShadowPages);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Draws each live page over the view where it "
+                                      "actually lands. Green: cached and reused. "
+                                      "Red: invalidated and redrawn this frame.");
+                ImGui::Checkbox("Show VSM Atlas Grid", &g_vsmShowPageOverlay);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("The 16 physical atlas slots, same colours.");
+                if (g_vsmShowPageOverlay) DrawVirtualShadowPageGrid();
+            }
             ImGui::Checkbox("Cache Static Spotlight Shadows", &scene.cacheSpotShadows);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Reuses static object shadows for stationary lights. "

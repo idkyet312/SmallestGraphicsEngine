@@ -222,6 +222,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
     g_forceTerrainErrorLOD =
         GetEnvironmentVariableA("SGE_TERRAIN_ERROR_LOD", nullptr, 0) > 0;
+    scene.virtualShadowMaps =
+        GetEnvironmentVariableA("SGE_VSM", nullptr, 0) > 0;
     scene.cacheFarShadowCascades =
         GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
@@ -4636,7 +4638,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
                 g_scopeShadowLightSpace = lightSpace;
-                g_scopeShadowResource = shadowResource;
+                g_scopeShadowResource = shadowMap.shadowMap.Get();
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
@@ -4686,7 +4688,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
                 g_scopeShadowLightSpace = lightSpace;
-                g_scopeShadowResource = shadowResource;
+                g_scopeShadowResource = shadowMap.shadowMap.Get();
             }
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
@@ -5584,6 +5586,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (showUI) RenderUI(scene, visBuffer);
                 DrawDestructionDebug(scene);
                 DrawRagdollPhysicsDebug(scene);
+                DrawVirtualShadowPageDebug(scene);
             }
         }
         ImGui::Render();

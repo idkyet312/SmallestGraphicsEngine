@@ -5,6 +5,11 @@
 
 // ---- Constant Buffers ----
 
+#if SGE_VIRTUAL_SHADOWS
+#include "virtual_shadow_types.hlsli"
+#include "virtual_shadow_sample.hlsli"
+#endif
+
 cbuffer FrameConstants : register(b0) {
     matrix viewMatrix;
     matrix projMatrix;
@@ -32,7 +37,7 @@ cbuffer FrameConstants : register(b0) {
     float4 palmPreviousPrimary;
     float4 palmPreviousSecondary;
     float4 palmParams;
-#if SGE_TERRAIN_VISIBILITY
+#if SGE_TERRAIN_VISIBILITY || SGE_VIRTUAL_SHADOWS
     // Terrain-in-visibility parameters, appended after every pre-existing field
     // so the default resolve cbuffer layout is byte-for-byte what it was.
     float  terrainMaterialType;
@@ -49,6 +54,9 @@ cbuffer FrameConstants : register(b0) {
     // after the matrix so the matrix keeps its 16-byte alignment.
     float2 terrainSplatInvExtent;
     float2 terrainSplatPad;
+#endif
+#if SGE_VIRTUAL_SHADOWS
+    VirtualShadowConstants virtualShadows;
 #endif
 };
 
@@ -1481,6 +1489,11 @@ float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
     float2 texel = rcp(float2(shadowWidth, shadowHeight));
     float slopeBias = max(shadowBias * (1.0 - saturate(dot(normal, lightDir))),
                           shadowBias * 0.25);
+#if SGE_VIRTUAL_SHADOWS
+    if (VirtualShadowAvailable(shadowMapTex, virtualShadows))
+        return VirtualShadowFilter(shadowMapTex, shadowSampler, virtualShadows,
+            cascade, uv, projected.z - slopeBias);
+#endif
     float visibility = 0.0;
     [unroll]
     for (int y = -1; y <= 1; ++y) {
