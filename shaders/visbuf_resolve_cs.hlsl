@@ -1489,11 +1489,6 @@ float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
     float2 texel = rcp(float2(shadowWidth, shadowHeight));
     float slopeBias = max(shadowBias * (1.0 - saturate(dot(normal, lightDir))),
                           shadowBias * 0.25);
-#if SGE_VIRTUAL_SHADOWS
-    if (VirtualShadowAvailable(shadowMapTex, virtualShadows))
-        return VirtualShadowFilter(shadowMapTex, shadowSampler, virtualShadows,
-            cascade, uv, projected.z - slopeBias);
-#endif
     float visibility = 0.0;
     [unroll]
     for (int y = -1; y <= 1; ++y) {
@@ -1510,6 +1505,14 @@ float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
 
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
+
+#if SGE_VIRTUAL_SHADOWS
+    // Virtual shadows replace the cascades outright, so nothing below runs:
+    // the clipmap selects its own level and there are no splits to blend.
+    if (VirtualShadowAvailable(virtualShadows))
+        return VirtualShadowVisibility(shadowMapTex, shadowSampler,
+            virtualShadows, worldPos, normal, lightDir);
+#endif
 
     float viewDepth = mul(float4(worldPos, 1.0), viewMatrix).z;
     uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :

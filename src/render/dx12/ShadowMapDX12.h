@@ -627,8 +627,47 @@ public:
         return true;
     }
 
+    // Single source of truth for "virtual shadows are replacing the cascades
+    // this frame". Read before the cascade render decides whether to run, and
+    // again by the toggle-edge handling that frees the cascade textures, so the
+    // two can never disagree about which system owns the shadowing.
+    bool VirtualShadowsActive(const Scene& scene) const {
+        return scene.virtualShadowMaps && scene.enableShadows &&
+               scene.lightType == 0 && virtualDepthShader.loaded &&
+               !virtualMaps.failed;
+    }
+
     ID3D12Resource* GetResource() const {
         return virtualMaps.Output() ? virtualMaps.Output() : shadowMap.Get();
+    }
+
+    // Cascade atlas lifetime, driven by the virtual-shadow toggle.
+    //
+    // Freeing these is worth ~192 MB on a card that is already spilling to
+    // shared memory, but it is only safe on a toggle edge and only after a full
+    // GPU flush: an in-flight command list can still reference the texture, and
+    // freeing under a live SRV descriptor is a GPU fault rather than a soft
+    // failure. Callers must also re-point anything holding a raw pointer to
+    // shadowMap (DDGI, the scope pass) at GetResource() afterwards.
+    void ReleaseCascadeResources() {
+        if (!shadowMap && !cachedFarShadowMap) return;
+        WaitForGPUAllFrames();
+        shadowMap.Reset();
+        dsvHeap.Reset();
+        cachedFarShadowMap.Reset();
+        cachedFarDsvHeap.Reset();
+        farCacheValid.fill(false);
+        cacheViewValid = false;
+    }
+
+    // Rebuild what ReleaseCascadeResources dropped. CreateShadowMap allocates
+    // only when the resource is missing, so this is safe to call unconditionally
+    // on the toggle back.
+    bool EnsureCascadeResources() {
+        if (shadowMap) return true;
+        if (!CreateShadowMap()) return false;
+        InvalidateCachedCascades();
+        return true;
     }
 
     ID3D12Resource* GetSpotResource() const {
@@ -1218,8 +1257,20 @@ public:
         g_vsmResident = g_vsmRefreshed = g_vsmReused = 0;
         g_vsmSlotStates.fill(0);
         g_vsmSlotKeys.fill(VirtualShadows::Invalid);
-        if (!scene.virtualShadowMaps || !scene.enableShadows || scene.lightType != 0)
-            virtualMaps.Disable();
+
+        // Decide this before any cascade work: when virtual shadows are on they
+        // replace the cascades outright rather than refining them, so the
+        // cascade render below is skipped entirely. The depth shader is loaded
+        // here (not inside the VSM block further down) because that load is part
+        // of what makes the system usable, and the answer gates the cascades.
+        if (scene.virtualShadowMaps && scene.enableShadows &&
+            scene.lightType == 0 && !virtualDepthAttempted) {
+            virtualDepthAttempted = true;
+            virtualDepthShader.Load("shaders/depth_vs.hlsl");
+        }
+        const bool virtualActive = VirtualShadowsActive(scene);
+        if (!virtualActive) virtualMaps.Disable();
+
         const auto candidateMatrices = ComputeCascadeMatrices(scene);
         const XMFLOAT4 candidateTexelWorld = g_shadowCascadeTexelWorld;
         const XMFLOAT4 candidateDepthRange = g_shadowCascadeDepthRange;
@@ -1229,7 +1280,9 @@ public:
         cachedCascadesThisFrame = 0;
         refreshedCascadesThisFrame = 0;
 
-        const bool useFarCache = scene.cacheFarShadowCascades &&
+        // Virtual shadows own the shadowing when active, so the cascade atlas
+        // and its far cache are neither rendered nor allocated.
+        const bool useFarCache = !virtualActive && scene.cacheFarShadowCascades &&
             EnsureFarCascadeCache();
         if (useFarCache) {
             const float aspect = static_cast<float>(g_dx12.screenWidth) /
@@ -1377,7 +1430,13 @@ public:
             g_dx12.commandList->ResourceBarrier(1, &barrier);
         };
 
-        if (!useFarCache) {
+        // The whole cascade render, skipped while virtual shadows are active.
+        // This is the point of the feature: previously the cascades were drawn
+        // in full and then copied into the page atlas, so virtual shadows could
+        // only ever cost more than the system they were meant to replace.
+        if (virtualActive) {
+            // Nothing to draw here; the page atlas is rendered below.
+        } else if (!useFarCache) {
             transition(shadowMap.Get(), SHADOW_SHADER_READ_STATE,
                 D3D12_RESOURCE_STATE_DEPTH_WRITE,
                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
@@ -1466,12 +1525,8 @@ public:
                     SHADOW_SHADER_READ_STATE, cascade);
         }
         lightSpace = cascadeMatrices[0];
-        if (scene.virtualShadowMaps && scene.enableShadows) {
-            if (!virtualDepthAttempted) {
-                virtualDepthAttempted = true;
-                virtualDepthShader.Load("shaders/depth_vs.hlsl");
-            }
-            if (virtualDepthShader.loaded) {
+        if (virtualActive) {
+            {
                 UpdateSpotStaticInputs(scene, geo, prefabRenderBatches, crateModel);
                 // Separate uploads keep page draws from exhausting or reusing
                 // the cascade/spot constants referenced earlier in the list.
@@ -1479,7 +1534,7 @@ public:
                 depthShader.BeginFrame();
                 depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
                 drawingVirtualPages = true;
-                virtualMaps.Render(scene, shadowMap.Get(), cascadeMatrices,
+                virtualMaps.Render(scene,
                     [&](const XMMATRIX& matrix, bool live) {
                         DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
                             bandits, matrix, false, terrainShader,
@@ -1498,8 +1553,9 @@ public:
                     g_vsmSlotKeys[slot] = virtualMaps.slotKeys[slot];
                 }
             }
-            g_vsmUnavailable = !virtualDepthShader.loaded || virtualMaps.failed;
         }
+        if (scene.virtualShadowMaps && scene.enableShadows)
+            g_vsmUnavailable = !virtualDepthShader.loaded || virtualMaps.failed;
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
             g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);

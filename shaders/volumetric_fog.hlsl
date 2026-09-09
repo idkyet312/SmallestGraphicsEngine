@@ -100,6 +100,17 @@ float SunVisibility(float3 worldPosition, float rotation)
 {
     if (fogParams.w < 0.5)
         return 1.0;
+
+    // Virtual shadows replace the cascades outright. No normal offset here:
+    // this samples air, not a surface, so there is no surface to bias away
+    // from -- only the constant depth bias below applies.
+    if (VirtualShadowAvailable(virtualShadows))
+    {
+        float3 lightSpace = VirtualShadowProject(virtualShadows, worldPosition);
+        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows,
+                                   lightSpace.xy, lightSpace.z - 0.0025);
+    }
+
     float viewDepth = dot(worldPosition - cameraPositionNear.xyz,
                           normalize(cameraForwardFar.xyz));
     uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
@@ -129,8 +140,6 @@ float SunVisibility(float3 worldPosition, float rotation)
     // Kept narrow deliberately: widening this to 3 texels softened the occluder
     // edge enough that sun-facing views bled a bright veil over the hillside in
     // front of the sun -- the same failure the phase clamp below guards against.
-    if (VirtualShadowAvailable(shadowMap, virtualShadows))
-        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows, cascade, uv, projected.z - 0.0025);
     float radius = 1.6 / 2048.0;
     float visibility = shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(uv, cascade), projected.z - 0.0025);

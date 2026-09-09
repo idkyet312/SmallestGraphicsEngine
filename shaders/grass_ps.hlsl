@@ -110,14 +110,18 @@ float SampleShadowCascadeCheap(float3 worldPos, float3 normal,
     float slope = clamp(sqrt(1.0 - ndotl * ndotl) / max(ndotl, 0.1), 0.0, 8.0);
     float bias = texelWorld * (1.0 + 2.0 * slope) /
                  max(shadowCascadeDepthRange[cascade], 1e-3);
-    if (VirtualShadowAvailable(shadowMap, virtualShadows))
-        return VirtualShadowFilter(shadowMap, shadowSampler, virtualShadows, cascade, shadowUV, projCoords.z - bias);
     return shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(shadowUV, cascade), projCoords.z - bias);
 }
 
 float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
+
+    // Virtual shadows replace the cascades outright, so nothing below runs:
+    // the clipmap selects its own level and there are no splits to blend.
+    if (VirtualShadowAvailable(virtualShadows))
+        return VirtualShadowVisibility(shadowMap, shadowSampler,
+            virtualShadows, worldPos, normal, lightDir);
 
     float viewDepth = mul(float4(worldPos, 1.0), view).z;
     uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :

@@ -225,8 +225,9 @@ static void DrawVirtualShadowPageDebug(Scene& scene) {
     // useful place to draw it is where its shadows actually land: unproject the
     // cell corner along the light ray and drop it onto the terrain.
     //
-    // Depth is [0,1] here, not [-1,1]: the cascades are built with
-    // XMMatrixOrthographicOffCenterLH (see ComputeCascadeMatrices).
+    // lx/ly are light-space world units (the lattice is metric, not normalized),
+    // so the two probe depths below are metres along the light, not [0,1] NDC.
+    const XMMATRIX lightRotation = VirtualShadowMapDX12::LightRotation(scene);
     TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
     terrainParams.heightScale = scene.terrainHeightScale;
 
@@ -234,9 +235,11 @@ static void DrawVirtualShadowPageDebug(Scene& scene) {
                        ImVec2& screen) {
         // Two points down the same light ray give its direction in world space.
         const XMVECTOR nearPoint = XMVector3TransformCoord(
-            XMVectorSet(lx, ly, 0.0f, 1.0f), inverseLight);
+            XMVectorSet(lx, ly, -VirtualShadowMapDX12::DepthExtent * 0.5f, 1.0f),
+            inverseLight);
         const XMVECTOR farPoint = XMVector3TransformCoord(
-            XMVectorSet(lx, ly, 1.0f, 1.0f), inverseLight);
+            XMVectorSet(lx, ly, VirtualShadowMapDX12::DepthExtent * 0.5f, 1.0f),
+            inverseLight);
         const XMVECTOR ray = XMVectorSubtract(farPoint, nearPoint);
         if (XMVectorGetY(ray) >= -0.0001f) return false;   // not pointing down
 
@@ -285,23 +288,26 @@ static void DrawVirtualShadowPageDebug(Scene& scene) {
         const uint8_t state = g_vsmSlotStates[slot];
         if (state == 0 || g_vsmSlotKeys[slot] == VirtualShadows::Invalid) continue;
 
-        // Unpack the virtual page key: cascade * Grid * Grid + y * Grid + x.
+        // Unpack the absolute lattice key. ix/iy are signed world-lattice
+        // coordinates, not indices into a viewer-centred window, so they stay
+        // constant while a page is resident -- watching them hold steady as the
+        // player walks is the visible proof that pages are world-anchored.
         const uint32_t key = g_vsmSlotKeys[slot];
-        const uint32_t cascade = key / (VirtualShadows::Grid * VirtualShadows::Grid);
-        const uint32_t x = key % VirtualShadows::Grid;
-        const uint32_t y = (key / VirtualShadows::Grid) % VirtualShadows::Grid;
-        if (cascade >= SHADOW_CASCADE_COUNT) continue;
+        const uint32_t level = VirtualShadows::KeyLevel(key);
+        const int32_t ix = VirtualShadows::KeyX(key);
+        const int32_t iy = VirtualShadows::KeyY(key);
+        if (level >= VirtualShadows::Levels) continue;
 
+        // A page is an axis-aligned rectangle in light space, so only the light
+        // rotation has to be undone -- there is no per-page projection to invert.
         XMVECTOR determinant;
         const XMMATRIX inverseLight =
-            XMMatrixInverse(&determinant, g_shadowCascadeMatrices[cascade]);
+            XMMatrixInverse(&determinant, lightRotation);
         if (XMVectorGetX(XMVectorAbs(determinant)) < 1e-12f) continue;
 
-        // Page cell -> light-space NDC. The grid runs left-to-right in x and
-        // top-to-bottom in y, matching the shader's uv * Grid page lookup.
-        const float step = 2.0f / static_cast<float>(VirtualShadows::Grid);
-        const float x0 = -1.0f + step * x,        x1 = x0 + step;
-        const float y0 =  1.0f - step * y,        y1 = y0 - step;
+        const float extent = VirtualShadows::PageExtent(level);
+        const float x0 = ix * extent, x1 = x0 + extent;
+        const float y0 = iy * extent, y1 = y0 + extent;
 
         ImVec2 corners[4];
         if (!project(inverseLight, x0, y0, corners[0]) ||
@@ -317,14 +323,16 @@ static void DrawVirtualShadowPageDebug(Scene& scene) {
         draw->AddConvexPolyFilled(corners, 4, fill);
         draw->AddPolyline(corners, 4, edge, ImDrawFlags_Closed, 2.0f);
 
-        // Label at the centroid: cascade, then the page's grid coordinate.
+        // Label at the centroid: level, then the page's absolute lattice
+        // coordinate. These numbers are the diagnostic -- they must not change
+        // while a page stays resident, however the camera moves.
         ImVec2 centre(0, 0);
         for (const ImVec2& corner : corners) {
             centre.x += corner.x * 0.25f;
             centre.y += corner.y * 0.25f;
         }
-        char label[32];
-        std::snprintf(label, sizeof(label), "C%u %u,%u", cascade, x, y);
+        char label[48];
+        std::snprintf(label, sizeof(label), "L%u %d,%d", level, ix, iy);
         const ImVec2 size = ImGui::CalcTextSize(label);
         const ImVec2 at(centre.x - size.x * 0.5f, centre.y - size.y * 0.5f);
         draw->AddRectFilled(ImVec2(at.x - 4, at.y - 2),

@@ -1470,11 +1470,15 @@ inline bool ViewmodelEyeDistanceRange(const Scene& scene, const SceneMesh& mesh,
     return true;
 }
 
-// The 16 physical atlas slots, laid out as the 4x4 grid VirtualShadowMapDX12
+// The physical atlas slots, laid out as the grid VirtualShadowMapDX12
 // rasterises into. Green means the page survived from an earlier frame and was
-// reused; red means it was invalidated and redrawn this frame. A wall of red
-// while standing still is the interesting failure: it means something is
-// invalidating the cache every frame and the pages are paying full cost.
+// reused; red means it was invalidated and redrawn this frame.
+//
+// Because pages are keyed by absolute world lattice coordinate, red should be
+// rare once the view settles: neither moving nor turning the camera can stale a
+// page, and walking should redraw roughly one page per level per boundary
+// crossed. A wall of red while standing still, or a whole level going red at
+// once as you walk, means something is invalidating by position again.
 inline void DrawVirtualShadowPageGrid() {
     const float cell = 34.0f;
     const float pad = 3.0f;
@@ -1483,7 +1487,8 @@ inline void DrawVirtualShadowPageGrid() {
 
     for (uint32_t slot = 0; slot < VirtualShadows::Capacity; ++slot) {
         // Slot -> atlas cell, matching VirtualShadowMapDX12::Rect().
-        const uint32_t column = slot % 4, row = slot / 4;
+        const uint32_t column = slot % VirtualShadows::AtlasPages;
+        const uint32_t row = slot / VirtualShadows::AtlasPages;
         const ImVec2 min(origin.x + column * (cell + pad),
                          origin.y + row * (cell + pad));
         const ImVec2 max(min.x + cell, min.y + cell);
@@ -1495,12 +1500,12 @@ inline void DrawVirtualShadowPageGrid() {
         draw->AddRectFilled(min, max, fill, 3.0f);
         draw->AddRect(min, max, IM_COL32(0, 0, 0, 120), 3.0f);
 
-        // Cascade index, so a page's depth range is readable at a glance. The
-        // key packs cascade * Grid * Grid + y * Grid + x; see VirtualShadows::Key.
+        // Clipmap level, so a page's texel density is readable at a glance.
+        // See VirtualShadows::Key for the packing.
         if (state != 0 && g_vsmSlotKeys[slot] != VirtualShadows::Invalid) {
             char label[8];
             std::snprintf(label, sizeof(label), "%u",
-                g_vsmSlotKeys[slot] / (VirtualShadows::Grid * VirtualShadows::Grid));
+                VirtualShadows::KeyLevel(g_vsmSlotKeys[slot]));
             const ImVec2 size = ImGui::CalcTextSize(label);
             draw->AddText(ImVec2(min.x + (cell - size.x) * 0.5f,
                                  min.y + (cell - size.y) * 0.5f),
@@ -1510,11 +1515,12 @@ inline void DrawVirtualShadowPageGrid() {
 
     // Reserve the space the draw list painted into, so ImGui lays out the rest
     // of the panel below the grid rather than on top of it.
-    const float extent = 4 * cell + 3 * pad;
+    const float extent = VirtualShadows::AtlasPages * cell +
+                         (VirtualShadows::AtlasPages - 1) * pad;
     ImGui::Dummy(ImVec2(extent, extent));
 
     ImGui::TextDisabled("Green: cached  Red: redrawn  Grey: unused");
-    ImGui::TextDisabled("Number is the cascade the page belongs to.");
+    ImGui::TextDisabled("Number is the clipmap level the page belongs to.");
 }
 
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
@@ -2078,7 +2084,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         if (scene.enableShadows) {
             ImGui::Checkbox("Virtual Shadow Maps", &scene.virtualShadowMaps);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Paged 16K sun shadows around the camera view; cascades cover missing pages.");
+                ImGui::SetTooltip("World-anchored paged sun shadows. Replaces the "
+                    "cascade shadow maps entirely: the cascade pass does not run, "
+                    "and areas with no resident page are unshadowed.");
             if (scene.virtualShadowMaps) {
                 ImGui::SliderInt("VSM Page Budget", &scene.virtualShadowPageBudget, 1, 16);
                 ImGui::Text("Pages: %u resident, %u refreshed, %u reused",

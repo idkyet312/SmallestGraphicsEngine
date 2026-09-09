@@ -353,7 +353,10 @@ struct Scene {
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
     bool  virtualShadowMaps = false;
-    int   virtualShadowPageBudget = 4;
+    // Full atlas by default. Virtual shadows have no cascade fallback, so an
+    // unmapped page is a hole in the shadowing rather than a softer sample:
+    // spending fewer pages does not trade quality for cost, it removes shadows.
+    int   virtualShadowPageBudget = 16;
     bool  showVirtualShadowPages = false;
     bool  cacheFarShadowCascades = false;
     bool  cacheSpotShadows = false;

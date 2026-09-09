@@ -4603,6 +4603,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
+
+        // Virtual shadows replace the cascade atlas rather than augmenting it,
+        // so the cascade textures are freed while they are on -- worth ~192 MB
+        // on a card that is already spilling into shared memory.
+        //
+        // Only on the toggle edge: the release flushes the GPU, so doing it per
+        // frame would stall every frame. Anything holding a raw pointer to the
+        // cascade texture has to be re-pointed here too, or it is left with a
+        // descriptor to freed memory.
+        {
+            static bool previousVirtualShadows = false;
+            const bool virtualNow = shadowMap.initialized &&
+                                    shadowMap.VirtualShadowsActive(scene);
+            if (virtualNow != previousVirtualShadows) {
+                previousVirtualShadows = virtualNow;
+                if (virtualNow) {
+                    shadowMap.ReleaseCascadeResources();
+                } else {
+                    shadowMap.EnsureCascadeResources();
+                }
+                // DDGI caches both the pointer and its SRV at registration time.
+                g_ddgiRenderer.RegisterShadowMap(shadowMap.GetResource());
+                // The scope pass reads last frame's pointer; drop it rather than
+                // let it dangle for the one frame before it is rewritten.
+                g_scopeShadowResource = nullptr;
+            }
+        }
         // The Humvee spotlight is added before clustered-light culling and
         // removed after the last consumer. Its caster list is rebuilt from the
         // current vehicle pose before the depth pass, leaving no player or
@@ -4638,7 +4665,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
                 g_scopeShadowLightSpace = lightSpace;
-                g_scopeShadowResource = shadowMap.shadowMap.Get();
+                // GetResource(), not shadowMap: the cascade texture is freed
+                // while virtual shadows are active, and this pointer is held
+                // across frames by the scope pass.
+                g_scopeShadowResource = shadowMap.GetResource();
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
@@ -4688,7 +4718,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
                 g_scopeShadowLightSpace = lightSpace;
-                g_scopeShadowResource = shadowMap.shadowMap.Get();
+                // GetResource(), not shadowMap: the cascade texture is freed
+                // while virtual shadows are active, and this pointer is held
+                // across frames by the scope pass.
+                g_scopeShadowResource = shadowMap.GetResource();
             }
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
@@ -5378,6 +5411,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 << (visBuffer.BentNormalGTAOAppliedLastResolve() ? 1 : 0)
                 << " bent_debug="
                 << static_cast<UINT>(visBuffer.bentNormalGTAODebugMode)
+                << " vsm=" << (scene.virtualShadowMaps ? 1 : 0)
+                << " vsm_resident=" << g_vsmResident
+                << " vsm_refreshed=" << g_vsmRefreshed
+                << " vsm_reused=" << g_vsmReused
+                << " vsm_unavailable=" << (g_vsmUnavailable ? 1 : 0)
+                << " cascades_refreshed=" << shadowMap.RefreshedCascadesThisFrame()
+                << " vram_mb=" << (GetVideoMemoryStatsDX12().usageBytes >> 20)
+                << " vram_budget_mb="
+                << (GetVideoMemoryStatsDX12().budgetBytes >> 20)
                 << '\n';
             visibilitySmokeReported = true;
         }

@@ -5,9 +5,20 @@
 #include "ProfilerDX12.h"
 #include <cstring>
 
-// The atlas shares a view with three fallback slices, keeping all existing
-// shadow consumers on one SRV. Outputs are frame-local because the resolve can
-// run on async compute; only the graphics queue touches the static cache.
+// A standalone virtual shadow map, independent of the cascade shadow maps.
+//
+// The atlas is its own resource, not a copy of the cascades with pages bolted
+// on: while this system is active ShadowMapDX12 swaps it into the shadow SRV
+// slot wholesale and skips the cascade render entirely, so nothing downstream
+// can fall back to a cascade sample.
+//
+// The page grid is anchored to the world, not the camera. All pages share one
+// light rotation and a page's identity is its absolute lattice coordinate, so
+// pages stay put as the camera moves and turns; the only thing that invalidates
+// them is a change to the light basis itself. See VirtualShadowPages.h.
+//
+// Outputs are frame-local because the resolve can run on async compute; only
+// the graphics queue touches the static cache.
 class VirtualShadowMapDX12 {
 public:
     VirtualShadows::PageCache pages;
@@ -31,6 +42,13 @@ public:
     }
     VirtualShadows::Constants constants{};
 
+    // World-space depth span the light basis covers, centred on the plane
+    // through the world origin. Fixed rather than fitted to the view frustum: a
+    // fitted range would change every frame and invalidate the whole clipmap,
+    // which is the cost this system exists to avoid. It also lets one depth
+    // value serve every level, since all pages share this range.
+    static constexpr float DepthExtent = 4000.0f;
+
     bool Ensure() {
         if (cache) return true;
         if (attempted) return false;
@@ -40,7 +58,7 @@ public:
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = desc.Height = VirtualShadows::AtlasSize;
-        desc.DepthOrArraySize = 4;
+        desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.SampleDesc.Count = 1;
@@ -57,7 +75,6 @@ public:
             if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
                 D3D12_HEAP_FLAG_NONE, &desc, ReadState, &clear, IID_PPV_ARGS(&target))))
                 return AllocationFailed();
-        desc.DepthOrArraySize = 1;
         if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
             D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
             &clear, IID_PPV_ARGS(&cache)))) return AllocationFailed();
@@ -66,69 +83,82 @@ public:
         view.Format = DXGI_FORMAT_D32_FLOAT;
         view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray.ArraySize = 1;
-        for (UINT i = 0; i <= FRAME_COUNT; ++i) {
-            view.Texture2DArray.FirstArraySlice = i == FRAME_COUNT ? 0 : 3;
-            g_dx12.device->CreateDepthStencilView(i == FRAME_COUNT ? cache.Get() : output[i].Get(),
-                &view, Dsv(i));
-        }
+        for (UINT i = 0; i <= FRAME_COUNT; ++i)
+            g_dx12.device->CreateDepthStencilView(
+                i == FRAME_COUNT ? cache.Get() : output[i].Get(), &view, Dsv(i));
         return true;
     }
 
+    // Renders the resident set. draw(matrix, live) records the shadow scene for
+    // one page; live selects the dynamic half, matching the static/live split
+    // the spot atlas uses.
     template<class Draw>
-    void Render(const Scene& scene, ID3D12Resource* fallback,
-                const std::array<XMMATRIX, 3>& matrices, Draw draw) {
+    void Render(const Scene& scene, Draw draw) {
         using namespace VirtualShadows;
         constants = {};
         active = false;
         resident = refreshed = reused = 0;
         slotStates.fill(SlotState::Unused);
         slotKeys.fill(VirtualShadows::Invalid);
-        if (!Ensure() || fallback->GetDesc().Width != AtlasSize) return;
+        if (!Ensure()) return;
         ProfilerDX12::Scope timer(g_profiler, "Virtual Shadow Maps", g_dx12.commandList.Get());
-        for (UINT c = 0; c < 3; ++c) {
-            XMFLOAT4X4 matrix;
-            XMStoreFloat4x4(&matrix, matrices[c]);
-            if (std::memcmp(&matrix, &previous[c], sizeof(matrix)) != 0) pages.InvalidateCascade(c);
-            previous[c] = matrix;
+
+        // The light basis. Built from the light direction ONLY -- never from the
+        // camera -- which is what keeps the lattice world-anchored: turning or
+        // moving the camera changes nothing here.
+        XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
+        XMVECTOR lightUp = XMVectorSet(0, 1, 0, 0);
+        if (std::fabs(XMVectorGetX(XMVector3Dot(lightDir, lightUp))) > 0.95f)
+            lightUp = XMVectorSet(0, 0, 1, 0);
+        const XMMATRIX rotation = XMMatrixLookAtLH(
+            XMVectorZero(), -lightDir, lightUp);
+
+        // A rotation change is the only event that invalidates pages: it
+        // re-rasterizes every one of them through a different projection.
+        XMFLOAT4X4 rotationStore;
+        XMStoreFloat4x4(&rotationStore, rotation);
+        if (std::memcmp(&rotationStore, &previousRotation, sizeof(rotationStore)) != 0) {
+            pages.Invalidate();
+            previousRotation = rotationStore;
         }
+
+        // Where the viewer sits on the lattice. This selects which pages to
+        // request; it never affects what a page is.
+        XMFLOAT3 viewer;
+        XMStoreFloat3(&viewer, XMVector3TransformCoord(
+            XMLoadFloat3(&scene.camera.Position), rotation));
+
+        // Residency: spiral outward from the viewer's cell, finest level first,
+        // then spend what is left on coarser levels. With no cascade to fall
+        // back on an unmapped cell is a hole in the shadowing, so the budget
+        // buys contiguous coverage around the viewer rather than an even split.
         std::array<uint32_t, Capacity> requests;
         requests.fill(Invalid);
-        const UINT budget = (std::clamp)(scene.virtualShadowPageBudget, 1, (int)Capacity);
-        const XMVECTOR position = XMLoadFloat3(&scene.camera.Position);
-        const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
-        // Each cascade gets its own slice of the budget and its own spiral, so
-        // the three do not all re-request the cell under the crosshair. The
-        // remainder goes to the nearest cascade, where texels are smallest and
-        // an extra page buys the most detail.
-        //
-        // A generated spiral replaces the old six-entry offset table: with a
-        // budget of 16 that table could only name six cells per cascade, so the
-        // pages piled into one clump instead of tiling outward from the focus.
+        const UINT budget = (std::clamp)(
+            scene.virtualShadowPageBudget, 1, (int)Capacity);
         UINT written = 0;
-        for (UINT c = 0; c < 3 && written < budget; ++c) {
-            UINT share = budget / 3 + (c < budget % 3 ? 1 : 0);
-            if (share == 0) continue;
+        for (UINT level = 0; level < Levels && written < budget; ++level) {
+            const float extent = PageExtent(level);
+            const int focusX = (int)std::floor(viewer.x / extent);
+            const int focusY = (int)std::floor(viewer.y / extent);
 
-            const float nearZ = c ? (&g_shadowCascadeSplits.x)[c - 1] : scene.cameraNear;
-            const float farZ = (&g_shadowCascadeSplits.x)[c];
-            XMFLOAT3 projected;
-            XMStoreFloat3(&projected, XMVector3TransformCoord(
-                position + forward * (nearZ + (farZ - nearZ) * 0.4f), matrices[c]));
-            const int focusX = (int)std::floor((projected.x * 0.5f + 0.5f) * Grid);
-            const int focusY = (int)std::floor((0.5f - projected.y * 0.5f) * Grid);
+            // A coarser level only needs the ring its finer neighbour does not
+            // already cover; inner cells would be redundant detail. The finer
+            // level reaches about one page beyond its own focus cell in each
+            // direction for the share it was given.
+            const int skipRadius = level ? 1 : 0;
 
-            // Square spiral out from the focus cell: right, down, left, up, with
-            // the run length growing every second turn. Cells off the grid are
-            // skipped without consuming the cascade's share, so a focus near an
-            // edge still fills its quota from the cells that do exist. The step
-            // cap bounds the walk when most of the neighbourhood is off-grid.
+            // Square spiral: right, down, left, up, the run length growing every
+            // second turn. The lattice is unbounded, so unlike a fixed grid
+            // there is nothing to bounds-check -- the walk simply runs until the
+            // budget is spent.
             int x = focusX, y = focusY, dx = 1, dy = 0, run = 1, stepsInRun = 0, turns = 0;
-            const int maxSteps = (int)(Grid * Grid);
-            for (int step = 0; step < maxSteps && share > 0 && written < budget; ++step) {
-                if (x >= 0 && y >= 0 && x < (int)Grid && y < (int)Grid) {
-                    requests[written++] = Key(c, (uint32_t)x, (uint32_t)y);
-                    --share;
-                }
+            const int maxSteps = 256;
+            for (int step = 0; step < maxSteps && written < budget; ++step) {
+                const bool covered = std::abs(x - focusX) <= skipRadius &&
+                                     std::abs(y - focusY) <= skipRadius;
+                if (!covered && CoordInRange(x) && CoordInRange(y))
+                    requests[written++] = Key(level, x, y);
                 x += dx;
                 y += dy;
                 if (++stepsInRun == run) {          // corner: turn right
@@ -138,15 +168,26 @@ public:
                     dy = swap;
                     if (++turns % 2 == 0) ++run;    // every second turn lengthens
                 }
+                // Stop this level once the spiral has walked past what the
+                // remaining budget can hold, so a coarse level still gets a turn.
+                if (run > 5) break;
             }
         }
         pages.Request(requests, written);
+
+        // Per-page projection: the shared light rotation, then an orthographic
+        // box over exactly this page's lattice square. Because the lattice is
+        // absolute, this depends only on the key -- never on the viewer.
         auto matrixFor = [&](UINT slot) {
-            const UINT key = pages.keys[slot], c = key / 256;
-            const UINT x = key % 16, y = (key / 16) % 16;
-            return matrices[c] * XMMatrixScaling(16, 16, 1) *
-                XMMatrixTranslation(15.0f - 2.0f * x, 2.0f * y - 15.0f, 0);
+            const uint32_t key = pages.keys[slot];
+            const float extent = PageExtent(KeyLevel(key));
+            const float left = KeyX(key) * extent;
+            const float bottom = KeyY(key) * extent;
+            return rotation * XMMatrixOrthographicOffCenterLH(
+                left, left + extent, bottom, bottom + extent,
+                -DepthExtent * 0.5f, DepthExtent * 0.5f);
         };
+
         const auto cacheDsv = Dsv(FRAME_COUNT);
         for (UINT slot = 0; slot < Capacity; ++slot) {
             if (!pages.requested[slot]) continue;
@@ -165,14 +206,12 @@ public:
             pages.valid[slot] = true;
             ++refreshed;
         }
+
         auto* target = output[g_dx12.frameIndex].Get();
         Transition(target, ReadState, D3D12_RESOURCE_STATE_COPY_DEST);
-        Transition(fallback, ReadState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        for (UINT c = 0; c < 3; ++c) Copy(target, c, fallback, c);
-        Transition(fallback, D3D12_RESOURCE_STATE_COPY_SOURCE, ReadState);
         Transition(cache.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
         // Depth/stencil copies must cover a complete subresource (D3D12).
-        Copy(target, 3, cache.Get(), 0);
+        Copy(target, 0, cache.Get(), 0);
         Transition(cache.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         Transition(target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         bool complete = true;
@@ -184,8 +223,32 @@ public:
         }
         Transition(target, D3D12_RESOURCE_STATE_DEPTH_WRITE, ReadState);
         if (!complete) { constants = {}; pages.Invalidate(); return; }
-        constants.config = {1, resident, Grid, PageSize};
+
+        constants.config = {1, resident, TableSize, PageSize};
+        for (UINT level = 0; level < Levels; ++level)
+            constants.levelScale[level] = 1.0f / PageExtent(level);
+        // The matrix the shaders sample with: the light rotation with the depth
+        // range folded in, so its z is directly comparable against what the page
+        // projections above wrote. All pages share it, which is what lets one
+        // sample serve whichever level turns out to be resident.
+        XMFLOAT4X4 sampleTransform;
+        XMStoreFloat4x4(&sampleTransform, rotation *
+            XMMatrixOrthographicOffCenterLH(-1, 1, -1, 1,
+                -DepthExtent * 0.5f, DepthExtent * 0.5f));
+        for (UINT row = 0; row < 4; ++row)
+            for (UINT column = 0; column < 4; ++column)
+                constants.lightRotation[row][column] = sampleTransform.m[row][column];
         active = true;
+    }
+
+    // The light basis, for consumers that need to place a page in the world
+    // (the debug overlay). Same construction as Render.
+    static XMMATRIX LightRotation(const Scene& scene) {
+        XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
+        XMVECTOR lightUp = XMVectorSet(0, 1, 0, 0);
+        if (std::fabs(XMVectorGetX(XMVector3Dot(lightDir, lightUp))) > 0.95f)
+            lightUp = XMVectorSet(0, 0, 1, 0);
+        return XMMatrixLookAtLH(XMVectorZero(), -lightDir, lightUp);
     }
 
 private:
@@ -194,13 +257,13 @@ private:
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> output;
     ComPtr<ID3D12Resource> cache;
     ComPtr<ID3D12DescriptorHeap> dsvs;
-    std::array<XMFLOAT4X4, 3> previous{};
+    XMFLOAT4X4 previousRotation{};
     bool attempted = false, active = false;
     bool AllocationFailed() {
         failed = true;
         cache.Reset(); dsvs.Reset();
         for (auto& target : output) target.Reset();
-        std::cerr << "VSM allocation failed; using cascade shadows\n";
+        std::cerr << "VSM allocation failed; virtual shadows disabled\n";
         return false;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE Dsv(UINT index) const {
@@ -209,12 +272,15 @@ private:
         return handle;
     }
     static D3D12_RECT Rect(UINT slot) {
-        const LONG x = (slot % 4) * 1024, y = (slot / 4) * 1024;
-        return {x, y, x + 1024, y + 1024};
+        const LONG size = (LONG)VirtualShadows::PageSize;
+        const LONG x = (slot % VirtualShadows::AtlasPages) * size;
+        const LONG y = (slot / VirtualShadows::AtlasPages) * size;
+        return {x, y, x + size, y + size};
     }
     static void Bind(UINT slot, D3D12_CPU_DESCRIPTOR_HANDLE dsv) {
         const auto rect = Rect(slot);
-        const D3D12_VIEWPORT viewport = {(float)rect.left, (float)rect.top, 1024, 1024, 0, 1};
+        const D3D12_VIEWPORT viewport = {(float)rect.left, (float)rect.top,
+            (float)VirtualShadows::PageSize, (float)VirtualShadows::PageSize, 0, 1};
         g_dx12.commandList->RSSetViewports(1, &viewport);
         g_dx12.commandList->RSSetScissorRects(1, &rect);
         g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
