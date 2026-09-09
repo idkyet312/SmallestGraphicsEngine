@@ -3416,6 +3416,37 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // nothing samples these while they are still missing.
         if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
 
+        // Virtual shadows replace the cascade atlas rather than augmenting it,
+        // so the cascade textures are freed while they are on -- worth ~192 MB
+        // on a card that is already spilling into shared memory.
+        //
+        // Run before BeginFrame: a queue flush cannot protect resources already
+        // referenced by the open frame (including the scope pass).
+        // Only on the toggle edge: the release flushes the GPU, so doing it per
+        // frame would stall every frame. Anything holding a raw pointer to the
+        // cascade texture has to be re-pointed here too, or it is left with a
+        // descriptor to freed memory.
+        {
+            static bool previousVirtualShadows = false;
+            const bool virtualNow = shadowMap.initialized &&
+                                    shadowMap.VirtualShadowsActive(scene);
+            if (virtualNow != previousVirtualShadows) {
+                previousVirtualShadows = virtualNow;
+                if (virtualNow) {
+                    shadowMap.ReleaseCascadeResources();
+                } else {
+                    WaitForGPUAllFrames();
+                    shadowMap.EnsureCascadeResources();
+                    shadowMap.virtualMaps.Disable();
+                }
+                // DDGI caches both the pointer and its SRV at registration time.
+                g_ddgiRenderer.RegisterShadowMap(shadowMap.GetResource());
+                // The scope pass reads last frame's pointer; drop it rather than
+                // let it dangle for the one frame before it is rewritten.
+                g_scopeShadowResource = nullptr;
+            }
+        }
+
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) {
@@ -4604,32 +4635,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
 
-        // Virtual shadows replace the cascade atlas rather than augmenting it,
-        // so the cascade textures are freed while they are on -- worth ~192 MB
-        // on a card that is already spilling into shared memory.
-        //
-        // Only on the toggle edge: the release flushes the GPU, so doing it per
-        // frame would stall every frame. Anything holding a raw pointer to the
-        // cascade texture has to be re-pointed here too, or it is left with a
-        // descriptor to freed memory.
-        {
-            static bool previousVirtualShadows = false;
-            const bool virtualNow = shadowMap.initialized &&
-                                    shadowMap.VirtualShadowsActive(scene);
-            if (virtualNow != previousVirtualShadows) {
-                previousVirtualShadows = virtualNow;
-                if (virtualNow) {
-                    shadowMap.ReleaseCascadeResources();
-                } else {
-                    shadowMap.EnsureCascadeResources();
-                }
-                // DDGI caches both the pointer and its SRV at registration time.
-                g_ddgiRenderer.RegisterShadowMap(shadowMap.GetResource());
-                // The scope pass reads last frame's pointer; drop it rather than
-                // let it dangle for the one frame before it is rewritten.
-                g_scopeShadowResource = nullptr;
-            }
-        }
         // The Humvee spotlight is added before clustered-light culling and
         // removed after the last consumer. Its caster list is rebuilt from the
         // current vehicle pose before the depth pass, leaving no player or
@@ -6163,6 +6168,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             SGE_LOG("LogPrefab", EngineLog::Level::Display, budgets);
             PostQuitMessage(0);
         }
+        // Exercise both toggle edges after submitted frames have used each atlas.
+        // Run with SGE_VISIBILITY_TEST=1 and SGE_VSM_TOGGLE_TEST=1.
+        static const bool vsmToggleTest =
+            GetEnvironmentVariableA("SGE_VSM_TOGGLE_TEST", nullptr, 0) > 0;
+        if (vsmToggleTest && visibilitySmokeEnabled && visibilitySmokeReported &&
+            IsSceneScreen() && !g_game.loading.Active()) {
+            static UINT toggleFrames = 0;
+            ++toggleFrames;
+            if (toggleFrames == 1) scene.virtualShadowMaps = false;
+            if (toggleFrames % 12 == 0 && toggleFrames <= 60) {
+                const bool expectedVsm = scene.virtualShadowMaps;
+                const bool passed = expectedVsm
+                    ? shadowMap.virtualMaps.Output() && !shadowMap.shadowMap &&
+                      g_vsmResident > 0 && !g_vsmUnavailable
+                    : shadowMap.shadowMap && !shadowMap.virtualMaps.Output();
+                std::ofstream("vsm_toggle_smoke.log", toggleFrames == 12
+                    ? std::ios::trunc : std::ios::app)
+                    << "frame=" << toggleFrames << " vsm=" << expectedVsm
+                    << " passed=" << passed << '\n';
+                if (!passed || toggleFrames == 60)
+                    PostQuitMessage(passed ? 0 : 3);
+                else
+                    scene.virtualShadowMaps = !expectedVsm;
+            }
+        }
+
         if (visibilitySmokeEnabled && ++visibilityCpuReportFrames >= 300) {
             visibilityCpuReportFrames = 0;
             std::ofstream cpuLog("visibility_cpu.log", std::ios::trunc);

@@ -77,6 +77,8 @@ float VirtualShadowTap(Texture2DArray<float> atlas, SamplerComparisonState samp,
     float2 local;
     if (!VirtualShadowLookup(pages, lightXY, slot, local)) return 1.0;
 
+    // The light-space lattice grows upward; rasterized texture rows grow downward.
+    local.y = 1.0 - local.y;
     float2 texel = clamp(local * SGE_VSM_PAGE_SIZE + offsetTexels,
                          0.5, SGE_VSM_PAGE_SIZE - 0.5);
     float2 corner = float2(slot % 4, slot / 4) * SGE_VSM_PAGE_SIZE;

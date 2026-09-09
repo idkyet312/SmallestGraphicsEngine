@@ -649,6 +649,7 @@ public:
     // freeing under a live SRV descriptor is a GPU fault rather than a soft
     // failure. Callers must also re-point anything holding a raw pointer to
     // shadowMap (DDGI, the scope pass) at GetResource() afterwards.
+    // Must run before BeginFrame, while no unsubmitted list references these.
     void ReleaseCascadeResources() {
         if (!shadowMap && !cachedFarShadowMap) return;
         WaitForGPUAllFrames();
@@ -790,6 +791,9 @@ public:
                          bool spotCull,
                          ShaderDX12* terrainShader = nullptr,
                          ShadowScenePart part = ShadowScenePart::All) {
+        // Swapping shader objects copies UploadBuffer mappings; the temporary
+        // then unmaps storage still used by the live shader. Select in place.
+        auto& drawShader = drawingVirtualPages ? virtualDepthShader : depthShader;
         const bool drawStatic = part == ShadowScenePart::All ||
             part == ShadowScenePart::Static || part == ShadowScenePart::SpotStatic;
         const bool drawDynamic = part == ShadowScenePart::All ||
@@ -798,7 +802,7 @@ public:
             part == ShadowScenePart::Static || part == ShadowScenePart::SpotLive;
         // Terrain first, while the main graphics root signature can still be
         // bound: it runs on the mesh-shader pipeline and needs slots that
-        // DepthOnlyShaderDX12 does not declare. depthShader.Use() below then
+        // DepthOnlyShaderDX12 does not declare. drawShader.Use() below then
         // takes the signature back for every other caster.
         if (drawTerrain && terrainShader && g_terrain.supported &&
             !g_emptyLevelMode) {
@@ -819,16 +823,16 @@ public:
             // slot (or the origin passed through TerrainParams) first.
             g_terrain.DrawShadow(*terrainShader, CurrentTerrainParams());
         }
-        depthShader.Use();
+        drawShader.Use();
 
         if (drawStatic && crateModel) {
-            DrawSceneNodeShadow(crateModel, depthShader, XMMatrixIdentity(), lightSpace);
+            DrawSceneNodeShadow(crateModel, drawShader, XMMatrixIdentity(), lightSpace);
         }
         if (drawStatic && !crateModel && !g_destruction.IsInitialized()) {
             XMMATRIX model = scene.cube1.GetModelMatrix();
-            depthShader.SetMatrices(model, lightSpace);
+            drawShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
-            depthShader.NextDrawCall();
+            drawShader.NextDrawCall();
         }
 
         // Detached chunks keep casting shadows from their live physics poses.
@@ -869,28 +873,28 @@ public:
             if (!batches.empty()) {
                 for (const DestructionRenderBatch& batch : batches) {
                     if (!inLightBox(batch.sphereCenter, batch.sphereRadius)) continue;
-                    DrawSceneNodeShadow(batch.shadowNode, depthShader,
+                    DrawSceneNodeShadow(batch.shadowNode, drawShader,
                         XMLoadFloat4x4(&batch.transform), lightSpace);
                 }
             }
             for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
                     if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
-                    DrawSceneNodeShadow(item.node, depthShader,
+                    DrawSceneNodeShadow(item.node, drawShader,
                         XMLoadFloat4x4(&item.transform), lightSpace);
             }
             for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
                 if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
-                depthShader.SetMatrices(XMLoadFloat4x4(&item.transform), lightSpace);
+                drawShader.SetMatrices(XMLoadFloat4x4(&item.transform), lightSpace);
                 DrawCube(geo);
-                depthShader.NextDrawCall();
+                drawShader.NextDrawCall();
             }
         }
 
         if (drawDynamic && !g_emptyLevelMode && scene.cube2.visible) {
             XMMATRIX model = scene.cube2.GetModelMatrix();
-            depthShader.SetMatrices(model, lightSpace);
+            drawShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
-            depthShader.NextDrawCall();
+            drawShader.NextDrawCall();
         }
 
         if (drawDynamic && !g_emptyLevelMode && !g_trainingRangeMode &&
@@ -900,13 +904,13 @@ public:
                 PrepareHumveeModelForRender(index);
                 DrawSceneNodeShadow(
                     g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
-                    depthShader, HumveeWorldMatrix(index), lightSpace);
+                    drawShader, HumveeWorldMatrix(index), lightSpace);
             }
             if (g_stressTestMode) {
                 PrepareHumveeModelForRender(0);
                 DrawSceneNodeShadow(
                     g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
-                    depthShader, SecondaryHumveeWorldMatrix(), lightSpace);
+                    drawShader, SecondaryHumveeWorldMatrix(), lightSpace);
             }
         }
 
@@ -915,7 +919,7 @@ public:
             std::vector<XMMATRIX> boatTransforms = { BoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
                 g_boatShadowModel ? g_boatShadowModel : g_boatModel,
-                depthShader, boatTransforms, lightSpace);
+                drawShader, boatTransforms, lightSpace);
         }
 
         if (drawDynamic && !g_emptyLevelMode && g_insertionBoatModel &&
@@ -925,7 +929,7 @@ public:
             DrawSceneNodeShadowInstances(
                 g_insertionBoatShadowModel ? g_insertionBoatShadowModel
                                            : g_insertionBoatModel,
-                depthShader, insertionBoatTransforms, lightSpace);
+                drawShader, insertionBoatTransforms, lightSpace);
         }
 
         if (drawDynamic && !g_emptyLevelMode && g_insertionBoatModel &&
@@ -935,14 +939,14 @@ public:
             DrawSceneNodeShadowInstances(
                 g_insertionBoatShadowModel ? g_insertionBoatShadowModel
                                            : g_insertionBoatModel,
-                depthShader, escapeBoatTransforms, lightSpace);
+                drawShader, escapeBoatTransforms, lightSpace);
         }
 
         if (drawDynamic && !g_emptyLevelMode && g_blackHawkModel &&
             BlackHawkVisible()) {
             // Skinned, so it takes the per-node path with the rotor palette
             // rather than the instanced fast path.
-            DrawSceneNodeShadow(g_blackHawkModel, depthShader,
+            DrawSceneNodeShadow(g_blackHawkModel, drawShader,
                 BlackHawkWorldMatrix(), lightSpace, UploadBlackHawkPalette());
         }
 
@@ -952,18 +956,18 @@ public:
         // Mirrors the draw gates in RenderForward.
         if (drawDynamic && !g_emptyLevelMode && g_helicopterModel &&
             scene.showHelicopter) {
-            DrawSceneNodeShadow(g_helicopterModel, depthShader,
+            DrawSceneNodeShadow(g_helicopterModel, drawShader,
                 HelicopterWorldMatrix(), lightSpace);
             if (SecondaryHelicopterVisible())
                 DrawSceneNodeShadow(
                     g_secondaryHelicopterModel ? g_secondaryHelicopterModel
                                                : g_helicopterModel,
-                    depthShader, SecondaryHelicopterWorldMatrix(), lightSpace);
+                    drawShader, SecondaryHelicopterWorldMatrix(), lightSpace);
         }
 
         if (drawStatic) for (const PrefabRenderBatch& batch : prefabRenderBatches) {
             if (batch.model && batch.castShadow && !batch.transforms.empty())
-                DrawSceneNodeShadowInstances(batch.model, depthShader,
+                DrawSceneNodeShadowInstances(batch.model, drawShader,
                     batch.transforms, lightSpace);
         }
 
@@ -982,10 +986,10 @@ public:
 
                 const XMMATRIX model = XMLoadFloat4x4(&item.transform);
                 if (!slice) {
-                    depthShader.Use();
-                    depthShader.SetMatrices(model, lightSpace);
+                    drawShader.Use();
+                    drawShader.SetMatrices(model, lightSpace);
                     DrawCube(geo);
-                    depthShader.NextDrawCall();
+                    drawShader.NextDrawCall();
                     continue;
                 }
 
@@ -994,11 +998,11 @@ public:
                     const bool alphaCutout = prim.material &&
                         prim.material->alphaCutout &&
                         prim.material->baseColorTexture;
-                    depthShader.UsePalm(alphaCutout);
+                    drawShader.UsePalm(alphaCutout);
                     if (alphaCutout)
-                        depthShader.SetPalmTexture(
+                        drawShader.SetPalmTexture(
                             prim.material->baseColorTexture.Get());
-                    depthShader.SetMatrices(model, lightSpace, item.palmWindRoot);
+                    drawShader.SetMatrices(model, lightSpace, item.palmWindRoot);
                     g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                     g_dx12.commandList->IASetPrimitiveTopology(
                         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1011,10 +1015,10 @@ public:
                             static_cast<UINT>(prim.vertices.size() / 12),
                             1, 0, 0);
                     }
-                    depthShader.NextDrawCall();
+                    drawShader.NextDrawCall();
                 }
             }
-            depthShader.Use();
+            drawShader.Use();
         }
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow
@@ -1023,7 +1027,7 @@ public:
         // not a contiguous prefix that forms bands.
         if (drawDynamic && !g_emptyLevelMode && g_grass.IsInitialized() &&
             g_grass.CastShadows() &&
-            g_grass.ShadowDensity() > 0.0f && depthShader.grassPipelineState) {
+            g_grass.ShadowDensity() > 0.0f && drawShader.grassPipelineState) {
             g_grass.SetViewer(scene.camera.Position);
             static std::vector<GrassField::DrawRange> grassShadowRanges;
             g_grass.GetVisible(grassShadowRanges);
@@ -1031,10 +1035,10 @@ public:
             const auto& grassIbv = g_grass.GetIBV();
             const auto instances = g_grass.GetInstanceBufferAddress();
             if (!grassShadowRanges.empty() && grassVbv.BufferLocation && instances) {
-                depthShader.UseGrass();
+                drawShader.UseGrass();
                 // Pipeline/root signature must be bound before its b0 matrix;
                 // binding it afterward invalidates the light-space transform.
-                depthShader.SetMatrices(XMMatrixIdentity(), lightSpace);
+                drawShader.SetMatrices(XMMatrixIdentity(), lightSpace);
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &grassVbv);
                 g_dx12.commandList->IASetIndexBuffer(&grassIbv);
                 g_dx12.commandList->IASetPrimitiveTopology(
@@ -1048,15 +1052,15 @@ public:
                     // a stripe-forming contiguous prefix.
                     params.drawDistance = g_grass.ShadowDensity();
                     params.pixelWorldScale = static_cast<float>(range.instanceCount);
-                    depthShader.SetGrass(params, instances);
+                    drawShader.SetGrass(params, instances);
                     const UINT sparseCount = static_cast<UINT>(
                         range.instanceCount * g_grass.ShadowDensity());
                     if (!sparseCount) continue;
                     g_dx12.commandList->DrawIndexedInstanced(
                         GrassField::IndexCount(), sparseCount, 0, 0, 0);
-                    depthShader.NextDrawCall();
+                    drawShader.NextDrawCall();
                 }
-                depthShader.Use();
+                drawShader.Use();
             }
         }
 
@@ -1072,16 +1076,16 @@ public:
             DrawSceneNodeShadowInstances(
                 g_explosiveBarrelShadowModel
                     ? g_explosiveBarrelShadowModel : g_explosiveBarrelModel,
-                depthShader, barrelTransforms, lightSpace);
+                drawShader, barrelTransforms, lightSpace);
         } else if (drawDynamic && !g_emptyLevelMode) for (
             const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (barrel.active) {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
                                         barrel.position.z);
-                depthShader.SetMatrices(model, lightSpace);
+                drawShader.SetMatrices(model, lightSpace);
                 DrawCapsule(geo);
-                depthShader.NextDrawCall();
+                drawShader.NextDrawCall();
             }
         }
 
@@ -1093,8 +1097,8 @@ public:
             const XMMATRIX model = bandit->MeshWorldMatrix();
             for (const auto& prim : bandit->model.node->mesh->primitives) {
                 if (!prim.vbv.BufferLocation || !prim.skinBuffer) continue;
-                depthShader.SetMatrices(model, lightSpace);
-                depthShader.SetSkinning(palette, prim.skinBuffer->GetGPUVirtualAddress());
+                drawShader.SetMatrices(model, lightSpace);
+                drawShader.SetSkinning(palette, prim.skinBuffer->GetGPUVirtualAddress());
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 if (prim.ibv.BufferLocation) {
@@ -1103,7 +1107,7 @@ public:
                 } else {
                     g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 12), 1, 0, 0);
                 }
-                depthShader.NextDrawCall();
+                drawShader.NextDrawCall();
             }
         }
 
@@ -1119,9 +1123,9 @@ public:
             if (!castsShadow) continue;
             XMMATRIX model = XMMatrixScaling(scene.projectileScale, scene.projectileScale, scene.projectileScale);
             model = model * XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
-            depthShader.SetMatrices(model, lightSpace);
+            drawShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
-            depthShader.NextDrawCall();
+            drawShader.NextDrawCall();
         }
     }
 
@@ -1530,19 +1534,17 @@ public:
                 UpdateSpotStaticInputs(scene, geo, prefabRenderBatches, crateModel);
                 // Separate uploads keep page draws from exhausting or reusing
                 // the cascade/spot constants referenced earlier in the list.
-                std::swap(depthShader, virtualDepthShader);
-                depthShader.BeginFrame();
-                depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
+                virtualDepthShader.BeginFrame();
+                virtualDepthShader.SetPalmWindFrame(g_trees.GetWindFrame());
                 drawingVirtualPages = true;
                 virtualMaps.Render(scene,
                     [&](const XMMATRIX& matrix, bool live) {
                         DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
                             bandits, matrix, false, terrainShader,
                             live ? ShadowScenePart::SpotLive : ShadowScenePart::SpotStatic);
-                        return depthShader.currentDrawCall < SHADOW_MAX_DRAWS - 1;
+                        return virtualDepthShader.currentDrawCall < SHADOW_MAX_DRAWS - 1;
                     });
                 drawingVirtualPages = false;
-                std::swap(depthShader, virtualDepthShader);
                 g_virtualShadowConstants = virtualMaps.constants;
                 g_vsmResident = virtualMaps.resident;
                 g_vsmRefreshed = virtualMaps.refreshed;

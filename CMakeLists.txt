@@ -398,6 +398,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(VirtualShadowPagesTests tests/VirtualShadowPagesTests.cpp)
+    target_include_directories(VirtualShadowPagesTests PRIVATE src/render)
+    add_test(NAME VirtualShadowPagesTests COMMAND VirtualShadowPagesTests)
     add_executable(LevelDefinitionTests
         tests/LevelDefinitionTests.cpp
         tests/GLBImporterPixelStub.cpp

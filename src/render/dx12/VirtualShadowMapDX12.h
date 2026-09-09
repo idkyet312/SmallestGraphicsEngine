@@ -128,51 +128,10 @@ public:
         XMStoreFloat3(&viewer, XMVector3TransformCoord(
             XMLoadFloat3(&scene.camera.Position), rotation));
 
-        // Residency: spiral outward from the viewer's cell, finest level first,
-        // then spend what is left on coarser levels. With no cascade to fall
-        // back on an unmapped cell is a hole in the shadowing, so the budget
-        // buys contiguous coverage around the viewer rather than an even split.
         std::array<uint32_t, Capacity> requests;
-        requests.fill(Invalid);
         const UINT budget = (std::clamp)(
             scene.virtualShadowPageBudget, 1, (int)Capacity);
-        UINT written = 0;
-        for (UINT level = 0; level < Levels && written < budget; ++level) {
-            const float extent = PageExtent(level);
-            const int focusX = (int)std::floor(viewer.x / extent);
-            const int focusY = (int)std::floor(viewer.y / extent);
-
-            // A coarser level only needs the ring its finer neighbour does not
-            // already cover; inner cells would be redundant detail. The finer
-            // level reaches about one page beyond its own focus cell in each
-            // direction for the share it was given.
-            const int skipRadius = level ? 1 : 0;
-
-            // Square spiral: right, down, left, up, the run length growing every
-            // second turn. The lattice is unbounded, so unlike a fixed grid
-            // there is nothing to bounds-check -- the walk simply runs until the
-            // budget is spent.
-            int x = focusX, y = focusY, dx = 1, dy = 0, run = 1, stepsInRun = 0, turns = 0;
-            const int maxSteps = 256;
-            for (int step = 0; step < maxSteps && written < budget; ++step) {
-                const bool covered = std::abs(x - focusX) <= skipRadius &&
-                                     std::abs(y - focusY) <= skipRadius;
-                if (!covered && CoordInRange(x) && CoordInRange(y))
-                    requests[written++] = Key(level, x, y);
-                x += dx;
-                y += dy;
-                if (++stepsInRun == run) {          // corner: turn right
-                    stepsInRun = 0;
-                    const int swap = dx;
-                    dx = -dy;
-                    dy = swap;
-                    if (++turns % 2 == 0) ++run;    // every second turn lengthens
-                }
-                // Stop this level once the spiral has walked past what the
-                // remaining budget can hold, so a coarse level still gets a turn.
-                if (run > 5) break;
-            }
-        }
+        const UINT written = BuildRequests(viewer.x, viewer.y, budget, requests);
         pages.Request(requests, written);
 
         // Per-page projection: the shared light rotation, then an orthographic
@@ -232,9 +191,10 @@ public:
         // projections above wrote. All pages share it, which is what lets one
         // sample serve whichever level turns out to be resident.
         XMFLOAT4X4 sampleTransform;
-        XMStoreFloat4x4(&sampleTransform, rotation *
+        // HLSL uses column-major storage, matching the other matrix uploads.
+        XMStoreFloat4x4(&sampleTransform, XMMatrixTranspose(rotation *
             XMMatrixOrthographicOffCenterLH(-1, 1, -1, 1,
-                -DepthExtent * 0.5f, DepthExtent * 0.5f));
+                -DepthExtent * 0.5f, DepthExtent * 0.5f)));
         for (UINT row = 0; row < 4; ++row)
             for (UINT column = 0; column < 4; ++column)
                 constants.lightRotation[row][column] = sampleTransform.m[row][column];

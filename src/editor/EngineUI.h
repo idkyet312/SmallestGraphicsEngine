@@ -2080,7 +2080,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SetTooltip(
                 "On: the Humvee spotlight glows in the volumetric fog.\n"
                 "Off (default): it lights surfaces only.");
-        ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
+        ImGui::Checkbox("Enable Shadows (Sun and Spotlights)", &scene.enableShadows);
         if (scene.enableShadows) {
             ImGui::Checkbox("Virtual Shadow Maps", &scene.virtualShadowMaps);
             if (ImGui::IsItemHovered())
@@ -2107,11 +2107,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Reuses static object shadows for stationary lights. "
                                   "Terrain and moving objects still update every frame.");
+            if (scene.virtualShadowMaps && !g_vsmUnavailable)
+                ImGui::TextUnformatted("Sun shadows: VSM (cascades disabled)");
+            ImGui::BeginDisabled(scene.virtualShadowMaps && !g_vsmUnavailable);
             ImGui::Checkbox("Cache Far Cascades",
                             &scene.cacheFarShadowCascades);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Keeps cascades 2-3 cached while cascade 1 "
                                   "and moving shadow casters remain dynamic.");
+            ImGui::EndDisabled();
             ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");
             ImGui::DragFloat3("Shadow Center", &scene.shadowCenter.x, 0.1f);
             ImGui::DragFloat("Shadow Size", &scene.shadowOrthoSize, 0.5f, 5.0f, 80.0f);

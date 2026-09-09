@@ -86,6 +86,39 @@ constexpr int32_t KeyY(uint32_t key) {
     return static_cast<int32_t>(key & CoordMask) - CoordBias;
 }
 
+inline uint32_t BuildRequests(float viewerX, float viewerY, uint32_t budget,
+                             std::array<uint32_t, Capacity>& requests) {
+    requests.fill(Invalid);
+    budget = (std::min)(budget, Capacity);
+    uint32_t count = 0;
+    auto add = [&](uint32_t level, int x, int y) {
+        if (count == budget || !CoordInRange(x) || !CoordInRange(y)) return;
+        const auto key = Key(level, x, y);
+        if (std::find(requests.begin(), requests.end(), key) == requests.end())
+            requests[count++] = key;
+    };
+    // Reserve coverage at every scale before spending spare slots on detail.
+    // The nearest 2x2 block contains the viewer even across negative coordinates
+    // and gives the outer level at least half a page of coverage in every direction.
+    for (uint32_t corner = 0; corner < 4; ++corner) {
+        for (uint32_t level = 0; level < Levels; ++level) {
+            const float x = viewerX / PageExtent(level);
+            const float y = viewerY / PageExtent(level);
+            const int cx = static_cast<int>(std::floor(x));
+            const int cy = static_cast<int>(std::floor(y));
+            const int dx = x - cx < 0.5f ? -1 : 1;
+            const int dy = y - cy < 0.5f ? -1 : 1;
+            add(level, cx + ((corner & 1) ? dx : 0),
+                       cy + ((corner & 2) ? dy : 0));
+        }
+    }
+    const int cx = static_cast<int>(std::floor(viewerX / PageExtent(0)));
+    const int cy = static_cast<int>(std::floor(viewerY / PageExtent(0)));
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) add(0, cx + x, cy + y);
+    return count;
+}
+
 // Sparse page table published to shaders: open addressing with linear probing.
 // A dense array is not an option now that the lattice is unbounded.
 //

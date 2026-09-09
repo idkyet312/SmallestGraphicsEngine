@@ -388,7 +388,7 @@ public:
 
     void RegisterShadowMap(ID3D12Resource* resource) {
         shadowMapResource = resource;
-        if (srvHeap && resource) {
+        if (srvHeap) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle = srvHeap->GetCPUDescriptorHandleForHeapStart();
             handle.ptr += 3 * g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             
@@ -397,7 +397,10 @@ public:
             srvDesc.Format = DXGI_FORMAT_R32_FLOAT; // Assuming Depth texture
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             srvDesc.Texture2DArray.MipLevels = 1;
-            srvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
+            // VSM has one slice; clearing a registration must also replace
+            // the descriptor so it cannot retain a freed cascade resource.
+            srvDesc.Texture2DArray.ArraySize = resource
+                ? resource->GetDesc().DepthOrArraySize : SHADOW_CASCADE_COUNT;
             g_dx12.device->CreateShaderResourceView(resource, &srvDesc, handle);
         }
     }
