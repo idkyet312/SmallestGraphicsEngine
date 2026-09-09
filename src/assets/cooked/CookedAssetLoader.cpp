@@ -1,6 +1,7 @@
 #include "CookedAssetLoader.h"
 
 #include "CookedAssetFormat.h"
+#include "CookedAssetPaths.h"
 #include "StaticBufferDX12.h"
 #include "TextureUploadArenaDX12.h"
 
@@ -309,22 +310,7 @@ uint64_t CookedAssetLoader::HashFile(const fs::path& path) {
 }
 
 fs::path CookedAssetLoader::FindForSource(const fs::path& source) {
-    if (source.extension() == ".sgeasset" && fs::exists(source))
-        return source;
-    fs::path sibling = source;
-    sibling.replace_extension(".sgeasset");
-    if (fs::exists(sibling)) return sibling;
-
-    const std::string generic = source.lexically_normal().generic_string();
-    constexpr const char* contentPrefix = "Content/";
-    const size_t content = generic.find(contentPrefix);
-    if (content != std::string::npos) {
-        fs::path relative = generic.substr(content + std::strlen(contentPrefix));
-        relative.replace_extension(".sgeasset");
-        fs::path candidate = fs::path("Content/Cooked") / relative;
-        if (fs::exists(candidate)) return candidate;
-    }
-    return {};
+    return SGE::Cooked::FindAssetForSource(source);
 }
 
 // Bisect helper for the cooked-asset GPU hang.

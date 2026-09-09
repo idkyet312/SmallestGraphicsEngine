@@ -25,6 +25,7 @@
 #include "DX12Core.h"
 #include "FBXImporter.h"
 #include "GLBImporter.h"
+#include "CookedAssetPaths.h"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <array>
@@ -740,7 +741,8 @@ private:
 
     static std::string Resolve(const std::string& rel) {
         for (const std::string& c : { rel, "build/" + rel, "../" + rel, "../../build/" + rel })
-            if (std::filesystem::exists(c)) return c;
+            if (std::filesystem::exists(c) ||
+                !SGE::Cooked::FindAssetForSource(c).empty()) return c;
         return rel;
     }
 
@@ -766,6 +768,13 @@ private:
                     }),
                 node->children.end());
             if (node->mesh) {
+                // Cooked geometry has no node hierarchy; the backdrop's
+                // material name survives flattening, unlike its BG node.
+                auto& primitives = node->mesh->primitives;
+                primitives.erase(std::remove_if(primitives.begin(), primitives.end(),
+                    [](const MeshPrimitive& primitive) {
+                        return primitive.material && primitive.material->name == "BG";
+                    }), primitives.end());
                 // Material names here describe the product, not the parts:
                 // "RedDot" is the sight HOUSING (1905 of the asset's 2291
                 // triangles), not the reticle. Dropping it deleted the whole

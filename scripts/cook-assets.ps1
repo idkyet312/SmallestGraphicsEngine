@@ -21,11 +21,12 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
 $cooker = Join-Path $repo "build\$Configuration\AssetCooker.exe"
-if (-not (Test-Path $cooker)) {
-    Write-Host "Building AssetCooker..." -ForegroundColor Cyan
-    cmake --build build --target AssetCooker --config $Configuration | Out-Null
-    if (-not (Test-Path $cooker)) { throw "AssetCooker.exe not found at $cooker" }
-}
+# Incremental builds are cheap; an existing executable may predate changes to
+# the exclusion list or texture resolution and silently produce obsolete output.
+Write-Host "Building AssetCooker..." -ForegroundColor Cyan
+cmake --build build --target AssetCooker --config $Configuration
+if ($LASTEXITCODE -ne 0) { throw "AssetCooker build failed with exit code $LASTEXITCODE" }
+if (-not (Test-Path $cooker)) { throw "AssetCooker.exe not found at $cooker" }
 
 $content = Join-Path $repo 'Content'
 $cooked = Join-Path $repo 'Content\Cooked'

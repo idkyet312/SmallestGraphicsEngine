@@ -532,12 +532,28 @@ bool IsModel(const fs::path& path) {
 // The first-person arms are excluded alongside the AK47: the arms are posed
 // against the weapon's own local space, so cooking one but not the other leaves
 // the hands floating off the gun. They must stay on the same import path.
+//
+// The exclusion is per-asset rather than the whole of models/mainplayer/. That
+// blanket match was costing far more than the two assets it was written for:
+// everything living under MainPlayer/ was swept up with it, and the red-dot
+// sight alone loads as 597 MB of uncooked RGBA8. The AK47 and the arms are
+// named directly; the other weapons and attachments cook normally.
 bool IsCookExcluded(const fs::path& path) {
     std::string generic = path.generic_string();
     std::transform(generic.begin(), generic.end(), generic.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
-    return generic.find("models/ak47/") != std::string::npos ||
-           generic.find("models/mainplayer/") != std::string::npos;
+    // The hanging AK47, in both the places it is spelled: the top-level
+    // models/ak47/ folder and the copy under the player's gun set.
+    if (generic.find("models/ak47/") != std::string::npos) return true;
+    if (generic.find("models/mainplayer/guns/ak47/") != std::string::npos)
+        return true;
+    // The arms, and the rifle-idle FBX they were cut out of -- same import
+    // path as the weapon they are posed against.
+    if (generic.find("models/mainplayer/armsonly/") != std::string::npos)
+        return true;
+    if (generic.find("models/mainplayer/rifle idle") != std::string::npos)
+        return true;
+    return false;
 }
 
 struct CookContext {
@@ -565,10 +581,27 @@ struct CookContext {
             if (!LoadEmbeddedImage(scene->GetEmbeddedTexture(raw.c_str()), image))
                 return Cooked::kInvalidIndex;
         } else {
-            fs::path path = fs::path(raw);
-            if (!path.is_absolute()) path = sourcePath.parent_path() / path;
-            path = path.lexically_normal();
-            if (!LoadExternalImage(path, image)) return Cooked::kInvalidIndex;
+            // Same re-resolution as the ufbx path: the reference is often an
+            // absolute path from the machine the art was authored on, which
+            // does not exist here, and the file is really sitting next to the
+            // model or in a Textures/ folder beside it.
+            const fs::path reference = fs::path(raw);
+            const std::array<fs::path, 4> candidates = {
+                reference.is_absolute()
+                    ? reference : sourcePath.parent_path() / reference,
+                sourcePath.parent_path() / reference.filename(),
+                sourcePath.parent_path() / "Textures" / reference.filename(),
+                sourcePath.parent_path().parent_path() /
+                    "Textures" / reference.filename()
+            };
+            bool loaded = false;
+            for (const fs::path& candidate : candidates) {
+                if (LoadExternalImage(candidate.lexically_normal(), image)) {
+                    loaded = true;
+                    break;
+                }
+            }
+            if (!loaded) return Cooked::kInvalidIndex;
         }
         EncodedTexture texture = EncodeTexture(image, format);
         texture.record.name = strings.Add(fs::path(raw).filename().string());
@@ -598,10 +631,21 @@ struct CookContext {
                 return Cooked::kInvalidIndex;
         } else {
             const fs::path reference = fs::path(raw);
-            std::array<fs::path, 3> candidates = {
+            // The absolute path baked in by the artist's machine almost never
+            // exists here ("E:/Users/vikto/OneDrive/..."), so the filename is
+            // re-resolved against the places the art actually ships in.
+            //
+            // The sibling Textures/ candidate matters as much as the parent
+            // one: SK_Bandit.FBX sits directly in MilitaryMercenaryBandit/ with
+            // its Textures/ folder beside it, whereas a model nested one level
+            // deeper (fbx/foo.fbx) needs the parent form. Without both, the
+            // bandit and marine sets cooked with zero textures and silently
+            // fell back to loading 4K PNGs as RGBA8 -- 256 MB per material set.
+            std::array<fs::path, 4> candidates = {
                 reference.is_absolute()
                     ? reference : sourcePath.parent_path() / reference,
                 sourcePath.parent_path() / reference.filename(),
+                sourcePath.parent_path() / "Textures" / reference.filename(),
                 sourcePath.parent_path().parent_path() /
                     "Textures" / reference.filename()
             };
@@ -1298,7 +1342,22 @@ std::vector<std::string> LoadOnlyList(const fs::path& file) {
     if (!input) throw std::runtime_error(
         "Unable to open --only list: " + file.string());
     std::string line;
+    bool firstLine = true;
     while (std::getline(input, line)) {
+        // Strip a UTF-8 BOM off the first line. PowerShell 5.1's
+        // `Set-Content -Encoding utf8` always writes one, and Write-CookOnlyList
+        // uses exactly that, so the leading bytes end up glued to the first
+        // entry: the prefix becomes "\xEF\xBB\xBFModels/..." and silently
+        // matches nothing. Harmless in the generated list only because a
+        // comment happens to sit on line one -- a hand-written list has no such
+        // luck, and the cook quietly does nothing.
+        if (firstLine && line.size() >= 3 &&
+            static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+        firstLine = false;
         // Trim whitespace and CR, so a CRLF list written by PowerShell works.
         const size_t first = line.find_first_not_of(" \t\r\n");
         if (first == std::string::npos) continue;
