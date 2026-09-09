@@ -1301,21 +1301,64 @@ inline void ProfilerPanelBody() {
             "Update", "Render/PreFrame", "Render/BeginFrame (wait)",
             "Render/FrameSetup", "Render/Submit", "Editor/UI", "Render/EndFrame",
         };
+        const auto isTopLevel = [](const std::string& name) {
+            for (const char* candidate : kTopLevel)
+                if (name == candidate) return true;
+            return false;
+        };
+
         double accounted = 0.0;
         for (const auto& sample : g_profiler.CpuSamples())
-            for (const char* name : kTopLevel)
-                if (sample.name == name) { accounted += sample.milliseconds; break; }
+            if (isTopLevel(sample.name)) accounted += sample.milliseconds;
         const double cpuTotal = g_profiler.CpuFrameMs();
         const double unaccounted = cpuTotal - accounted;
         ImGui::Text("Accounted %6.2f / %6.2f ms", accounted, cpuTotal);
-        // Amber past a quarter of a millisecond of drift; the scopes cannot be
-        // perfectly exhaustive, but a large gap means a real blind spot.
+        // Amber past a millisecond of drift; the scopes cannot be perfectly
+        // exhaustive, but a large gap means a real blind spot.
         const ImVec4 color = unaccounted > 1.0 ? ImVec4(1.0f, 0.72f, 0.35f, 1.0f)
                                                : ImVec4(0.65f, 0.70f, 0.67f, 1.0f);
         ImGui::TextColored(color, "  unaccounted %.2f ms", unaccounted);
+
+        // Top-level spans, most expensive first. Sorted rather than left in
+        // record order because the question this panel answers is "where did
+        // the frame go", and record order buries a 20 ms row between two
+        // 0.01 ms ones. Children stay in the collapsible section below so the
+        // costly rows are not visually interchangeable with the scopes nested
+        // inside them -- the flat list gave both the same weight.
+        std::vector<const ProfilerSampleDX12*> top;
+        std::vector<const ProfilerSampleDX12*> nested;
+        for (const auto& sample : g_profiler.CpuSamples())
+            (isTopLevel(sample.name) ? top : nested).push_back(&sample);
+        const auto byCost = [](const ProfilerSampleDX12* a,
+                               const ProfilerSampleDX12* b) {
+            return a->milliseconds > b->milliseconds;
+        };
+        std::sort(top.begin(), top.end(), byCost);
+        std::sort(nested.begin(), nested.end(), byCost);
+
+        for (const ProfilerSampleDX12* sample : top) {
+            const double share = cpuTotal > 0.0001
+                ? 100.0 * sample->milliseconds / cpuTotal : 0.0;
+            // The heaviest span gets the amber treatment once it owns most of
+            // the frame: that is the row to go and open next.
+            const ImVec4 rowColor = share >= 40.0
+                ? ImVec4(1.0f, 0.72f, 0.35f, 1.0f)
+                : ImVec4(0.82f, 0.85f, 0.83f, 1.0f);
+            ImGui::TextColored(rowColor, "  %-26s %7.3f ms  (%.0f%%)",
+                               sample->name.c_str(), sample->milliseconds, share);
+        }
+
+        // Nested CPU scopes -- "Bandit Update", "Crater/Stamp", the Editor/*
+        // family. Already counted inside a parent above, so they are collapsed
+        // and must not be added to the total.
+        if (!nested.empty() && ImGui::TreeNode("CPU: nested scopes")) {
+            ImGui::TextDisabled("Counted inside the spans above -- do not add up.");
+            for (const ProfilerSampleDX12* sample : nested)
+                ImGui::BulletText("%s: %.3f ms", sample->name.c_str(),
+                                  sample->milliseconds);
+            ImGui::TreePop();
+        }
     }
-    for (const auto& sample : g_profiler.CpuSamples())
-        ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
 
     // Command recording, kept apart from the CPU scopes above and from the GPU
     // scopes below. These names match the GPU passes but measure a different
