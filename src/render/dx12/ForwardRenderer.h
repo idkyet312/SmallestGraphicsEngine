@@ -939,25 +939,27 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         shader.InvalidateGraphicsRootBinding();
         shader.UseTransparent();
     } else {
-    std::vector<const ImpactParticle*> transparentParticles;
+    struct SortedParticle {
+        const ImpactParticle* particle;
+        float distanceSquared;
+    };
+    static thread_local std::vector<SortedParticle> transparentParticles;
+    transparentParticles.clear();
     transparentParticles.reserve(scene.impactParticles.size());
-    for (const ImpactParticle& particle : scene.impactParticles)
-        if (!particle.spark && includeEffect(particle.position, particle.size))
-            transparentParticles.push_back(&particle);
     const XMFLOAT3 cameraPosition = scene.camera.Position;
+    for (const ImpactParticle& particle : scene.impactParticles)
+        if (!particle.spark && includeEffect(particle.position, particle.size)) {
+            const float dx = particle.position.x - cameraPosition.x;
+            const float dy = particle.position.y - cameraPosition.y;
+            const float dz = particle.position.z - cameraPosition.z;
+            transparentParticles.push_back({ &particle, dx * dx + dy * dy + dz * dz });
+        }
     std::sort(transparentParticles.begin(), transparentParticles.end(),
-        [&](const ImpactParticle* a, const ImpactParticle* b) {
-            const float adx = a->position.x - cameraPosition.x;
-            const float ady = a->position.y - cameraPosition.y;
-            const float adz = a->position.z - cameraPosition.z;
-            const float bdx = b->position.x - cameraPosition.x;
-            const float bdy = b->position.y - cameraPosition.y;
-            const float bdz = b->position.z - cameraPosition.z;
-            return adx * adx + ady * ady + adz * adz >
-                   bdx * bdx + bdy * bdy + bdz * bdz;
+        [](const SortedParticle& a, const SortedParticle& b) {
+            return a.distanceSquared > b.distanceSquared;
         });
-    for (const ImpactParticle* particle : transparentParticles) {
-        const ImpactParticle& sp = *particle;
+    for (const SortedParticle& particle : transparentParticles) {
+        const ImpactParticle& sp = *particle.particle;
         const float fade = sp.life / sp.maxLife;
         const float age = 1.0f - fade;
         const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
@@ -2032,7 +2034,9 @@ inline void DrawSceneNodeInstances(const std::shared_ptr<SceneNode>& node,
     }
 
     if (node->mesh) {
-        std::vector<XMMATRIX> models;
+        // Consumed before descending into children; recursion never retains it.
+        static thread_local std::vector<XMMATRIX> models;
+        models.clear();
         models.reserve(worldTransforms.size());
         const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
         for (const XMMATRIX& world : worldTransforms) models.push_back(local * world);
@@ -2091,6 +2095,7 @@ class ForwardStaticBatchQueueDX12 {
     };
     std::vector<Entry> entries;
     std::unordered_map<const SceneNode*, size_t> byGeometry;
+    size_t activeEntries = 0;
 
 public:
     bool Submit(const std::shared_ptr<SceneNode>& node,
@@ -2103,9 +2108,10 @@ public:
         }
         if (!SceneNodeSupportsMeshInstancing(node)) return false;
         auto [insertedIt, inserted] = byGeometry.emplace(
-            node.get(), entries.size());
+            node.get(), activeEntries);
         (void)inserted;
-        entries.push_back({ node, {} });
+        if (activeEntries == entries.size()) entries.push_back({});
+        entries[activeEntries++].node = node;
         it = insertedIt;
         entries[it->second].transforms.push_back(transform);
         return true;
@@ -2113,10 +2119,14 @@ public:
 
     void Flush(ShaderDX12& shader, const XMMATRIX& view,
                const XMMATRIX& proj, const XMMATRIX& lightSpace) {
-        for (Entry& entry : entries)
+        for (size_t i = 0; i < activeEntries; ++i) {
+            Entry& entry = entries[i];
             DrawSceneNodeInstances(entry.node, shader, entry.transforms,
                 view, proj, lightSpace);
-        entries.clear();
+            entry.transforms.clear();
+            entry.node.reset();
+        }
+        activeEntries = 0;
         byGeometry.clear();
     }
 };
@@ -2383,7 +2393,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     g_meshShader.wireframe = scene.meshletWireframe;
     g_terrain.wireframe = scene.meshletWireframe;
-    ForwardStaticBatchQueueDX12 staticBatches;
+    static thread_local ForwardStaticBatchQueueDX12 staticBatches;
 
     // Floor: visibility owns the flat floor in hybrid mode. Mesh terrain rides
     // this pass too, unless it emitted visibility IDs itself this frame -- then

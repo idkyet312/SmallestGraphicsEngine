@@ -353,6 +353,7 @@ struct Scene {
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
     bool  cacheFarShadowCascades = false;
+    bool  cacheSpotShadows = false;
     XMFLOAT3 shadowCenter    = { 0.0f, 3.0f, 0.0f };
     float shadowOrthoSize    = 30.0f;
 

@@ -753,6 +753,48 @@ inline void BeginFrame() {
     g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
 }
 
+// Live video memory usage, straight from DXGI.
+//
+// `budget` is what the OS is currently willing to give this process, not the
+// card's physical size: it shrinks when another application wants VRAM, so a
+// process can be over budget on a card that looks half empty. Going over is
+// what pushes allocations into system memory, and eventually what makes them
+// fail outright -- which is the failure this is here to make visible.
+//
+// `usage` counts everything the process has resident, so it includes the
+// driver's own allocations as well as this engine's resources.
+struct VideoMemoryStatsDX12 {
+    bool     valid = false;
+    uint64_t usageBytes = 0;
+    uint64_t budgetBytes = 0;
+    // Physical size of the adapter, for the "of a 8 GB card" denominator that
+    // the budget alone does not give.
+    uint64_t dedicatedBytes = 0;
+};
+
+inline VideoMemoryStatsDX12 GetVideoMemoryStatsDX12() {
+    VideoMemoryStatsDX12 stats;
+    if (!g_dx12.adapter) return stats;
+
+    // LOCAL is the memory on the card itself. NON_LOCAL is the system-memory
+    // fallback, which is reported separately and is not what "VRAM" means to
+    // anyone reading a performance panel.
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(g_dx12.adapter->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        return stats;
+    }
+    stats.usageBytes = info.CurrentUsage;
+    stats.budgetBytes = info.Budget;
+
+    DXGI_ADAPTER_DESC1 desc = {};
+    if (SUCCEEDED(g_dx12.adapter->GetDesc1(&desc)))
+        stats.dedicatedBytes = desc.DedicatedVideoMemory;
+
+    stats.valid = true;
+    return stats;
+}
+
 // Prints and clears any queued D3D12 validation-layer messages (Debug builds only)
 inline void DumpDX12DebugMessages() {
 #ifdef _DEBUG

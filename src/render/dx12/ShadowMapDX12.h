@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <fstream>
 #include <sstream>
+#include <cstring>
 
 // 4096 rather than 2048: at 2048 a cascade-1/2 texel covered enough wall that
 // building edges rasterised as visible stair-steps. Doubling the axis quarters
@@ -500,7 +501,9 @@ inline bool SceneNodeSupportsShadowInstancing(const std::shared_ptr<SceneNode>& 
 enum class ShadowScenePart {
     All,
     Static,
-    Dynamic
+    Dynamic,
+    SpotStatic,
+    SpotLive
 };
 
 inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
@@ -515,7 +518,8 @@ inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
     }
 
     if (node->mesh) {
-        std::vector<XMMATRIX> models;
+        static thread_local std::vector<XMMATRIX> models;
+        models.clear();
         models.reserve(worlds.size());
         const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
         for (const XMMATRIX& world : worlds) models.push_back(local * world);
@@ -574,10 +578,13 @@ public:
     bool initialized = false;
     UINT cachedCascadesThisFrame = 0;
     UINT refreshedCascadesThisFrame = 0;
+    UINT cachedSpotSlicesThisFrame = 0;
+    UINT refreshedSpotSlicesThisFrame = 0;
 
     void InvalidateCachedCascades() {
         farCacheValid.fill(false);
         cacheViewValid = false;
+        spotCacheValid.fill(false);
     }
 
     // Same invalidation, but spread over the next few frames instead of landing
@@ -737,13 +744,17 @@ public:
                          bool spotCull,
                          ShaderDX12* terrainShader = nullptr,
                          ShadowScenePart part = ShadowScenePart::All) {
-        const bool drawStatic = part != ShadowScenePart::Dynamic;
-        const bool drawDynamic = part != ShadowScenePart::Static;
+        const bool drawStatic = part == ShadowScenePart::All ||
+            part == ShadowScenePart::Static || part == ShadowScenePart::SpotStatic;
+        const bool drawDynamic = part == ShadowScenePart::All ||
+            part == ShadowScenePart::Dynamic || part == ShadowScenePart::SpotLive;
+        const bool drawTerrain = part == ShadowScenePart::All ||
+            part == ShadowScenePart::Static || part == ShadowScenePart::SpotLive;
         // Terrain first, while the main graphics root signature can still be
         // bound: it runs on the mesh-shader pipeline and needs slots that
         // DepthOnlyShaderDX12 does not declare. depthShader.Use() below then
         // takes the signature back for every other caster.
-        if (drawStatic && terrainShader && g_terrain.supported &&
+        if (drawTerrain && terrainShader && g_terrain.supported &&
             !g_emptyLevelMode) {
             // The previous caster leaves DepthOnlyShaderDX12's root signature
             // bound. ShaderDX12 caches its binding state, so invalidate that
@@ -1085,9 +1096,23 @@ public:
         // shaders must see zero, or they keep sampling last frame's depth for
         // a vehicle that has since been destroyed or driven out of the level.
         g_spotShadowActiveCount = casterCount;
+        cachedSpotSlicesThisFrame = 0;
+        refreshedSpotSlicesThisFrame = 0;
         for (UINT slice = 0; slice < casterCount; ++slice)
             g_spotShadowMatrices[slice] = g_spotShadowCasters[slice].viewProjection;
-        if (!casterCount || !spotShadowMap) return;
+        if (!casterCount || !spotShadowMap) {
+            spotMatrixSeen.fill(false);
+            spotCacheValid.fill(false);
+            return;
+        }
+
+        ProfilerDX12::Scope spotScope(g_profiler, "Spot Shadows", g_dx12.commandList.Get());
+        const bool useCache = scene.cacheSpotShadows && EnsureSpotCache();
+        if (useCache) UpdateSpotStaticInputs(scene, geo, prefabRenderBatches, crateModel);
+        else {
+            spotCacheValid.fill(false);
+            spotMatrixSeen.fill(false);
+        }
 
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1113,6 +1138,53 @@ public:
             D3D12_CPU_DESCRIPTOR_HANDLE spotDsv =
                 spotDsvHeap->GetCPUDescriptorHandleForHeapStart();
             spotDsv.ptr += static_cast<SIZE_T>(slice) * dsvStride;
+            XMFLOAT4X4 matrix;
+            XMStoreFloat4x4(&matrix, g_spotShadowCasters[slice].viewProjection);
+            // A moving light takes the original path: copying a cache that
+            // would need rebuilding every frame adds cost without any reuse.
+            const bool stationary = useCache && spotMatrixSeen[slice] &&
+                std::memcmp(&matrix, &spotCacheMatrices[slice], sizeof(matrix)) == 0;
+            if (stationary) {
+                ProfilerDX12::Scope cacheScope(g_profiler, "Spot Cached Path", g_dx12.commandList.Get());
+                if (!spotCacheValid[slice]) {
+                    TransitionSpotCache(cachedSpotShadowMap.Get(),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE, slice);
+                    auto cacheDsv = cachedSpotDsvHeap->GetCPUDescriptorHandleForHeapStart();
+                    cacheDsv.ptr += static_cast<SIZE_T>(slice) * dsvStride;
+                    g_dx12.commandList->ClearDepthStencilView(
+                        cacheDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+                    g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &cacheDsv);
+                    DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                        bandits, g_spotShadowCasters[slice].viewProjection,
+                        true, terrainShader, ShadowScenePart::SpotStatic);
+                    TransitionSpotCache(cachedSpotShadowMap.Get(),
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE, slice);
+                    spotCacheMatrices[slice] = matrix;
+                    spotCacheValid[slice] = true;
+                    ++refreshedSpotSlicesThisFrame;
+                } else ++cachedSpotSlicesThisFrame;
+                // The atlas always starts from static depth, so a moving caster
+                // cannot leave its previous silhouette behind.
+                TransitionSpotCache(spotShadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_COPY_DEST, slice);
+                D3D12_TEXTURE_COPY_LOCATION source = {};
+                source.pResource = cachedSpotShadowMap.Get();
+                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                source.SubresourceIndex = slice;
+                D3D12_TEXTURE_COPY_LOCATION destination = source;
+                destination.pResource = spotShadowMap.Get();
+                g_dx12.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+                TransitionSpotCache(spotShadowMap.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE, slice);
+                g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &spotDsv);
+                DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                    bandits, g_spotShadowCasters[slice].viewProjection,
+                    true, terrainShader, ShadowScenePart::SpotLive);
+                continue;
+            }
+            spotCacheMatrices[slice] = matrix;
+            spotMatrixSeen[slice] = useCache;
+            spotCacheValid[slice] = false;
             g_dx12.commandList->ClearDepthStencilView(
                 spotDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
             g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &spotDsv);
@@ -1258,7 +1330,10 @@ public:
             return lightSpace;
         }
 
-        depthShader.BeginFrame();
+        // The opt-in cache records spot draws before cascades. Keep their
+        // upload slots alive until execution instead of overwriting them with
+        // cascade constants/instances. Preserve the legacy path when disabled.
+        if (!scene.cacheSpotShadows) depthShader.BeginFrame();
         depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
 
         D3D12_VIEWPORT shadowViewport = {};
@@ -1391,6 +1466,134 @@ public:
     }
 
 private:
+    ComPtr<ID3D12Resource> cachedSpotShadowMap;
+    ComPtr<ID3D12DescriptorHeap> cachedSpotDsvHeap;
+    bool spotCacheAllocationAttempted = false;
+    std::array<bool, SPOT_SHADOW_COUNT> spotCacheValid = {};
+    std::array<bool, SPOT_SHADOW_COUNT> spotMatrixSeen = {};
+    std::array<XMFLOAT4X4, SPOT_SHADOW_COUNT> spotCacheMatrices = {};
+    std::vector<unsigned char> spotStaticInputs;
+    std::vector<unsigned char> previousSpotStaticInputs;
+
+    template<class T> void AppendSpotInput(const T& value) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+        spotStaticInputs.insert(spotStaticInputs.end(), bytes, bytes + sizeof(value));
+    }
+
+    void AppendSpotNode(const std::shared_ptr<SceneNode>& node) {
+        AppendSpotInput(node.get());
+        if (!node) return;
+        AppendSpotInput(node->globalTransform);
+        AppendSpotInput(node->mesh.get());
+        if (node->mesh) {
+            AppendSpotInput(node->mesh->primitives.size());
+            for (const auto& prim : node->mesh->primitives) {
+                AppendSpotInput(prim.vbv.BufferLocation);
+                AppendSpotInput(prim.vbv.SizeInBytes);
+                AppendSpotInput(prim.vbv.StrideInBytes);
+                AppendSpotInput(prim.ibv.BufferLocation);
+                AppendSpotInput(prim.ibv.Format);
+                AppendSpotInput(prim.indexCount);
+                AppendSpotInput(prim.vertices.size());
+                AppendSpotInput(prim.skinBuffer.Get());
+                AppendSpotInput(prim.material.get());
+                if (prim.material) {
+                    const auto& material = *prim.material;
+                    AppendSpotInput(material.baseColorFactor.w);
+                    AppendSpotInput(material.alphaCutout);
+                    AppendSpotInput(material.alphaBlend);
+                    AppendSpotInput(material.alphaCutoff);
+                    AppendSpotInput(material.alphaFromLuminance);
+                    AppendSpotInput(material.baseColorTexture.Get());
+                }
+            }
+        }
+        AppendSpotInput(node->children.size());
+        for (const auto& child : node->children) AppendSpotNode(child);
+    }
+
+    void UpdateSpotStaticInputs(const Scene& scene, const GeometryBuffers& geo,
+        const std::vector<PrefabRenderBatch>& batches,
+        const std::shared_ptr<SceneNode>& crateModel) {
+        spotStaticInputs.clear();
+        AppendSpotNode(crateModel);
+        const bool fallbackCube = !crateModel && !g_destruction.IsInitialized();
+        AppendSpotInput(fallbackCube);
+        if (fallbackCube) {
+            XMFLOAT4X4 model;
+            XMStoreFloat4x4(&model, scene.cube1.GetModelMatrix());
+            AppendSpotInput(model);
+            AppendSpotInput(geo.cubeVBV.BufferLocation);
+        }
+        AppendSpotInput(batches.size());
+        for (const auto& batch : batches) {
+            AppendSpotInput(batch.castShadow);
+            if (!batch.castShadow) continue;
+            AppendSpotNode(batch.model);
+            AppendSpotInput(batch.transforms.size());
+            for (const auto& world : batch.transforms) {
+                XMFLOAT4X4 matrix;
+                XMStoreFloat4x4(&matrix, world);
+                AppendSpotInput(matrix);
+            }
+        }
+        // Compare actual inputs rather than a hash: LOD swaps, material edits,
+        // and transforms must invalidate even when batch counts stay constant.
+        // In-place GPU asset edits use InvalidateCachedCascades, as for the sun.
+        if (spotStaticInputs != previousSpotStaticInputs) spotCacheValid.fill(false);
+        spotStaticInputs.swap(previousSpotStaticInputs);
+    }
+
+    static void TransitionSpotCache(ID3D12Resource* resource,
+        D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, UINT slice) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        barrier.Transition.Subresource = slice;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+    }
+
+    bool EnsureSpotCache() {
+        if (cachedSpotShadowMap && cachedSpotDsvHeap) return true;
+        if (spotCacheAllocationAttempted) return false;
+        spotCacheAllocationAttempted = true;
+        // Allocate once on first opt-in, retain across toggles, and fall back
+        // without retrying resource creation every frame on allocation failure.
+        const auto desc = spotShadowMap->GetDesc();
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_CLEAR_VALUE clear = {};
+        clear.Format = DXGI_FORMAT_D32_FLOAT;
+        clear.DepthStencil.Depth = 1.0f;
+        if (FAILED(g_dx12.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, &clear,
+            IID_PPV_ARGS(&cachedSpotShadowMap)))) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        heapDesc.NumDescriptors = SPOT_SHADOW_COUNT;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc,
+            IID_PPV_ARGS(&cachedSpotDsvHeap)))) {
+            cachedSpotShadowMap.Reset();
+            return false;
+        }
+        cachedSpotShadowMap->SetName(L"Cached Static Spotlight Depth");
+        D3D12_DEPTH_STENCIL_VIEW_DESC view = {};
+        view.Format = DXGI_FORMAT_D32_FLOAT;
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray.ArraySize = 1;
+        auto dsv = cachedSpotDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        const UINT stride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        for (UINT slice = 0; slice < SPOT_SHADOW_COUNT; ++slice) {
+            view.Texture2DArray.FirstArraySlice = slice;
+            g_dx12.device->CreateDepthStencilView(cachedSpotShadowMap.Get(), &view, dsv);
+            dsv.ptr += stride;
+        }
+        return true;
+    }
+
     static constexpr UINT FAR_CASCADE_CACHE_COUNT =
         SHADOW_CASCADE_COUNT - 1;
     std::array<bool, FAR_CASCADE_CACHE_COUNT> farCacheValid = {};

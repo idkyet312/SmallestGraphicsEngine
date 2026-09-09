@@ -1186,6 +1186,42 @@ inline void ProfilerPanelBody() {
             ImGui::Text("GPU      %6.2f ms", gpuMs);
         else
             ImGui::TextDisabled("GPU         -- ms");
+
+        // VRAM sits with the frame numbers because it fails the same way they
+        // do: over budget, allocations spill to system memory and the frame
+        // time follows, so the two are read together. Measured per frame --
+        // the figure moves with what is resident right now, and a level load
+        // is exactly when it moves most.
+        const VideoMemoryStatsDX12 memory = GetVideoMemoryStatsDX12();
+        if (memory.valid) {
+            constexpr double kMiB = 1024.0 * 1024.0;
+            const double usedMiB = static_cast<double>(memory.usageBytes) / kMiB;
+            const double budgetMiB =
+                static_cast<double>(memory.budgetBytes) / kMiB;
+            ImGui::Text("VRAM   %6.0f MB", usedMiB);
+            // Against the budget rather than the card: over budget is the
+            // condition that actually costs performance, and the budget can be
+            // well under the card's size while another app holds memory.
+            if (memory.budgetBytes > 0) {
+                const double fraction =
+                    static_cast<double>(memory.usageBytes) /
+                    static_cast<double>(memory.budgetBytes);
+                // Red once over budget, amber approaching it: past this point
+                // the driver is paging, which shows up as GPU time above.
+                const ImVec4 color =
+                    fraction >= 1.0 ? ImVec4(1.0f, 0.35f, 0.30f, 1.0f)
+                  : fraction >= 0.9 ? ImVec4(1.0f, 0.80f, 0.35f, 1.0f)
+                                    : ImVec4(0.65f, 0.70f, 0.67f, 1.0f);
+                ImGui::TextColored(color, "  of %.0f MB budget  (%.0f%%)",
+                                   budgetMiB, fraction * 100.0);
+            }
+            if (memory.dedicatedBytes > 0) {
+                ImGui::TextDisabled("  card: %.0f MB",
+                    static_cast<double>(memory.dedicatedBytes) / kMiB);
+            }
+        } else {
+            ImGui::TextDisabled("VRAM        -- MB");
+        }
     }
     ImGui::Separator();
 
@@ -1931,6 +1967,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Off (default): it lights surfaces only.");
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
+            ImGui::Checkbox("Cache Static Spotlight Shadows", &scene.cacheSpotShadows);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Reuses static object shadows for stationary lights. "
+                                  "Terrain and moving objects still update every frame.");
             ImGui::Checkbox("Cache Far Cascades",
                             &scene.cacheFarShadowCascades);
             if (ImGui::IsItemHovered())
