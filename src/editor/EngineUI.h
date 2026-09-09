@@ -1289,6 +1289,31 @@ inline void ProfilerPanelBody() {
                 g_palmDrawStats.drawn, g_palmDrawStats.considered);
     ImGui::Text("Prefabs drawn: %d / %d",
                 g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
+    // Accounting line. The scopes below nest -- "Bandit Update" is inside
+    // "Update" -- so summing the whole list double-counts every parent. Only
+    // the top-level spans are summed here; together they tile the frame from
+    // BeginCpuFrame to EndCpuFrame, so the remainder is genuinely unmeasured
+    // work rather than an artefact of the sum. A large "unaccounted" figure is
+    // the signal that a new cost has landed outside every scope, which is
+    // exactly how the render path went untimed while CPU read 24 ms.
+    {
+        static const char* const kTopLevel[] = {
+            "Update", "Render/PreFrame", "Render/BeginFrame (wait)",
+            "Render/FrameSetup", "Render/Submit", "Editor/UI", "Render/EndFrame",
+        };
+        double accounted = 0.0;
+        for (const auto& sample : g_profiler.CpuSamples())
+            for (const char* name : kTopLevel)
+                if (sample.name == name) { accounted += sample.milliseconds; break; }
+        const double cpuTotal = g_profiler.CpuFrameMs();
+        const double unaccounted = cpuTotal - accounted;
+        ImGui::Text("Accounted %6.2f / %6.2f ms", accounted, cpuTotal);
+        // Amber past a quarter of a millisecond of drift; the scopes cannot be
+        // perfectly exhaustive, but a large gap means a real blind spot.
+        const ImVec4 color = unaccounted > 1.0 ? ImVec4(1.0f, 0.72f, 0.35f, 1.0f)
+                                               : ImVec4(0.65f, 0.70f, 0.67f, 1.0f);
+        ImGui::TextColored(color, "  unaccounted %.2f ms", unaccounted);
+    }
     for (const auto& sample : g_profiler.CpuSamples())
         ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
 

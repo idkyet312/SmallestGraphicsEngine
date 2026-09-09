@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <optional>
 #include <array>
 #include <cfloat>
 #include <cmath>
@@ -3371,6 +3372,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         }
 
+        // Everything from here to EndFrame used to be unmeasured on the CPU
+        // side: "Update" closes above, and the next CPU scope was "Editor/UI"
+        // two thousand lines below. A frame could report 24 ms of CPU with the
+        // scope list summing to a fraction of it, because the render setup and
+        // the command recording that dominate a heavy scene were simply not
+        // timed. These three scopes span that gap end to end, so the list
+        // accounts for the frame instead of sampling it.
+        std::optional<ProfilerDX12::CpuScope> presentPrepProfile;
+        std::optional<ProfilerDX12::CpuScope> frameSetupProfile;
+        std::optional<ProfilerDX12::CpuScope> renderSubmitProfile;
+        presentPrepProfile.emplace(g_profiler, "Render/PreFrame");
+
         // Sky environment swap. Must land here, before BeginFrame opens the
         // frame's command list: the swap drains every frame slot, then records
         // the replacement texture upload on its private list. Done with a list
@@ -3447,13 +3460,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         }
 
+        presentPrepProfile.reset();
+
         // ?? begin frame ??
-        try { BeginFrame(); }
-        catch (const std::exception& e) {
-            std::ofstream("engine_runtime_error.log", std::ios::app)
-                << "BeginFrame: " << e.what() << '\n';
-            std::cerr << "BeginFrame: " << e.what() << "\n"; break;
+        // Timed on its own: BeginFrame blocks on the frame fence, so folding it
+        // into the setup scope below would report a GPU stall as CPU work. Read
+        // this row next to the Wait line, not next to the scopes around it.
+        {
+            ProfilerDX12::CpuScope beginFrameProfile(g_profiler,
+                                                     "Render/BeginFrame (wait)");
+            try { BeginFrame(); }
+            catch (const std::exception& e) {
+                std::ofstream("engine_runtime_error.log", std::ios::app)
+                    << "BeginFrame: " << e.what() << '\n';
+                std::cerr << "BeginFrame: " << e.what() << "\n"; break;
+            }
         }
+        frameSetupProfile.emplace(g_profiler, "Render/FrameSetup");
         bindlessHeap.BeginFrame(g_dx12.frameIndex);
         if (IsSceneScreen() && g_prefabRebuildRequested) {
             // Rebuilding prefab batches recreates model/GPU resources. If the
@@ -3632,6 +3655,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         visBuffer.SetImpactDecals(BuildImpactDecalGPUList(),
                                   g_impactDecalsEnabled &&
                                       g_impactDecalCutouts);
+        frameSetupProfile.reset();
+        // Command recording for every pass. This is the row that carries a
+        // heavy scene's CPU cost; the per-pass split inside it is the
+        // "Recording" list, which breaks the same span down by pass.
+        renderSubmitProfile.emplace(g_profiler, "Render/Submit");
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
@@ -4461,6 +4489,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: material owners cleared");
                 ArmsModel::ReleaseUploadHeaps();
+                GunModel::ReleaseImportResources();
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: arms owners cleared");
                 g_terrain.ReleaseUploadHeaps();
@@ -5645,11 +5674,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
         // ?? end frame ??
         g_profiler.EndGpuFrame(g_dx12.commandList.Get());
+        renderSubmitProfile.reset();
         // Present reads the interval off g_dx12, so mirror the scene setting
         // here rather than only when the slider moves -- that way a value
         // loaded with a level applies too.
         g_dx12.syncInterval = static_cast<UINT>(
             (std::max)(0, (std::min)(4, scene.vsyncInterval)));
+        // Submission plus Present. The blocking part is already subtracted from
+        // the CPU total as Wait, so a large figure here is execute/present
+        // overhead rather than a stall. Scoped explicitly and closed before
+        // EndCpuFrame below: a plain local would destruct after the frame had
+        // already been closed, and AddCpuSample drops samples once the frame is
+        // no longer active -- the row would never appear.
+        std::optional<ProfilerDX12::CpuScope> endFrameProfile;
+        endFrameProfile.emplace(g_profiler, "Render/EndFrame");
         try { EndFrame(); }
         catch (const std::exception& e) {
             const HRESULT removedReason = g_dx12.device
@@ -5678,6 +5716,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             previousHZBViewProjection =
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
+        endFrameProfile.reset();
         g_profiler.EndCpuFrame();
         LogFrameSpike(deltaTime);
         if (molotovSmokeInjected && ++molotovSmokeFrames >= 240) {
