@@ -8,7 +8,11 @@ VSOutput main(uint vertexID : SV_VertexID) {
                     : vertexID == 1 ? float2(-1.0,  3.0)
                                     : float2( 3.0, -1.0);
     VSOutput output;
+#ifdef SGE_SKY_DEPTH_TEST
+    output.position = float4(position, 1.0, 1.0);
+#else
     output.position = float4(position, 0.9999, 1.0);
+#endif
     output.uv = position * float2(0.5, -0.5) + 0.5;
     return output;
 }

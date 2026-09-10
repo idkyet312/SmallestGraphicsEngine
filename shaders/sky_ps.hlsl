@@ -16,6 +16,8 @@ cbuffer SkyBuffer : register(b0) {
     float  sunAngularRadius;
     float  sunDiscIntensity;
     float4 sunLensColorHalo;  // direct-light tint, wide-halo intensity
+    float hdriEnabled;
+    float3 skyPadding;
 };
 
 Texture2D skyEquirectangular : register(t0);
@@ -440,6 +442,7 @@ float4 RaymarchClouds2D(float3 ray) {
     return float4(accumulated, 1.0 - transmittance);
 }
 
+[earlydepthstencil]
 float4 main(PSInput input) : SV_Target {
     float2 ndc = input.uv * 2.0 - 1.0;
     ndc.y = -ndc.y;
@@ -447,25 +450,30 @@ float4 main(PSInput input) : SV_Target {
                            cameraRight * ndc.x * aspectRatio * tanHalfFov +
                            cameraUp * ndc.y * tanHalfFov);
 
-    float2 skyUV = float2(atan2(ray.z, ray.x) * 0.159154943 + 0.5,
-                          acos(clamp(ray.y, -1.0, 1.0)) * 0.318309886);
-    // DirectX +Y yaw rotates the environment clockwise when viewed from above.
-    // Sampling the source at world longitude + yaw applies that rotation.
-    skyUV.x = frac(skyUV.x + environmentRotation * 0.159154943);
+    float3 hdr = lerp(float3(0.65, 0.78, 1.0), float3(0.12, 0.32, 0.70),
+                      sqrt(saturate(ray.y)));
+    // A uniform branch skips the HDRI lookup and spherical mapping by default.
+    [branch] if (hdriEnabled > 0.5) {
+        float2 skyUV = float2(atan2(ray.z, ray.x) * 0.159154943 + 0.5,
+                              acos(clamp(ray.y, -1.0, 1.0)) * 0.318309886);
+        // DirectX +Y yaw rotates the environment clockwise when viewed from above.
+        // Sampling the source at world longitude + yaw applies that rotation.
+        skyUV.x = frac(skyUV.x + environmentRotation * 0.159154943);
 
-    // Pick the mip by how fast longitude changes per pixel. Near the poles a
-    // single pixel spans a huge U range, so a coarse mip (whose texels already
-    // average many longitudes) removes the radial smear. Deriving LOD from the
-    // world-space ray avoids the atan2 wrap seam that fools automatic Sample()
-    // gradients into selecting a garbage mip along the +/-180 longitude line.
-    uint texW, texH, mipCount;
-    skyEquirectangular.GetDimensions(0, texW, texH, mipCount);
-    float horiz = length(float2(ray.x, ray.z));           // cos(latitude): ->0 at poles
-    float3 dRayX = ddx(ray), dRayY = ddy(ray);
-    float angleDeriv = max(length(dRayX), length(dRayY)); // radians of view swept per pixel
-    float uTexelsPerPixel = angleDeriv / max(horiz, 1e-3) * 0.159154943 * texW;
-    float lod = clamp(log2(max(uTexelsPerPixel, 1.0)), 0.0, (float)(mipCount - 1));
-    float3 hdr = skyEquirectangular.SampleLevel(skySampler, skyUV, lod).rgb;
+        // Pick the mip by how fast longitude changes per pixel. Near the poles a
+        // single pixel spans a huge U range, so a coarse mip (whose texels already
+        // average many longitudes) removes the radial smear. Deriving LOD from the
+        // world-space ray avoids the atan2 wrap seam that fools automatic Sample()
+        // gradients into selecting a garbage mip along the +/-180 longitude line.
+        uint texW, texH, mipCount;
+        skyEquirectangular.GetDimensions(0, texW, texH, mipCount);
+        float horiz = length(float2(ray.x, ray.z));           // cos(latitude): ->0 at poles
+        float3 dRayX = ddx(ray), dRayY = ddy(ray);
+        float angleDeriv = max(length(dRayX), length(dRayY)); // radians of view swept per pixel
+        float uTexelsPerPixel = angleDeriv / max(horiz, 1e-3) * 0.159154943 * texW;
+        float lod = clamp(log2(max(uTexelsPerPixel, 1.0)), 0.0, (float)(mipCount - 1));
+        hdr = skyEquirectangular.SampleLevel(skySampler, skyUV, lod).rgb;
+    }
     hdr = PhysicalSky(ray, hdr);
     if (sunLensEnabled >= 0.5)
         hdr += OpticalSun(ray);

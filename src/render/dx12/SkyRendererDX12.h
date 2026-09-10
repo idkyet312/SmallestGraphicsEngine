@@ -13,7 +13,7 @@
 
 // Poly Haven "Qwantani Dawn (Pure Sky)", CC0. Temporary daylight test sky.
 inline constexpr const char* kSkyEnvironmentPath =
-    "Content/Textures/Sky/qwantani_dawn_puresky_4k.exr";
+    "Content/Textures/Sky/qwantani_dawn_puresky_1k.exr";
 // The Night preset used to swap in a second 70 MB EXR here. Decoding it and
 // re-prefiltering the IBL stalled every switch into and out of Night, and the
 // file had to ship purely for that one preset, so the night environment map is
@@ -42,6 +42,8 @@ struct alignas(256) SkyBufferDX12 {
     float sunDiscIntensity;
     // RGB is the direct-light tint; alpha is the wide atmospheric halo.
     XMFLOAT4 sunLensColorHalo;
+    float hdriEnabled;
+    XMFLOAT3 skyPadding;
 };
 
 class SkyRendererDX12 {
@@ -49,6 +51,7 @@ public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> hdrPipelineState;
+    ComPtr<ID3D12PipelineState> hdrDepthPipelineState;
     ComPtr<ID3D12PipelineState> msaaPipelineState;
     ComPtr<ID3D12DescriptorHeap> srvHeap;
     ComPtr<ID3D12Resource> skyTexture;
@@ -80,6 +83,8 @@ public:
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool hdrTargetEnabled = false;
+    bool hdriEnabled = false;
+    bool depthTestEnabled = false;
     bool sunLensEnabled = false;
     float sunAngularRadius = XMConvertToRadians(0.10f);
     float sunDiscIntensity = 61.9f;
@@ -95,7 +100,7 @@ public:
         std::string vsSource = vsText.str();
         std::string psSource = psText.str();
 
-        ComPtr<ID3DBlob> vs, ps, hdrPs, errors;
+        ComPtr<ID3DBlob> vs, depthVs, ps, hdrPs, errors;
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
         HRESULT hr = ShaderCacheDX12::CompileCached(vsSource.data(), vsSource.size(), "sky_vs.hlsl",
             nullptr, nullptr, "main", "vs_5_0", flags, 0, &vs, &errors);
@@ -112,6 +117,14 @@ public:
         hr = ShaderCacheDX12::CompileCached(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
             hdrDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE,
             "main", "ps_5_0", flags, 0, &hdrPs, &errors);
+        if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
+
+        const D3D_SHADER_MACRO depthDefines[] = {
+            { "SGE_SKY_DEPTH_TEST", "1" }, { nullptr, nullptr }
+        };
+        errors.Reset();
+        hr = ShaderCacheDX12::CompileCached(vsSource.data(), vsSource.size(), "sky_vs.hlsl",
+            depthDefines, nullptr, "main", "vs_5_0", flags, 0, &depthVs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
 
         D3D12_ROOT_PARAMETER roots[3] = {};
@@ -186,6 +199,15 @@ public:
         desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &desc, IID_PPV_ARGS(&hdrPipelineState)))) return false;
+        // The late sky only fills clear-depth pixels and never changes depth.
+        desc.VS = { depthVs->GetBufferPointer(), depthVs->GetBufferSize() };
+        desc.DepthStencilState.DepthEnable = TRUE;
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&hdrDepthPipelineState)))) return false;
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.DepthStencilState.DepthEnable = FALSE;
         desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
         desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = MSAADX12::SampleCount;
@@ -296,6 +318,8 @@ public:
     }
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
+    void SetHDRIEnabled(bool enabled) { hdriEnabled = enabled; }
+    void SetDepthTestEnabled(bool enabled) { depthTestEnabled = enabled; }
 
     void SetSunLens(bool enabled, const XMFLOAT3& color,
                     float angularRadiusDegrees, float discIntensity,
@@ -367,6 +391,7 @@ public:
         data.exposure = 1.32f + (0.10f - 1.32f) * nightBlend;
         data.cameraPosition = camera.Position;
         data.time = time;
+        data.hdriEnabled = hdriEnabled ? 1.0f : 0.0f;
         data.atmosphereParams = atmosphereParams;
         if (!physicalAtmosphere)
             data.atmosphereParams.x = 0.0f;
@@ -388,7 +413,7 @@ public:
         constants.CopyData(constantIndex, data);
 
         g_dx12.commandList->SetPipelineState(hdrTargetEnabled
-            ? hdrPipelineState.Get()
+            ? (depthTestEnabled ? hdrDepthPipelineState.Get() : hdrPipelineState.Get())
             : (msaaEnabled ? msaaPipelineState.Get() : pipelineState.Get()));
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         ID3D12DescriptorHeap* heaps[] = { srvHeap.Get() };
