@@ -51,6 +51,9 @@ public:
     }
     static bool Loaded() { return Mesh() != nullptr; }
 
+    // Called only after the level loader's existing direct-queue drain.
+    static void ReleaseImportResources() { ImportMaterials().clear(); }
+
     static std::shared_ptr<SceneMesh>& ShotgunMesh() {
         static std::shared_ptr<SceneMesh> mesh;
         return mesh;
@@ -756,6 +759,20 @@ private:
             return;
         }
 
+        // Snapshot before removing the backdrop or clearing lens maps: those
+        // textures are still destinations of copies on the open command list.
+        const auto retainMaterials = [&](const auto& self,
+                                         const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (const auto& primitive : node->mesh->primitives)
+                    if (primitive.material)
+                        ImportMaterials().push_back(*primitive.material);
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        retainMaterials(retainMaterials, root);
+
         // The downloaded scene includes a large black presentation backdrop.
         // It is not part of the attachment and would cover most of the viewmodel.
         const auto prepare = [&](const auto& self,
@@ -828,6 +845,11 @@ private:
         prepare(prepare, root);
         RedDotSightModel() = std::move(root);
         std::cout << "Red dot sight GLB ready\n";
+    }
+
+    static std::vector<SceneMaterial>& ImportMaterials() {
+        static std::vector<SceneMaterial> materials;
+        return materials;
     }
 
     static void LoadHarpoonSpear() {

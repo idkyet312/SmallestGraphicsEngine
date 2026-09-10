@@ -426,6 +426,11 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
     for (uint32_t i = 0; i < header.textureCount; ++i) {
         textures[i] = CreateTexture(map, textureRecords[i], device.Get(),
                                     commandList.Get(), textureUploads);
+        if (textures[i]) {
+            const std::wstring name = cookedPath.wstring() + L" texture #" +
+                std::to_wstring(i);
+            textures[i]->SetName(name.c_str());
+        }
         PumpPendingWindowMessages();
     }
 
