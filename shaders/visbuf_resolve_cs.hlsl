@@ -1951,6 +1951,10 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     // across all four. A pixel covered by a single layer pays one extra fetch
     // and takes the identity path through TerrainVBHeightBlend.
     float4 layerHeights = 0.0;
+#ifdef SGE_TERRAIN_PACKED_REUSE
+    float4 packedLayers[4] = { float4(0, 0, 0, 0), float4(0, 0, 0, 0),
+                              float4(0, 0, 0, 0), float4(0, 0, 0, 0) };
+#endif
     // FXC cannot lower a dynamically indexed float4 component used as an
     // l-value here. Keep one compact loop for reasonable compile time, but route
     // the sampled scalar through statically addressable components.
@@ -1958,9 +1962,16 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
         const TerrainVBGrads heightGrads =
             TerrainVBTriplanarGrads(worldDx, worldDy, scales[heightLayer]);
+#ifdef SGE_TERRAIN_PACKED_REUSE
+        packedLayers[heightLayer] = SampleTerrainVBArray(
+            terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
+            scales[heightLayer], heightGrads);
+        const float sampledHeight = packedLayers[heightLayer].r;
+#else
         const float sampledHeight = SampleTerrainVBArray(
             terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
             scales[heightLayer], heightGrads).r;
+#endif
         if (heightLayer == 0) layerHeights.x = sampledHeight;
         else if (heightLayer == 1) layerHeights.y = sampledHeight;
         else if (heightLayer == 2) layerHeights.z = sampledHeight;
@@ -1980,9 +1991,19 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         result.normal += SampleTerrainVBNormalLayer(
             worldPos, geometricNormal, projectionWeights, layer,
             scales[layer], normalStrengths[layer], grads) * weight;
+#ifdef SGE_TERRAIN_PACKED_REUSE
+        float4 packedPBR = packedLayers[layer];
+        // Height normalization can promote a layer skipped by the pre-pass.
+        // Those layers still need the original shading fetch.
+        if (layerWeights[layer] <= kLayerEpsilon)
+            packedPBR = SampleTerrainVBArray(
+                terrainMetalRoughArray, worldPos, projectionWeights, layer,
+                scales[layer], grads);
+#else
         const float4 packedPBR = SampleTerrainVBArray(
             terrainMetalRoughArray, worldPos, projectionWeights, layer,
             scales[layer], grads);
+#endif
         result.roughness += packedPBR.g * weight;
         result.metallic += packedPBR.b * weight;
         result.occlusion += packedPBR.r * weight;

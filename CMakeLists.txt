@@ -219,6 +219,15 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling terrain mesh shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso
+        COMMAND ${DXC_EXECUTABLE} -T ms_6_5 -E MSMain -D SGE_TERRAIN_SHADOW_DEPTH_ONLY=1
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_height.hlsli
+        COMMENT "Compiling position-only terrain shadow mesh shader"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/terrain_ps.cso
         COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main -D SGE_TERRAIN_PBR=1
                 -I ${CMAKE_SOURCE_DIR}/shaders
@@ -328,6 +337,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso
         ${CMAKE_BINARY_DIR}/terrain_as.cso
         ${CMAKE_BINARY_DIR}/terrain_ms.cso
+        ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
         ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
         ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
@@ -667,6 +677,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps_motion.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_shadow_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_visibility_ps.cso

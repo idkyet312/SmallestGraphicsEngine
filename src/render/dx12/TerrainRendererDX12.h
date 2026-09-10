@@ -232,6 +232,14 @@ public:
         // Depth bias matches DepthOnlyShaderDX12's so terrain acne behaves the
         // same as every other caster's.
         {
+            // Keep the full mesh shader as the default until GPU parity and
+            // timing validate the position-only export on the target hardware.
+            ComPtr<ID3DBlob> shadowMs;
+            if (GetEnvironmentVariableA("SGE_TERRAIN_SHADOW_DEPTH_ONLY", nullptr, 0) > 0) {
+                if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_shadow_ms.cso", &shadowMs)))
+                    return false;
+                stream.ms.value = { shadowMs->GetBufferPointer(), shadowMs->GetBufferSize() };
+            }
             const D3D12_SHADER_BYTECODE noPixelShader = {};
             stream.ps.value = noPixelShader;
             stream.rt.value.NumRenderTargets = 0;
@@ -244,6 +252,7 @@ public:
                              "(non-fatal; terrain casts no shadow)\n";
                 psoShadow.Reset();
             }
+            stream.ms.value = { ms->GetBufferPointer(), ms->GetBufferSize() };
             stream.raster.value.DepthBias = 0;
             stream.raster.value.SlopeScaledDepthBias = 0.0f;
             stream.rt.value.NumRenderTargets = 1;

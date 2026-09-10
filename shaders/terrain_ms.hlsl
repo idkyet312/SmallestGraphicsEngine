@@ -23,11 +23,13 @@ struct TerrainPayload {
 
 struct OutVertex {
     float4 position : SV_Position;
+#ifndef SGE_TERRAIN_SHADOW_DEPTH_ONLY
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
+#endif
 };
 
 // k-th vertex along the tile perimeter, counterclockwise, k in [0, 4n).
@@ -59,6 +61,7 @@ uint2 EdgeCoord(uint edge, uint k, uint n) {
 OutVertex MakeVertex(float2 xz, float y) {
     float3 worldPos = mul(float4(xz.x, y, xz.y, 1), model).xyz;
 
+#ifndef SGE_TERRAIN_SHADOW_DEPTH_ONLY
     // Finite-difference normal from the height function (skirt verts reuse the
     // surface normal of the perimeter vertex above them, which is fine - they
     // are crack fillers, not visible surface).
@@ -70,14 +73,17 @@ OutVertex MakeVertex(float2 xz, float y) {
     float3 normal = normalize(float3(hL - hR, 2.0 * eps, hD - hU));
     float3 tangent = normalize(float3(2.0 * eps, hR - hL, 0));
 
+#endif
     OutVertex v;
     float4 viewPosition = mul(mul(float4(worldPos, 1), view), projection);
     v.position = viewPosition;
+#ifndef SGE_TERRAIN_SHADOW_DEPTH_ONLY
     v.fragPos = worldPos;
     v.normal = normalize(mul(normal, (float3x3)model));
     v.texCoord = xz * 0.2; // match the old floor plane's mud tiling (8 reps / 40 m)
     v.tangent = float4(normalize(mul(tangent, (float3x3)model)), 1.0);
     v.fragPosLightSpace = mul(float4(worldPos, 1), lightSpaceMatrix);
+#endif
     return v;
 }
 

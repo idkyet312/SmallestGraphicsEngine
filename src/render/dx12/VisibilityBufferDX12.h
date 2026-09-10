@@ -6670,6 +6670,8 @@ private:
         std::stringstream csSS;
         csSS << csFile.rdbuf();
         std::string csCode = csSS.str();
+        if (GetEnvironmentVariableA("SGE_TERRAIN_PACKED_REUSE", nullptr, 0) > 0)
+            csCode = "#define SGE_TERRAIN_PACKED_REUSE 1\n" + csCode;
 
         UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
