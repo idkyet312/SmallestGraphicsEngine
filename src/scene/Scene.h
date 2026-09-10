@@ -352,7 +352,7 @@ struct Scene {
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
-    bool  virtualShadowMaps = false;
+    bool  virtualShadowMaps = true;
     // Virtual shadows have no cascade fallback, so an unmapped page is a hole
     // in the shadowing rather than a softer sample: spending fewer pages does
     // not trade quality for cost, it removes shadows. BuildRequests spends the
@@ -681,6 +681,8 @@ struct Scene {
     bool  enableMSAA = true;
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
+    bool  enableHDRISky = true;
+    bool  enableSkyDepthTest = true;
     bool  enablePhysicalAtmosphere = true;
     // Selects the baked 3D noise raymarch. Off keeps the legacy 2D cloud slab
     // as a cheap fallback, so the toggle never removes weather entirely.

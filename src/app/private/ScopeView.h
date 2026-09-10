@@ -97,38 +97,29 @@ static void RenderSniperScopeTexture(float now) {
         skyRenderer.SetSunLens(false, scene.lightColor,
             scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
             scene.sunHaloIntensity);
-        // The same bracket the main view puts around its own sky, and not
-        // optional here -- for the reason written on BeginHDRBackground
-        // itself. The resolve compute shader leaves outputColor untouched
-        // wherever the visibility buffer holds no geometry, on the contract
-        // that a cleared target already carries this view's sky.
-        //
-        // The scope used to draw its sky into g_sniperScope's own render
-        // target, which the CopyResource below then overwrote, so it satisfied
-        // neither half of that contract: no clear, and no sky in the surface
-        // the resolve preserves. Every background pixel of the lens therefore
-        // kept whatever the MAIN view left in outputTexture last frame --
-        // including its forward-extensions pass, which is where the viewmodel
-        // is drawn. The player saw their own rifle and hands through the
-        // scope, one frame stale, while the scope's own sky was discarded.
-        //
-        // Bracketing here fixes both halves at once: the clear removes the
-        // stale main-view image, and the sky lands in the surface that
-        // CopyResolveOutputTo actually reads. It must follow BindViewSurface
-        // above, because the clear and the draw take the scope's viewport
-        // through ActiveViewport().
+        const bool lateScopeSky = scene.enableSkyDepthTest && scopeUsesVisibilityBuffer;
+        auto drawScopeSky = [&]() {
+            ProfilerDX12::Scope skyProfile(
+                g_profiler, "Scope/Sky", g_dx12.commandList.Get());
+            skyRenderer.SetHDRIEnabled(scene.enableHDRISky);
+            skyRenderer.SetDepthTestEnabled(lateScopeSky);
+            skyRenderer.Render(
+                scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
+                scene.enablePhysicalAtmosphere, false,
+                XMFLOAT4(scene.atmosphereRayleighStrength,
+                         scene.atmosphereMieStrength,
+                         scene.atmosphereMieAnisotropy,
+                         scene.atmosphereAerialDensity),
+                XMFLOAT4(0.0f, 0.0f, scene.atmosphereCloudBaseHeight,
+                         scene.atmosphereCloudThickness),
+                1, 1.0f);
+            skyRenderer.SetDepthTestEnabled(false);
+            mainShader.InvalidateGraphicsRootBinding();
+        };
+        // Resolve preserves the background, so clear this view even for a late sky.
         if (scopeUsesVisibilityBuffer)
             visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
-        skyRenderer.Render(
-            scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
-            scene.enablePhysicalAtmosphere, false,
-            XMFLOAT4(scene.atmosphereRayleighStrength,
-                     scene.atmosphereMieStrength,
-                     scene.atmosphereMieAnisotropy,
-                     scene.atmosphereAerialDensity),
-            XMFLOAT4(0.0f, 0.0f, scene.atmosphereCloudBaseHeight,
-                     scene.atmosphereCloudThickness),
-            1, 1.0f);
+        if (!lateScopeSky) drawScopeSky();
         if (scopeUsesVisibilityBuffer)
             visBuffer.EndHDRBackground(g_dx12.commandList.Get());
 
@@ -158,6 +149,7 @@ static void RenderSniperScopeTexture(float now) {
 
         if (scopeUsesVisibilityBuffer) {
             visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
+            if (lateScopeSky) drawScopeSky();
             const bool mainTerrainOwned = g_terrainInVisibilityBuffer;
             g_terrainInVisibilityBuffer = visBuffer.terrainVisibilityActiveThisFrame;
             RenderForward(scene, mainShader, geo, g_prefabRenderBatches,

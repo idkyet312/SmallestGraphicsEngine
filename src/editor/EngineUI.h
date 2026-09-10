@@ -2798,6 +2798,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
         ImGui::TextDisabled("%s", WeatherStateBriefing(scene.weatherState));
 
+        ImGui::Checkbox("HDRI Sky", &scene.enableHDRISky);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Use the photographic environment as the sky background. Off uses a procedural sky; environment lighting is unchanged.");
+        ImGui::Checkbox("Sky Depth Test (VB)", &scene.enableSkyDepthTest);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Draw sky after visibility geometry and reject covered pixels. Applies to the main and scope visibility-buffer views.");
         ImGui::Checkbox("Physical Atmosphere", &scene.enablePhysicalAtmosphere);
         if (scene.enablePhysicalAtmosphere) {
             ImGui::Checkbox("Sky Clouds: 3D Quality",

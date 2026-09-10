@@ -223,8 +223,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
     g_forceTerrainErrorLOD =
         GetEnvironmentVariableA("SGE_TERRAIN_ERROR_LOD", nullptr, 0) > 0;
-    scene.virtualShadowMaps =
-        GetEnvironmentVariableA("SGE_VSM", nullptr, 0) > 0;
+    // Virtual shadows are on by default; SGE_VSM_OFF opts a run back out to
+    // the cascade path without needing an editor toggle.
+    if (GetEnvironmentVariableA("SGE_VSM_OFF", nullptr, 0) > 0)
+        scene.virtualShadowMaps = false;
+    else if (GetEnvironmentVariableA("SGE_VSM", nullptr, 0) > 0)
+        scene.virtualShadowMaps = true;
     scene.cacheFarShadowCascades =
         GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
@@ -627,6 +631,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     std::vector<double> terrainLODScopeSamples;
     std::vector<double> terrainLODFrameSamples;
     std::vector<double> terrainLODShadowSamples;
+    std::vector<double> terrainResolveSamples;
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
     bool molotovSmokeInjected = false;
@@ -642,6 +647,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     size_t vortexSmokePeakBarrelBodies = 0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
         visibilitySmokeEnabled = true;
+        scene.enableHDRISky =
+            GetEnvironmentVariableA("SGE_VISIBILITY_TEST_HDRI", nullptr, 0) > 0;
+        scene.enableSkyDepthTest =
+            GetEnvironmentVariableA("SGE_VISIBILITY_TEST_SKY_DEPTH", nullptr, 0) > 0;
         std::ofstream("visibility_smoke.log", std::ios::trunc)
             << "starting\n";
         char visibilityDebugMode[8] = {};
@@ -3841,12 +3850,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         skyRenderer.SetMSAAEnabled(msaaActive);
         if (msaaActive) msaa.BindAndClear(cc);
         else ClearRenderTarget(cc);
-        {
+        const bool lateSky = scene.enableSkyDepthTest && usingVisibility &&
+            IsSceneScreen() && !g_game.loading.Active() &&
+            !visibilityDebugActive && !bentGTAODiagnosticActive;
+        visBuffer.SetSunLens(
+            scene.enableSunLens && !deploymentHideAtmosphere,
+            scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
+            scene.camera.Position, scene.lightPos, scene.lightColor,
+            scene.directionalLightIntensity);
+        auto drawSky = [&]() {
             ProfilerDX12::Scope profile(g_profiler, "Sky", g_dx12.commandList.Get());
-            if (commonHDRValidationTarget) {
-                visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
-                skyRenderer.SetHDRTargetEnabled(true);
-            }
+            skyRenderer.SetHDRTargetEnabled(commonHDRValidationTarget);
+            skyRenderer.SetHDRIEnabled(scene.enableHDRISky);
+            skyRenderer.SetDepthTestEnabled(lateSky);
             const XMFLOAT4 skyCloudParams = deploymentHideAtmosphere
                 ? XMFLOAT4(0.0f, 0.0f,
                            scene.atmosphereCloudBaseHeight,
@@ -3865,11 +3881,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 sunLensEnabled, scene.lightColor,
                 scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
                 scene.sunHaloIntensity);
-            visBuffer.SetSunLens(
-                sunLensEnabled,
-                scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
-                scene.camera.Position, scene.lightPos, scene.lightColor,
-                scene.directionalLightIntensity);
             skyRenderer.Render(
                 scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
                 scene.enablePhysicalAtmosphere,
@@ -3879,11 +3890,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                          scene.atmosphereMieAnisotropy,
                          scene.atmosphereAerialDensity),
                 skyCloudParams);
-            if (commonHDRValidationTarget) {
-                skyRenderer.SetHDRTargetEnabled(false);
-                visBuffer.EndHDRBackground(g_dx12.commandList.Get());
-            }
-        }
+            skyRenderer.SetHDRTargetEnabled(false);
+            skyRenderer.SetDepthTestEnabled(false);
+            mainShader.InvalidateGraphicsRootBinding();
+        };
+        // Clear even when the sky is deferred: resolve preserves background.
+        if (commonHDRValidationTarget)
+            visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
+        if (!lateSky) drawSky();
+        if (commonHDRValidationTarget)
+            visBuffer.EndHDRBackground(g_dx12.commandList.Get());
 
         hzbCaptureActive = IsSceneScreen() &&
             !g_game.loading.Active() && !usingRaytracing && !msaaActive &&
@@ -4711,6 +4727,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
                     (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
             }
+            // RenderVBDraw has bound HDR colour and the populated depth buffer.
+            // Fill the background before forward materials can blend over it.
+            if (lateSky) drawSky();
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
             renderedScene = !visibilityDebugActive;
@@ -5496,6 +5515,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     terrainLODFrameSamples.push_back(g_profiler.GpuFrameMs());
                     terrainLODShadowSamples.push_back(
                         g_profiler.GpuScopeMs("Shadow"));
+                    terrainResolveSamples.push_back(
+                        g_profiler.GpuScopeMs("VB Terrain Resolve"));
                 }
             }
             if (terrainLODScopeSamples.size() >= 300) {
@@ -5520,6 +5541,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 writeStats("terrain", terrainLODScopeSamples);
                 writeStats("frame", terrainLODFrameSamples);
                 writeStats("shadow", terrainLODShadowSamples);
+                writeStats("terrain_resolve", terrainResolveSamples);
+                log << "packed_reuse=" << (GetEnvironmentVariableA(
+                    "SGE_TERRAIN_PACKED_REUSE", nullptr, 0) > 0) << '\n'
+                    << "shadow_depth_only=" << (GetEnvironmentVariableA(
+                    "SGE_TERRAIN_SHADOW_DEPTH_ONLY", nullptr, 0) > 0) << '\n';
                 terrainLODBenchmarkComplete = true;
                 PostQuitMessage(0);
             }
