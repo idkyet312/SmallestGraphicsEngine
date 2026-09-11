@@ -5,6 +5,7 @@
 #include "BanditWeapon.h"
 #include "SkinnedFBXImporter.h"
 #include "AnimationRuntime.h"
+#include "DirectionalLocomotion.h"
 #include "MeshShaderDX12.h"
 #include "DX12Core.h"
 #include "DestructionDX12.h"
@@ -59,6 +60,7 @@ enum class Faction : uint8_t { Bandit, Marine };
 
 class SkinnedEnemy {
 public:
+    inline static bool directionalLocomotionIK = false;
     SkinnedModel      model;
     AnimationInstance anim;
     DirectX::XMFLOAT3 position{ 0, 0, 0 };
@@ -269,6 +271,7 @@ public:
     bool Init(const SkinnedModel& m) {
         model = m;
         if (!model.valid) return false;
+        locomotion_.Initialize(model.skeleton, model.clips);
         // One palette upload buffer per in-flight frame so we never overwrite a
         // palette the GPU is still reading.
         const UINT bytes = (UINT)(model.skeleton.BoneCount() * sizeof(DirectX::XMFLOAT4X4));
@@ -345,6 +348,7 @@ public:
 
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
         if (dead_) return;
+        const DirectX::XMFLOAT3 locomotionStart = position;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
         position.y = groundY;
@@ -457,8 +461,7 @@ public:
                     position.z += moveZ * travel;
                 }
             }
-            PlayClip(moveSpeedThisTick > 0.01f ? "Walk" : "Idle");
-            anim.Advance(dt);
+            UpdateLocomotion(dt, locomotionStart, moveSpeedThisTick);
             ComputePose(dt);
             return;
         }
@@ -615,20 +618,16 @@ public:
             const auto angleDelta = [](float from, float to) {
                 return std::atan2(std::sin(to - from), std::cos(to - from));
             };
-            // Legs always face the player regardless of travel direction (strafe,
-            // retreat, or approach), so body and aim yaw already agree and the
-            // spine barely needs to twist.
+            // Facing stays on the target; local velocity selects the leg gait.
             const float turn = angleDelta(yaw, aimYaw);
             const float maxTurn = 5.5f * dt;
             yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
         }
         const bool running = speed > moveSpeed * 1.2f;
-        PlayClip(running ? "Run" : speed > 0.01f ? "Walk" : "Idle");
         const float referenceSpeed = running ? moveSpeed * 1.65f : moveSpeed;
         const float playbackRate = speed > 0.01f
-            ? (std::max)(0.75f, (std::min)(1.15f, speed / referenceSpeed))
-            : 1.0f;
-        anim.Advance(dt * playbackRate);
+            ? (std::max)(0.75f, (std::min)(1.15f, speed / referenceSpeed)) : 1.0f;
+        UpdateLocomotion(dt, locomotionStart, speed, playbackRate);
         ComputePose(dt);
     }
 
@@ -1639,6 +1638,25 @@ private:
     UINT  paletteBytes_ = 0;
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
     AnimationInstance upperBodyAnim_;
+    LocomotionBlendSpace locomotion_;
+
+    void UpdateLocomotion(float dt, const DirectX::XMFLOAT3& start,
+                          float requestedSpeed, float fallbackPlaybackRate = 1.0f) {
+        const float inverseDt = dt > 1e-5f ? 1.0f / dt : 0.0f;
+        const float vx = (position.x - start.x) * inverseDt;
+        const float vz = (position.z - start.z) * inverseDt;
+        const float c = std::cos(yaw), s = std::sin(yaw);
+        const AnimationClip* pose = directionalLocomotionIK
+            ? locomotion_.Update(dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)
+            : nullptr;
+        if (pose) {
+            if (anim.clip != pose) anim.Play(pose);
+        } else {
+            PlayClip(requestedSpeed > moveSpeed * 1.2f ? "Run" :
+                     requestedSpeed > 0.01f ? "Walk" : "Idle");
+            anim.Advance(dt * fallbackPlaybackRate);
+        }
+    }
     std::vector<float> upperBodyMask_;
     std::vector<DirectX::XMFLOAT4> gunPoseOffsets_;
     std::vector<DirectX::XMFLOAT4X4> poseGlobals_;

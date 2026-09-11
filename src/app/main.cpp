@@ -4384,6 +4384,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid) {
+                    if (!DirectionalLocomotion::Bake(bm.skeleton, bm.clips))
+                        std::cerr << "Bandit directional locomotion unavailable; using source clips\n";
                     g_banditModel = std::move(bm);
                 } else {
                     std::cerr << "Bandit squad failed to load\n";

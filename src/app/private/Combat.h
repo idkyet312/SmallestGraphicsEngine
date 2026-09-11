@@ -1096,6 +1096,9 @@ static void UpdateMolotovFireDamage() {
 
 // One-line Bandit status for the debug HUD (declared in EngineUI.h).
 void BanditDebugText() {
+    ImGui::Checkbox("Directional locomotion IK", &SkinnedEnemy::directionalLocomotionIK);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Enable procedural sideways/backward leg animations. Off uses the original Idle/Walk/Run clips.");
     if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
     int textured = 0, parts = 0;
     if (g_banditModel.node && g_banditModel.node->mesh) {

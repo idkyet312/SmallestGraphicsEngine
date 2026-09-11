@@ -163,16 +163,17 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             drawScale = instance.modelMaxScale;
         }
         MeshletBounds bounds = meshletBounds[globalMeshlet];
-        // Animated bounds cannot safely use cone/backface or occlusion tests,
-        // but bind-pose bounds remain good enough for coarse frustum rejection.
-        bool visible = (skinningEnabled == 2)
+        // Skinned meshlet bounds are bind-pose: they describe where the geometry
+        // WAS, not where the pose put it. A ragdoll is posed further from bind
+        // pose than any animation, so those bounds reject clusters that are
+        // plainly on screen and a corpse loses limbs. Skinned draws skip meshlet
+        // culling entirely; static geometry keeps the full test.
+        bool visible = skinningEnabled
             ? true
-            : (skinningEnabled
-                ? IntersectsFrustum(bounds, drawMVP, drawScale)
-                : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
-                   ((cullingFlags & 2u) != 0u ||
-                    !IsBackfacing(bounds, drawModel, drawScale)) &&
-                   !IsOccluded(bounds, drawModel, drawModelView, drawScale)));
+            : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
+               ((cullingFlags & 2u) != 0u ||
+                !IsBackfacing(bounds, drawModel, drawScale)) &&
+               !IsOccluded(bounds, drawModel, drawModelView, drawScale));
         if (visible) {
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);

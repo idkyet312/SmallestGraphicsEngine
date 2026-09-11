@@ -599,6 +599,9 @@ if(BUILD_TESTING)
     add_test(NAME SphereMeshCutTests COMMAND SphereMeshCutTests)
 
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
+    add_executable(DirectionalLocomotionTests tests/DirectionalLocomotionTests.cpp)
+    target_link_libraries(DirectionalLocomotionTests PRIVATE SGEProjectHeaders assimp::assimp)
+    add_test(NAME DirectionalLocomotionTests COMMAND DirectionalLocomotionTests "${CMAKE_SOURCE_DIR}")
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
