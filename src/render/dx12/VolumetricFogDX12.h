@@ -57,8 +57,10 @@ public:
     // SRV descriptors, installed after the boot fence has completed generation.
     void SetCloudVolumes(ID3D12Resource* shape, ID3D12Resource* detail) {
         cloudVolumesReady_ = shape && detail && descriptorHeap_;
-        CreateCloudVolumeSRV(shape, CpuHandle(5));
-        CreateCloudVolumeSRV(detail, CpuHandle(6));
+        for (UINT slot = 0; slot < FRAME_COUNT; ++slot) {
+            CreateCloudVolumeSRV(shape, CpuHandle(5, slot));
+            CreateCloudVolumeSRV(detail, CpuHandle(6, slot));
+        }
     }
 
     void Render(const Scene& scene, const WaterVolume& ocean,
@@ -67,7 +69,9 @@ public:
                 bool multisampledDepth,
                 D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
                 bool hdrTarget = false,
-                bool depthAlreadyReadable = false) {
+                bool depthAlreadyReadable = false,
+                const D3D12_VIEWPORT* viewport = nullptr,
+                const D3D12_RECT* scissor = nullptr) {
         if (!initialized || !g_dx12.commandList || !depthResource) return;
         fogTime_ += 1.0f / 60.0f;
         UpdateFrameData(scene, ocean, lightSpace, shadowResource, depthResource,
@@ -99,8 +103,8 @@ public:
             : GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(),
                 g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
         commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        commandList->RSSetViewports(1, &g_dx12.viewport);
-        commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        commandList->RSSetViewports(1, viewport ? viewport : &g_dx12.viewport);
+        commandList->RSSetScissorRects(1, scissor ? scissor : &g_dx12.scissorRect);
         ID3D12PipelineState* compositePipeline = nullptr;
         if (multisampledDepth)
             compositePipeline = scene.enableFlyableClouds
@@ -355,7 +359,8 @@ private:
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         // 8: the seven original views plus the spot shadow atlas at slot 7.
-        heapDesc.NumDescriptors = 8;
+        // Depth and shadow descriptors may still be in flight from older frames.
+        heapDesc.NumDescriptors = 8 * FRAME_COUNT;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -382,15 +387,19 @@ private:
         uav.Format = volume.Format;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
         uav.Texture3D.WSize = MaxGridZ;
-        g_dx12.device->CreateUnorderedAccessView(volume_.Get(), nullptr, &uav, CpuHandle(1));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Format = volume.Format;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         srv.Texture3D.MipLevels = 1;
-        g_dx12.device->CreateShaderResourceView(volume_.Get(), &srv, CpuHandle(3));
-        CreateCloudVolumeSRV(nullptr, CpuHandle(5));
-        CreateCloudVolumeSRV(nullptr, CpuHandle(6));
+        for (UINT slot = 0; slot < FRAME_COUNT; ++slot) {
+            g_dx12.device->CreateUnorderedAccessView(
+                volume_.Get(), nullptr, &uav, CpuHandle(1, slot));
+            g_dx12.device->CreateShaderResourceView(
+                volume_.Get(), &srv, CpuHandle(3, slot));
+            CreateCloudVolumeSRV(nullptr, CpuHandle(5, slot));
+            CreateCloudVolumeSRV(nullptr, CpuHandle(6, slot));
+        }
         return true;
     }
 
@@ -636,13 +645,16 @@ private:
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT index) const {
+        return CpuHandle(index, frame_);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT index, UINT slot) const {
         auto handle = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
-        handle.ptr += static_cast<SIZE_T>(index) * descriptorSize_;
+        handle.ptr += static_cast<SIZE_T>(slot * 8 + index) * descriptorSize_;
         return handle;
     }
     D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle(UINT index) const {
         auto handle = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
-        handle.ptr += static_cast<UINT64>(index) * descriptorSize_;
+        handle.ptr += static_cast<UINT64>(frame_ * 8 + index) * descriptorSize_;
         return handle;
     }
     static void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,

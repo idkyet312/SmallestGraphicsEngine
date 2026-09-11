@@ -438,6 +438,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
     }
+    if (!scopeVolumetricFog.Init())
+        std::cerr << "Scope volumetric fog init failed (non-fatal)\n";
     // The cloud volumes are baked in EnsureSceneRenderAssets, which now runs
     // after this, so the fog is pointed at them there rather than here.
     BootStep("Initializing ambient occlusion...");
@@ -3841,7 +3843,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
         g_meshShader.BeginFrame();
         mainShader.SetPreviousViewProjection(previousHZBViewProjection);
-        RenderSniperScopeTexture(now);
+        RenderSniperScopeTexture(now, editorHideFog || deploymentHideAtmosphere);
 
         BeginWaterTransparencySplitDX12(scene, false);
         mainShader.SetMSAAEnabled(msaaActive);

@@ -16,7 +16,7 @@ static void BindSniperScopeMaterial() {
 
 // The scope uses its own view storage and a square HDR feed. Presentation
 // effects and temporal history belong to the main camera.
-static void RenderSniperScopeTexture(float now) {
+static void RenderSniperScopeTexture(float now, bool hideFog) {
     scene.sniperScopeFeedReady = false;
     const bool frameReady = PrepareR700ScopeFrame(scene);
     if (!g_sniperScope.ShouldRender(
@@ -185,9 +185,8 @@ static void RenderSniperScopeTexture(float now) {
         // resolved terrain have to be in it already -- they are, which is why
         // this sits at the end of the bracket rather than anywhere earlier.
         //
-        // This must stay LAST in the bracket. Render() leaves colour bound
-        // with no depth-stencil view, so anything added after it has to rebind
-        // for itself.
+        // Render() leaves colour bound with no depth-stencil view. The fog
+        // composite below binds its own target and samples depth instead.
         // Matches the main view's waterPassEnabled, minus its raytracing
         // exclusion: scopeUsesVisibilityBuffer already implies the visibility
         // path, so the ray-traced path never reaches here.
@@ -214,6 +213,37 @@ static void RenderSniperScopeTexture(float now) {
                 /*motionTarget=*/nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{},
                 D3D12_RESOURCE_STATE_DEPTH_WRITE,
                 /*profiler=*/nullptr, &scopeView);
+        }
+
+        const bool nvgFogThinned =
+            g_game.mission.Loadout().gear == GearType::NightVisionGoggles &&
+            scene.player.health > 0.0f &&
+            (g_nightVisionActive || g_nightVisionBlend > 0.001f);
+        const bool volumetricShafts =
+            scene.lightShaftMode == Scene::LightShaftMode::Volumetric &&
+            !(nvgFogThinned && g_nightVisionBlend > 0.35f);
+        if (!hideFog && scopeVolumetricFog.initialized &&
+            ((scene.enableVolumetricFog && volumetricShafts) ||
+             scene.enableFlyableClouds)) {
+            ProfilerDX12::Scope fogProfile(
+                g_profiler, "Scope/Fog", g_dx12.commandList.Get());
+            const float savedDensity = scene.volumetricFogDensity;
+            if (nvgFogThinned) {
+                const float thinBlend = (std::max)(
+                    g_nightVisionBlend, g_nightVisionActive ? 0.18f : 0.0f);
+                scene.volumetricFogDensity *= 1.0f - 0.94f * thinBlend;
+            }
+            // Fog is world atmosphere: composite it after water, while the
+            // scope camera and its clustered light lists are still current.
+            // Dedicated storage keeps the main view's uploads intact.
+            scopeVolumetricFog.Render(scene, g_ocean,
+                g_scopeShadowLightSpace, g_scopeShadowResource,
+                g_sniperScope.Depth(), false,
+                scopeUsesVisibilityBuffer ? visBuffer.GetOutputRTV()
+                                          : g_sniperScope.RTV(),
+                true, false, &g_sniperScope.Viewport(), &g_sniperScope.Scissor());
+            scene.volumetricFogDensity = savedDensity;
+            mainShader.InvalidateGraphicsRootBinding();
         }
     }
     if (scopeUsesVisibilityBuffer) {

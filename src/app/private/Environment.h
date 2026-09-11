@@ -252,6 +252,7 @@ static void UpdateLightning(float deltaTime) {
     g_lightningAmbient = g_lightningFlash * 0.35f;
 }
 static VolumetricFogDX12    volumetricFog;
+static VolumetricFogDX12    scopeVolumetricFog;
 static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
 static ScreenSpaceReflectionsDX12 screenSpaceReflections;

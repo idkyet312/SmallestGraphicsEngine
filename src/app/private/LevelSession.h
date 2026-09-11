@@ -494,6 +494,9 @@ static void EnsureSceneRenderAssets() {
     if (scene.enableVolumetricFog && g_cloudNoise.Generated())
         volumetricFog.SetCloudVolumes(
             g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
+    if (scopeVolumetricFog.initialized && g_cloudNoise.Generated())
+        scopeVolumetricFog.SetCloudVolumes(
+            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
 
     // Second half of the boot MSAA test: terrain and sky exist only now, and a
     // pipeline of theirs without an MSAA variant has to turn MSAA off for the
