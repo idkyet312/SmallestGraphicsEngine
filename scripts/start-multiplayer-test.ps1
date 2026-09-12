@@ -91,6 +91,12 @@ if ($HostOnly) {
     return
 }
 
+# The bound socket only says the listener exists; the host is still finishing
+# its own boot behind it. Two instances racing through shader and asset loading
+# at once makes both slower and the handshake flakier, so let the host get clear
+# of that before the second process starts competing for the same disk and GPU.
+Start-Sleep -Seconds 2
+
 Write-Host "Starting client -> ${Address}:${Port}..." -ForegroundColor Cyan
 $clientProcess = Start-Instance @('-join', $Address, "$Port")
 

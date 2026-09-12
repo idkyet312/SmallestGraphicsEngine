@@ -423,7 +423,7 @@ public:
     // the thing splits there: the part above the cut becomes a new dynamic log.
     bool Shoot(const XMFLOAT3& start, const XMFLOAT3& end,
                const XMFLOAT3& direction, float radius, float damage,
-               XMFLOAT3& hitPos) {
+               XMFLOAT3& hitPos, bool applyDamage = true) {
         if (B3_IS_NULL(m_world)) return false;
 
         const XMVECTOR a = XMLoadFloat3(&start);
@@ -501,6 +501,8 @@ public:
 
         if (bestSeg < 0) return false;
         hitPos = bestPos;
+        // Multiplayer predicts the hit, then waits for the host's damage event.
+        if (!applyDamage) return true;
 
         // Drain the struck segment's health, wherever it lives.
         Segment& seg = bestTree ? bestTree->segments[bestSeg]

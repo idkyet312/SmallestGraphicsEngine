@@ -2062,6 +2062,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Remote bodies only: the session itself is driven every frame from
         // outside this gameplay gate, so a handshake can complete at the menu.
         UpdateMultiplayerBodies(deltaTime);
+        UpdateNetworkWorldImpacts();
+        UpdateNetworkGrenades();
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this
@@ -2354,6 +2356,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (projectile.grenade || projectile.rocket) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
+                        if (projectile.grenade && !projectile.missile &&
+                            !projectile.remoteCharge && MultiplayerActive()) {
+                            if (g_netSession.CurrentRole() == net::Role::Client &&
+                                !projectile.netAuthoritative)
+                                continue;
+                            if (g_netSession.CurrentRole() == net::Role::Host)
+                                g_netSession.PublishGrenadeDetonation(
+                                    projectile.netGrenadeId,
+                                    NetworkGrenadeKind(projectile),
+                                    projectile.position.x, projectile.position.y,
+                                    projectile.position.z, projectile.hostile);
+                        }
                         const XMFLOAT3 center = projectile.position;
                         if (projectile.grenadePhysicsHandle != 0) {
                             g_destruction.DestroyGrenadeBody(
@@ -2482,7 +2496,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 blastRadius * blastRadius)
                                 DetonateBarrel(i);
                         }
-                        if (g_banditLoaded) {
+                        if (g_banditLoaded &&
+                            (!MultiplayerActive() ||
+                             g_netSession.CurrentRole() != net::Role::Client)) {
                             for (auto& bandit : g_bandits) {
                                 if (bandit) bandit->ApplyExplosion(
                                     center, enemyRadius,
@@ -3209,7 +3225,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // the burning-material tick anyway.
                         if (!projectile.harpoon ||
                             projectile.harpoonPiercedCount == 0)
-                            DamagePrefabEntity(flyingPlane,
+                            DamageBulletPrefabEntity(flyingPlane,
                                 34.0f * projectile.damageMultiplier, planeHit,
                                 projectile.remoteCharge, projectile.playerOwned);
                         stopProjectileAt(planeHit);
@@ -3235,7 +3251,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     }
                     if (!projectile.harpoon ||
                         projectile.harpoonPiercedCount == 0)
-                        DamagePrefabEntity(prefabEntityId,
+                        DamageBulletPrefabEntity(prefabEntityId,
                             34.0f * projectile.damageMultiplier, hit,
                             projectile.remoteCharge, projectile.playerOwned);
                     stopProjectileAt(hit);
@@ -3281,7 +3297,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     } else if (projectile.flame) {
                         g_destruction.IgniteChunkAt(hit);
                     }
-                    if (protectedHit) {
+                    // In a session the host owns the destruction sim. Report the
+                    // hit instead of chipping the wall here; the host applies the
+                    // committed edge and broadcasts it, so both machines take the
+                    // same chunk out. The host's own rounds go through the same
+                    // queue rather than a local shortcut -- one code path is the
+                    // only way the two ends stay identical.
+                    //
+                    // Laser, flame and harpoon stay local: the first two are
+                    // presentation, and the harpoon is a tether pull on the
+                    // shooter's own camera, none of which has a wire format yet.
+                    const bool networkedSurfaceHit =
+                        !protectedHit && MultiplayerActive() &&
+                        !projectile.laser && !projectile.flame &&
+                        !projectile.harpoon;
+                    if (networkedSurfaceHit) {
+                        g_netSession.ReportWorldImpact(
+                            0, 34.0f * projectile.damageMultiplier,
+                            hit.x, hit.y, hit.z, 0,
+                            scene.destructionDamageRadius,
+                            scene.destructionBulletImpulse * projectile.damageMultiplier,
+                            0, projectile.direction.x, projectile.direction.y,
+                            projectile.direction.z, projectile.playerOwned);
+                    } else if (protectedHit) {
                         // No chunk chipping, no impulse: the lattice stands rigid
                         // until its health is gone.
                     } else if (projectile.laser) {
@@ -3294,8 +3332,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             projectile.harpoon ? 2.5f :
                             34.0f * projectile.damageMultiplier);
                     }
-                    if (protectedHit) {
-                        // Nothing to pull or shove: see above.
+                    if (networkedSurfaceHit || protectedHit) {
+                        // Nothing to pull or shove: the impulse rides with the
+                        // replicated impact, or the lattice stands rigid.
                     } else if (projectile.harpoon &&
                         projectile.harpoonPiercedCount == 0) {
                         scene.ShowHarpoonTether(hit);
@@ -3385,7 +3424,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                              ? 0.0f
                                              : scene.treeDamagePerShot *
                                                projectile.damageMultiplier,
-                                         treeHit)) {
+                                         treeHit,
+                                         !MultiplayerActive() || projectile.laser ||
+                                             projectile.flame || projectile.harpoon)) {
+                    if (MultiplayerActive() && !projectile.laser &&
+                        !projectile.flame && !projectile.harpoon)
+                        g_netSession.ReportWorldImpact(
+                            0, scene.treeDamagePerShot * projectile.damageMultiplier,
+                            treeHit.x, treeHit.y, treeHit.z, 2, bulletRadius,
+                            0.0f, 0, projectile.direction.x, projectile.direction.y,
+                            projectile.direction.z, projectile.playerOwned);
                     // Chewed a palm trunk; enough rounds and it snaps and topples.
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,

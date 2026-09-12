@@ -37,6 +37,16 @@ int main() {
         "ServerPlayerStateChangedMessage must stay memcpy-able");
     static_assert(std::is_trivially_copyable<ClientReviveProgressMessage>::value,
                   "ClientReviveProgressMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientWorldImpactMessage>::value,
+                  "ClientWorldImpactMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerWorldBreakMessage>::value,
+                  "ServerWorldBreakMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientGrenadeThrowMessage>::value,
+                  "ClientGrenadeThrowMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerGrenadeSpawnMessage>::value,
+                  "ServerGrenadeSpawnMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerGrenadeDetonatedMessage>::value,
+                  "ServerGrenadeDetonatedMessage must stay memcpy-able");
 
     // Dispatch reads the header before it knows the payload type, so the header
     // must be at offset 0 of every message.
@@ -54,12 +64,22 @@ int main() {
                   "header must lead");
     static_assert(offsetof(ClientReviveProgressMessage, header) == 0,
                   "header must lead");
+    static_assert(offsetof(ClientWorldImpactMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ServerWorldBreakMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ClientGrenadeThrowMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ServerGrenadeSpawnMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ServerGrenadeDetonatedMessage, header) == 0,
+                  "header must lead");
 
     // The version must be bumped whenever a struct in the file changes shape.
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 5, "protocol version was not bumped");
+    Check(kProtocolVersion == 7, "protocol version was not bumped");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something

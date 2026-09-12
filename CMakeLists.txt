@@ -669,6 +669,13 @@ if(BUILD_TESTING)
     add_executable(NetClientReviveTests tests/NetClientReviveTests.cpp)
     target_link_libraries(NetClientReviveTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetClientReviveTests COMMAND NetClientReviveTests)
+
+    # World impact and grenade lifecycle authority/idempotence against a fake
+    # transport. This stays at the session seam; gameplay applies the events.
+    add_executable(NetWorldReplicationTests
+        tests/NetWorldReplicationTests.cpp)
+    target_link_libraries(NetWorldReplicationTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetWorldReplicationTests COMMAND NetWorldReplicationTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Owns "are we in a multiplayer game, and who is in it".
@@ -118,6 +119,52 @@ struct PlayerStateChange {
     float impactX = 0.0f, impactY = 0.0f, impactZ = 0.0f;
 };
 
+struct WorldImpactRequest {
+    uint32_t impactId = 0;
+    uint8_t kind = 0;
+    PlayerId shooter = kInvalidPlayerId;
+    bool playerOwned = true;
+    uint64_t entityId = 0;
+    float damage = 0.0f;
+    float radius = 0.0f;
+    float impulse = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+};
+
+struct WorldBreakEvent {
+    uint32_t impactId = 0;
+    uint8_t kind = 0;
+    // The player whose round caused it, so a receiver can skip the impact FX
+    // for its own shot, which it drew when it fired.
+    PlayerId shooter = kInvalidPlayerId;
+    bool playerOwned = true;
+    uint64_t entityId = 0;
+    float damage = 0.0f;
+    float radius = 0.0f;
+    float impulse = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+};
+
+struct GrenadeSpawnEvent {
+    uint32_t grenadeId = 0;
+    uint32_t clientToken = 0;
+    PlayerId owner = kInvalidPlayerId;
+    GrenadeKind kind = GrenadeKind::Frag;
+    bool hostile = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float velocityX = 0.0f, velocityY = 0.0f, velocityZ = 0.0f;
+    float fuse = 0.0f;
+};
+
+struct GrenadeDetonationEvent {
+    uint32_t grenadeId = 0;
+    GrenadeKind kind = GrenadeKind::Frag;
+    bool hostile = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+
 // What the local player is doing this frame, handed to the session.
 struct LocalPlayerState {
     PlayerInput input;
@@ -175,6 +222,17 @@ public:
         hostEnemies_.clear();
         remoteEnemies_.clear();
         enemyHits_.clear();
+        worldImpacts_.clear();
+        worldBreaks_.clear();
+        grenadeSpawns_.clear();
+        grenadeDetonations_.clear();
+        acceptedGrenadeTokens_.clear();
+        receivedWorldImpacts_.clear();
+        receivedGrenadeIds_.clear();
+        receivedGrenadeDetonations_.clear();
+        receivedWorldBreaks_.clear();
+        nextGrenadeId_ = 1;
+        nextImpactId_ = 1;
         lastEnemyTick_ = 0;
         tick_ = 0;
         clock_.Reset();
@@ -291,6 +349,195 @@ public:
     }
 
     uint32_t Tick() const { return tick_; }
+
+    // ---- World destruction and grenades -----------------------------
+    //
+    // These are event seams for the gameplay layer. NetSession never owns a
+    // prefab, physics body, or Projectile; it only moves the authoritative
+    // edges and leaves application of them to the caller.
+    void ReportWorldImpact(uint64_t entityId, float damage,
+                           float hitX, float hitY, float hitZ,
+                           uint8_t kind = 1, float radius = 0.0f,
+                           float impulse = 0.0f, uint32_t impactId = 0,
+                           float dirX = 0.0f, float dirY = 0.0f,
+                           float dirZ = 0.0f, bool playerOwned = true) {
+        const uint32_t assignedImpactId = impactId ? impactId : AllocateImpactId();
+        if (!Active() || !ValidWorldTarget(entityId, kind, assignedImpactId) ||
+            !(damage > 0.0f) ||
+            !std::isfinite(damage) || !std::isfinite(hitX) ||
+            !std::isfinite(hitY) || !std::isfinite(hitZ) ||
+            !std::isfinite(radius) || !std::isfinite(impulse) ||
+            !Finite3(dirX, dirY, dirZ) ||
+            radius < 0.0f) return;
+        if (role_ == Role::Host) {
+            worldImpacts_.push_back({ assignedImpactId,
+                                       kind, localId_, playerOwned, entityId,
+                                       damage,
+                                       radius, impulse, dirX, dirY, dirZ,
+                                       hitX, hitY, hitZ });
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientWorldImpactMessage message;
+        message.impactId = assignedImpactId;
+        message.kind = kind;
+        message.playerOwned = playerOwned ? 1 : 0;
+        message.entityId = entityId;
+        message.damage = damage;
+        message.radius = radius;
+        message.impulse = impulse;
+        message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+        message.hitX = hitX; message.hitY = hitY; message.hitZ = hitZ;
+        message.shooterTick = tick_;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    void DrainWorldImpacts(std::vector<WorldImpactRequest>& out) {
+        out.clear();
+        out.swap(worldImpacts_);
+    }
+
+    // Host only, called after the gameplay layer has committed a break. The
+    // host does not enqueue its own event: it already changed its world, and
+    // replaying the edge locally would double-count score/effects.
+    void PublishWorldBreak(uint64_t entityId, float hitX, float hitY,
+                           float hitZ) {
+        PublishWorldBreak(1, entityId, 0.0f, 0.0f, 0.0f,
+                          hitX, hitY, hitZ, 0.0f, 0.0f, 0.0f,
+                          kInvalidPlayerId);
+    }
+
+    // The id on the wire is minted here rather than carried over from the
+    // request: every client allocates impact ids from its own counter, so two
+    // peers routinely hand the host the same number, and forwarding it would
+    // make one client's break dedupe away another's.
+    void PublishWorldBreak(uint8_t kind,
+                           uint64_t entityId, float damage, float radius,
+                           float impulse, float hitX, float hitY,
+                           float hitZ, float dirX = 0.0f,
+                           float dirY = 0.0f, float dirZ = 0.0f,
+                           PlayerId shooter = kInvalidPlayerId,
+                           bool playerOwned = true) {
+        const uint32_t canonicalImpactId = AllocateImpactId();
+        if (role_ != Role::Host ||
+            !ValidWorldTarget(entityId, kind, canonicalImpactId) ||
+            !transport_) return;
+        ServerWorldBreakMessage message;
+        message.impactId = canonicalImpactId;
+        message.kind = kind;
+        message.shooter = shooter;
+        message.playerOwned = playerOwned ? 1 : 0;
+        message.entityId = entityId;
+        message.damage = damage;
+        message.radius = radius;
+        message.impulse = impulse;
+        message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+        message.hitX = hitX; message.hitY = hitY; message.hitZ = hitZ;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+    }
+
+    void DrainWorldBreaks(std::vector<WorldBreakEvent>& out) {
+        out.clear();
+        out.swap(worldBreaks_);
+    }
+
+    // Returns a session-wide id for a host-created grenade. Zero is reserved
+    // as "not networked" so existing offline projectiles remain unchanged.
+    uint32_t AllocateGrenadeId() {
+        if (nextGrenadeId_ == 0) ++nextGrenadeId_;
+        return nextGrenadeId_++;
+    }
+
+    uint32_t AllocateImpactId() {
+        if (nextImpactId_ == 0) ++nextImpactId_;
+        return nextImpactId_++;
+    }
+
+    // A local player calls this immediately after creating its predicted throw.
+    // The host receives it, allocates the canonical id, and broadcasts the
+    // approved spawn. Host callers can use PublishGrenadeSpawn directly.
+    void ReportGrenadeThrow(uint32_t clientToken, GrenadeKind kind,
+                            float x, float y, float z,
+                            float velocityX, float velocityY, float velocityZ,
+                            float fuse) {
+        if (!Active() || clientToken == 0 || !ValidGrenade(kind) ||
+            !Finite3(x, y, z) || !Finite3(velocityX, velocityY, velocityZ) ||
+            !std::isfinite(fuse) || fuse < 0.0f) return;
+        if (role_ == Role::Host) {
+            PublishGrenadeSpawn(clientToken, localId_, kind, x, y, z,
+                                velocityX, velocityY, velocityZ, fuse);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientGrenadeThrowMessage message;
+        message.clientToken = clientToken;
+        message.kind = kind;
+        message.x = x; message.y = y; message.z = z;
+        message.velocityX = velocityX; message.velocityY = velocityY;
+        message.velocityZ = velocityZ; message.fuse = fuse;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Host-only. Returns the assigned id so the caller can tag its own
+    // authoritative Projectile and publish its later detonation by id.
+    uint32_t PublishGrenadeSpawn(uint32_t clientToken, PlayerId owner,
+                                 GrenadeKind kind, float x, float y, float z,
+                                 float velocityX, float velocityY,
+                                 float velocityZ, float fuse,
+                                 bool hostile = false) {
+        if (role_ != Role::Host || !transport_ || owner >= kMaxPlayers ||
+            !ValidGrenade(kind) || !Finite3(x, y, z) ||
+            !Finite3(velocityX, velocityY, velocityZ) ||
+            !std::isfinite(fuse) || fuse < 0.0f) return 0;
+        if (clientToken != 0) {
+            const uint64_t tokenKey = (uint64_t(owner) << 32) | clientToken;
+            if (!acceptedGrenadeTokens_.insert(tokenKey).second) return 0;
+        }
+        const uint32_t id = AllocateGrenadeId();
+        GrenadeSpawnEvent event{ id, clientToken, owner, kind, hostile,
+                                 x, y, z, velocityX, velocityY, velocityZ,
+                                 fuse };
+        // The host's game already owns the initiating projectile. Queue only
+        // requests arriving from a client; host-created throws are represented
+        // by their caller and must not spawn a duplicate.
+        ServerGrenadeSpawnMessage message;
+        message.grenadeId = id; message.clientToken = clientToken;
+        message.owner = owner; message.kind = kind;
+        message.hostile = hostile ? 1 : 0;
+        message.x = x; message.y = y; message.z = z;
+        message.velocityX = velocityX; message.velocityY = velocityY;
+        message.velocityZ = velocityZ; message.fuse = fuse;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+        return id;
+    }
+
+    void QueueAuthoritativeGrenadeSpawn(const GrenadeSpawnEvent& event) {
+        if (role_ != Role::Host || event.owner >= kMaxPlayers ||
+            event.grenadeId == 0 || !ValidGrenade(event.kind)) return;
+        grenadeSpawns_.push_back(event);
+    }
+
+    void DrainGrenadeSpawns(std::vector<GrenadeSpawnEvent>& out) {
+        out.clear(); out.swap(grenadeSpawns_);
+    }
+
+    void PublishGrenadeDetonation(uint32_t grenadeId, GrenadeKind kind,
+                                  float x, float y, float z,
+                                  bool hostile = false) {
+        if (role_ != Role::Host || !transport_ || grenadeId == 0 ||
+            !ValidGrenade(kind) || !Finite3(x, y, z)) return;
+        ServerGrenadeDetonatedMessage message;
+        message.grenadeId = grenadeId; message.kind = kind;
+        message.hostile = hostile ? 1 : 0;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+    }
+
+    void DrainGrenadeDetonations(std::vector<GrenadeDetonationEvent>& out) {
+        out.clear(); out.swap(grenadeDetonations_);
+    }
 
     // ---- PvP ----------------------------------------------------------
     //
@@ -505,6 +752,22 @@ public:
     }
 
 private:
+    static bool Finite3(float x, float y, float z) {
+        return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+    }
+    static bool ValidGrenade(GrenadeKind kind) {
+        return kind == GrenadeKind::Frag || kind == GrenadeKind::Molotov ||
+               kind == GrenadeKind::Vortex;
+    }
+    static bool ValidWorldKind(uint8_t kind) { return kind <= 2; }
+    static bool ValidWorldTarget(uint64_t entityId, uint8_t kind,
+                                 uint32_t impactId) {
+        // Destruction surfaces and trees have no prefab entity id. Their
+        // per-impact id is the stable key used for reliable dedupe.
+        return ValidWorldKind(kind) &&
+               (entityId != 0 || (kind != 1 && impactId != 0));
+    }
+
     struct PlayerSlot {
         PlayerId id = kInvalidPlayerId;
         bool active = false;
@@ -759,6 +1022,21 @@ private:
         case MessageType::ClientEnemyHitReport:
             if (role_ == Role::Host) HandleEnemyHitReport(event);
             break;
+        case MessageType::ClientWorldImpact:
+            if (role_ == Role::Host) HandleWorldImpact(event);
+            break;
+        case MessageType::ServerWorldBreak:
+            if (role_ == Role::Client) HandleWorldBreak(event);
+            break;
+        case MessageType::ClientGrenadeThrow:
+            if (role_ == Role::Host) HandleGrenadeThrow(event);
+            break;
+        case MessageType::ServerGrenadeSpawn:
+            if (role_ == Role::Client) HandleGrenadeSpawn(event);
+            break;
+        case MessageType::ServerGrenadeDetonated:
+            if (role_ == Role::Client) HandleGrenadeDetonated(event);
+            break;
         default:
             break;
         }
@@ -865,6 +1143,10 @@ private:
         std::memcpy(&welcome, event.payload.data(), sizeof(welcome));
         if (welcome.assignedId >= kMaxPlayers) return;
         localId_ = welcome.assignedId;
+        // The welcome is sufficient to establish the server peer even in a
+        // transport/test harness that delivers the handshake without a
+        // separate Connected event.
+        serverPeer_ = event.peer;
         players_[localId_].active = true;
         players_[localId_].id = localId_;
         SGE_LOG("LogNet", EngineLog::Level::Display,
@@ -1075,6 +1357,135 @@ private:
         enemyHits_.push_back(request);
     }
 
+    void HandleWorldImpact(Event& event) {
+        if (event.payload.size() < sizeof(ClientWorldImpactMessage)) return;
+        ClientWorldImpactMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const auto it = peerToPlayer_.find(event.peer);
+        // A surface or tree hit names no entity, so its impactId is the only
+        // stable key. A client that sent one gets exact-once delivery; one that
+        // sent zero still gets its damage applied, under an id minted here --
+        // rejecting it instead silently drops every unkeyed bullet.
+        const uint32_t impactId =
+            (message.impactId == 0 && message.entityId == 0 &&
+             ValidWorldKind(message.kind) && message.kind != 1)
+                ? AllocateImpactId() : message.impactId;
+        if (it == peerToPlayer_.end() ||
+            !ValidWorldTarget(message.entityId, message.kind, impactId) ||
+            !(message.damage > 0.0f) || !std::isfinite(message.damage) ||
+            !std::isfinite(message.radius) || !std::isfinite(message.impulse) ||
+            !Finite3(message.dirX, message.dirY, message.dirZ) ||
+            message.radius < 0.0f ||
+            !Finite3(message.hitX, message.hitY, message.hitZ)) return;
+        // Dedupe on the sender's own key only. An id minted above is unique by
+        // construction, so putting it in the set would only grow the set.
+        if (message.impactId != 0) {
+            const uint64_t impactKey =
+                (uint64_t(it->second) << 32) | message.impactId;
+            if (!receivedWorldImpacts_.insert(impactKey).second) return;
+        }
+        worldImpacts_.push_back({ impactId, message.kind, it->second,
+                                  message.playerOwned != 0,
+                                  message.entityId,
+                                  message.damage, message.radius,
+                                  message.impulse, message.dirX,
+                                  message.dirY, message.dirZ,
+                                  message.hitX,
+                                  message.hitY, message.hitZ });
+    }
+
+    void HandleWorldBreak(Event& event) {
+        if (event.payload.size() < sizeof(ServerWorldBreakMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerWorldBreakMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (!ValidWorldTarget(message.entityId, message.kind,
+                              message.impactId) ||
+            !std::isfinite(message.damage) || !std::isfinite(message.radius) ||
+            !std::isfinite(message.impulse) ||
+            !Finite3(message.dirX, message.dirY, message.dirZ) ||
+            message.radius < 0.0f ||
+            !Finite3(message.hitX, message.hitY, message.hitZ)) return;
+        const uint64_t dedupe = message.impactId != 0
+            ? ((uint64_t(1) << 63) | message.impactId) : message.entityId;
+        if (!receivedWorldBreaks_.insert(dedupe).second) return;
+        worldBreaks_.push_back({ message.impactId, message.kind,
+                                 message.shooter, message.playerOwned != 0,
+                                 message.entityId, message.damage,
+                                 message.radius, message.impulse,
+                                 message.dirX, message.dirY, message.dirZ,
+                                 message.hitX, message.hitY, message.hitZ });
+    }
+
+    void HandleGrenadeThrow(Event& event) {
+        if (event.payload.size() < sizeof(ClientGrenadeThrowMessage)) return;
+        ClientGrenadeThrowMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end() || message.clientToken == 0 ||
+            !ValidGrenade(message.kind) || !Finite3(message.x, message.y,
+                                                     message.z) ||
+            !Finite3(message.velocityX, message.velocityY,
+                     message.velocityZ) || !std::isfinite(message.fuse) ||
+            message.fuse < 0.0f) return;
+        // The client is allowed to supply its launch pose, but one token may
+        // only become one canonical grenade. Reliable retransmission must not
+        // spawn duplicate physics bodies or detonation events.
+        const uint64_t tokenKey =
+            (uint64_t(it->second) << 32) | message.clientToken;
+        if (!acceptedGrenadeTokens_.insert(tokenKey).second) return;
+        const uint32_t id = AllocateGrenadeId();
+        GrenadeSpawnEvent spawn{ id, message.clientToken, it->second,
+                                 message.kind, false, message.x, message.y,
+                                 message.z, message.velocityX,
+                                 message.velocityY, message.velocityZ,
+                                 message.fuse };
+        grenadeSpawns_.push_back(spawn);
+        ServerGrenadeSpawnMessage reply;
+        reply.grenadeId = id; reply.clientToken = spawn.clientToken;
+        reply.owner = spawn.owner; reply.kind = spawn.kind;
+        reply.hostile = 0;
+        reply.x = spawn.x; reply.y = spawn.y; reply.z = spawn.z;
+        reply.velocityX = spawn.velocityX; reply.velocityY = spawn.velocityY;
+        reply.velocityZ = spawn.velocityZ; reply.fuse = spawn.fuse;
+        transport_->Broadcast(&reply, sizeof(reply), Channel::Reliable);
+    }
+
+    void HandleGrenadeSpawn(Event& event) {
+        if (event.payload.size() < sizeof(ServerGrenadeSpawnMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerGrenadeSpawnMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.grenadeId == 0 || message.owner >= kMaxPlayers ||
+            !ValidGrenade(message.kind) || !Finite3(message.x, message.y,
+                                                     message.z) ||
+            !Finite3(message.velocityX, message.velocityY,
+                     message.velocityZ) || !std::isfinite(message.fuse) ||
+            message.fuse < 0.0f) return;
+        // A retransmitted reliable packet or a delayed duplicate must not
+        // create a second grenade. The app can match owner/token to its local
+        // predicted throw and transfer the canonical id.
+        if (!receivedGrenadeIds_.insert(message.grenadeId).second) return;
+        grenadeSpawns_.push_back({ message.grenadeId, message.clientToken,
+            message.owner, message.kind, message.hostile != 0,
+            message.x, message.y, message.z,
+            message.velocityX, message.velocityY, message.velocityZ,
+            message.fuse });
+    }
+
+    void HandleGrenadeDetonated(Event& event) {
+        if (event.payload.size() < sizeof(ServerGrenadeDetonatedMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerGrenadeDetonatedMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.grenadeId == 0 || !ValidGrenade(message.kind) ||
+            !Finite3(message.x, message.y, message.z)) return;
+        if (!receivedGrenadeDetonations_.insert(message.grenadeId).second) return;
+        grenadeDetonations_.push_back({ message.grenadeId, message.kind,
+                                        message.hostile != 0, message.x,
+                                        message.y, message.z });
+    }
+
     void SendInput(const LocalPlayerState& local) {
         if (localId_ == kInvalidPlayerId || serverPeer_ == kInvalidPeer) return;
         ClientInputMessage message;
@@ -1136,6 +1547,20 @@ private:
     std::vector<HostEnemyState> hostEnemies_;
     std::vector<RemoteEnemy> remoteEnemies_;
     std::vector<EnemyHitRequest> enemyHits_;
+    std::vector<WorldImpactRequest> worldImpacts_;
+    std::vector<WorldBreakEvent> worldBreaks_;
+    std::vector<GrenadeSpawnEvent> grenadeSpawns_;
+    std::vector<GrenadeDetonationEvent> grenadeDetonations_;
+    // Reliable does not mean a caller cannot retry a send. Retain these keys
+    // beyond queue draining so delayed duplicates cannot create another body or
+    // replay a destruction edge on a later frame.
+    std::unordered_set<uint64_t> acceptedGrenadeTokens_;
+    std::unordered_set<uint64_t> receivedWorldImpacts_;
+    std::unordered_set<uint32_t> receivedGrenadeIds_;
+    std::unordered_set<uint32_t> receivedGrenadeDetonations_;
+    std::unordered_set<uint64_t> receivedWorldBreaks_;
+    uint32_t nextGrenadeId_ = 1;
+    uint32_t nextImpactId_ = 1;
     uint32_t lastEnemyTick_ = 0;
     // Scratch for the per-client nearest-enemy sort, kept so the send does not
     // allocate once per client per tick.

@@ -20,8 +20,124 @@ static PlayerInput g_localPlayerInput;
 // Reused across frames so the per-frame snapshot read does not allocate.
 static std::vector<net::RemotePlayer> g_netRemoteScratch;
 static std::vector<net::PlayerStateChange> g_netStateChanges;
+static std::vector<net::WorldImpactRequest> g_netWorldImpactScratch;
+static std::vector<net::WorldBreakEvent> g_netWorldBreakScratch;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
+
+static void DamageBulletPrefabEntity(uint64_t entityId, float damage,
+                                      const XMFLOAT3& hit, bool remoteCharge,
+                                      bool playerOwned) {
+    if (MultiplayerActive() && !remoteCharge)
+        g_netSession.ReportWorldImpact(entityId, damage, hit.x, hit.y, hit.z,
+                                       /*kind=*/1, 0.0f, 0.0f, 0, 0.0f, 0.0f,
+                                       0.0f, playerOwned);
+    else
+        DamagePrefabEntity(entityId, damage, hit, remoteCharge, playerOwned);
+}
+
+// Applies a single authoritative world impact. The host and every client use
+// the same damage and impulse inputs; the session only transports the event and
+// never touches game state.
+//
+// `spawnImpactFx` is what makes another player's fire visible at all. The
+// shooter drew its sparks, decal and dust the instant it fired; every other
+// machine has drawn nothing, and without this a remote player's rounds would
+// silently eat a wall with no sign of where they landed.
+static void ApplyNetworkWorldImpact(uint8_t kind, uint64_t entityId,
+                                    float damage, float radius, float impulse,
+                                    float dirX, float dirY, float dirZ,
+                                    const XMFLOAT3& hit,
+                                    bool spawnImpactFx, bool playerOwned) {
+    const XMFLOAT3 normal{ -dirX, -dirY, -dirZ };
+    if (kind == 1) {
+        // spawnImpactFx doubles as "this was not my round": the shot's own
+        // machine already marked and sparked at the trigger pull.
+        DamagePrefabEntity(entityId, damage, hit, false, playerOwned,
+                           /*localShot=*/!spawnImpactFx);
+        if (spawnImpactFx) {
+            scene.SpawnBulletImpact(hit, normal);
+            scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
+        }
+        return;
+    }
+    XMFLOAT3 direction{ dirX, dirY, dirZ };
+    if (XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&direction))) < 1e-6f)
+        direction = { 0.0f, 1.0f, 0.0f };
+    if (kind == 0) {
+        if (!scene.useDestruction || !g_destruction.IsInitialized()) return;
+        const float hitRadius = radius > 0.0f
+            ? radius : scene.destructionDamageRadius;
+        // Sampled before the damage, which can tear the sheet loose and leave
+        // the query looking at whatever is behind it -- the same order the
+        // local hit path uses.
+        const bool metalSheetHit =
+            spawnImpactFx && g_destruction.IsMetalSheetAt(hit);
+        g_destruction.ApplyRadialDamage(hit, hitRadius, damage);
+        if (impulse > 0.0f)
+            g_destruction.ApplyImpulse(hit, direction, impulse, hitRadius);
+        if (spawnImpactFx) {
+            if (metalSheetHit) PlayMetalHitAudio(hit, 0.9f);
+            scene.SpawnBulletImpact(hit, normal);
+            scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
+        }
+        return;
+    }
+    if (kind == 2 && !g_emptyLevelMode && g_trees.IsInitialized()) {
+        // PalmTrees::Shoot owns the segment selection and damage bookkeeping.
+        // Reconstruct a short segment around the authoritative hit so the
+        // host/client choose the same nearby trunk without adding a second tree
+        // replication format.
+        const XMVECTOR point = XMLoadFloat3(&hit);
+        const XMVECTOR travel = XMLoadFloat3(&direction) * 0.5f;
+        XMFLOAT3 start, end, ignored;
+        XMStoreFloat3(&start, point - travel);
+        XMStoreFloat3(&end, point + travel);
+        if (g_trees.Shoot(start, end, direction,
+                          radius > 0.0f ? radius : 0.08f, damage, ignored) &&
+            spawnImpactFx) {
+            scene.SpawnBulletImpact(hit, normal);
+            scene.SpawnSmokeBurst(hit, 0.25f, 0.1f);
+        }
+    }
+}
+
+// Called from the gameplay update after NetSession::Update and level state are
+// ready. Host requests are one frame delayed by design; clients apply only the
+// committed server edge, so an originating bullet never mutates shared world
+// state twice and no event can bounce back into the network.
+static void UpdateNetworkWorldImpacts() {
+    if (!MultiplayerActive()) return;
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.DrainWorldImpacts(g_netWorldImpactScratch);
+        for (const net::WorldImpactRequest& impact : g_netWorldImpactScratch) {
+            const XMFLOAT3 hit{ impact.hitX, impact.hitY, impact.hitZ };
+            ApplyNetworkWorldImpact(impact.kind, impact.entityId,
+                                    impact.damage, impact.radius,
+                                    impact.impulse, impact.dirX,
+                                    impact.dirY, impact.dirZ, hit,
+                                    impact.shooter != g_netSession.LocalId(),
+                                    impact.playerOwned);
+            g_netSession.PublishWorldBreak(
+                impact.kind, impact.entityId,
+                impact.damage, impact.radius, impact.impulse,
+                impact.hitX, impact.hitY, impact.hitZ,
+                impact.dirX, impact.dirY, impact.dirZ, impact.shooter,
+                impact.playerOwned);
+        }
+    } else {
+        g_netSession.DrainWorldBreaks(g_netWorldBreakScratch);
+        for (const net::WorldBreakEvent& impact : g_netWorldBreakScratch) {
+            const XMFLOAT3 hit{ impact.hitX, impact.hitY, impact.hitZ };
+            ApplyNetworkWorldImpact(impact.kind, impact.entityId,
+                                    impact.damage, impact.radius,
+                                    impact.impulse, impact.dirX,
+                                    impact.dirY, impact.dirZ, hit,
+                                    impact.shooter != g_netSession.LocalId(),
+                                    impact.playerOwned);
+        }
+    }
+}
 
 // Remote bodies live in g_bandits alongside the AI actors, so they are drawn,
 // lit and shadowed by the paths that already exist. They are found by scanning
@@ -287,6 +403,124 @@ static void UpdateClientEnemies(float frameDelta) {
                            return true;
                        }),
         g_bandits.end());
+}
+
+// Grenades are simulated by the host. A client may keep its locally thrown
+// copy moving for responsiveness, but it cannot commit the blast until the
+// host's detonation edge arrives.
+static std::vector<net::GrenadeSpawnEvent> g_netGrenadeSpawns;
+static std::vector<net::GrenadeDetonationEvent> g_netGrenadeDetonations;
+static uint32_t g_nextGrenadeClientToken = 1;
+
+static net::GrenadeKind NetworkGrenadeKind(const Projectile& p) {
+    return p.molotov ? net::GrenadeKind::Molotov
+         : p.vortex ? net::GrenadeKind::Vortex : net::GrenadeKind::Frag;
+}
+
+static Projectile* FindNetworkGrenade(uint32_t id) {
+    for (Projectile& p : scene.projectiles)
+        if (p.grenade && p.netGrenadeId == id) return &p;
+    return nullptr;
+}
+
+static void UpdateNetworkGrenades() {
+    if (!MultiplayerActive()) {
+        // A level/session teardown can leave predicted projectiles in Scene;
+        // never carry their network identity into the next session.
+        for (Projectile& p : scene.projectiles) {
+            p.netGrenadeId = 0;
+            p.netClientToken = 0;
+            p.netAuthoritative = false;
+            p.netAwaitingDetonation = false;
+        }
+        return;
+    }
+
+    g_netSession.DrainGrenadeSpawns(g_netGrenadeSpawns);
+    for (const net::GrenadeSpawnEvent& spawn : g_netGrenadeSpawns) {
+        Projectile* existing = (g_netSession.CurrentRole() == net::Role::Client &&
+                                spawn.owner == g_netSession.LocalId() &&
+                                spawn.clientToken)
+            ? [&]() -> Projectile* {
+                for (Projectile& p : scene.projectiles)
+                    if (p.grenade && p.netClientToken == spawn.clientToken)
+                        return &p;
+                return nullptr;
+            }() : nullptr;
+        if (existing) {
+            existing->netGrenadeId = spawn.grenadeId;
+            existing->netAuthoritative = false;
+            continue;
+        }
+        Projectile p{};
+        p.position = p.previousPosition = { spawn.x, spawn.y, spawn.z };
+        p.velocity = { spawn.velocityX, spawn.velocityY, spawn.velocityZ };
+        p.grenade = true;
+        p.molotov = spawn.kind == net::GrenadeKind::Molotov;
+        p.vortex = spawn.kind == net::GrenadeKind::Vortex;
+        p.hostile = spawn.hostile;
+        p.active = true;
+        p.fuse = (std::max)(0.0f, spawn.fuse);
+        p.netGrenadeId = spawn.grenadeId;
+        p.netClientToken = spawn.clientToken;
+        p.netAuthoritative = g_netSession.CurrentRole() == net::Role::Host;
+        scene.projectiles.push_back(p);
+    }
+
+    g_netSession.DrainGrenadeDetonations(g_netGrenadeDetonations);
+    for (const net::GrenadeDetonationEvent& event : g_netGrenadeDetonations) {
+        Projectile* p = FindNetworkGrenade(event.grenadeId);
+        if (!p) {
+            Projectile blast{};
+            blast.grenade = true;
+            blast.molotov = event.kind == net::GrenadeKind::Molotov;
+            blast.vortex = event.kind == net::GrenadeKind::Vortex;
+            blast.hostile = event.hostile;
+            blast.position = blast.previousPosition =
+                { event.x, event.y, event.z };
+            blast.netGrenadeId = event.grenadeId;
+            blast.netAuthoritative = true;
+            blast.active = false;
+            blast.detonate = true;
+            scene.projectiles.push_back(blast);
+            continue;
+        }
+        // The local physics pose must not overwrite the host's blast center
+        // during the two physics synchronizations before the projectile pass.
+        ReleaseGrenadePhysicsBody(*p);
+        p->position = { event.x, event.y, event.z };
+        p->active = false;
+        p->detonate = true;
+        p->netAwaitingDetonation = false;
+        p->netAuthoritative = true;
+    }
+
+    for (Projectile& p : scene.projectiles) {
+        if (!p.grenade || p.held || (!p.active && !p.detonate) ||
+            p.netGrenadeId != 0 || p.netClientToken != 0 ||
+            p.missile || p.remoteCharge) continue;
+        if (g_netSession.CurrentRole() == net::Role::Host) {
+            const uint32_t id = g_netSession.PublishGrenadeSpawn(
+                0, g_netSession.LocalId(), NetworkGrenadeKind(p),
+                p.position.x, p.position.y, p.position.z,
+                p.velocity.x, p.velocity.y, p.velocity.z,
+                (std::max)(0.0f, p.fuse),
+                p.hostile);
+            if (id != 0) {
+                p.netGrenadeId = id;
+                p.netAuthoritative = true;
+            }
+        } else {
+            uint32_t token = g_nextGrenadeClientToken++;
+            if (token == 0) token = g_nextGrenadeClientToken++;
+            p.netClientToken = token;
+            p.netAwaitingDetonation = true;
+            g_netSession.ReportGrenadeThrow(
+                token, NetworkGrenadeKind(p), p.position.x, p.position.y,
+                p.position.z, p.velocity.x, p.velocity.y, p.velocity.z,
+                (std::max)(0.0f, p.fuse));
+        }
+    }
 }
 
 static void ShutdownMultiplayer() {

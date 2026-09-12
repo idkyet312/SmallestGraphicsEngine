@@ -5,10 +5,9 @@
 
 #include <cstdint>
 
-// Wire format for milestone 1: connect, move, see each other. Nothing here
-// describes shooting, AI, vehicles or destruction -- those are later milestones
-// and adding their fields now would be guessing at a format before the traffic
-// that shapes it exists.
+// Fixed-width wire format for connection, player state, and authoritative
+// gameplay events. Each message is versioned as one protocol contract so a
+// peer cannot silently interpret a changed event layout as an older packet.
 //
 // Every struct is a fixed-width POD written and read by memcpy. No pointers, no
 // std types, no virtuals. Endianness is deliberately ignored: both ends are
@@ -25,7 +24,11 @@ namespace net {
 // 4: PlayerSnapshot gained reviveProgress, without which a client could never
 //    draw a revive bar -- the host was the only machine that knew the number.
 // 5: client input carries the locally simulated feet position.
-inline constexpr uint32_t kProtocolVersion = 5;
+// 6: authoritative world break and grenade lifecycle messages.
+// 7: world impacts and breaks name their shooter, so a receiver can tell
+//    someone else's bullet (draw the impact) from its own coming back (already
+//    drawn), and carry whether the round was player fire.
+inline constexpr uint32_t kProtocolVersion = 7;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -59,6 +62,11 @@ enum class MessageType : uint8_t {
     ClientReviveProgress,     // client -> host, unreliable
     ServerEnemySnapshot,      // host -> client, unreliable, every net tick
     ClientEnemyHitReport,     // client -> host, reliable
+    ClientWorldImpact,        // client -> host, reliable
+    ServerWorldBreak,         // host -> clients, reliable
+    ClientGrenadeThrow,       // client -> host, reliable
+    ServerGrenadeSpawn,       // host -> clients, reliable
+    ServerGrenadeDetonated,   // host -> clients, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -265,6 +273,99 @@ struct ClientEnemyHitReportMessage {
     // different way on every machine.
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
     float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+};
+
+// A client-side bullet hit on a destructible world entity. The client may play
+// its immediate impact, but only the host applies the health change. This
+// message is deliberately an impact rather than a "destroy" command: a shot
+// can chip a prop without breaking it, and the host remains the one deciding
+// when the break transition occurs.
+struct ClientWorldImpactMessage {
+    MessageHeader header{ MessageType::ClientWorldImpact, {} };
+    uint32_t impactId = 0;
+    uint8_t kind = 0; // 0 = destruction surface, 1 = prefab, 2 = tree
+    // Player fire or not. Some prefabs -- the objective aircraft -- take damage
+    // only from a player, so an enemy round replicated as player fire would let
+    // the garrison shoot down the objective the players are sent to destroy.
+    uint8_t playerOwned = 1;
+    uint8_t padding[2] = {};
+    uint64_t entityId = 0;
+    float damage = 0.0f;
+    float radius = 0.0f;
+    float impulse = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+    uint32_t shooterTick = 0;
+};
+
+// The committed break edge. Reliable because a missed fracture leaves a
+// client colliding with and rendering a prop the host has already removed.
+// The event is idempotent: applying it to an already-removed entity is harmless.
+struct ServerWorldBreakMessage {
+    MessageHeader header{ MessageType::ServerWorldBreak, {} };
+    uint32_t impactId = 0;
+    uint8_t kind = 0;
+    // Who fired it. The shooter already drew its own sparks and decal at this
+    // point the moment it pulled the trigger, so it must not draw them again
+    // when its own impact comes back committed -- and everyone else has drawn
+    // nothing yet and needs them. Padded out to the eight-byte boundary
+    // `entityId` sits on, which the previous layout left to the compiler.
+    PlayerId shooter = kInvalidPlayerId;
+    uint8_t playerOwned = 1;
+    uint8_t padding[5] = {};
+    uint64_t entityId = 0;
+    float damage = 0.0f;
+    float radius = 0.0f;
+    float impulse = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
+};
+
+enum class GrenadeKind : uint8_t {
+    Frag = 0,
+    Molotov,
+    Vortex,
+};
+
+// Client throw request. `clientToken` is unique for the throwing player's
+// session and lets the client match the host's assigned id to its predicted
+// projectile without echoing a second grenade into its own scene.
+struct ClientGrenadeThrowMessage {
+    MessageHeader header{ MessageType::ClientGrenadeThrow, {} };
+    uint32_t clientToken = 0;
+    GrenadeKind kind = GrenadeKind::Frag;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float velocityX = 0.0f, velocityY = 0.0f, velocityZ = 0.0f;
+    float fuse = 0.0f;
+};
+
+// Host-approved throw, sent before the host simulates the grenade. Reliable so
+// every client sees the same projectile even when the throw is brief or out of
+// view. The host's app consumes the same event to create its authoritative copy.
+struct ServerGrenadeSpawnMessage {
+    MessageHeader header{ MessageType::ServerGrenadeSpawn, {} };
+    uint32_t grenadeId = 0;
+    uint32_t clientToken = 0;
+    PlayerId owner = kInvalidPlayerId;
+    GrenadeKind kind = GrenadeKind::Frag;
+    uint8_t hostile = 0;
+    uint8_t padding = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float velocityX = 0.0f, velocityY = 0.0f, velocityZ = 0.0f;
+    float fuse = 0.0f;
+};
+
+// Host committed the explosion. Clients do not decide when a remote grenade
+// detonates; they move the predicted body until this edge arrives, then run
+// the existing blast presentation at this center exactly once.
+struct ServerGrenadeDetonatedMessage {
+    MessageHeader header{ MessageType::ServerGrenadeDetonated, {} };
+    uint32_t grenadeId = 0;
+    GrenadeKind kind = GrenadeKind::Frag;
+    uint8_t hostile = 0;
+    uint8_t padding[2] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
 } // namespace net

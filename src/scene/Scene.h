@@ -82,6 +82,13 @@ struct Projectile {
     // thrown frag is meant to be bounced around cover, but a missile called in
     // on a map coordinate has to burst where it was aimed.
     bool     impactFuse = false;
+    // Multiplayer grenade identity. The client token identifies a predicted
+    // local throw until the host assigns the canonical id; the id then keeps
+    // spawn/detonation edges matched to one projectile.
+    uint32_t netGrenadeId = 0;
+    uint32_t netClientToken = 0;
+    bool     netAuthoritative = false;
+    bool     netAwaitingDetonation = false;
     // Called-in strike rather than a thrown frag. It shares the grenade blast
     // path but scales every radius by missileBlastScale, so the strike can be
     // tuned without moving what a hand grenade does.
@@ -2299,6 +2306,7 @@ struct Scene {
         p.previousPosition = p.position;
         p.direction = camera.Front;
         p.grenade   = true;
+        p.playerOwned = true;
         p.molotov   = selectedGrenade == GrenadeType::Molotov;
         p.vortex    = selectedGrenade == GrenadeType::Vortex;
         p.active    = true;

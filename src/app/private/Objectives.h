@@ -831,9 +831,12 @@ static void UpdateObjectivePlanes(float dt) {
 // aircraft objective and drives its hitmarker; it defaults true so the many
 // existing world-damage callers keep their behaviour for ordinary props, which
 // are damageable by anything.
+// `localShot` is what stops a teammate's round from marking this player's
+// screen: in a session the damage is applied on every machine, but the
+// hitmarker belongs only to whoever pulled the trigger.
 static void DamagePrefabEntity(uint64_t entityId, float damage,
                                const XMFLOAT3& hit, bool fromRemoteCharge,
-                               bool fromPlayer = true) {
+                               bool fromPlayer = true, bool localShot = true) {
     if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
     if (!ObjectivePlaneDamageAllowed(entityId, fromPlayer)) return;
     const bool isObjectivePlane = IsObjectivePlaneEntity(entityId);
@@ -865,7 +868,7 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     // so rounds into an already-downed wreck (health <= 0) do not keep marking.
     if (isObjectivePlane && result.applied) {
         PlayMetalHitAudio(hit, 1.05f);
-        scene.TriggerHitMarker(result.destroyed);
+        if (localShot) scene.TriggerHitMarker(result.destroyed);
     }
     if (result.destroyed) {
         if (g_game.session.TimerRunning()) {
