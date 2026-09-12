@@ -107,6 +107,7 @@ set(SGE_SOURCE_DIRS
     "${SGE_SOURCE_ROOT}/gameplay/weapons"
     "${SGE_SOURCE_ROOT}/level"
     "${SGE_SOURCE_ROOT}/navigation"
+    "${SGE_SOURCE_ROOT}/net"
     "${SGE_SOURCE_ROOT}/physics"
     "${SGE_SOURCE_ROOT}/render"
     "${SGE_SOURCE_ROOT}/render/dx11"
@@ -142,6 +143,7 @@ set(SGE_RUNTIME_SOURCES
     src/gameplay/weapons/ArmsTextures.cpp
     src/level/LevelDefinition.cpp
     src/navigation/NavigationSystem.cpp
+    src/net/NetTransportNull.cpp
     src/physics/CollisionMesh.cpp
     src/physics/CollisionMeshCache.cpp
     src/physics/DestructionDX12.cpp
@@ -607,6 +609,12 @@ if(BUILD_TESTING)
     add_executable(PlayerInputTests tests/PlayerInputTests.cpp)
     target_link_libraries(PlayerInputTests PRIVATE SGEProjectHeaders)
     add_test(NAME PlayerInputTests COMMAND PlayerInputTests)
+
+    # Wire-format layout and round-trip. Also pure: the protocol headers pull in
+    # no socket library by design.
+    add_executable(NetProtocolTests tests/NetProtocolTests.cpp)
+    target_link_libraries(NetProtocolTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetProtocolTests COMMAND NetProtocolTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
