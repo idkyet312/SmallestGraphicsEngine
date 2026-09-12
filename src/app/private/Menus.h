@@ -217,6 +217,11 @@ static void RenderMainMenu(HWND hwnd) {
         ImGui::End();
         return;
     }
+    if (g_showMultiplayerMenu) {
+        RenderMultiplayerMenu();
+        ImGui::End();
+        return;
+    }
 
     // The base is the way in: every run now starts by walking out to the
     // helicopter and picking a destination there, so the island is reached
@@ -241,6 +246,11 @@ static void RenderMainMenu(HWND hwnd) {
     // without a full island's content confusing what is being measured.
     if (UIMenuRow("TEST LEVEL"))
         StartLevelOne(hwnd, true, false, true, nullptr, true);
+    // Above SETTINGS rather than below it: a session has to be joined before a
+    // level is started, so it belongs with the rows that start a run, not with
+    // the ones that configure the game.
+    if (UIMenuRow("MULTIPLAYER"))
+        g_showMultiplayerMenu = true;
     if (UIMenuRow("SETTINGS"))
         g_showSettingsMenu = true;
     if (UIMenuRow("QUIT"))

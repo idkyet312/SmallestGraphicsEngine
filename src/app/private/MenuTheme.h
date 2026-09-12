@@ -289,6 +289,114 @@ static void RenderSettingsMenu() {
     ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
 }
 
+// Defined in Multiplayer.h, which is included after this file because it needs
+// g_bandits and the camera. The menu only needs to be able to call it.
+static void ShutdownMultiplayer();
+
+// Multiplayer panel. Drawn in place of the menu body exactly like the settings
+// panel above, for the same reason: one column of controls reads better as the
+// whole screen than as a popup floating over a list it has nothing to do with.
+//
+// Both sides can connect from here, before either player has loaded a level --
+// the session is polled every frame from any screen, so a handshake completes
+// while both players are still sitting on this panel.
+static void RenderMultiplayerMenu() {
+    const net::Role role = g_netSession.CurrentRole();
+    const bool offline = role == net::Role::Offline;
+
+    UISectionLabel("SESSION");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    // Status first: it is the only part of the panel that matters once a
+    // session is live, and it is what the player is waiting on while joining.
+    if (!offline) {
+        if (role == net::Role::Host) {
+            ImGui::TextColored(UITheme::kAccent, "Hosting on port %s",
+                               g_multiplayerPort);
+        } else if (g_netSession.LocalId() == net::kInvalidPlayerId) {
+            // The client is connected at the socket level but has not been
+            // given an id yet, so it is mid-handshake rather than in.
+            ImGui::TextColored(UITheme::kTextDim, "Connecting to %s:%s...",
+                               g_multiplayerJoinAddress, g_multiplayerPort);
+        } else {
+            ImGui::TextColored(UITheme::kAccent, "Connected as player %d",
+                               static_cast<int>(g_netSession.LocalId()) + 1);
+        }
+    } else if (!g_multiplayerStatusError.empty()) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                           g_multiplayerStatusError.c_str());
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::TextColored(UITheme::kTextDim, "Offline");
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+
+    // The port is shared by both halves: you host on it or you join to it, and
+    // having two fields that must agree is one more thing to get wrong.
+    ImGui::TextColored(UITheme::kTextDim, "PORT");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::BeginDisabled(!offline);
+    ImGui::InputText("##mpport", g_multiplayerPort, sizeof(g_multiplayerPort),
+                     ImGuiInputTextFlags_CharsDecimal);
+
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    ImGui::TextColored(UITheme::kTextDim, "ADDRESS");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::InputTextWithHint("##mpaddress", "127.0.0.1",
+                             g_multiplayerJoinAddress,
+                             sizeof(g_multiplayerJoinAddress));
+    ImGui::TextColored(UITheme::kTextDim,
+                       "The host's address. 127.0.0.1 is this machine.");
+    ImGui::EndDisabled();
+
+    // atoi rather than a parse with error reporting: the field is digits-only
+    // and an empty one falling back to the default port is the right answer.
+    const int parsedPort = std::atoi(g_multiplayerPort);
+    const uint16_t port = (parsedPort > 0 && parsedPort <= 65535)
+                              ? static_cast<uint16_t>(parsedPort)
+                              : uint16_t{27015};
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+
+    if (offline) {
+        if (UIPrimaryButton("HOST", 44.0f)) {
+            g_multiplayerStatusError.clear();
+            std::string error;
+            if (!g_netSession.StartHost(port, &error))
+                g_multiplayerStatusError = "Could not host: " + error;
+        }
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        if (UIMenuButton("JOIN", 44.0f)) {
+            g_multiplayerStatusError.clear();
+            std::string error;
+            if (!g_netSession.StartClient(g_multiplayerJoinAddress, port,
+                                          &error))
+                g_multiplayerStatusError = "Could not join: " + error;
+        }
+    } else {
+        if (UIMenuButton("DISCONNECT", 44.0f)) {
+            ShutdownMultiplayer();
+            g_multiplayerStatusError.clear();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    if (UIPrimaryButton("BACK", 44.0f))
+        g_showMultiplayerMenu = false;
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    // Said plainly because it is the one part of milestone 1 that will
+    // otherwise read as a bug: the session survives the menu, but each player
+    // still picks their own level.
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Stay connected while you start a level. Both players "
+                       "must start the same one.");
+    ImGui::PopTextWrapPos();
+}
+
 // Resolved UI images, keyed by path. Uploading a texture costs a
 // descriptor slot out of the ImGui heap, so each image is loaded once and the
 // result -- including the failure -- is cached: a missing PNG must not retry

@@ -10,7 +10,9 @@
 
 #include <sstream>
 
-static net::NetSession g_netSession;
+// g_netSession lives in TerrainAndDamage.h, ahead of Menus.h, so the menu can
+// start and stop a session.
+//
 // The local player's intent for this frame, published by ProcessInput. Held
 // here rather than passed down through the frame so the multiplayer update can
 // be a single call at one clear point in the loop.

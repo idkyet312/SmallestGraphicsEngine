@@ -118,6 +118,10 @@ static void OpenMainMenu() {
     // Always return to the menu's root rather than whatever sub-panel was open
     // when the player last left it.
     g_showSettingsMenu = false;
+    // The panel closes but the session behind it does not: returning to the
+    // menu mid-run must not drop the other players, or every level change
+    // would cost a reconnect.
+    g_showMultiplayerMenu = false;
     g_insertionChoicePending = false;
     g_deploymentZones.clear();
     g_selectedDeploymentZone = -1;

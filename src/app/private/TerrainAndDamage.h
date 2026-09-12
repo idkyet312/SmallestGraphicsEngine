@@ -497,6 +497,22 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
 static GameSettings g_settings;
 static bool g_showSettingsMenu = false;
 
+// Multiplayer session state. Declared here rather than in Multiplayer.h,
+// because Menus.h is included before Multiplayer.h and has to be able to
+// start, report and stop a session -- so the session object and the panel's UI
+// state have to exist before either file.
+static net::NetSession g_netSession;
+static bool g_showMultiplayerMenu = false;
+// Edited by the host/join fields. Fixed char buffers rather than std::string
+// because that is what ImGui::InputText writes into.
+static char g_multiplayerJoinAddress[64] = "127.0.0.1";
+static char g_multiplayerPort[8] = "27015";
+// Last StartHost/StartClient failure. Kept separate from the live session's
+// state so a failed attempt still has something to say after the session has
+// gone back to Offline -- otherwise the panel reports "Offline" and the player
+// never learns why the connect did not take.
+static std::string g_multiplayerStatusError;
+
 // Extraction payout, captured once as the win screen opens. Snapshotted rather
 // than recomputed while the screen draws, because the wallet keeps moving --
 // re-reading SessionEarned() every frame would be fine today but silently
