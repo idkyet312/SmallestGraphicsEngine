@@ -649,6 +649,14 @@ if(BUILD_TESTING)
     add_executable(NetProtocolTests tests/NetProtocolTests.cpp)
     target_link_libraries(NetProtocolTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetProtocolTests COMMAND NetProtocolTests)
+
+    # Session state machine against the null transport: no socket, no device,
+    # no second process.
+    add_executable(NetSessionTests
+        tests/NetSessionTests.cpp
+        src/net/NetTransportNull.cpp)
+    target_link_libraries(NetSessionTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetSessionTests COMMAND NetSessionTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
