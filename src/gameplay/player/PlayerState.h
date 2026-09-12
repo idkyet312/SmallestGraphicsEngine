@@ -30,6 +30,14 @@ struct PlayerState {
     // run, StartLevelOne still takes it as a parameter, and the debug UI
     // checkbox toggles it live.
     bool godMode = false;
+    // Multiplayer only: health reached zero but a teammate can still pick you
+    // up, so this is not death. Single-player never sets it, which is what
+    // keeps the death screen and every gate that reads health exactly as they
+    // were offline.
+    bool downed = false;
+    // 0..1, how far along whoever is reviving you has got. Mirrored from the
+    // host purely for the HUD.
+    float reviveProgress = 0.0f;
     bool healthRegen = true;
     float regenDelay = 5.0f;
     float regenDuration = 2.0f;

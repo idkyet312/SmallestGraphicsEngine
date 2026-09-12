@@ -19,6 +19,11 @@
 static PlayerInput g_localPlayerInput;
 // Reused across frames so the per-frame snapshot read does not allocate.
 static std::vector<net::RemotePlayer> g_netRemoteScratch;
+static std::vector<net::PlayerStateChange> g_netStateChanges;
+// Edge detector for the local player standing back up. The session reports the
+// state, not the transition, and the regen clear below only applies on the
+// frame it changes.
+static bool g_wasDownedLastFrame = false;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
 
@@ -74,6 +79,85 @@ static void ReportNetworkPlayerHit(net::PlayerId target, bool headshot,
     if (!MultiplayerActive() || target == net::kInvalidPlayerId) return;
     g_netSession.ReportHit(target, bodyDamage, headshot,
                            impact.x, impact.y, impact.z);
+}
+
+// The downed teammate the local player is standing close enough to pick up, or
+// null. Nearest wins, the same rule NearbyWeaponPickup uses and for the same
+// reason: the prompt and the key handler read this one function, so they can
+// never disagree about who is being revived.
+static SkinnedEnemy* NearbyDownedPlayer(net::PlayerId* outId = nullptr) {
+    if (!MultiplayerActive() || g_drivingHumvee) return nullptr;
+    // You cannot pick anyone up while you are on the floor yourself.
+    if (scene.player.downed) return nullptr;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return nullptr;
+
+    const XMFLOAT3& camera = scene.camera.Position;
+    SkinnedEnemy* best = nullptr;
+    float bestDistanceSquared = net::kReviveRadius * net::kReviveRadius;
+    for (const auto& actor : g_bandits) {
+        if (!actor || !actor->networkControlled || !actor->netDowned) continue;
+        const float dx = camera.x - actor->position.x;
+        const float dz = camera.z - actor->position.z;
+        // Compared in the plane: the camera is at eye height and the body is on
+        // the ground, so including Y would push every revive out of range.
+        const float distanceSquared = dx * dx + dz * dz;
+        if (distanceSquared >= bestDistanceSquared) continue;
+        bestDistanceSquared = distanceSquared;
+        best = actor.get();
+    }
+    if (best && outId) *outId = best->netPlayerId;
+    return best;
+}
+
+// "[E] REVIVE PLAYER-N" over a downed teammate, with a progress bar once the
+// hold starts. Same projection and drawing shape as DrawWeaponPickupPrompt.
+static void DrawRevivePrompt(DirectX::CXMMATRIX view,
+                             DirectX::CXMMATRIX projection) {
+    const SkinnedEnemy* body = NearbyDownedPlayer();
+    if (!body) return;
+
+    // Low: the body is lying down, so an anchor at standing height would float
+    // the prompt above a player who is not there.
+    const XMFLOAT3 anchor{ body->position.x, body->position.y + 0.6f,
+                           body->position.z };
+    const XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&anchor),
+                                             view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    char label[64];
+    std::snprintf(label, sizeof(label), "[E] REVIVE PLAYER-%d",
+                  static_cast<int>(body->netPlayerId) + 1);
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
+        ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
+        IM_COL32(14, 12, 6, 185), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y),
+                  IM_COL32(255, 255, 255, 245), label);
+
+    // Progress comes off the session rather than being timed locally, so what
+    // is drawn is what the host has actually credited.
+    net::LocalPlayerStatus status;
+    if (!g_netSession.PlayerStatus(body->netPlayerId, status)) return;
+    if (status.reviveProgress <= 0.0f) return;
+    constexpr float kBarWidth = 120.0f;
+    const float barX = screen.x - kBarWidth * 0.5f;
+    const float barY = screen.y + size.y + 8.0f;
+    draw->AddRectFilled(ImVec2(barX, barY),
+                        ImVec2(barX + kBarWidth, barY + 5.0f),
+                        IM_COL32(18, 22, 20, 200), 2.0f);
+    draw->AddRectFilled(
+        ImVec2(barX, barY),
+        ImVec2(barX + kBarWidth * status.reviveProgress, barY + 5.0f),
+        IM_COL32(120, 230, 150, 240), 2.0f);
 }
 
 static void ShutdownMultiplayer() {
@@ -140,6 +224,16 @@ static void UpdateMultiplayerSession(float frameDelta,
         // player's damage stops being reported into nothing and single-player
         // is left exactly as it was.
         if (scene.playerDamageNetworkSink) scene.playerDamageNetworkSink = {};
+        // Leaving a session while down must not strand the player on the floor
+        // with no one left who could ever pick them up. Nothing outside a
+        // session can clear this, so it is cleared here.
+        if (scene.player.downed) {
+            scene.player.downed = false;
+            scene.player.reviveProgress = 0.0f;
+            g_wasDownedLastFrame = false;
+            if (scene.player.health <= 0.0f)
+                scene.player.health = net::kReviveHealth;
+        }
         return;
     }
     // Installed here rather than at StartHost/StartClient because there are
@@ -168,8 +262,32 @@ static void UpdateMultiplayerSession(float frameDelta,
     // bar; this is the correction that arrives a tick later, which is why it
     // overwrites rather than subtracts.
     net::LocalPlayerStatus status;
-    if (g_netSession.LocalStatus(status))
+    if (g_netSession.LocalStatus(status)) {
         scene.player.health = status.health;
+        scene.player.downed = status.downed;
+        scene.player.reviveProgress = status.reviveProgress;
+        // Standing back up has to clear the regen hold, or a revived player
+        // spends the first few seconds unable to recover -- DamagePlayer re-arms
+        // that timer on the hit that put them down.
+        if (!status.downed && status.health > 0.0f &&
+            scene.player.regenTimer > 0.0f && g_wasDownedLastFrame)
+            scene.player.regenTimer = 0.0f;
+    }
+    g_wasDownedLastFrame = scene.player.downed;
+
+    // Life-state edges. Drained every frame whether or not anything is
+    // listening, so the queue cannot grow unbounded in a long session.
+    g_netSession.DrainStateChanges(g_netStateChanges);
+    for (const net::PlayerStateChange& change : g_netStateChanges) {
+        const int playerNumber = static_cast<int>(change.id) + 1;
+        if (change.event == net::PlayerStateEvent::Downed) {
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                    "player " + std::to_string(playerNumber) + " is down");
+        } else if (change.event == net::PlayerStateEvent::Revived) {
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                    "player " + std::to_string(playerNumber) + " is back up");
+        }
+    }
 }
 
 // Moves and animates the remote player bodies. Gameplay-only: these need a

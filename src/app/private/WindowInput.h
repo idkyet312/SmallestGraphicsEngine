@@ -181,7 +181,7 @@ static void ProcessInput(HWND) {
     controlWasDown = controlDown;
 
     const bool crouching = controlDown || scene.camera.IsSliding;
-    scene.camera.SetCrouching(crouching, deltaTime);
+    scene.camera.SetCrouching(crouching, deltaTime, scene.player.downed);
     // Everything the player is asking for this frame, captured as data before
     // it is applied. Only the local player fills this from the keyboard; a
     // networked player will receive the same struct instead (see PlayerInput).
@@ -217,10 +217,30 @@ static void ProcessInput(HWND) {
                     !ridingBlackHawk && scene.camera.IsSwimming && controlDown);
     // Sliding and riding suppress movement but not the look/jump state above,
     // matching the previous behaviour exactly.
-    if (scene.camera.IsSliding || ridingBlackHawk) {
+    // A downed player joins that list: they keep the look above, because
+    // watching for a teammate is the only thing left to do, but they do not
+    // get to crawl.
+    if (scene.camera.IsSliding || ridingBlackHawk || scene.player.downed) {
         playerInput.forward = 0.0f;
         playerInput.strafe = 0.0f;
     }
+    // Revive is a hold, so it is sampled here with the other held keys rather
+    // than from the edge-triggered WM_KEYDOWN chain below -- which is also
+    // gated on !g_emptyLevelMode, and the empty test level is exactly where
+    // multiplayer gets tested. Only set when there is actually someone to pick
+    // up, so holding E beside a Humvee does not transmit a revive intent.
+    {
+        net::PlayerId reviveTarget = net::kInvalidPlayerId;
+        const bool nearDowned = NearbyDownedPlayer(&reviveTarget) != nullptr;
+        const bool reviveHeld =
+            nearDowned && (GetAsyncKeyState('E') & 0x8000) != 0;
+        playerInput.Set(PlayerInput::Revive, reviveHeld);
+        if (MultiplayerActive()) {
+            g_netSession.ReportReviveIntent(
+                reviveHeld ? reviveTarget : net::kInvalidPlayerId, reviveHeld);
+        }
+    }
+
     scene.camera.ApplyInput(playerInput);
     // Published for the multiplayer layer, which sends it after the local
     // player has finished moving this frame.
@@ -232,7 +252,7 @@ static void ProcessInput(HWND) {
     const bool mouseHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     if (!mouseHeld) g_suppressFireUntilMouseRelease = false;
     if (scene.autoFire && mouseHeld && !g_suppressFireUntilMouseRelease &&
-        !ImGui::GetIO().WantCaptureMouse &&
+        !ImGui::GetIO().WantCaptureMouse && !scene.player.downed &&
         scene.fireCooldown <= 0.0f && ShootPlayerWeapon()) {
         scene.fireCooldown = PlayerFireInterval();
     }
@@ -246,7 +266,8 @@ static void ProcessInput(HWND) {
 
     // Grenade: press G to lob one. Cooldown debounces the held key.
     scene.grenadeCooldown -= deltaTime;
-    if ((GetAsyncKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f) {
+    if ((GetAsyncKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f &&
+        !scene.player.downed) {
         const size_t projectileStart = scene.projectiles.size();
         scene.ThrowGrenade();
         for (size_t index = projectileStart; index < scene.projectiles.size(); ++index)
@@ -275,8 +296,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     const bool blocksGameplayMouse =
         g_game.session.Screen() == GameScreen::MainMenu ||
         g_game.session.Screen() == GameScreen::WinScreen ||
+        // A downed player keeps their mouse: they can still look around while
+        // waiting to be picked up, which is most of what there is to do down
+        // there. Only actual death takes the mouse away.
         (g_game.session.Screen() == GameScreen::Level1 &&
-         !scene.player.godMode && scene.player.health <= 0.0f);
+         !scene.player.godMode && scene.player.health <= 0.0f &&
+         !scene.player.downed);
     if (blocksGameplayMouse &&
         (msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL ||
          msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
@@ -542,7 +567,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // The travel board behaves the same way: E opens it and E leaves
             // it, and it sits after the armory in the chain so a counter placed
             // beside a helicopter still wins the key at its own range.
-            if (g_armoryShopOpen) CloseArmoryShop(hwnd);
+            //
+            // A downed teammate underfoot takes the key before any of that.
+            // The revive itself is a hold sampled in ProcessInput, so nothing
+            // happens here -- this only stops the same press from ALSO putting
+            // the player in a Humvee parked beside the body.
+            if (NearbyDownedPlayer()) { /* handled as a held key above */ }
+            else if (g_armoryShopOpen) CloseArmoryShop(hwnd);
             else if (g_travelScreenOpen) CloseTravelScreen(hwnd);
             else if (!g_game.vehicles.BailOutOfBlackHawk() &&
                 !g_game.vehicles.BailOutOfInsertionBoat() &&

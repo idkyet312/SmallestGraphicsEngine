@@ -506,6 +506,50 @@ static void RenderLoadingScreen() {
     ImGui::End();
 }
 
+// Drawn over the live scene while the local player is downed in a session.
+//
+// Deliberately does NOT touch cameraLocked or release the cursor the way
+// RenderDeathScreen does: cameraLocked short-circuits ProcessInput, which would
+// take mouse-look away from a player whose only remaining activity is looking
+// around for the teammate coming to pick them up.
+static void RenderDownedOverlay() {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    // Much lighter than the death screen's wash: the player still needs to read
+    // the world through it to see who is coming.
+    draw->AddRectFilled(ImVec2(0, 0), display, IM_COL32(70, 0, 0, 90));
+
+    ImDrawList* front = ImGui::GetForegroundDrawList();
+    const char* title = "YOU ARE DOWN";
+    const ImVec2 titleSize = ImGui::CalcTextSize(title);
+    const float centreX = display.x * 0.5f;
+    const float titleY = display.y * 0.34f;
+    front->AddText(ImVec2(centreX - titleSize.x * 0.5f, titleY),
+                   IM_COL32(255, 78, 62, 245), title);
+
+    const bool beingRevived = scene.player.reviveProgress > 0.0f;
+    const char* subtitle = beingRevived ? "HOLD ON" : "WAIT FOR A TEAMMATE";
+    const ImVec2 subtitleSize = ImGui::CalcTextSize(subtitle);
+    front->AddText(ImVec2(centreX - subtitleSize.x * 0.5f, titleY + 22.0f),
+                   IM_COL32(226, 232, 228, 210), subtitle);
+
+    // The progress bar only appears once someone is actually working on you,
+    // so an empty bar never sits there implying a revive that is not happening.
+    if (!beingRevived) return;
+    constexpr float kBarWidth = 220.0f;
+    constexpr float kBarHeight = 6.0f;
+    const float barX = centreX - kBarWidth * 0.5f;
+    const float barY = titleY + 48.0f;
+    front->AddRectFilled(ImVec2(barX, barY),
+                         ImVec2(barX + kBarWidth, barY + kBarHeight),
+                         IM_COL32(18, 22, 20, 200), 2.0f);
+    front->AddRectFilled(
+        ImVec2(barX, barY),
+        ImVec2(barX + kBarWidth * scene.player.reviveProgress,
+               barY + kBarHeight),
+        IM_COL32(120, 230, 150, 240), 2.0f);
+}
+
 static void RenderDeathScreen(HWND hwnd) {
     if (!deathCursorReleased) {
         cameraLocked = true;

@@ -326,9 +326,42 @@ public:
     // is what normally drives the clip and the skinning pose -- without this a
     // remote player would slide around frozen in its bind pose.
     void UpdateNetworkedPose(float dt, bool moving, bool sprinting) {
+        if (netDowned) {
+            // Hold whatever pose they were in and let the roll below lay the
+            // body out. Advancing the clip would have a downed player jogging
+            // on their side.
+            EaseDownedRoll(dt, true);
+            ComputePose(dt);
+            return;
+        }
+        EaseDownedRoll(dt, false);
         PlayClip(moving ? (sprinting ? "Run" : "Walk") : "Idle");
         anim.Advance(dt);
         ComputePose(dt);
+    }
+
+    // Tips a downed player onto their side, and stands them back up on revive.
+    //
+    // Deliberately not a ragdoll. DestructionDX12 has SpawnAuthoredRagdoll and
+    // no counterpart, so a body handed to the solver can never be taken back --
+    // and a downed player is someone who has to stand up again. There is also
+    // no downed or prone clip in the marine's animation set (idle, walk, run
+    // and jumps only), so a frozen pose rolled onto its side is what is
+    // available without new content. It reads as stiff; it is also the only
+    // option here that is reversible.
+    void EaseDownedRoll(float dt, bool down) {
+        constexpr float kDownedRoll = DirectX::XM_PIDIV2;
+        // Standing footOffset lifts the model so its feet meet the ground. On
+        // its side that same lift floats the body, so it drops toward zero.
+        constexpr float kStandingFootOffset = 0.16f;
+        constexpr float kDownedFootOffset = 0.02f;
+        // Roughly half a second either way: fast enough to read as falling
+        // over rather than sinking, slow enough not to pop.
+        const float step = (std::min)(1.0f, dt * 2.5f);
+        const float targetRoll = down ? kDownedRoll : 0.0f;
+        const float targetFoot = down ? kDownedFootOffset : kStandingFootOffset;
+        rootRoll += (targetRoll - rootRoll) * step;
+        footOffset += (targetFoot - footOffset) * step;
     }
 
     void PlayClip(const std::string& name) {

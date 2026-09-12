@@ -21,6 +21,10 @@ static void PlayReloadSound() {
 // shot was blocked (empty magazine or mid-reload) so callers can skip arming the
 // fire cooldown. Ammo is only enforced outside god mode -- see Scene::ConsumeAmmo.
 static bool ShootPlayerWeapon() {
+    // A downed player cannot shoot. Gated here rather than at each of the three
+    // call sites (auto-fire, click, and the vehicle path) so a fourth one
+    // cannot be added without inheriting the rule.
+    if (scene.player.downed) return false;
     const int slot = GunModel::SelectedWeapon();
     const SGE::ResolvedWeaponStats weaponStats =
         scene.player.ResolveWeaponStats(slot);

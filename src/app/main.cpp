@@ -1000,8 +1000,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // are still moved inside the gate, where a level actually exists.
         UpdateMultiplayerSession(deltaTime, g_localPlayerInput);
 
+        // A downed player keeps simulating. Their health is zero, but they are
+        // not out: remote bodies have to keep moving so they can watch a
+        // teammate walk over, and projectiles have to keep flying so the
+        // firefight around them carries on. Without this the world freezes the
+        // instant you go down, which reads as the game having crashed.
+        // Single-player never sets `downed`, so this is unchanged offline.
         if (IsGameplayScreen() && !g_game.loading.Active() &&
-            (scene.player.godMode || scene.player.health > 0.0f)) {
+            (scene.player.godMode || scene.player.health > 0.0f ||
+             scene.player.downed)) {
 
         if (g_game.commands.Consume(GameCommand::ResetLevelRuntime)) {
             // Restart is requested from ImGui after the previous frame's enemy
@@ -5772,6 +5779,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawWeaponPickupPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawRevivePrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawArmoryShopPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 RenderArmoryShopPanel(hwnd);
@@ -5802,7 +5811,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawDXRDDGIProbeDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
-            if (!scene.player.godMode && scene.player.health <= 0.0f) {
+            if (scene.player.downed) {
+                // Not the death screen: the world behind this is still running
+                // and a teammate can still reach you, so it draws over the live
+                // scene instead of taking the frame. The HUD stays up for the
+                // same reason.
+                RenderDownedOverlay();
+                if (showUI) RenderUI(scene, visBuffer);
+            } else if (!scene.player.godMode && scene.player.health <= 0.0f) {
                 RenderDeathScreen(hwnd);
             } else if (g_insertionChoicePending) {
                 // Takes over the frame the same way the death screen does: the

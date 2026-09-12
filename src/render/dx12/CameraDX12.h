@@ -272,13 +272,19 @@ public:
         updateCameraVectors();
     }
 
-    void SetCrouching(bool crouching, float deltaTime) {
+    // `downed` drops the eye to the floor and outranks crouching: a downed
+    // player is on the ground, and it is the one unambiguous way to tell them
+    // so from inside their own head. Driven through the same lerp as crouch so
+    // the grounded position correction below applies unchanged.
+    void SetCrouching(bool crouching, float deltaTime, bool downed = false) {
         if (!FPSMode) return;
         constexpr float standingHeight = 1.7f;
         constexpr float crouchingHeight = 0.95f;
+        constexpr float downedHeight = 0.40f;
         constexpr float transitionSpeed = 5.0f;
         IsCrouching = crouching;
-        const float target = crouching ? crouchingHeight : standingHeight;
+        const float target = downed ? downedHeight
+                           : (crouching ? crouchingHeight : standingHeight);
         const float oldHeight = PlayerHeight;
         const float step = transitionSpeed * deltaTime;
         if (PlayerHeight < target)
