@@ -1500,6 +1500,22 @@ public:
         const XMMATRIX prevWorld = XMLoadFloat4x4(&previousMeshWorld_);
         shader.SetMatrices(world, view, proj, lightSpace, {}, prevWorld);
 
+        // Corpses skip meshlet culling because their bind-pose bounds no longer
+        // describe the ragdoll pose, but that costs a full meshlet dispatch per
+        // body. Only pay it for bodies near the camera, where a dropped limb is
+        // actually visible; distant corpses keep the coarse frustum test. The
+        // camera sits at the translation of the inverted view matrix.
+        bool nearCorpse = false;
+        if (dead_) {
+            const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
+            const XMVECTOR eye = inverseView.r[3];
+            const XMVECTOR toBody = XMVectorSet(position.x, position.y,
+                                                position.z, 1.0f) - eye;
+            constexpr float kNoCullDistance = 30.0f;
+            nearCorpse = XMVectorGetX(XMVector3LengthSq(toBody)) <=
+                         kNoCullDistance * kNoCullDistance;
+        }
+
         for (const auto& prim : model.node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0 || !prim.skinBuffer) continue;
             shader.Use(false);
@@ -1542,9 +1558,10 @@ public:
                     // A ragdoll can be carried far from deathWorld_ while its
                     // meshlet bounds remain in the bind pose. Those stale bounds
                     // can reject an on-screen corpse, especially after a harpoon
-                    // pins it to a wall. Dead bodies are few and already visible
-                    // candidates, so draw every posed meshlet.
-                    !dead_, dead_,
+                    // pins it to a wall. Draw every posed meshlet for bodies
+                    // within kNoCullDistance; beyond that a missing cluster is
+                    // too small to read, so the coarse frustum test is kept.
+                    !dead_, nearCorpse,
                     prevPaletteAddr);
             }
             shader.NextDrawCall();

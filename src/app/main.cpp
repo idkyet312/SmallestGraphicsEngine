@@ -4325,13 +4325,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Content/Models/BlackHawk/blackhawk.glb",
                 g_dx12.device, g_dx12.commandList,
                 g_blackHawkAirframeSkeleton[0]);
-            // Plain loader: this GLB's skin binds no geometry, so the skinned
-            // path would buy an unused palette. Its node hierarchy is what
-            // matters, and LoadGLB keeps that -- ApplyInsertionAirframe finds
-            // the 'Bone' node the rotor disc hangs from and spins it there.
-            g_blackHawkAirframeModel[1] = GLBImporter::LoadGLB(
+            // The static cooked cache flattens away the 'Bone' node that turns
+            // this rotor. Request the authored hierarchy even though this
+            // asset's skin binds no geometry; ApplyInsertionAirframe selects
+            // node animation instead of a palette when no vertices are skinned.
+            g_blackHawkAirframeModel[1] = GLBImporter::LoadGLBSkinned(
                 "Content/Models/NewBlackHawk/NewBlackHawk.glb",
-                g_dx12.device, g_dx12.commandList);
+                g_dx12.device, g_dx12.commandList,
+                g_blackHawkAirframeSkeleton[1]);
             if (g_blackHawkAirframeModel[1])
                 std::cout << "Second insertion airframe GLB ready\n";
             else

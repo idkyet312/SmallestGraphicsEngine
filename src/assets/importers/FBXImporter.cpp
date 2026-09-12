@@ -27,10 +27,13 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     bool loadMaterials,
     bool diffuseAndNormalOnly,
     bool buildMeshlets) {
+    // The OH-1 used to be listed here because its spinning rotors need their own
+    // scene nodes and the cooked format stores a flat primitive list. The cooked
+    // loader now lifts the rotor primitives into nodes itself (keyed off the
+    // preserved primitive names), so the aircraft can come from cache.
     const bool needsAuthoredHierarchy =
         filepath.find("Humvee") != std::string::npos ||
-        filepath.find("humvee") != std::string::npos ||
-        filepath.find("OH-1") != std::string::npos;
+        filepath.find("humvee") != std::string::npos;
     // loadMaterials=false callers (the AK47 and the other view models) assign
     // their material by hand. The cooked loader has no way to skip material
     // work: it creates every baked texture and records its upload into the open
@@ -39,8 +42,18 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     // the GPU is still about to copy into -- "referenced by GPU operations
     // in-flight" corruption, then a device hang. Use the raw importer, which
     // never creates those textures in the first place.
+    // diffuseAndNormalOnly only changes which texture SUFFIX the raw importer
+    // looks for (_Diffuse rather than _BaseColor) while resolving materials by
+    // hand. A cooked asset already carries its baked materials, so the suffix
+    // convention no longer applies there and the flag need not veto the cache;
+    // vetoing it is what kept the OH-1 re-importing a 9.8 MB FBX every load.
+    // Kept narrow deliberately: the OH-1 is the only caller that passes the
+    // flag, and widening this for a future one should be a considered change.
+    const bool suffixOnlyMaterials =
+        diffuseAndNormalOnly &&
+        filepath.find("OH-1") == std::string::npos;
     if (device && loadMaterials && !splitIntoDestructibleBoards &&
-        !diffuseAndNormalOnly && !needsAuthoredHierarchy) {
+        !suffixOnlyMaterials && !needsAuthoredHierarchy) {
         if (auto cooked = CookedAssetLoader::LoadForSource(
                 filepath, device, commandList)) {
             std::cout << "Loaded cooked model: "

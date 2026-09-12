@@ -4,10 +4,14 @@
 #include "CookedAssetPaths.h"
 #include "StaticBufferDX12.h"
 #include "TextureUploadArenaDX12.h"
+// Rotor primitives are re-centred and lifted into their own nodes below, which
+// needs the meshlet builder.
+#include "GLBImporter.h"
 
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -574,6 +578,72 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
             source.meshletTriangleCount,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             "CookedMeshletTriangles");
+        // Parts that have to move independently cannot live in the shared mesh:
+        // the cooked format stores a flat primitive list, so anything that needs
+        // its own transform is lifted into a child node here, keyed off the
+        // primitive name the cooker preserved. The OH-1's rotor discs are the
+        // only such parts today, and this is what lets the aircraft load from
+        // cache instead of re-importing its FBX just to keep two nodes.
+        //
+        // Vertices are re-centred on the part's own bounds and the offset moved
+        // into the node translation, so rotating the node spins the disc about
+        // its hub rather than sweeping it around the model origin.
+        const std::string primitiveName = GetString(map, header, source.name);
+        const bool isRotor = primitiveName == "Rotor" ||
+                             primitiveName == "Tail_Rotor";
+        if (isRotor) {
+            XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                minimum.x = (std::min)(minimum.x, primitive.vertices[v]);
+                minimum.y = (std::min)(minimum.y, primitive.vertices[v + 1]);
+                minimum.z = (std::min)(minimum.z, primitive.vertices[v + 2]);
+                maximum.x = (std::max)(maximum.x, primitive.vertices[v]);
+                maximum.y = (std::max)(maximum.y, primitive.vertices[v + 1]);
+                maximum.z = (std::max)(maximum.z, primitive.vertices[v + 2]);
+            }
+            const XMFLOAT3 pivot{ (minimum.x + maximum.x) * 0.5f,
+                                  (minimum.y + maximum.y) * 0.5f,
+                                  (minimum.z + maximum.z) * 0.5f };
+            for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                primitive.vertices[v] -= pivot.x;
+                primitive.vertices[v + 1] -= pivot.y;
+                primitive.vertices[v + 2] -= pivot.z;
+            }
+            // The GPU buffers above were filled from the cooked (un-centred)
+            // vertices, so rebuild them plus the meshlet data from the shifted
+            // copy or the disc would draw at its original offset.
+            primitive.vertexBuffer = StaticBuffer(device.Get(),
+                reinterpret_cast<const Cooked::Vertex*>(
+                    primitive.vertices.data()),
+                source.vertexCount,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                "CookedRotorVertexBuffer");
+            if (primitive.vertexBuffer) {
+                primitive.vbv.BufferLocation =
+                    primitive.vertexBuffer->GetGPUVirtualAddress();
+                primitive.vbv.SizeInBytes =
+                    source.vertexCount * sizeof(Cooked::Vertex);
+                primitive.vbv.StrideInBytes = sizeof(Cooked::Vertex);
+            }
+            primitive.boundsMin = { minimum.x - pivot.x, minimum.y - pivot.y,
+                                    minimum.z - pivot.z };
+            primitive.boundsMax = { maximum.x - pivot.x, maximum.y - pivot.y,
+                                    maximum.z - pivot.z };
+            GLBImporter::BuildMeshletData(primitive, device.Get());
+
+            auto rotorNode = std::make_shared<SceneNode>(
+                primitiveName == "Rotor" ? "OH1MainRotor" : "OH1TailRotor");
+            rotorNode->translation = pivot;
+            rotorNode->mesh = std::make_shared<SceneMesh>();
+            rotorNode->mesh->name = rotorNode->name;
+            rotorNode->mesh->primitives.push_back(std::move(primitive));
+            rotorNode->UpdateLocalTransform();
+            root->AddChild(rotorNode);
+            PumpPendingWindowMessages();
+            continue;
+        }
         root->mesh->primitives.push_back(std::move(primitive));
         PumpPendingWindowMessages();
     }

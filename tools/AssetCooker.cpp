@@ -26,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <functional>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -1303,8 +1304,22 @@ bool Cook(const fs::path& source, const fs::path& destination) {
 
     if (animationScene->HasMeshes()) {
         Assimp::Importer geometryImporter;
+        // PreTransformVertices is kept for every asset: the cooked format has no
+        // node hierarchy, so geometry must arrive already placed or the model
+        // falls apart. OptimizeMeshes/OptimizeGraph, however, merge meshes that
+        // share a material and erase the per-mesh names with them. The OH-1's
+        // rotor discs have to survive as their own named meshes so the loader
+        // can lift them into spinnable nodes, so merging alone is disabled
+        // there -- the discs stay separate and still land in the right place.
+        const bool preserveRotorMeshes =
+            source.filename().string().find("OH-1") != std::string::npos;
+        unsigned geometryFlags = baseFlags | aiProcess_PreTransformVertices;
+        if (preserveRotorMeshes)
+            geometryFlags &= ~(aiProcess_PreTransformVertices |
+                               aiProcess_OptimizeMeshes |
+                               aiProcess_OptimizeGraph);
         const aiScene* scene = geometryImporter.ReadFile(
-            source.string(), baseFlags | aiProcess_PreTransformVertices);
+            source.string(), geometryFlags);
         if (!scene || !scene->HasMeshes()) {
             std::cerr << source.generic_string() << ": "
                       << geometryImporter.GetErrorString() << "\n";
@@ -1312,10 +1327,54 @@ bool Cook(const fs::path& source, const fs::path& destination) {
         }
         context.scene = scene;
         ExtractMaterials(context);
+        // Without PreTransformVertices the meshes arrive in node space, so the
+        // node transforms are collected and baked per mesh below -- the flat
+        // cooked format cannot carry a hierarchy, and this keeps the geometry
+        // placed exactly as the merged path would have while leaving each mesh
+        // separately named.
+        std::vector<aiMatrix4x4> meshTransforms(scene->mNumMeshes);
+        std::vector<bool> meshPlaced(scene->mNumMeshes, false);
+        if (preserveRotorMeshes) {
+            std::function<void(const aiNode*, const aiMatrix4x4&)> collect =
+                [&](const aiNode* node, const aiMatrix4x4& parent) {
+                    if (!node) return;
+                    const aiMatrix4x4 global = parent * node->mTransformation;
+                    for (uint32_t m = 0; m < node->mNumMeshes; ++m) {
+                        const uint32_t index = node->mMeshes[m];
+                        if (index < meshTransforms.size() && !meshPlaced[index]) {
+                            meshTransforms[index] = global;
+                            meshPlaced[index] = true;
+                        }
+                    }
+                    for (uint32_t c = 0; c < node->mNumChildren; ++c)
+                        collect(node->mChildren[c], global);
+                };
+            collect(scene->mRootNode, aiMatrix4x4());
+        }
+
         context.primitives.reserve(scene->mNumMeshes);
-        for (uint32_t i = 0; i < scene->mNumMeshes; ++i)
+        for (uint32_t i = 0; i < scene->mNumMeshes; ++i) {
+            if (preserveRotorMeshes && meshPlaced[i]) {
+                aiMesh& mesh = *scene->mMeshes[i];
+                const aiMatrix4x4& transform = meshTransforms[i];
+                aiMatrix3x3 normalMatrix(transform);
+                normalMatrix.Inverse().Transpose();
+                for (uint32_t v = 0; v < mesh.mNumVertices; ++v) {
+                    mesh.mVertices[v] = transform * mesh.mVertices[v];
+                    if (mesh.HasNormals())
+                        mesh.mNormals[v] =
+                            (normalMatrix * mesh.mNormals[v]).Normalize();
+                    if (mesh.HasTangentsAndBitangents()) {
+                        mesh.mTangents[v] =
+                            (normalMatrix * mesh.mTangents[v]).Normalize();
+                        mesh.mBitangents[v] =
+                            (normalMatrix * mesh.mBitangents[v]).Normalize();
+                    }
+                }
+            }
             context.primitives.push_back(ExtractPrimitive(
                 *scene->mMeshes[i], context.strings, context.materials));
+        }
     }
     return WriteAsset(context, destination);
 }

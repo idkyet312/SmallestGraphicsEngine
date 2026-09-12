@@ -775,7 +775,7 @@ struct Scene {
     }
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.69f;
-    float ambientOcclusionStrength = 2.80f;
+    float ambientOcclusionStrength = 1.59f;
     float ambientOcclusionBias = 0.035f;
     float contactShadowStrength = 0.65f;
     // Test the contact-shadow occluder slab in linear depth instead of device
