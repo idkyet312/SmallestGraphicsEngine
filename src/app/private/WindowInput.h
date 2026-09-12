@@ -182,6 +182,17 @@ static void ProcessInput(HWND) {
 
     const bool crouching = controlDown || scene.camera.IsSliding;
     scene.camera.SetCrouching(crouching, deltaTime);
+    // Everything the player is asking for this frame, captured as data before
+    // it is applied. Only the local player fills this from the keyboard; a
+    // networked player will receive the same struct instead (see PlayerInput).
+    PlayerInput playerInput;
+    playerInput.forward = forwardInput;
+    playerInput.strafe = strafeInput;
+    playerInput.yaw = scene.camera.Yaw;
+    playerInput.pitch = scene.camera.Pitch;
+    playerInput.deltaTime = deltaTime;
+    playerInput.Set(PlayerInput::Crouch, crouching);
+    playerInput.Set(PlayerInput::Sprint, sprinting);
     // Sprint is 1.5x walk (7.5 m/s against a 5.0 m/s Camera::MovementSpeed).
     // Was 2.0x, which outran the traversal the island is built for.
     constexpr float kSprintMovementScale = 1.5f;
@@ -192,21 +203,25 @@ static void ProcessInput(HWND) {
     // crouched must NOT speed the legs up -- the multiplier above is the
     // authority on whether this is a sprint, not the key state alone.
     g_playerSprinting = sprinting && !crouching;
-    if (!scene.camera.IsSliding && !ridingBlackHawk) {
-        if ((GetAsyncKeyState('W') & 0x8000) || mouseWalkForward)
-            scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
-        if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, movementMultiplier);
-        if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
-        if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
-    }
+    playerInput.movementMultiplier = movementMultiplier;
     // Space rises, crouch dives. While swimming the crouch gate is lifted:
     // crouching underwater means "swim down", so it must not also block the
     // ascend key the way it blocks jumping on land.
-    if (!ridingBlackHawk && (scene.camera.IsSwimming || !crouching) &&
-        (GetAsyncKeyState(VK_SPACE) & 0x8000))
-        scene.camera.ProcessKeyboard(' ', deltaTime);
-    if (!ridingBlackHawk && scene.camera.IsSwimming && controlDown)
-        scene.camera.ProcessKeyboard('Q', deltaTime);
+    const bool jumpHeld = !ridingBlackHawk &&
+        (scene.camera.IsSwimming || !crouching) &&
+        (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+    playerInput.Set(PlayerInput::Jump,
+                    jumpHeld && !scene.camera.IsSwimming);
+    playerInput.Set(PlayerInput::Swim, jumpHeld && scene.camera.IsSwimming);
+    playerInput.Set(PlayerInput::SwimDown,
+                    !ridingBlackHawk && scene.camera.IsSwimming && controlDown);
+    // Sliding and riding suppress movement but not the look/jump state above,
+    // matching the previous behaviour exactly.
+    if (scene.camera.IsSliding || ridingBlackHawk) {
+        playerInput.forward = 0.0f;
+        playerInput.strafe = 0.0f;
+    }
+    scene.camera.ApplyInput(playerInput);
 
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.

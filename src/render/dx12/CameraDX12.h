@@ -1,6 +1,8 @@
 #ifndef CAMERA_DX12_H
 #define CAMERA_DX12_H
 
+#include "PlayerInput.h"
+
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cmath>
@@ -224,6 +226,40 @@ public:
             
             XMStoreFloat3(&Position, pos);
         }
+    }
+
+    // Applies one sampled frame of intent. Deliberately delegates to
+    // ProcessKeyboard rather than reimplementing the movement maths: the two
+    // must stay identical, and the only way to guarantee that is to have one
+    // implementation. Axes are thresholded rather than scaled so a full-tilt
+    // stick reproduces the old key-held behaviour exactly; partial deflection
+    // scales the speed through the existing multiplier argument.
+    //
+    // Look angles are absolute (see PlayerInput), so they are assigned rather
+    // than accumulated -- that is what makes a dropped packet cost one stale
+    // frame instead of a permanent aim desync.
+    void ApplyInput(const PlayerInput& input) {
+        const float dt = input.deltaTime;
+        if (input.forward != 0.0f) {
+            const float scale = std::abs(input.forward) * input.movementMultiplier;
+            ProcessKeyboard(input.forward > 0.0f ? 'W' : 'S', dt, scale);
+        }
+        if (input.strafe != 0.0f) {
+            const float scale = std::abs(input.strafe) * input.movementMultiplier;
+            ProcessKeyboard(input.strafe > 0.0f ? 'A' : 'D', dt, scale);
+        }
+        if (input.Held(PlayerInput::Jump) || input.Held(PlayerInput::Swim))
+            ProcessKeyboard(' ', dt);
+        if (input.Held(PlayerInput::SwimDown)) ProcessKeyboard('Q', dt);
+    }
+
+    // Points the camera at an absolute orientation, for a remote player whose
+    // angles arrive over the wire. Local look still goes through
+    // ProcessMouseMovement, which owns sensitivity and pitch clamping.
+    void SetViewAngles(float yawDegrees, float pitchDegrees) {
+        Yaw = yawDegrees;
+        Pitch = std::clamp(pitchDegrees, -89.0f, 89.0f);
+        updateCameraVectors();
     }
 
     void ProcessMouseMovement(float xoffset, float yoffset) {

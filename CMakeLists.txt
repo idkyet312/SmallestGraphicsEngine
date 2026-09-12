@@ -602,6 +602,11 @@ if(BUILD_TESTING)
     add_executable(DirectionalLocomotionTests tests/DirectionalLocomotionTests.cpp)
     target_link_libraries(DirectionalLocomotionTests PRIVATE SGEProjectHeaders assimp::assimp)
     add_test(NAME DirectionalLocomotionTests COMMAND DirectionalLocomotionTests "${CMAKE_SOURCE_DIR}")
+
+    # Pure struct/bitfield checks -- no device, no socket, no content root.
+    add_executable(PlayerInputTests tests/PlayerInputTests.cpp)
+    target_link_libraries(PlayerInputTests PRIVATE SGEProjectHeaders)
+    add_test(NAME PlayerInputTests COMMAND PlayerInputTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
