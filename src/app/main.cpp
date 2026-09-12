@@ -147,6 +147,7 @@ using namespace DirectX;
 #include "private/Multiplayer.h"
 #include "private/WindowInput.h"
 #include "private/Boot.h"
+#include "private/EnemyDeathSmoke.h"
 
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdShow) {
@@ -609,6 +610,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // launched from a shell is what milestone 1 actually needs to be testable,
     // and a failure leaves the game running single-player rather than exiting.
     StartMultiplayerFromCommandLine(commandLine ? commandLine : "");
+    StartEnemyDeathSmoke(hwnd);
 
     // Deterministic renderer smoke path for GPU validation and crash dumps.
     bool visibilityTestPending = false;
@@ -2136,6 +2138,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         break; // one moving chunk damages one character per frame
                     }
                 }
+            }
+            // Test-level and replicated actors need the same corpse handoff as
+            // authored squads, even when the level skips AI and debris damage.
+            if (AnySkinnedActorsToDraw()) {
                 PlayBanditDeathEvents();
                 for (auto& bandit : g_bandits)
                     if (bandit && bandit->Dead()) bandit->SyncRagdoll();
@@ -6176,6 +6182,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool shotgunSmokeReady =
             (fullLevelAssetsLoaded || emptyLevelAssetsLoaded) &&
             !g_prefabRebuildRequested;
+        if (shotgunSmokeReady && !g_game.loading.Active())
+            UpdateEnemyDeathSmoke();
         if (g_shotgunSmokeEnabled && shotgunSmokeReady &&
             ++g_shotgunSmokeFrames > kSmokeInterval) {
             g_shotgunSmokeFrames = 0;

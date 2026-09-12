@@ -1697,6 +1697,9 @@ public:
         g_dx12.commandList->SetGraphicsRootSignature(currentDrawBindless
             ? bindlessRootSignature.Get() : rootSignature.Get());
         BindFrameConstants();
+        // A root-signature switch invalidates b9. Procedural draws have no
+        // skin buffers; skinned IA draws explicitly opt in after binding.
+        SetSkinningEnabled(false);
         if (activeMatrixDrawCall < kDrawCallsPerView)
             g_dx12.commandList->SetGraphicsRootConstantBufferView(
                     0, matrixBuffer.GetGPUAddress(
@@ -1723,6 +1726,9 @@ public:
             graphicsRootBound = false;
         }
         EnsureGraphicsRootBound();
+        // Materials also precede procedural draws after a skinned IA draw.
+        // The mesh draw opts back in once its palette and skin SRVs are ready.
+        SetSkinningEnabled(false);
         ID3D12PipelineState* pso = nullptr;
         if (drawPipelineKind == DrawPipelineKind::Transparent)
             pso = GetTransparentPipelineState();
