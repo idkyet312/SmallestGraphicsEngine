@@ -21,7 +21,8 @@ namespace net {
 // far worse to debug than being told the builds differ.
 // 2: PlayerSnapshot gained health/downed/reviver, and PvP hit reporting,
 // player state events and revive progress were added.
-inline constexpr uint32_t kProtocolVersion = 2;
+// 3: enemies are host-authoritative and ride in their own snapshot.
+inline constexpr uint32_t kProtocolVersion = 3;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -30,6 +31,17 @@ inline constexpr uint32_t kProtocolMagic = 0x53474531u; // "SGE1"
 inline constexpr uint8_t kMaxPlayers = 4;
 using PlayerId = uint8_t;
 inline constexpr PlayerId kInvalidPlayerId = 0xFF;
+
+// Enemies are identified by a stable id assigned at spawn, not by their index
+// in g_bandits -- that vector is compacted when bodies are removed, which would
+// silently renumber every actor after the gap and hand a client the wrong one.
+using EnemyId = uint16_t;
+inline constexpr EnemyId kInvalidEnemyId = 0xFFFF;
+// How many enemies ride in one snapshot. A level holds far more than this, so
+// the host sends the nearest few to each client: at combat range that is every
+// enemy that matters, and it keeps the message inside one datagram no matter
+// how large the level gets. Distant actors pop in as a player approaches.
+inline constexpr uint8_t kMaxReplicatedEnemies = 16;
 
 enum class MessageType : uint8_t {
     ClientHello = 1,   // client -> host, reliable
@@ -42,6 +54,8 @@ enum class MessageType : uint8_t {
     ClientHitReport,   // client -> host, reliable
     ServerPlayerStateChanged, // host -> client, reliable
     ClientReviveProgress,     // client -> host, unreliable
+    ServerEnemySnapshot,      // host -> client, unreliable, every net tick
+    ClientEnemyHitReport,     // client -> host, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -189,6 +203,52 @@ struct ClientReviveProgressMessage {
     PlayerId target = kInvalidPlayerId;
     uint8_t holding = 0;
     uint8_t padding[2] = {};
+};
+
+// One AI actor, as the host sees it. Clients do not run enemy AI at all: they
+// render what arrives here, so this has to carry everything the body needs to
+// be drawn and animated, not just where it is.
+struct EnemySnapshot {
+    EnemyId id = kInvalidEnemyId;
+    // Packed pose state, so the client can pick a clip without re-deriving it
+    // from position deltas -- which would lag a frame behind and read as the
+    // animation sticking.
+    uint8_t moving = 0;
+    uint8_t dead = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    // Radians, matching SkinnedEnemy. Both are sent because the upper body aims
+    // independently of the legs, and a client that guessed one from the other
+    // would have every enemy facing its feet.
+    float yaw = 0.0f;
+    float aimYaw = 0.0f;
+    float aimPitch = 0.0f;
+    float health = 0.0f;
+};
+
+// The enemies nearest one client. Sent per-connection rather than broadcast,
+// because "nearest" is different for every player.
+struct ServerEnemySnapshotMessage {
+    MessageHeader header{ MessageType::ServerEnemySnapshot, {} };
+    uint32_t tick = 0;
+    uint8_t enemyCount = 0;
+    uint8_t padding[3] = {};
+    EnemySnapshot enemies[kMaxReplicatedEnemies];
+};
+
+// A client's round connected with an enemy. Same shooter-authoritative bargain
+// as ClientHitReport: the client ran the geometry test against the body it can
+// see, and the host owns what the damage does.
+struct ClientEnemyHitReportMessage {
+    MessageHeader header{ MessageType::ClientEnemyHitReport, {} };
+    EnemyId target = kInvalidEnemyId;
+    uint8_t headshot = 0;
+    uint8_t padding = 0;
+    float damage = 0.0f;
+    // Direction the round was travelling and where it struck, so the host's
+    // ragdoll gets the same impulse the shooter saw rather than flopping a
+    // different way on every machine.
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
 };
 
 } // namespace net

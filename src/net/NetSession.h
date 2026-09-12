@@ -6,6 +6,7 @@
 #include "NetProtocol.h"
 #include "NetTransport.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -58,6 +59,40 @@ struct RemotePlayer {
     bool downed = false;
     PlayerId reviver = kInvalidPlayerId;
     float reviveProgress = 0.0f;   // 0..1
+};
+
+// One AI actor as the game should render it. The client's view of an enemy is
+// entirely this: it runs no enemy AI of its own.
+struct RemoteEnemy {
+    EnemyId id = kInvalidEnemyId;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f, aimYaw = 0.0f, aimPitch = 0.0f;
+    float health = 0.0f;
+    bool moving = false;
+    bool dead = false;
+};
+
+// What the host publishes about one of its enemies each tick. The host fills a
+// vector of these from g_bandits; the session does the culling and the sending.
+struct HostEnemyState {
+    EnemyId id = kInvalidEnemyId;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f, aimYaw = 0.0f, aimPitch = 0.0f;
+    float health = 0.0f;
+    bool moving = false;
+    bool dead = false;
+};
+
+// A hit a client reported on one of the host's enemies, drained by the host and
+// applied to the real actor. The session cannot apply it itself: it knows
+// nothing about SkinnedEnemy, which is the boundary that keeps it testable.
+struct EnemyHitRequest {
+    EnemyId target = kInvalidEnemyId;
+    PlayerId shooter = kInvalidPlayerId;
+    float damage = 0.0f;
+    bool headshot = false;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float hitX = 0.0f, hitY = 0.0f, hitZ = 0.0f;
 };
 
 // The local player's own authoritative life state, read back every frame so the
@@ -136,6 +171,10 @@ public:
         players_ = {};
         peerToPlayer_.clear();
         stateChanges_.clear();
+        hostEnemies_.clear();
+        remoteEnemies_.clear();
+        enemyHits_.clear();
+        lastEnemyTick_ = 0;
         tick_ = 0;
         clock_.Reset();
     }
@@ -187,6 +226,7 @@ public:
                 StepRegen(step);
                 StepRevives(step);
                 SendSnapshot();
+                SendEnemySnapshots();
             } else {
                 SendInput(local.input);
             }
@@ -392,6 +432,63 @@ public:
         out.reviveProgress = kReviveSeconds > 0.0f
             ? Clamp01(slot.reviveProgress / kReviveSeconds) : 0.0f;
         return true;
+    }
+
+    // ---- Enemies ------------------------------------------------------
+    //
+    // Enemies are host-authoritative outright: a client runs no enemy AI at
+    // all. Two machines each simulating their own copy would diverge within
+    // seconds -- the scatter seed alone is std::time(nullptr), so they would
+    // not even start from the same layout -- and each player would be killing
+    // a private set of bodies the other never saw fall.
+
+    // Host-side, once per frame: hand the session the current state of every
+    // AI actor. Stored rather than sent immediately, because sending happens on
+    // the net tick and per-client culling needs all of them to choose from.
+    void PublishEnemies(const std::vector<HostEnemyState>& enemies) {
+        if (role_ != Role::Host) return;
+        hostEnemies_ = enemies;
+    }
+
+    // Client-side: the enemies the host last told us about.
+    const std::vector<RemoteEnemy>& RemoteEnemies() const {
+        return remoteEnemies_;
+    }
+
+    // A round from this machine hit an enemy. On a client this reports to the
+    // host; on the host it queues into the same list the reports land in, so
+    // both take one identical path into the damage code.
+    void ReportEnemyHit(EnemyId target, float damage, bool headshot,
+                        float dirX, float dirY, float dirZ,
+                        float hitX, float hitY, float hitZ) {
+        if (!Active() || target == kInvalidEnemyId) return;
+        if (role_ == Role::Host) {
+            EnemyHitRequest request;
+            request.target = target;
+            request.shooter = localId_;
+            request.damage = damage;
+            request.headshot = headshot;
+            request.dirX = dirX; request.dirY = dirY; request.dirZ = dirZ;
+            request.hitX = hitX; request.hitY = hitY; request.hitZ = hitZ;
+            enemyHits_.push_back(request);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientEnemyHitReportMessage message;
+        message.target = target;
+        message.headshot = headshot ? 1 : 0;
+        message.damage = damage;
+        message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+        message.hitX = hitX; message.hitY = hitY; message.hitZ = hitZ;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Host-side: the hits to apply this frame, moved out so each is applied
+    // exactly once.
+    void DrainEnemyHits(std::vector<EnemyHitRequest>& out) {
+        out.clear();
+        out.swap(enemyHits_);
     }
 
     // Seats a player in a slot without a handshake. The host uses this for
@@ -610,6 +707,12 @@ private:
         case MessageType::ServerPlayerStateChanged:
             if (role_ == Role::Client) HandlePlayerStateChanged(event);
             break;
+        case MessageType::ServerEnemySnapshot:
+            if (role_ == Role::Client) HandleEnemySnapshot(event);
+            break;
+        case MessageType::ClientEnemyHitReport:
+            if (role_ == Role::Host) HandleEnemyHitReport(event);
+            break;
         default:
             break;
         }
@@ -804,6 +907,112 @@ private:
         transport_->Broadcast(&snapshot, sizeof(snapshot), Channel::Unreliable);
     }
 
+    // Per-connection rather than broadcast: "nearest" is a different set for
+    // every player, so each client gets its own message.
+    void SendEnemySnapshots() {
+        if (hostEnemies_.empty()) return;
+        for (const auto& entry : peerToPlayer_) {
+            const PeerId peer = entry.first;
+            const PlayerId id = entry.second;
+            if (id >= kMaxPlayers || !players_[id].active) continue;
+            const PlayerSlot& slot = players_[id];
+
+            // Nearest first. Partial rather than a full sort: only the front
+            // kMaxReplicatedEnemies matter and a level can hold many times that.
+            enemyOrder_.clear();
+            enemyOrder_.reserve(hostEnemies_.size());
+            for (size_t i = 0; i < hostEnemies_.size(); ++i) {
+                const HostEnemyState& enemy = hostEnemies_[i];
+                const float dx = enemy.x - slot.current.x;
+                const float dz = enemy.z - slot.current.z;
+                enemyOrder_.push_back({ dx * dx + dz * dz, i });
+            }
+            const size_t send =
+                enemyOrder_.size() < kMaxReplicatedEnemies
+                    ? enemyOrder_.size() : kMaxReplicatedEnemies;
+            std::partial_sort(
+                enemyOrder_.begin(), enemyOrder_.begin() + send,
+                enemyOrder_.end(),
+                [](const RankedEnemy& a, const RankedEnemy& b) {
+                    return a.distanceSquared < b.distanceSquared;
+                });
+
+            ServerEnemySnapshotMessage message;
+            message.tick = tick_;
+            message.enemyCount = static_cast<uint8_t>(send);
+            for (size_t i = 0; i < send; ++i) {
+                const HostEnemyState& source =
+                    hostEnemies_[enemyOrder_[i].index];
+                EnemySnapshot& out = message.enemies[i];
+                out.id = source.id;
+                out.x = source.x; out.y = source.y; out.z = source.z;
+                out.yaw = source.yaw;
+                out.aimYaw = source.aimYaw;
+                out.aimPitch = source.aimPitch;
+                out.health = source.health;
+                out.moving = source.moving ? 1 : 0;
+                out.dead = source.dead ? 1 : 0;
+            }
+            transport_->Send(peer, &message, sizeof(message),
+                             Channel::Unreliable);
+        }
+    }
+
+    void HandleEnemySnapshot(Event& event) {
+        if (event.payload.size() < sizeof(ServerEnemySnapshotMessage)) return;
+        ServerEnemySnapshotMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        // Same discard rule as the player snapshot: older than what we have is
+        // dropped rather than rewound, which is what makes UDP reordering
+        // harmless. An enemy that flickered back to a stale position would read
+        // as the AI teleporting.
+        if (message.tick <= lastEnemyTick_ && lastEnemyTick_ != 0) return;
+        lastEnemyTick_ = message.tick;
+
+        const uint8_t count = message.enemyCount < kMaxReplicatedEnemies
+            ? message.enemyCount : kMaxReplicatedEnemies;
+        remoteEnemies_.clear();
+        remoteEnemies_.reserve(count);
+        for (uint8_t i = 0; i < count; ++i) {
+            const EnemySnapshot& incoming = message.enemies[i];
+            if (incoming.id == kInvalidEnemyId) continue;
+            RemoteEnemy enemy;
+            enemy.id = incoming.id;
+            enemy.x = incoming.x; enemy.y = incoming.y; enemy.z = incoming.z;
+            enemy.yaw = incoming.yaw;
+            enemy.aimYaw = incoming.aimYaw;
+            enemy.aimPitch = incoming.aimPitch;
+            enemy.health = incoming.health;
+            enemy.moving = incoming.moving != 0;
+            enemy.dead = incoming.dead != 0;
+            remoteEnemies_.push_back(enemy);
+        }
+    }
+
+    void HandleEnemyHitReport(Event& event) {
+        if (event.payload.size() < sizeof(ClientEnemyHitReportMessage)) return;
+        ClientEnemyHitReportMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        // Clamped for the same reason player damage is: shooter-authoritative
+        // means unvalidated, and a bug must not be able to send a wild value
+        // into the gameplay code.
+        if (!(message.damage >= 0.0f)) return;
+        EnemyHitRequest request;
+        request.target = message.target;
+        request.shooter = it->second;
+        request.damage = message.damage < 1000.0f ? message.damage : 1000.0f;
+        request.headshot = message.headshot != 0;
+        request.dirX = message.dirX;
+        request.dirY = message.dirY;
+        request.dirZ = message.dirZ;
+        request.hitX = message.hitX;
+        request.hitY = message.hitY;
+        request.hitZ = message.hitZ;
+        enemyHits_.push_back(request);
+    }
+
     void SendInput(const PlayerInput& input) {
         if (localId_ == kInvalidPlayerId || serverPeer_ == kInvalidPeer) return;
         ClientInputMessage message;
@@ -855,6 +1064,18 @@ private:
 
     // Life-state edges waiting to be drained by the game this frame.
     std::vector<PlayerStateChange> stateChanges_;
+
+    // Enemy replication. hostEnemies_ is what the host published this frame;
+    // remoteEnemies_ is what a client was last told. Only one is ever populated
+    // on a given machine.
+    std::vector<HostEnemyState> hostEnemies_;
+    std::vector<RemoteEnemy> remoteEnemies_;
+    std::vector<EnemyHitRequest> enemyHits_;
+    uint32_t lastEnemyTick_ = 0;
+    // Scratch for the per-client nearest-enemy sort, kept so the send does not
+    // allocate once per client per tick.
+    struct RankedEnemy { float distanceSquared; size_t index; };
+    std::vector<RankedEnemy> enemyOrder_;
 
     std::unique_ptr<NetTransport> transport_;
     Role role_ = Role::Offline;

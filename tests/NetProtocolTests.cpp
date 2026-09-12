@@ -59,7 +59,7 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 2, "protocol version was not bumped");
+    Check(kProtocolVersion == 3, "protocol version was not bumped");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -250,11 +250,69 @@ int main() {
     Check(reviveInputReceived.input.Held(PlayerInput::Revive),
           "revive button did not round-trip");
 
-    // A snapshot must fit comfortably in a normal MTU, or every send fragments.
+    // The enemy snapshot, which is the largest message on the wire.
+    static_assert(std::is_trivially_copyable<ServerEnemySnapshotMessage>::value,
+                  "ServerEnemySnapshotMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientEnemyHitReportMessage>::value,
+                  "ClientEnemyHitReportMessage must stay memcpy-able");
+    static_assert(offsetof(ServerEnemySnapshotMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ClientEnemyHitReportMessage, header) == 0,
+                  "header must lead");
+    Check(ServerEnemySnapshotMessage{}.header.type ==
+              MessageType::ServerEnemySnapshot,
+          "ServerEnemySnapshotMessage has the wrong default type");
+    Check(ClientEnemyHitReportMessage{}.header.type ==
+              MessageType::ClientEnemyHitReport,
+          "ClientEnemyHitReportMessage has the wrong default type");
+
+    ServerEnemySnapshotMessage enemiesSent;
+    enemiesSent.tick = 555u;
+    enemiesSent.enemyCount = kMaxReplicatedEnemies;
+    for (uint8_t i = 0; i < kMaxReplicatedEnemies; ++i) {
+        enemiesSent.enemies[i].id = static_cast<EnemyId>(1000 + i);
+        enemiesSent.enemies[i].x = 4.0f * i;
+        enemiesSent.enemies[i].yaw = 0.5f * i;
+        enemiesSent.enemies[i].aimYaw = -0.25f * i;
+        enemiesSent.enemies[i].health = 100.0f - i;
+        enemiesSent.enemies[i].moving = static_cast<uint8_t>(i % 2);
+        enemiesSent.enemies[i].dead = static_cast<uint8_t>(i == 5 ? 1 : 0);
+    }
+
+    unsigned char enemyBuffer[sizeof(ServerEnemySnapshotMessage)];
+    std::memcpy(enemyBuffer, &enemiesSent, sizeof(enemyBuffer));
+    ServerEnemySnapshotMessage enemiesReceived;
+    std::memcpy(&enemiesReceived, enemyBuffer, sizeof(enemyBuffer));
+
+    Check(enemiesReceived.tick == enemiesSent.tick,
+          "enemy snapshot tick did not round-trip");
+    Check(enemiesReceived.enemyCount == kMaxReplicatedEnemies,
+          "enemy count did not round-trip");
+    for (uint8_t i = 0; i < kMaxReplicatedEnemies; ++i) {
+        Check(enemiesReceived.enemies[i].id == enemiesSent.enemies[i].id,
+              "enemy id lost");
+        Check(enemiesReceived.enemies[i].x == enemiesSent.enemies[i].x,
+              "enemy x lost");
+        Check(enemiesReceived.enemies[i].aimYaw ==
+                  enemiesSent.enemies[i].aimYaw,
+              "enemy aimYaw lost");
+        Check(enemiesReceived.enemies[i].health ==
+                  enemiesSent.enemies[i].health,
+              "enemy health lost");
+        Check(enemiesReceived.enemies[i].dead == enemiesSent.enemies[i].dead,
+              "enemy dead flag lost");
+    }
+
+    // Both snapshots must fit comfortably in a normal MTU, or every send
+    // fragments. The enemy one is the message that grows with kMaxReplicatedEnemies,
+    // so this is the assertion that catches raising that cap too far.
     Check(sizeof(ServerSnapshotMessage) < 1200,
           "snapshot is too large for a single unfragmented datagram");
+    Check(sizeof(ServerEnemySnapshotMessage) < 1200,
+          "enemy snapshot is too large for a single unfragmented datagram");
 
     std::cout << "NetProtocol tests passed ("
-              << sizeof(ServerSnapshotMessage) << " byte snapshot)\n";
+              << sizeof(ServerSnapshotMessage) << " byte player snapshot, "
+              << sizeof(ServerEnemySnapshotMessage) << " byte enemy snapshot)\n";
     return 0;
 }

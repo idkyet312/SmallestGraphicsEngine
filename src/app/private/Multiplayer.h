@@ -156,6 +156,139 @@ static void DrawRevivePrompt(DirectX::CXMMATRIX view,
         IM_COL32(120, 230, 150, 240), 2.0f);
 }
 
+// Next id to hand out. Monotonic and never reused within a session: an id that
+// came back after its body was gone would let a late hit report land on a
+// different enemy entirely.
+static uint16_t g_nextNetEnemyId = 0;
+// Reused across frames so the per-frame publish does not allocate.
+static std::vector<net::HostEnemyState> g_hostEnemyScratch;
+static std::vector<net::EnemyHitRequest> g_enemyHitScratch;
+
+// Host-side: give every AI actor an id and tell the session where they are.
+//
+// Ids are assigned here rather than at each of the seven spawn sites, so a new
+// kind of spawn cannot be added without one -- an actor with no id would simply
+// never replicate, and it would take a two-machine test to notice.
+static void PublishHostEnemies() {
+    if (g_netSession.CurrentRole() != net::Role::Host) return;
+    g_hostEnemyScratch.clear();
+    g_hostEnemyScratch.reserve(g_bandits.size());
+    for (const auto& actor : g_bandits) {
+        // Player bodies replicate through the player snapshot; replicating them
+        // twice would have each client fighting its own teammate's shadow.
+        if (!actor || actor->networkControlled) continue;
+        if (actor->netEnemyId == net::kInvalidEnemyId)
+            actor->netEnemyId = g_nextNetEnemyId++;
+        net::HostEnemyState state;
+        state.id = actor->netEnemyId;
+        state.x = actor->position.x;
+        state.y = actor->position.y;
+        state.z = actor->position.z;
+        state.yaw = actor->yaw;
+        state.aimYaw = actor->aimYaw;
+        state.aimPitch = actor->aimPitch;
+        state.health = actor->health;
+        state.dead = actor->Dead();
+        state.moving = actor->NetworkMoving();
+        g_hostEnemyScratch.push_back(state);
+    }
+    g_netSession.PublishEnemies(g_hostEnemyScratch);
+}
+
+// Finds an AI actor by its replication id. Linear for the same reason
+// FindNetworkPlayerBody is: g_bandits owns these and is cleared wholesale on a
+// level reset, so a side map would strand dangling pointers.
+static SkinnedEnemy* FindEnemyByNetId(net::EnemyId id) {
+    if (id == net::kInvalidEnemyId) return nullptr;
+    for (const auto& actor : g_bandits) {
+        if (!actor || actor->networkControlled) continue;
+        if (actor->netEnemyId == id) return actor.get();
+    }
+    return nullptr;
+}
+
+// Host-side: apply the hits clients reported. This is where a client's round
+// actually kills something -- the client only ran the geometry test.
+//
+// Routed through Shoot rather than by subtracting health directly, so a
+// client's kill produces exactly what a host's kill does: the same damage
+// scaling, the same headshot rule, the same ragdoll, the same one-shot death
+// event that pays out and plays the audio.
+static void ApplyReportedEnemyHits() {
+    g_netSession.DrainEnemyHits(g_enemyHitScratch);
+    for (const net::EnemyHitRequest& hit : g_enemyHitScratch) {
+        SkinnedEnemy* enemy = FindEnemyByNetId(hit.target);
+        // Gone already: the actor died to something else between the client
+        // firing and the report arriving. Dropping it is correct -- the kill
+        // simply went to whoever got there first.
+        if (!enemy || enemy->Dead()) continue;
+        const XMFLOAT3 impact{ hit.hitX, hit.hitY, hit.hitZ };
+        const XMFLOAT3 direction{ hit.dirX, hit.dirY, hit.dirZ };
+        if (hit.headshot) {
+            // The client's hit test found a head. Reproducing that here as a
+            // guaranteed-lethal hit keeps the one-headshot rule identical on
+            // both machines rather than re-testing geometry the client already
+            // resolved against the position it could see.
+            enemy->KillFromNetworkHeadshot(direction, impact);
+        } else {
+            enemy->ApplyNetworkBodyDamage(hit.damage, direction, impact);
+        }
+    }
+}
+
+// Client-side: enemies are whatever the host last said. No AI runs here at all.
+static void UpdateClientEnemies(float frameDelta) {
+    const std::vector<net::RemoteEnemy>& enemies = g_netSession.RemoteEnemies();
+    for (const net::RemoteEnemy& remote : enemies) {
+        SkinnedEnemy* body = FindEnemyByNetId(remote.id);
+        if (!body) {
+            if (remote.dead) continue;   // do not spawn a corpse
+            if (!g_banditModel.valid) continue;
+            auto spawned = std::make_unique<SkinnedEnemy>();
+            if (!spawned->Init(g_banditModel)) continue;
+            spawned->faction = Faction::Bandit;
+            spawned->netEnemyId = remote.id;
+            spawned->leftArmReach = g_banditLeftArmReach;
+            // The host owns this actor's life. Local damage must not touch it
+            // or the two machines disagree about who is still standing; the
+            // client reports its hits and waits to be told.
+            spawned->damageTakenScale = 0.0f;
+            spawned->position = { remote.x, remote.y, remote.z };
+            body = spawned.get();
+            g_bandits.push_back(std::move(spawned));
+        }
+        body->position = { remote.x, remote.y, remote.z };
+        body->yaw = remote.yaw;
+        body->aimYaw = remote.aimYaw;
+        body->aimPitch = remote.aimPitch;
+        body->health = remote.health;
+        if (remote.dead) {
+            // Kill locally so the ragdoll, the death audio and the payout all
+            // run through the paths that already exist, rather than a second
+            // notion of "dead" the rest of the game does not know about.
+            if (!body->Dead())
+                body->KillFromNetwork({ 0.0f, 0.0f, 0.0f }, body->position);
+            continue;
+        }
+        body->UpdateNetworkedPose(frameDelta, remote.moving, false);
+    }
+
+    // Drop bodies the host has stopped sending. An enemy that fell out of the
+    // nearest-N window is gone from this client's view until it comes back,
+    // which is what keeps a distant firefight off the wire.
+    g_bandits.erase(
+        std::remove_if(g_bandits.begin(), g_bandits.end(),
+                       [&enemies](const std::unique_ptr<SkinnedEnemy>& actor) {
+                           if (!actor || actor->networkControlled) return false;
+                           if (actor->netEnemyId == net::kInvalidEnemyId)
+                               return false;
+                           for (const net::RemoteEnemy& remote : enemies)
+                               if (remote.id == actor->netEnemyId) return false;
+                           return true;
+                       }),
+        g_bandits.end());
+}
+
 static void ShutdownMultiplayer() {
     g_bandits.erase(
         std::remove_if(g_bandits.begin(), g_bandits.end(),
@@ -388,4 +521,14 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                            return true;
                        }),
         g_bandits.end());
+
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        // Apply what clients reported hitting, then publish the result. Both
+        // after the player bodies above, so a hit reported this frame lands on
+        // the positions the snapshot is about to carry.
+        ApplyReportedEnemyHits();
+        PublishHostEnemies();
+    } else {
+        UpdateClientEnemies(frameDelta);
+    }
 }

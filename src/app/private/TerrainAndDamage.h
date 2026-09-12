@@ -519,6 +519,13 @@ static std::string g_multiplayerStatusError;
 // networked player bodies, because they live in g_bandits but arrive without a
 // squad behind them. One predicate rather than six edited conditions, so a new
 // draw site cannot pick up half the rule.
+// Whether this machine is a client whose AI actors belong to the host. True
+// only in a session and only on the client side, so single-player and the host
+// both keep simulating exactly as they always did.
+static bool ClientOwnedByHost() {
+    return g_netSession.CurrentRole() == net::Role::Client;
+}
+
 static bool AnySkinnedActorsToDraw() {
     return (!g_emptyLevelMode && g_banditLoaded) ||
            (g_netSession.Active() && !g_bandits.empty());

@@ -159,6 +159,13 @@ public:
     // already hold it and should not reach back into the session.
     bool              netDowned = false;
     float             netHealth = 100.0f;
+    // Stable network identity for an AI actor, assigned at spawn and never
+    // reused within a session. Deliberately not the index in g_bandits: that
+    // vector is compacted when bodies are removed, which would renumber every
+    // actor after the gap and point a client's hit report at the wrong enemy.
+    // 0xFFFF means "not replicated" -- the value for every actor in a
+    // single-player game, and for player bodies, which replicate separately.
+    uint16_t          netEnemyId = 0xFFFF;
     // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
     // point instead of the actor's own spawn position -- lets a marine loiter
     // near the player instead of near wherever it was placed. Left unset
@@ -366,6 +373,56 @@ public:
 
     void PlayClip(const std::string& name) {
         if (const AnimationClip* c = model.FindClip(name); c && anim.clip != c) anim.Play(c);
+    }
+
+    // Damage a remote player's round did to this actor, applied host-side.
+    //
+    // The shooter already ran the geometry test against the body it could see,
+    // so this deliberately does not re-test it: re-running the sweep here would
+    // resolve against the host's position rather than the one the client aimed
+    // at, and every shot at a moving target would miss. Everything after the
+    // test is the same path a local shot takes, so a client's kill produces the
+    // same ragdoll, death event and payout as the host's own.
+    void ApplyNetworkBodyDamage(float damage,
+                                const DirectX::XMFLOAT3& direction,
+                                const DirectX::XMFLOAT3& impact) {
+        if (dead_) return;
+        const float applied = ScaleIncomingDamage(damage);
+        health -= applied;
+        RegisterThreat(applied);
+        if (health <= 0.0f)
+            Kill(direction, impact, 1.0f, false,
+                 RagdollImpactSource::Bullet, {});
+    }
+
+    // As above for a headshot, which is lethal regardless of remaining health.
+    void KillFromNetworkHeadshot(const DirectX::XMFLOAT3& direction,
+                                 const DirectX::XMFLOAT3& impact) {
+        if (dead_) return;
+        health = 0.0f;
+        Kill(direction, impact, 1.0f, true, RagdollImpactSource::Bullet, {});
+    }
+
+    // Client-side: the host says this actor is dead, so drop it the same way a
+    // local kill would -- ragdoll, death event, audio and payout all through
+    // the existing paths rather than a second notion of "dead" the rest of the
+    // game would have to learn about. Kill itself is private, and should stay
+    // that way: this is the one narrow door the network is allowed through.
+    void KillFromNetwork(const DirectX::XMFLOAT3& direction,
+                         const DirectX::XMFLOAT3& impact) {
+        if (dead_) return;
+        health = 0.0f;
+        Kill(direction, impact, 1.0f, false, RagdollImpactSource::Bullet, {});
+    }
+
+    // Whether this actor should read as moving on another machine. Taken from
+    // the clip actually playing rather than from a position delta: the receiver
+    // would have to derive that a frame late, which shows up as the animation
+    // starting after the body has already set off.
+    bool NetworkMoving() const {
+        if (!anim.clip) return false;
+        const AnimationClip* idle = model.FindClip("Idle");
+        return anim.clip != idle;
     }
 
     // Shared world matrix for both the skinned mesh and the skeleton overlay:

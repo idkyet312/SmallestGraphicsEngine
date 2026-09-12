@@ -394,6 +394,69 @@ void OutOfOrderSnapshotsDoNotResurrect() {
     Check(status.health == before, "health must not drift while downed");
 }
 
+void EnemyReplication() {
+    // The host stores what it published, and the hit queue is host-side and
+    // drains exactly once -- a hit applied twice would kill an enemy the other
+    // player was still shooting at.
+    {
+        Fixture fixture;
+        std::vector<HostEnemyState> enemies;
+        for (uint16_t i = 0; i < 3; ++i) {
+            HostEnemyState enemy;
+            enemy.id = i;
+            enemy.x = 10.0f * i;
+            enemy.health = 100.0f;
+            enemies.push_back(enemy);
+        }
+        fixture.session.PublishEnemies(enemies);
+
+        fixture.session.ReportEnemyHit(1, 20.0f, false, 0, 0, 1, 5, 1, 5);
+        std::vector<EnemyHitRequest> hits;
+        fixture.session.DrainEnemyHits(hits);
+        Check(hits.size() == 1, "the host's own hit should queue once");
+        Check(hits[0].target == 1, "wrong enemy targeted");
+        Check(hits[0].damage == 20.0f, "damage did not survive the queue");
+        Check(hits[0].shooter == 0, "the host should be credited as shooter");
+
+        fixture.session.DrainEnemyHits(hits);
+        Check(hits.empty(), "draining twice must not replay a hit");
+    }
+
+    // An offline session must ignore enemy traffic entirely: main.cpp calls
+    // these unconditionally, and single-player must not pay for them.
+    {
+        NetSession offline;
+        std::vector<HostEnemyState> enemies(1);
+        offline.PublishEnemies(enemies);
+        offline.ReportEnemyHit(0, 20.0f, false, 0, 0, 1, 0, 0, 0);
+        std::vector<EnemyHitRequest> hits;
+        offline.DrainEnemyHits(hits);
+        Check(hits.empty(), "an offline session must queue no enemy hits");
+        Check(offline.RemoteEnemies().empty(),
+              "an offline session has no remote enemies");
+    }
+
+    // A client has no enemies until the host tells it about some -- it runs no
+    // AI of its own, so an empty list is the correct starting state rather than
+    // something to fill in locally.
+    {
+        Fixture fixture;
+        Check(fixture.session.RemoteEnemies().empty(),
+              "a host should expose no remote enemies of its own");
+    }
+
+    // Garbage damage is rejected before it reaches gameplay, the same way
+    // player damage is.
+    {
+        Fixture fixture;
+        fixture.session.ReportEnemyHit(kInvalidEnemyId, 20.0f, false,
+                                       0, 0, 1, 0, 0, 0);
+        std::vector<EnemyHitRequest> hits;
+        fixture.session.DrainEnemyHits(hits);
+        Check(hits.empty(), "a hit on an invalid enemy id must be dropped");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -402,6 +465,7 @@ int main() {
     DownedIsNotDerivedFromHealth();
     ReviveRules();
     OutOfOrderSnapshotsDoNotResurrect();
+    EnemyReplication();
     std::cout << "NetPvP tests passed\n";
     return 0;
 }

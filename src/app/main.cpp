@@ -1740,6 +1740,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // shoot with it. Skipped here rather than inside Update so
                     // the single-player path is untouched.
                     if (bandit->networkControlled) continue;
+                    // On a client every AI actor is the host's, driven entirely
+                    // by the enemy snapshot. Running the AI here as well would
+                    // have two machines simulating the same enemy from the same
+                    // start and diverging within seconds -- each player would
+                    // end up killing a private copy the other never saw fall.
+                    if (ClientOwnedByHost()) continue;
                     bandit->Update(banditDeltaTime, target, groundY);
                     // Keep an actor on the platform it started the frame on.
                     // The navmesh is terrain-only, so steering happily walks a
@@ -2840,6 +2846,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 ReportNetworkPlayerHit(
                                     bandit->netPlayerId, headshot, banditHit,
                                     20.0f * projectile.damageMultiplier);
+                            }
+                        } else if (ClientOwnedByHost() &&
+                                   bandit->netEnemyId != net::kInvalidEnemyId) {
+                            // A client's round against a host-owned enemy takes
+                            // the same shooter-authoritative path as PvP: test
+                            // the geometry locally, because this machine is the
+                            // one that can see where the player aimed, and let
+                            // the host decide what the hit did. Applying it
+                            // here would kill the enemy on one screen only.
+                            bool headshot = false;
+                            hitBandit = bandit->BlocksProjectile(
+                                projectile.previousPosition,
+                                projectile.position, bulletRadius, &banditHit,
+                                &headshot, &banditBone);
+                            if (hitBandit && projectile.playerOwned) {
+                                g_netSession.ReportEnemyHit(
+                                    bandit->netEnemyId,
+                                    20.0f * projectile.damageMultiplier,
+                                    headshot,
+                                    projectile.direction.x,
+                                    projectile.direction.y,
+                                    projectile.direction.z,
+                                    banditHit.x, banditHit.y, banditHit.z);
                             }
                         } else if (projectile.harpoon) {
                             hitBandit = bandit->HitByHarpoon(
@@ -4452,12 +4481,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // were the largest single cost in its load. BanditSpawn below
             // already no-ops on an invalid model, so skipping the import needs
             // no further guarding.
-            // The empty test level has no enemies, so it skips the bandit
-            // import and takes only the marine one below -- which it needs for
-            // networked player bodies. Paying for the enemy mesh, skeleton,
-            // three clips and physics asset on a level that spawns none would
-            // undo the point of the empty level.
-            if (!g_baseMode && !g_emptyLevelMode) {
+            // The empty test level spawns no enemies of its own, so it normally
+            // skips the bandit import and takes only the marine one below --
+            // paying for the enemy mesh, skeleton, three clips and physics
+            // asset on a level that spawns none would undo the point of it.
+            //
+            // Except in a session: a client renders the host's enemies, and
+            // the host's level may well have them even when this one does not.
+            // Without the model those bodies fail to spawn and the client sees
+            // an empty map while the host is in a firefight.
+            if (!g_baseMode && (!g_emptyLevelMode || g_netSession.Active())) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
                 std::vector<std::string> clips = {
