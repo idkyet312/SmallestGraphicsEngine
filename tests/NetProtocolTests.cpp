@@ -30,6 +30,13 @@ int main() {
                   "ClientInputMessage must stay memcpy-able");
     static_assert(std::is_trivially_copyable<ServerSnapshotMessage>::value,
                   "ServerSnapshotMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientHitReportMessage>::value,
+                  "ClientHitReportMessage must stay memcpy-able");
+    static_assert(
+        std::is_trivially_copyable<ServerPlayerStateChangedMessage>::value,
+        "ServerPlayerStateChangedMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientReviveProgressMessage>::value,
+                  "ClientReviveProgressMessage must stay memcpy-able");
 
     // Dispatch reads the header before it knows the payload type, so the header
     // must be at offset 0 of every message.
@@ -41,6 +48,18 @@ int main() {
                   "header must lead");
     static_assert(offsetof(PlayerJoinedMessage, header) == 0, "header must lead");
     static_assert(offsetof(PlayerLeftMessage, header) == 0, "header must lead");
+    static_assert(offsetof(ClientHitReportMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ServerPlayerStateChangedMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ClientReviveProgressMessage, header) == 0,
+                  "header must lead");
+
+    // The version must be bumped whenever a struct in the file changes shape.
+    // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
+    // would have two builds silently misreading each other's bytes -- fails
+    // here instead of in a session.
+    Check(kProtocolVersion == 2, "protocol version was not bumped");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -59,6 +78,14 @@ int main() {
           "PlayerJoinedMessage has the wrong default type");
     Check(PlayerLeftMessage{}.header.type == MessageType::PlayerLeft,
           "PlayerLeftMessage has the wrong default type");
+    Check(ClientHitReportMessage{}.header.type == MessageType::ClientHitReport,
+          "ClientHitReportMessage has the wrong default type");
+    Check(ServerPlayerStateChangedMessage{}.header.type ==
+              MessageType::ServerPlayerStateChanged,
+          "ServerPlayerStateChangedMessage has the wrong default type");
+    Check(ClientReviveProgressMessage{}.header.type ==
+              MessageType::ClientReviveProgress,
+          "ClientReviveProgressMessage has the wrong default type");
 
     // The hello carries the magic and version by default: a peer that sends a
     // default-constructed hello must be accepted by a matching build.
@@ -79,6 +106,10 @@ int main() {
         sent.players[i].moving = static_cast<uint8_t>(i % 2);
         sent.players[i].crouching = static_cast<uint8_t>((i + 1) % 2);
         sent.players[i].sprinting = static_cast<uint8_t>(i % 2);
+        sent.players[i].health = 100.0f - 20.0f * i;
+        sent.players[i].downed = static_cast<uint8_t>(i == 3 ? 1 : 0);
+        sent.players[i].reviver =
+            static_cast<PlayerId>(i == 3 ? 1 : kInvalidPlayerId);
     }
 
     unsigned char buffer[sizeof(ServerSnapshotMessage)];
@@ -104,6 +135,12 @@ int main() {
               "crouching lost");
         Check(received.players[i].sprinting == sent.players[i].sprinting,
               "sprinting lost");
+        Check(received.players[i].health == sent.players[i].health,
+              "health lost");
+        Check(received.players[i].downed == sent.players[i].downed,
+              "downed lost");
+        Check(received.players[i].reviver == sent.players[i].reviver,
+              "reviver lost");
     }
 
     // An input message must carry the PlayerInput through untouched, since the
@@ -130,6 +167,88 @@ int main() {
           "input sequence did not round-trip");
     Check(inputReceived.input.Held(PlayerInput::Crouch),
           "input buttons did not round-trip");
+
+    // The three PvP messages, through raw bytes the same way.
+    ClientHitReportMessage hitSent;
+    hitSent.target = 2;
+    hitSent.headshot = 1;
+    hitSent.damage = 20.0f;
+    hitSent.hitX = 1.5f;
+    hitSent.hitY = 1.7f;
+    hitSent.hitZ = -3.25f;
+    hitSent.shooterTick = 4242u;
+
+    unsigned char hitBuffer[sizeof(ClientHitReportMessage)];
+    std::memcpy(hitBuffer, &hitSent, sizeof(hitBuffer));
+    ClientHitReportMessage hitReceived;
+    std::memcpy(&hitReceived, hitBuffer, sizeof(hitBuffer));
+
+    Check(hitReceived.header.type == MessageType::ClientHitReport,
+          "hit report type did not round-trip");
+    Check(hitReceived.target == hitSent.target, "hit target did not round-trip");
+    Check(hitReceived.headshot == hitSent.headshot,
+          "hit headshot did not round-trip");
+    Check(hitReceived.damage == hitSent.damage, "hit damage did not round-trip");
+    Check(hitReceived.hitX == hitSent.hitX && hitReceived.hitY == hitSent.hitY &&
+              hitReceived.hitZ == hitSent.hitZ,
+          "hit position did not round-trip");
+    Check(hitReceived.shooterTick == hitSent.shooterTick,
+          "hit shooterTick did not round-trip");
+
+    ServerPlayerStateChangedMessage stateSent;
+    stateSent.id = 1;
+    stateSent.event = PlayerStateEvent::Downed;
+    stateSent.instigator = 0;
+    stateSent.health = 0.0f;
+    stateSent.impulseX = 0.0f;
+    stateSent.impulseY = 1.0f;
+    stateSent.impulseZ = 0.0f;
+    stateSent.impactX = 5.0f;
+    stateSent.impactY = 1.2f;
+    stateSent.impactZ = -7.0f;
+
+    unsigned char stateBuffer[sizeof(ServerPlayerStateChangedMessage)];
+    std::memcpy(stateBuffer, &stateSent, sizeof(stateBuffer));
+    ServerPlayerStateChangedMessage stateReceived;
+    std::memcpy(&stateReceived, stateBuffer, sizeof(stateBuffer));
+
+    Check(stateReceived.header.type == MessageType::ServerPlayerStateChanged,
+          "state change type did not round-trip");
+    Check(stateReceived.id == stateSent.id, "state change id did not round-trip");
+    Check(stateReceived.event == PlayerStateEvent::Downed,
+          "state change event did not round-trip");
+    Check(stateReceived.instigator == stateSent.instigator,
+          "state change instigator did not round-trip");
+    Check(stateReceived.impactY == stateSent.impactY,
+          "state change impact did not round-trip");
+
+    ClientReviveProgressMessage reviveSent;
+    reviveSent.target = 3;
+    reviveSent.holding = 1;
+
+    unsigned char reviveBuffer[sizeof(ClientReviveProgressMessage)];
+    std::memcpy(reviveBuffer, &reviveSent, sizeof(reviveBuffer));
+    ClientReviveProgressMessage reviveReceived;
+    std::memcpy(&reviveReceived, reviveBuffer, sizeof(reviveBuffer));
+
+    Check(reviveReceived.header.type == MessageType::ClientReviveProgress,
+          "revive progress type did not round-trip");
+    Check(reviveReceived.target == reviveSent.target,
+          "revive target did not round-trip");
+    Check(reviveReceived.holding == reviveSent.holding,
+          "revive holding did not round-trip");
+
+    // The revive bit has to survive the input round-trip too, or a held key
+    // reaches the host as nothing.
+    ClientInputMessage reviveInput;
+    reviveInput.input.Set(PlayerInput::Revive, true);
+    unsigned char reviveInputBuffer[sizeof(ClientInputMessage)];
+    std::memcpy(reviveInputBuffer, &reviveInput, sizeof(reviveInputBuffer));
+    ClientInputMessage reviveInputReceived;
+    std::memcpy(&reviveInputReceived, reviveInputBuffer,
+                sizeof(reviveInputBuffer));
+    Check(reviveInputReceived.input.Held(PlayerInput::Revive),
+          "revive button did not round-trip");
 
     // A snapshot must fit comfortably in a normal MTU, or every send fragments.
     Check(sizeof(ServerSnapshotMessage) < 1200,

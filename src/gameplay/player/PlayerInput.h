@@ -43,6 +43,10 @@ struct PlayerInput {
         Sprint   = 1u << 2,
         Swim     = 1u << 3, // ascend while swimming
         SwimDown = 1u << 4,
+        // Held, not tapped: reviving a downed player is a hold, so this is
+        // sampled from the key's current state alongside the movement keys
+        // rather than from the edge-triggered WM_KEYDOWN chain.
+        Revive   = 1u << 5,
     };
     uint16_t buttons = 0;
 

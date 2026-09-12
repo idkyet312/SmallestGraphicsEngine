@@ -657,6 +657,14 @@ if(BUILD_TESTING)
         src/net/NetTransportNull.cpp)
     target_link_libraries(NetSessionTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetSessionTests COMMAND NetSessionTests)
+
+    # PvP damage, the downed transition and revive. Same null transport: these
+    # are arithmetic and state rules, and they fail invisibly in a playtest.
+    add_executable(NetPvPTests
+        tests/NetPvPTests.cpp
+        src/net/NetTransportNull.cpp)
+    target_link_libraries(NetPvPTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetPvPTests COMMAND NetPvPTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

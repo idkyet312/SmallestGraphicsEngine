@@ -24,6 +24,21 @@ namespace net {
 
 enum class Role : uint8_t { Offline, Host, Client };
 
+// PvP tuning. All of these are starting values meant to be played with rather
+// than defended -- they live here so changing one is a single edit, not a hunt
+// through gameplay code.
+inline constexpr float kMaxPlayerHealth = 100.0f;
+// Matches SkinnedEnemy::Shoot's balance comment: one headshot, five body hits.
+inline constexpr float kBodyShotDamage = 20.0f;
+// How long a reviver has to stand there holding the key.
+inline constexpr float kReviveSeconds = 3.0f;
+// How close they have to be. Re-checked by the host against its own copy of
+// both positions, so a client cannot claim a revive from across the map.
+inline constexpr float kReviveRadius = 2.2f;
+// What a revived player stands up with. Deliberately well under full: getting
+// picked up should leave you vulnerable, not reset the fight.
+inline constexpr float kReviveHealth = 40.0f;
+
 // Where a remote player is, already interpolated and ready to drive a body.
 struct RemotePlayer {
     PlayerId id = kInvalidPlayerId;
@@ -33,6 +48,32 @@ struct RemotePlayer {
     bool crouching = false;
     bool sprinting = false;
     bool active = false;
+    float health = kMaxPlayerHealth;
+    bool downed = false;
+    PlayerId reviver = kInvalidPlayerId;
+    float reviveProgress = 0.0f;   // 0..1
+};
+
+// The local player's own authoritative life state, read back every frame so the
+// HUD, the downed gate and the camera all work from one number.
+struct LocalPlayerStatus {
+    float health = kMaxPlayerHealth;
+    bool downed = false;
+    // 0..1, how far along someone is at picking us up.
+    float reviveProgress = 0.0f;
+    PlayerId reviver = kInvalidPlayerId;
+};
+
+// A life-state transition that just happened, drained once per frame by the
+// game so it can fire one-shot effects. Populated from the reliable event on a
+// client and directly by the host, so both ends run the same code.
+struct PlayerStateChange {
+    PlayerId id = kInvalidPlayerId;
+    PlayerStateEvent event = PlayerStateEvent::Downed;
+    PlayerId instigator = kInvalidPlayerId;
+    float health = 0.0f;
+    float impulseX = 0.0f, impulseY = 0.0f, impulseZ = 0.0f;
+    float impactX = 0.0f, impactY = 0.0f, impactZ = 0.0f;
 };
 
 // What the local player is doing this frame, handed to the session.
@@ -88,6 +129,7 @@ public:
         localId_ = kInvalidPlayerId;
         players_ = {};
         peerToPlayer_.clear();
+        stateChanges_.clear();
         tick_ = 0;
         clock_.Reset();
     }
@@ -120,14 +162,26 @@ public:
                 local.input.Held(PlayerInput::Crouch) ? 1 : 0;
             slot.current.sprinting =
                 local.input.Held(PlayerInput::Sprint) ? 1 : 0;
+            // Health and downed are NOT written from local state: the host owns
+            // them for every player including itself, so they flow the other
+            // way -- out through the snapshot, and back via LocalStatus.
+            slot.current.health = slot.health;
+            slot.current.downed = slot.downed ? 1 : 0;
+            slot.current.reviver = slot.reviver;
         }
 
         clock_.Accumulate(deltaTime);
         float step = 0.0f;
         while (clock_.Consume(step)) {
             ++tick_;
-            if (role_ == Role::Host) SendSnapshot();
-            else SendInput(local.input);
+            if (role_ == Role::Host) {
+                // Before the snapshot, so a revive completing this tick is
+                // carried by the snapshot it completed on rather than the next.
+                StepRevives(step);
+                SendSnapshot();
+            } else {
+                SendInput(local.input);
+            }
         }
         interpolationTime_ += deltaTime;
     }
@@ -156,6 +210,13 @@ public:
             remote.crouching = slot.current.crouching != 0;
             remote.sprinting = slot.current.sprinting != 0;
             remote.active = true;
+            // Not interpolated: these are states, not positions, and a
+            // half-downed player is not a thing.
+            remote.health = slot.health;
+            remote.downed = slot.downed;
+            remote.reviver = slot.reviver;
+            remote.reviveProgress = kReviveSeconds > 0.0f
+                ? Clamp01(slot.reviveProgress / kReviveSeconds) : 0.0f;
             out.push_back(remote);
         }
     }
@@ -182,6 +243,158 @@ public:
 
     uint32_t Tick() const { return tick_; }
 
+    // ---- PvP ----------------------------------------------------------
+    //
+    // Hits are shooter-authoritative: whoever fired ran the geometry test
+    // against the body it could see on its own screen and reports the result.
+    // The host owns the arithmetic, so there is exactly one place damage is
+    // applied -- this one -- whether the shot came from the host itself or
+    // arrived in a packet.
+    //
+    // Deliberately unvalidated beyond sanity clamping. A modified client can
+    // lie about damage; that is the accepted cost of a design that feels
+    // responsive on a home connection with no lag compensation. The clamps
+    // exist so a *bug* cannot destroy a session, not to stop a cheater.
+    void ReportHit(PlayerId target, float damage, bool headshot,
+                   float hitX, float hitY, float hitZ) {
+        if (!Active()) return;
+        if (role_ == Role::Host) {
+            // No point packeting to ourselves.
+            ApplyHitToPlayer(localId_, target, damage, headshot,
+                             hitX, hitY, hitZ);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientHitReportMessage message;
+        message.target = target;
+        message.headshot = headshot ? 1 : 0;
+        message.damage = damage;
+        message.hitX = hitX;
+        message.hitY = hitY;
+        message.hitZ = hitZ;
+        message.shooterTick = tick_;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Host-side damage application. Public so the host's own shots reach it
+    // without a round trip, and so tests can drive it with no transport.
+    void ApplyHitToPlayer(PlayerId shooter, PlayerId target, float damage,
+                          bool headshot, float hitX, float hitY, float hitZ) {
+        if (role_ != Role::Host) return;
+        if (target >= kMaxPlayers || target == shooter) return;
+        PlayerSlot& slot = players_[target];
+        if (!slot.active || slot.downed) return;
+        // Clamp rather than trust. A negative would heal, and a NaN or a wild
+        // value would put the slot somewhere no later arithmetic recovers from.
+        if (!(damage >= 0.0f)) return;   // false for NaN, which is the point
+        const float applied =
+            headshot ? slot.health
+                     : (damage < kMaxPlayerHealth ? damage : kMaxPlayerHealth);
+        slot.health -= applied;
+        if (slot.health < 0.0f) slot.health = 0.0f;
+        if (slot.health > 0.0f) return;
+
+        slot.downed = true;
+        slot.downedTimer = 0.0f;
+        slot.reviver = kInvalidPlayerId;
+        slot.reviveProgress = 0.0f;
+        PlayerStateChange change;
+        change.id = target;
+        change.event = PlayerStateEvent::Downed;
+        change.instigator = shooter;
+        change.health = 0.0f;
+        change.impactX = hitX;
+        change.impactY = hitY;
+        change.impactZ = hitZ;
+        PublishStateChange(change);
+    }
+
+    // Damage the local player took from something that is not another player --
+    // a bandit, a fall, their own grenade. The client predicts it locally for
+    // the flash and the chip bar; this is what makes the host agree.
+    void ReportLocalDamage(float damage) {
+        if (!Active() || localId_ == kInvalidPlayerId) return;
+        if (!(damage > 0.0f)) return;
+        if (role_ == Role::Host) {
+            ApplyHitToPlayer(kInvalidPlayerId, localId_, damage, false,
+                             0.0f, 0.0f, 0.0f);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientHitReportMessage message;
+        // Target is ourselves: the host trusts a client about its own damage,
+        // which it already does for position.
+        message.target = localId_;
+        message.damage = damage;
+        message.shooterTick = tick_;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Who the local player is holding the revive key on this tick, or
+    // kInvalidPlayerId for nobody. Sent every tick while held.
+    void ReportReviveIntent(PlayerId target, bool holding) {
+        if (!Active() || localId_ == kInvalidPlayerId) return;
+        if (role_ == Role::Host) {
+            players_[localId_].pendingReviveTarget = target;
+            players_[localId_].pendingReviveHolding = holding;
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientReviveProgressMessage message;
+        message.target = target;
+        message.holding = holding ? 1 : 0;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Unreliable);
+    }
+
+    bool LocalStatus(LocalPlayerStatus& out) const {
+        if (localId_ == kInvalidPlayerId || localId_ >= kMaxPlayers)
+            return false;
+        const PlayerSlot& slot = players_[localId_];
+        if (!slot.active) return false;
+        out.health = slot.health;
+        out.downed = slot.downed;
+        out.reviver = slot.reviver;
+        out.reviveProgress = kReviveSeconds > 0.0f
+            ? Clamp01(slot.reviveProgress / kReviveSeconds) : 0.0f;
+        return true;
+    }
+
+    // Drained once per frame. Moves the queue out rather than copying so a
+    // change cannot be handled twice.
+    void DrainStateChanges(std::vector<PlayerStateChange>& out) {
+        out.clear();
+        out.swap(stateChanges_);
+    }
+
+    // Any player's life state, not just the local one. Used by the HUD to show
+    // a teammate's health, and by the tests to assert on a player the harness
+    // never has to impersonate over a socket.
+    bool PlayerStatus(PlayerId id, LocalPlayerStatus& out) const {
+        if (id >= kMaxPlayers || !players_[id].active) return false;
+        const PlayerSlot& slot = players_[id];
+        out.health = slot.health;
+        out.downed = slot.downed;
+        out.reviver = slot.reviver;
+        out.reviveProgress = kReviveSeconds > 0.0f
+            ? Clamp01(slot.reviveProgress / kReviveSeconds) : 0.0f;
+        return true;
+    }
+
+    // Seats a player in a slot without a handshake. The host uses this for
+    // itself; tests use it to stand up a second player with no socket. Not a
+    // way to join a real session -- a client still has to complete the
+    // handshake to be given an id it can send under.
+    bool ActivatePlayerSlot(PlayerId id) {
+        if (id >= kMaxPlayers || players_[id].active) return false;
+        players_[id] = PlayerSlot{};
+        players_[id].id = id;
+        players_[id].active = true;
+        return true;
+    }
+
 private:
     struct PlayerSlot {
         PlayerId id = kInvalidPlayerId;
@@ -193,6 +406,21 @@ private:
         float previousTime = 0.0f;
         PlayerInput lastInput;
         bool hasInput = false;
+        // Life state. The host owns every one of these; a client writes them
+        // only from an inbound snapshot, never from its own gameplay.
+        float health = kMaxPlayerHealth;
+        bool downed = false;
+        // How long they have been down. Unused today -- carried so a bleedout
+        // timer is a tuning change rather than a protocol change.
+        float downedTimer = 0.0f;
+        PlayerId reviver = kInvalidPlayerId;
+        float reviveProgress = 0.0f;
+        // Set while a client is reporting a held revive key this tick. Cleared
+        // every tick by the host, which re-derives progress from scratch rather
+        // than trusting the flag to stop arriving -- a client that disconnects
+        // mid-hold must not revive anyone.
+        PlayerId pendingReviveTarget = kInvalidPlayerId;
+        bool pendingReviveHolding = false;
     };
 
     static float Clamp01(float value) {
@@ -209,6 +437,93 @@ private:
     }
     float RenderTime() const {
         return interpolationTime_ - kInterpolationDelay;
+    }
+
+    // Queues a transition locally and, on the host, tells everyone else. The
+    // queue is what the game drains; the message is what makes a client's queue
+    // fill too.
+    void PublishStateChange(const PlayerStateChange& change) {
+        stateChanges_.push_back(change);
+        if (role_ != Role::Host || !transport_) return;
+        ServerPlayerStateChangedMessage message;
+        message.id = change.id;
+        message.event = change.event;
+        message.instigator = change.instigator;
+        message.health = change.health;
+        message.impulseX = change.impulseX;
+        message.impulseY = change.impulseY;
+        message.impulseZ = change.impulseZ;
+        message.impactX = change.impactX;
+        message.impactY = change.impactY;
+        message.impactZ = change.impactZ;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            std::string("player ") + std::to_string(change.id) +
+            (change.event == PlayerStateEvent::Downed ? " downed by "
+                                                      : " revived by ") +
+            std::to_string(change.instigator));
+    }
+
+    // Host-only, once per net tick. Recomputes every downed player's revive
+    // progress from scratch rather than trusting the holding flags to stop
+    // arriving: a client that drops mid-hold leaves its last flag set forever,
+    // and distance is re-checked here against the host's own positions.
+    void StepRevives(float step) {
+        for (uint8_t target = 0; target < kMaxPlayers; ++target) {
+            PlayerSlot& slot = players_[target];
+            if (!slot.active) continue;
+            if (!slot.downed) {
+                slot.reviver = kInvalidPlayerId;
+                slot.reviveProgress = 0.0f;
+                continue;
+            }
+            slot.downedTimer += step;
+
+            // Nearest valid reviver wins, so two players crowding one body
+            // cannot both be credited and the progress cannot double-rate.
+            PlayerId best = kInvalidPlayerId;
+            float bestDistanceSquared = kReviveRadius * kReviveRadius;
+            for (uint8_t candidate = 0; candidate < kMaxPlayers; ++candidate) {
+                if (candidate == target) continue;   // no self-revive
+                const PlayerSlot& other = players_[candidate];
+                if (!other.active || other.downed) continue;
+                if (!other.pendingReviveHolding) continue;
+                if (other.pendingReviveTarget != target) continue;
+                const float dx = other.current.x - slot.current.x;
+                const float dy = other.current.y - slot.current.y;
+                const float dz = other.current.z - slot.current.z;
+                const float distanceSquared = dx * dx + dy * dy + dz * dz;
+                if (distanceSquared > bestDistanceSquared) continue;
+                bestDistanceSquared = distanceSquared;
+                best = candidate;
+            }
+
+            if (best == kInvalidPlayerId) {
+                // Decay rather than reset: stepping out of range for one tick
+                // of jitter should not throw away three seconds of work.
+                slot.reviver = kInvalidPlayerId;
+                slot.reviveProgress -= step;
+                if (slot.reviveProgress < 0.0f) slot.reviveProgress = 0.0f;
+                continue;
+            }
+
+            slot.reviver = best;
+            slot.reviveProgress += step;
+            if (slot.reviveProgress < kReviveSeconds) continue;
+
+            slot.downed = false;
+            slot.health = kReviveHealth;
+            slot.reviveProgress = 0.0f;
+            slot.downedTimer = 0.0f;
+            const PlayerId reviver = slot.reviver;
+            slot.reviver = kInvalidPlayerId;
+            PlayerStateChange change;
+            change.id = target;
+            change.event = PlayerStateEvent::Revived;
+            change.instigator = reviver;
+            change.health = kReviveHealth;
+            PublishStateChange(change);
+        }
     }
 
     void HandleEvent(Event& event) {
@@ -254,9 +569,68 @@ private:
         case MessageType::ServerSnapshot:
             if (role_ == Role::Client) HandleSnapshot(event);
             break;
+        case MessageType::ClientHitReport:
+            if (role_ == Role::Host) HandleHitReport(event);
+            break;
+        case MessageType::ClientReviveProgress:
+            if (role_ == Role::Host) HandleReviveProgress(event);
+            break;
+        case MessageType::ServerPlayerStateChanged:
+            if (role_ == Role::Client) HandlePlayerStateChanged(event);
+            break;
         default:
             break;
         }
+    }
+
+    void HandleHitReport(Event& event) {
+        if (event.payload.size() < sizeof(ClientHitReportMessage)) return;
+        ClientHitReportMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        const PlayerId shooter = it->second;
+        // A client reporting damage against itself is the environment-damage
+        // path; anything else is a shot at another player.
+        const PlayerId attributed =
+            message.target == shooter ? kInvalidPlayerId : shooter;
+        ApplyHitToPlayer(attributed, message.target, message.damage,
+                         message.headshot != 0, message.hitX, message.hitY,
+                         message.hitZ);
+    }
+
+    void HandleReviveProgress(Event& event) {
+        if (event.payload.size() < sizeof(ClientReviveProgressMessage)) return;
+        ClientReviveProgressMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        PlayerSlot& slot = players_[it->second];
+        slot.pendingReviveTarget = message.target;
+        slot.pendingReviveHolding = message.holding != 0;
+    }
+
+    void HandlePlayerStateChanged(Event& event) {
+        if (event.payload.size() < sizeof(ServerPlayerStateChangedMessage))
+            return;
+        ServerPlayerStateChangedMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.id >= kMaxPlayers) return;
+        // Queue the edge for its one-shot effect only. The state itself is not
+        // written here: the snapshot owns it, and letting a reliable event
+        // write state is exactly how the two end up disagreeing.
+        PlayerStateChange change;
+        change.id = message.id;
+        change.event = message.event;
+        change.instigator = message.instigator;
+        change.health = message.health;
+        change.impulseX = message.impulseX;
+        change.impulseY = message.impulseY;
+        change.impulseZ = message.impulseZ;
+        change.impactX = message.impactX;
+        change.impactY = message.impactY;
+        change.impactZ = message.impactZ;
+        stateChanges_.push_back(change);
     }
 
     void HandleHello(Event& event) {
@@ -366,6 +740,14 @@ private:
             slot.currentTime = interpolationTime_;
             slot.active = true;
             slot.id = incoming.id;
+            // The snapshot is the authority on life state. Mirrored onto the
+            // slot so LocalStatus and the revive logic read one place, and
+            // taken unconditionally: the stale-tick discard above already
+            // guarantees this snapshot is newer than what we had, which is what
+            // stops an out-of-order packet from resurrecting a downed player.
+            slot.health = incoming.health;
+            slot.downed = incoming.downed != 0;
+            slot.reviver = incoming.reviver;
         }
     }
 
@@ -377,6 +759,13 @@ private:
             if (!players_[i].active) continue;
             snapshot.players[count] = players_[i].current;
             snapshot.players[count].id = i;
+            // Life state comes off the slot, not off `current`. The host owns
+            // it for every player, and only the local slot's copy is refreshed
+            // in Update -- a remote player's would otherwise ship whatever was
+            // last received rather than what the host just decided.
+            snapshot.players[count].health = players_[i].health;
+            snapshot.players[count].downed = players_[i].downed ? 1 : 0;
+            snapshot.players[count].reviver = players_[i].reviver;
             ++count;
         }
         snapshot.playerCount = count;
@@ -411,12 +800,29 @@ private:
         const PlayerId id = it->second;
         peerToPlayer_.erase(it);
         if (id < kMaxPlayers) players_[id] = PlayerSlot{};
+        // Sweep the departed player out of everyone else's revive state. A slot
+        // still naming them as its reviver would hold progress that can never
+        // advance, and a stale pendingReviveTarget pointing at a freed id would
+        // credit whoever is allocated that slot next.
+        for (PlayerSlot& other : players_) {
+            if (other.reviver == id) {
+                other.reviver = kInvalidPlayerId;
+                other.reviveProgress = 0.0f;
+            }
+            if (other.pendingReviveTarget == id) {
+                other.pendingReviveTarget = kInvalidPlayerId;
+                other.pendingReviveHolding = false;
+            }
+        }
         if (role_ == Role::Host) {
             PlayerLeftMessage left;
             left.id = id;
             transport_->Broadcast(&left, sizeof(left), Channel::Reliable);
         }
     }
+
+    // Life-state edges waiting to be drained by the game this frame.
+    std::vector<PlayerStateChange> stateChanges_;
 
     std::unique_ptr<NetTransport> transport_;
     Role role_ = Role::Offline;
