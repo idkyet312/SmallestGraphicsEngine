@@ -101,6 +101,7 @@
 #include "DeploymentPlanner.h"
 #include "ArmoryCatalog.h"
 #include "GameRuntime.h"
+#include "NetSession.h"
 #include "DeferredReleaseQueue.h"
 #include "AssetRegistry.h"
 #include "AssetWatcher.h"
@@ -143,6 +144,7 @@ using namespace DirectX;
 #include "private/PlayerMovement.h"
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
+#include "private/Multiplayer.h"
 #include "private/WindowInput.h"
 #include "private/Boot.h"
 
@@ -601,6 +603,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
     const std::filesystem::path startupLevel = StartupLevelPath(commandLine);
     if (!startupLevel.empty()) StartCustomLevel(hwnd, startupLevel);
+
+    // Multiplayer is opt-in from the command line for now: -host [port], or
+    // -join <address> [port]. A menu belongs here eventually, but two instances
+    // launched from a shell is what milestone 1 actually needs to be testable,
+    // and a failure leaves the game running single-player rather than exiting.
+    StartMultiplayerFromCommandLine(commandLine ? commandLine : "");
 
     // Deterministic renderer smoke path for GPU validation and crash dumps.
     bool visibilityTestPending = false;
@@ -1714,6 +1722,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (onPrefabSurface)
                         groundY = (std::max)(groundY, prefabSurfaceY);
                     const XMFLOAT3 preMovePosition = bandit->position;
+                    // Another player's body: the network owns where it is and
+                    // which way it faces, so the AI must not steer, path or
+                    // shoot with it. Skipped here rather than inside Update so
+                    // the single-player path is untouched.
+                    if (bandit->networkControlled) continue;
                     bandit->Update(banditDeltaTime, target, groundY);
                     // Keep an actor on the platform it started the frame on.
                     // The navmesh is terrain-only, so steering happily walks a
@@ -2024,6 +2037,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_grass.Update(deltaTime);
         }
         UpdatePlayerVelocity(scene.camera.Position, deltaTime);
+        // After the local player has finished moving for this frame, so the
+        // position that goes on the wire is the one actually rendered, and
+        // before the destruction step, which has its own fixed clock.
+        UpdateMultiplayer(deltaTime, g_localPlayerInput);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this

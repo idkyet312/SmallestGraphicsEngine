@@ -141,6 +141,12 @@ public:
     // so it stays with this ally for the run rather than being re-rolled every
     // frame the marker is drawn.
     std::string       callsign;
+    // This body is another player: its position and facing come from the
+    // network, so the AI must not steer it, shoot with it, or path it. Only the
+    // animation is driven locally, from the movement flags in the snapshot.
+    // Checked at the update call site rather than inside Update, so the
+    // single-player path stays exactly as it was.
+    bool              networkControlled = false;
     // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
     // point instead of the actor's own spawn position -- lets a marine loiter
     // near the player instead of near wherever it was placed. Left unset
@@ -301,6 +307,16 @@ public:
         ConfigureGunLayer();
         ComputePose(0.0f);
         return true;
+    }
+
+    // Advances a body whose position and facing came from the network instead
+    // of from the AI. The ordinary Update path is skipped for those, and that
+    // is what normally drives the clip and the skinning pose -- without this a
+    // remote player would slide around frozen in its bind pose.
+    void UpdateNetworkedPose(float dt, bool moving, bool sprinting) {
+        PlayClip(moving ? (sprinting ? "Run" : "Walk") : "Idle");
+        anim.Advance(dt);
+        ComputePose(dt);
     }
 
     void PlayClip(const std::string& name) {

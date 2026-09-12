@@ -222,6 +222,9 @@ static void ProcessInput(HWND) {
         playerInput.strafe = 0.0f;
     }
     scene.camera.ApplyInput(playerInput);
+    // Published for the multiplayer layer, which sends it after the local
+    // player has finished moving this frame.
+    g_localPlayerInput = playerInput;
 
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.
