@@ -294,6 +294,51 @@ static bool SpawnDropshipBandit(const XMFLOAT3& position) {
     return true;
 }
 
+// One bandit on the empty test level, dropped at a random bearing around the
+// player's spawn.
+//
+// The test level authors no EnemySpawn entities, so SpawnBandit() -- which
+// picks from that rotation -- has nothing to place and returns false. This
+// takes no slot for the same reason the dropship spawn does not: there is no
+// rotation to belong to, and nothing should respawn it when it dies.
+//
+// Placed at a random bearing rather than a fixed offset so repeated test runs
+// do not all rehearse the same approach, and far enough out that it has to be
+// walked up to rather than being in the player's face on spawn.
+static bool SpawnTestLevelBandit(const XMFLOAT3& around) {
+    if (!g_banditModel.valid) return false;
+    auto bandit = std::make_unique<SkinnedEnemy>();
+    if (!bandit->Init(g_banditModel)) return false;
+
+    constexpr float kMinDistance = 14.0f;
+    constexpr float kMaxDistance = 26.0f;
+    const float bearing = RandomUnit() * DirectX::XM_2PI;
+    const float distance =
+        kMinDistance + RandomUnit() * (kMaxDistance - kMinDistance);
+    const float x = around.x + std::sin(bearing) * distance;
+    const float z = around.z + std::cos(bearing) * distance;
+    bandit->position = { x, GroundHeightAt(x, z), z };
+    // Face the player's spawn, so it reads as having been waiting rather than
+    // having been dropped in facing a random direction.
+    bandit->yaw = std::atan2(around.x - x, around.z - z);
+    // -1: not part of the authored rotation, so the slot search skips it and
+    // nothing respawns it. Same convention as the turret gunners.
+    bandit->spawnSlot = -1;
+    bandit->leftArmReach = g_banditLeftArmReach;
+    bandit->orbitRadius = 4.4f + RandomUnit() * 1.8f;
+    bandit->orbitDirection = (g_banditSpawnSerial & 1) ? -1.0f : 1.0f;
+    bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+        RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
+    // A beat before it opens up, so walking into view is not instantly lethal.
+    bandit->fireCooldown = 1.2f + RandomUnit() * 1.4f;
+    ApplyBanditLoadout(*bandit);
+    bandit->PlayClip("Idle");
+    bandit->anim.Advance(0.19f *
+                         static_cast<float>(g_banditSpawnSerial++ % 8));
+    g_bandits.push_back(std::move(bandit));
+    return true;
+}
+
 // Data-driven only: spawns one marine per enabled AllySpawn entity in the
 // current level. Levels with none (including the non-custom default level)
 // get zero marines -- mirrors how EnemySpawn entities drive SpawnBandit()'s

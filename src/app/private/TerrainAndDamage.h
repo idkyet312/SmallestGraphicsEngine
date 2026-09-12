@@ -527,8 +527,13 @@ static bool ClientOwnedByHost() {
 }
 
 static bool AnySkinnedActorsToDraw() {
-    return (!g_emptyLevelMode && g_banditLoaded) ||
-           (g_netSession.Active() && !g_bandits.empty());
+    // Asks what exists rather than what the level mode implies. The old form
+    // was "(!g_emptyLevelMode && g_banditLoaded)", which was a proxy for "are
+    // there any actors" that stopped being true twice: networked player bodies
+    // arrive on the empty level with no squad behind them, and the empty level
+    // now places a test enemy of its own. Keying it to the list itself means a
+    // third source of actors cannot be missed the same way.
+    return !g_bandits.empty();
 }
 
 // Extraction payout, captured once as the win screen opens. Snapshotted rather

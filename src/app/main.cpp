@@ -4481,16 +4481,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // were the largest single cost in its load. BanditSpawn below
             // already no-ops on an invalid model, so skipping the import needs
             // no further guarding.
-            // The empty test level spawns no enemies of its own, so it normally
-            // skips the bandit import and takes only the marine one below --
-            // paying for the enemy mesh, skeleton, three clips and physics
-            // asset on a level that spawns none would undo the point of it.
-            //
-            // Except in a session: a client renders the host's enemies, and
-            // the host's level may well have them even when this one does not.
-            // Without the model those bodies fail to spawn and the client sees
-            // an empty map while the host is in a firefight.
-            if (!g_baseMode && (!g_emptyLevelMode || g_netSession.Active())) {
+            // The base spawns nothing and skips both imports. Everywhere else
+            // needs the bandit model -- including the empty test level, which
+            // now places one enemy to shoot at, and which as a client also has
+            // to render whatever enemies the host's level holds.
+            if (!g_baseMode) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
                 std::vector<std::string> clips = {
@@ -4550,6 +4545,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_banditLoaded = true;
                 std::cout << "Bandit squad ready: " << LiveBanditCount()
                           << " live enemies\n";
+            }
+            // One enemy on the empty test level: something to actually shoot
+            // at while testing, without turning it into a populated map.
+            // Placed relative to the player's spawn, which the camera is
+            // already sitting on at this point in the load.
+            //
+            // Only on the host (or offline). A client's enemies all arrive from
+            // the host's snapshot, so spawning a local one here would give it a
+            // body nobody else can see and that no hit report can reach.
+            if (g_emptyLevelMode && g_banditModel.valid &&
+                !ClientOwnedByHost()) {
+                if (SpawnTestLevelBandit(scene.camera.Position)) {
+                    g_banditLoaded = true;
+                    std::cout << "Test level enemy ready\n";
+                }
             }
             // The empty level takes the marine model but none of its AI: it is
             // there to be a body for networked players, not a squad.
