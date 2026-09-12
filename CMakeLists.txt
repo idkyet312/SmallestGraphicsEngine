@@ -73,6 +73,22 @@ find_package(meshoptimizer CONFIG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)
 
+# Networking is optional: without it the engine still builds and runs
+# single-player against the null transport (see src/net/NetTransport.h). That
+# keeps a heavyweight dependency -- GameNetworkingSockets pulls in OpenSSL and
+# protobuf -- from being required to build the game at all.
+#   vcpkg install gamenetworkingsockets:x64-windows
+find_package(GameNetworkingSockets CONFIG)
+set(SGE_NET_SOURCES "")
+if(GameNetworkingSockets_FOUND)
+    set(SGE_NET_SOURCES src/net/NetTransportGNS.cpp)
+    message(STATUS "GameNetworkingSockets found: multiplayer transport enabled")
+else()
+    message(STATUS "GameNetworkingSockets not found: building without "
+                   "networking (single-player only). Install with "
+                   "'vcpkg install gamenetworkingsockets:x64-windows'.")
+endif()
+
 # If imgui not found, provide helpful message
 if(NOT imgui_FOUND)
     message(STATUS "========================================")
@@ -144,6 +160,7 @@ set(SGE_RUNTIME_SOURCES
     src/level/LevelDefinition.cpp
     src/navigation/NavigationSystem.cpp
     src/net/NetTransportNull.cpp
+    ${SGE_NET_SOURCES}
     src/physics/CollisionMesh.cpp
     src/physics/CollisionMeshCache.cpp
     src/physics/DestructionDX12.cpp
@@ -406,6 +423,23 @@ else()
         imgui::imgui
     )
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
+endif()
+
+# Applies to whichever renderer target was created above. SGE_WITH_NETWORKING
+# is what NetTransport.h keys its factory on, so defining it here is the single
+# switch between the real transport and the null one.
+if(GameNetworkingSockets_FOUND)
+    target_link_libraries(GraphicEngine GameNetworkingSockets::shared)
+    target_compile_definitions(GraphicEngine PRIVATE SGE_WITH_NETWORKING=1)
+    # GNS is a shared library. It happens to resolve from the vcpkg bin
+    # directory on a machine that has it on PATH, which hides the problem
+    # locally and then fails on any other machine. Copy it next to the exe so
+    # the build output is self-contained.
+    add_custom_command(TARGET GraphicEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:GameNetworkingSockets::shared>
+            $<TARGET_FILE_DIR:GraphicEngine>
+        COMMENT "Copying GameNetworkingSockets next to the executable")
 endif()
 
 include(CTest)

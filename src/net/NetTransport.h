@@ -78,6 +78,23 @@ public:
 // enabled still compiles and runs single-player unchanged.
 std::unique_ptr<NetTransport> MakeNullTransport();
 
+// Real UDP transport, built only when SGE_WITH_NETWORKING is defined (see
+// CMakeLists.txt). Declared unconditionally so call sites can be written once;
+// MakeTransport below picks whichever is available.
+#ifdef SGE_WITH_NETWORKING
+std::unique_ptr<NetTransport> MakeGNSTransport();
+#endif
+
+// The factory the game should call. Keeps the "is networking compiled in"
+// question in one place instead of at every call site.
+inline std::unique_ptr<NetTransport> MakeTransport() {
+#ifdef SGE_WITH_NETWORKING
+    return MakeGNSTransport();
+#else
+    return MakeNullTransport();
+#endif
+}
+
 } // namespace net
 
 #endif // NET_TRANSPORT_H
