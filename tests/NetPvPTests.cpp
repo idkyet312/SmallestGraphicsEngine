@@ -360,6 +360,72 @@ void ReviveRules() {
         Check(fixture.Status(1).downed, "a downed player must not be revived "
                                         "by another downed player");
     }
+
+    // Height between the two does not block a revive. The client's prompt asks
+    // an XZ question (NearbyDownedPlayer), so the host has to ask the same one:
+    // while this test was 3D, standing on a slope beside a downed teammate lit
+    // the prompt, sent the intent, and then silently accrued nothing.
+    //
+    // Both ends report feet (Multiplayer.h subtracts PlayerHeight), so eye
+    // height never enters this -- the separation that bites is terrain. 3.0m
+    // is over kReviveRadius, so a 3D test rejects it on the Y term alone while
+    // the two are standing right on top of each other in XZ.
+    {
+        Fixture fixture;
+        for (int i = 0; i < 5; ++i) fixture.Body(0, 1);
+        fixture.hostX = 0.0f;
+        fixture.hostY = 3.0f;
+        fixture.session.SetPlayerPosition(1, 0.0f, 0.0f, 0.0f);
+        fixture.session.ReportReviveIntent(1, true);
+        for (int i = 0; i < 300; ++i) fixture.Advance(1.0f / 60.0f);
+        const LocalPlayerStatus status = fixture.Status(1);
+        Check(!status.downed, "height alone must not block a revive");
+        Check(status.health == kReviveHealth,
+              "a revive across height should still stand them up at 40");
+    }
+
+    // ...but the radius is still a radius. Directly overhead is not "next to
+    // them", so dropping the Y term must not turn into reviving from anywhere.
+    {
+        Fixture fixture;
+        for (int i = 0; i < 5; ++i) fixture.Body(0, 1);
+        fixture.hostX = kReviveRadius + 5.0f;
+        fixture.hostY = 3.0f;
+        fixture.session.SetPlayerPosition(1, 0.0f, 0.0f, 0.0f);
+        fixture.session.ReportReviveIntent(1, true);
+        for (int i = 0; i < 300; ++i) fixture.Advance(1.0f / 60.0f);
+        const LocalPlayerStatus status = fixture.Status(1);
+        Check(status.downed, "XZ range must still be enforced");
+        Check(status.reviveProgress == 0.0f,
+              "an out-of-range hold must accrue nothing whatever the height");
+    }
+
+    // A downed player stops sending movement, so the host's integration loop
+    // gets no input for them. Their authoritative position must survive that:
+    // the host is the only writer of it, and while the write was gated on an
+    // input arriving, a downed client's copy sat at the default while the body
+    // everyone could see was somewhere else entirely. The host walked up to
+    // them and was never in range.
+    //
+    // Pinned at the session's contract: position set once, then many ticks with
+    // nothing arriving, and a reviver standing there still completes.
+    {
+        Fixture fixture;
+        for (int i = 0; i < 5; ++i) fixture.Body(0, 1);
+        constexpr float kAway = 120.0f;   // nowhere near the default origin
+        fixture.session.SetPlayerPosition(1, kAway, 0.0f, kAway);
+
+        // Time passes with no further position update, as for a downed player.
+        for (int i = 0; i < 120; ++i) fixture.Advance(1.0f / 60.0f);
+
+        // The host walks to where the body actually is and picks them up.
+        fixture.hostX = kAway;
+        fixture.hostZ = kAway;
+        fixture.session.ReportReviveIntent(1, true);
+        for (int i = 0; i < 300; ++i) fixture.Advance(1.0f / 60.0f);
+        Check(!fixture.Status(1).downed,
+              "a downed player's position must survive sending no input");
+    }
 }
 
 void OutOfOrderSnapshotsDoNotResurrect() {

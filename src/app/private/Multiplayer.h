@@ -417,38 +417,6 @@ static void UpdateMultiplayerSession(float frameDelta,
 static void UpdateMultiplayerBodies(float frameDelta) {
     if (!MultiplayerActive()) return;
 
-    // The host owns remote players' movement: it integrates them from the
-    // input they sent rather than from a position they claimed, then feeds the
-    // result back so the next snapshot carries it. Milestone 1 keeps that
-    // integration deliberately simple -- flat ground-follow, no collision --
-    // because the point is to prove the pipe, and a full second mover is
-    // milestone 2's problem.
-    if (g_netSession.CurrentRole() == net::Role::Host) {
-        for (const auto& actor : g_bandits) {
-            if (!actor || !actor->networkControlled) continue;
-            const net::PlayerId id = actor->netPlayerId;
-            const PlayerInput* input = g_netSession.PendingInput(id);
-            if (!input) continue;
-            SkinnedEnemy* body = actor.get();
-            const float yawRadians = DirectX::XMConvertToRadians(input->yaw);
-            const float forwardX = std::sin(yawRadians);
-            const float forwardZ = std::cos(yawRadians);
-            const float speed = scene.camera.MovementSpeed *
-                                input->movementMultiplier * input->deltaTime;
-            body->position.x +=
-                (forwardX * input->forward - forwardZ * input->strafe) * speed;
-            body->position.z +=
-                (forwardZ * input->forward + forwardX * input->strafe) * speed;
-            auto params = CurrentTerrainParams();
-            params.heightScale = scene.terrainHeightScale;
-            body->position.y = TerrainRendererDX12::HeightAt(
-                params, body->position.x, body->position.z);
-            g_netSession.SetPlayerPosition(id, body->position.x,
-                                           body->position.y, body->position.z);
-            g_netSession.ClearPendingInput(id);
-        }
-    }
-
     // Apply the session's interpolated view to the bodies. On the host this
     // only moves other players; on a client it moves everyone but the local
     // player, whose own position stays locally predicted.
@@ -491,13 +459,11 @@ static void UpdateMultiplayerBodies(float frameDelta) {
             // in from the origin, which would drag the new body across the map.
             body->position = { remote.x, remote.y, remote.z };
         }
-        // The host already integrated its own remote bodies above; overwriting
-        // them with the snapshot it just produced would be circular.
-        if (g_netSession.CurrentRole() != net::Role::Host)
-            body->position = { remote.x, remote.y, remote.z };
-        // SkinnedEnemy stores facing in radians; the wire carries degrees, in
-        // the same units the camera uses.
-        const float yawRadians = DirectX::XMConvertToRadians(remote.yaw);
+        body->position = { remote.x, remote.y, remote.z };
+        // Camera yaw faces (cos(yaw), sin(yaw)) in XZ; the mesh's +Z forward
+        // rotates to (sin(yaw), cos(yaw)), so units alone are not enough.
+        const float yawRadians = DirectX::XM_PIDIV2 -
+                                 DirectX::XMConvertToRadians(remote.yaw);
         body->yaw = yawRadians;
         body->aimYaw = yawRadians;
         // Mirror the authoritative life state onto the body. One direction

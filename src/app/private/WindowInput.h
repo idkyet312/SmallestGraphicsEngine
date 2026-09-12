@@ -3,6 +3,7 @@
 // Private application implementation; included once by main.cpp in dependency order.
 
 static void ApplyVirtualInput() {
+    if (!HasInputFocus()) return;
     Camera& cam = scene.camera;
     if (virtualInput.moveY > 0.0f) cam.ProcessKeyboard('W', deltaTime,  virtualInput.moveY);
     if (virtualInput.moveY < 0.0f) cam.ProcessKeyboard('S', deltaTime, -virtualInput.moveY);
@@ -44,7 +45,7 @@ static void ProcessInput(HWND) {
     // drives its secondary scope camera, but magnification stays on the physical
     // lens rather than replacing the player's main view.
     const bool rightMouseHeld =
-        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        (FocusedKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool c4DetonateRequested = IsGameplayScreen() &&
         scene.player.health > 0.0f && !g_drivingHumvee &&
         !cameraLocked && !ImGui::GetIO().WantCaptureMouse &&
@@ -84,14 +85,14 @@ static void ProcessInput(HWND) {
     // Space/Q lift and drop, matching the level editor's fly camera. Returning
     // early keeps walking, gravity, sliding and shooting out of the way.
     if (scene.ejected) {
-        const float speed = ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f);
-        if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
-        if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
-        if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
-        if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
+        const float speed = ((FocusedKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f);
+        if (FocusedKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
+        if (FocusedKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
+        if (FocusedKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
+        if (FocusedKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
         const float lift = scene.camera.MovementSpeed * speed * deltaTime;
-        if (GetAsyncKeyState(VK_SPACE) & 0x8000) scene.camera.Position.y += lift;
-        if (GetAsyncKeyState('Q') & 0x8000)      scene.camera.Position.y -= lift;
+        if (FocusedKeyState(VK_SPACE) & 0x8000) scene.camera.Position.y += lift;
+        if (FocusedKeyState('Q') & 0x8000)      scene.camera.Position.y -= lift;
         return;
     }
 
@@ -105,11 +106,11 @@ static void ProcessInput(HWND) {
         state.turretFireCooldown = (std::max)(
             0.0f, state.turretFireCooldown - deltaTime);
         const float throttle =
-            ((GetAsyncKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
-            ((GetAsyncKeyState('S') & 0x8000) ? 1.0f : 0.0f);
+            ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
         const float manualSteering =
-            ((GetAsyncKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
-            ((GetAsyncKeyState('D') & 0x8000) ? 1.0f : 0.0f);
+            ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f);
         float steering = manualSteering * 0.45f;
         XMFLOAT4X4 vehiclePose;
         XMFLOAT3 vehicleForward;
@@ -134,11 +135,11 @@ static void ProcessInput(HWND) {
         steering = (std::max)(-1.0f, (std::min)(1.0f, steering));
         g_destruction.SetVehicleInput(
             g_activeHumveeIndex, throttle, steering,
-            (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0);
+            (FocusedKeyState(VK_SPACE) & 0x8000) != 0);
         for (size_t index = 0; index < g_destruction.VehicleCount(); ++index)
             if (index != g_activeHumveeIndex)
                 g_destruction.SetVehicleInput(index, 0.0f, 0.0f, true);
-        if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+        if ((FocusedKeyState(VK_LBUTTON) & 0x8000) &&
             !ImGui::GetIO().WantCaptureMouse)
             FireHumveeTurret();
         return;
@@ -151,14 +152,14 @@ static void ProcessInput(HWND) {
     // out of the door on the way in.
     const bool ridingBlackHawk = g_game.vehicles.blackHawkCarryingPlayer;
     const bool controlDown = !ridingBlackHawk && scene.camera.FPSMode &&
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+        (FocusedKeyState(VK_CONTROL) & 0x8000);
     // An exhausted player keeps the key but loses the speed: the meter has to
     // rebuild past kStaminaRecoveredToSprint before shift means anything again.
     // Gating here rather than at the movement call keeps one authority for
     // "is this a sprint", which the viewmodel and the stamina drain both read.
     const bool sprinting = !ridingBlackHawk && scene.camera.FPSMode &&
         !g_staminaExhausted &&
-        (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+        (FocusedKeyState(VK_SHIFT) & 0x8000);
     // Mouse-walk mode: the right button reads as forward, exactly as if W were
     // held. Gated on the same UI capture the fire path uses, so dragging a debug
     // window does not also march the player across the map.
@@ -167,14 +168,14 @@ static void ProcessInput(HWND) {
     // equipped, a press both walks and detonates. That is intended -- the
     // detonator is worth more than a clean movement binding in one mode.
     const bool mouseWalkForward = g_mouseWalkTestMode &&
-        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 &&
+        (FocusedKeyState(VK_RBUTTON) & 0x8000) != 0 &&
         !ImGui::GetIO().WantCaptureMouse;
     const float forwardInput =
-        (((GetAsyncKeyState('W') & 0x8000) || mouseWalkForward) ? 1.0f : 0.0f) -
-        ((GetAsyncKeyState('S') & 0x8000) ? 1.0f : 0.0f);
+        (((FocusedKeyState('W') & 0x8000) || mouseWalkForward) ? 1.0f : 0.0f) -
+        ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
     const float strafeInput =
-        ((GetAsyncKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
-        ((GetAsyncKeyState('D') & 0x8000) ? 1.0f : 0.0f);
+        ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
+        ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f);
     static bool controlWasDown = false;
     if (controlDown && !controlWasDown && sprinting)
         scene.camera.StartSlide(forwardInput, strafeInput);
@@ -209,7 +210,7 @@ static void ProcessInput(HWND) {
     // ascend key the way it blocks jumping on land.
     const bool jumpHeld = !ridingBlackHawk &&
         (scene.camera.IsSwimming || !crouching) &&
-        (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        (FocusedKeyState(VK_SPACE) & 0x8000) != 0;
     playerInput.Set(PlayerInput::Jump,
                     jumpHeld && !scene.camera.IsSwimming);
     playerInput.Set(PlayerInput::Swim, jumpHeld && scene.camera.IsSwimming);
@@ -233,7 +234,7 @@ static void ProcessInput(HWND) {
         net::PlayerId reviveTarget = net::kInvalidPlayerId;
         const bool nearDowned = NearbyDownedPlayer(&reviveTarget) != nullptr;
         const bool reviveHeld =
-            nearDowned && (GetAsyncKeyState('E') & 0x8000) != 0;
+            nearDowned && (FocusedKeyState('E') & 0x8000) != 0;
         playerInput.Set(PlayerInput::Revive, reviveHeld);
         if (MultiplayerActive()) {
             g_netSession.ReportReviveIntent(
@@ -249,7 +250,7 @@ static void ProcessInput(HWND) {
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.
     scene.fireCooldown -= deltaTime;
-    const bool mouseHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool mouseHeld = (FocusedKeyState(VK_LBUTTON) & 0x8000) != 0;
     if (!mouseHeld) g_suppressFireUntilMouseRelease = false;
     if (scene.autoFire && mouseHeld && !g_suppressFireUntilMouseRelease &&
         !ImGui::GetIO().WantCaptureMouse && !scene.player.downed &&
@@ -260,13 +261,13 @@ static void ProcessInput(HWND) {
     // Reload: press R. Held keys are fine here because BeginReload rejects a
     // second start while one is already running.
     scene.UpdateReload(deltaTime);
-    if ((GetAsyncKeyState('R') & 0x8000) &&
+    if ((FocusedKeyState('R') & 0x8000) &&
         scene.BeginReload(GunModel::SelectedWeapon()))
         PlayReloadSound();
 
     // Grenade: press G to lob one. Cooldown debounces the held key.
     scene.grenadeCooldown -= deltaTime;
-    if ((GetAsyncKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f &&
+    if ((FocusedKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f &&
         !scene.player.downed) {
         const size_t projectileStart = scene.projectiles.size();
         scene.ThrowGrenade();
@@ -280,6 +281,32 @@ static void ProcessInput(HWND) {
 
 // ?? window proc ??????????????????????????????????????????????????????????????
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_SETFOCUS) {
+        g_inputWindow = hwnd;
+        firstMouse = true;
+        ignoreNextMouseMove = false;
+        if (!cameraLocked) {
+            SetCapture(hwnd);
+            SetCursorVisible(false);
+        }
+    } else if (msg == WM_KILLFOCUS) {
+        g_inputWindow = nullptr;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        SetCursorVisible(true);
+        firstMouse = true;
+        ignoreNextMouseMove = false;
+        if (IsEditorEditing()) cameraLocked = true;
+        virtualInput.moveX = virtualInput.moveY = 0.0f;
+        virtualInput.lookX = virtualInput.lookY = 0.0f;
+        virtualInput.down = virtualInput.jump = virtualInput.shoot = false;
+    }
+
+    // Focus messages still reach ImGui so it can clear its own held state.
+    if (!HasInputFocus() &&
+        ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
+         (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)))
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+
     // RMB over the editor viewport means "return control to the scene". A
     // focused InputText/slider leaves ActiveId set and therefore keeps
     // WantCaptureKeyboard true even after mouse-look starts. Removing ImGui
@@ -469,7 +496,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (IsEditorEditing()) {
             const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (!(GetAsyncKeyState(VK_RBUTTON) & 0x8000))
+            if (!(FocusedKeyState(VK_RBUTTON) & 0x8000))
                 g_levelEditor.OnKeyDown(static_cast<unsigned>(wParam), controlDown);
         }
         else if (wParam == VK_TAB) {

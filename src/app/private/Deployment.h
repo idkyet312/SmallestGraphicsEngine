@@ -391,10 +391,10 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
             // -cross(front, Up); in this basis that is (forwardZ, -forwardX).
             const float rightX = forwardZ;
             const float rightZ = -forwardX;
-            if (GetAsyncKeyState('W') & 0x8000) { moveX += forwardX; moveZ += forwardZ; }
-            if (GetAsyncKeyState('S') & 0x8000) { moveX -= forwardX; moveZ -= forwardZ; }
-            if (GetAsyncKeyState('D') & 0x8000) { moveX += rightX; moveZ += rightZ; }
-            if (GetAsyncKeyState('A') & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
+            if (FocusedKeyState('W') & 0x8000) { moveX += forwardX; moveZ += forwardZ; }
+            if (FocusedKeyState('S') & 0x8000) { moveX -= forwardX; moveZ -= forwardZ; }
+            if (FocusedKeyState('D') & 0x8000) { moveX += rightX; moveZ += rightZ; }
+            if (FocusedKeyState('A') & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
         }
         const float moveLength = std::sqrt(moveX * moveX + moveZ * moveZ);
         if (moveLength > 1e-4f) {
@@ -404,9 +404,9 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
             // crosses it in under a second, but moving at a different rate in
             // here than everywhere else is what reads as wrong.
             const bool cabinCrouching =
-                (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                (FocusedKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool cabinSprinting =
-                (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                (FocusedKeyState(VK_SHIFT) & 0x8000) != 0;
             const float cabinMultiplier = cabinCrouching ? 0.55f
                 : (cabinSprinting ? 1.5f : 1.0f);
             const float step = scene.camera.MovementSpeed * cabinMultiplier *
@@ -423,7 +423,7 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         // Jump, in cabin space. Fires on the press rather than the hold so it
         // matches the ground jump, and only with both feet on the deck --
         // otherwise the player could climb the air out of the aircraft.
-        const bool jumpDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        const bool jumpDown = (FocusedKeyState(VK_SPACE) & 0x8000) != 0;
         if (jumpDown && !g_blackHawkCabinJumpHeld && g_blackHawkCabinGrounded) {
             g_blackHawkCabinVertVel = scene.camera.JumpStrength;
             g_blackHawkCabinGrounded = false;

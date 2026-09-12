@@ -112,6 +112,7 @@
 using namespace DirectX;
 
 // Application modules are ordered to preserve declarations and static initialization.
+#include "private/InputFocus.h"
 #include "private/AppState.h"
 #include "private/TerrainAndDamage.h"
 #include "private/VehicleModels.h"
@@ -968,15 +969,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
         if (IsEditorEditing() && !cameraLocked &&
             !ImGui::GetIO().WantCaptureKeyboard) {
-            const float speed = ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f)
+            const float speed = ((FocusedKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f)
                 * g_editorCameraSpeed;
-            if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
-            if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
-            if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
-            if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
-            if (GetAsyncKeyState(VK_SPACE) & 0x8000)
+            if (FocusedKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
+            if (FocusedKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
+            if (FocusedKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
+            if (FocusedKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
+            if (FocusedKeyState(VK_SPACE) & 0x8000)
                 scene.camera.Position.y += scene.camera.MovementSpeed * speed * deltaTime;
-            if (GetAsyncKeyState('Q') & 0x8000)
+            if (FocusedKeyState('Q') & 0x8000)
                 scene.camera.Position.y -= scene.camera.MovementSpeed * speed * deltaTime;
         }
 

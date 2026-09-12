@@ -22,7 +22,10 @@ namespace net {
 // 2: PlayerSnapshot gained health/downed/reviver, and PvP hit reporting,
 // player state events and revive progress were added.
 // 3: enemies are host-authoritative and ride in their own snapshot.
-inline constexpr uint32_t kProtocolVersion = 3;
+// 4: PlayerSnapshot gained reviveProgress, without which a client could never
+//    draw a revive bar -- the host was the only machine that knew the number.
+// 5: client input carries the locally simulated feet position.
+inline constexpr uint32_t kProtocolVersion = 5;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -103,6 +106,7 @@ struct ServerReject {
 struct ClientInputMessage {
     MessageHeader header{ MessageType::ClientInput, {} };
     PlayerInput input;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
 // One player's replicated state. Weapons and ammo are still local-only; health
@@ -130,6 +134,18 @@ struct PlayerSnapshot {
     // every client can draw the progress, not just the two players involved.
     PlayerId reviver = kInvalidPlayerId;
     uint8_t padding[2] = {};
+    // Seconds of hold the host has credited, NOT normalised -- receivers divide
+    // by kReviveSeconds themselves (PlayerStatus, LocalStatus, GetRemotePlayers
+    // all already do), so normalising here would divide twice.
+    //
+    // Replicated rather than timed locally because a locally timed bar would
+    // fill even on the ticks the host is rejecting the hold for range, which is
+    // exactly the case the bar exists to show. Without this on the wire the
+    // field is host-only: StepRevives is the sole writer, so a client's copy sat
+    // at zero forever and its revive bar never drew at all.
+    //
+    // Lands on a 4-byte boundary: the padding above closes out `reviver`.
+    float reviveProgress = 0.0f;
 };
 
 struct ServerSnapshotMessage {

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -228,7 +229,7 @@ public:
                 SendSnapshot();
                 SendEnemySnapshots();
             } else {
-                SendInput(local.input);
+                SendInput(local);
             }
         }
         interpolationTime_ += deltaTime;
@@ -531,6 +532,9 @@ private:
         bool pendingReviveHolding = false;
         // Counts down after the last hit; regen starts when it reaches zero.
         float regenTimer = 0.0f;
+        // Throttles the "revive denied" diagnostic to roughly one line a second
+        // so a 30 Hz rejection does not bury the log it is meant to explain.
+        float diagnosticTimer = 0.0f;
     };
 
     static float Clamp01(float value) {
@@ -618,16 +622,57 @@ private:
                 if (!other.active || other.downed) continue;
                 if (!other.pendingReviveHolding) continue;
                 if (other.pendingReviveTarget != target) continue;
+                // Compared in the plane, which is the same rule the client's
+                // prompt uses (NearbyDownedPlayer). Including Y here instead
+                // made the two disagree on sloped terrain: the prompt appeared
+                // and the intent was sent, but this test rejected it and the
+                // bar never filled. Over kReviveRadius of ground a slope can
+                // easily separate two sets of feet by more than the radius
+                // itself, and "standing next to them" is an XZ question.
                 const float dx = other.current.x - slot.current.x;
-                const float dy = other.current.y - slot.current.y;
                 const float dz = other.current.z - slot.current.z;
-                const float distanceSquared = dx * dx + dy * dy + dz * dz;
+                const float distanceSquared = dx * dx + dz * dz;
                 if (distanceSquared > bestDistanceSquared) continue;
                 bestDistanceSquared = distanceSquared;
                 best = candidate;
             }
 
             if (best == kInvalidPlayerId) {
+                // Why nobody was credited, about once a second while someone is
+                // on the floor. A revive that silently does nothing has three
+                // very different causes -- the intent never reached the host,
+                // it named someone else, or it arrived and lost the range test
+                // -- and they are indistinguishable from inside the game. The
+                // numbers separate them; guessing between them does not.
+                slot.diagnosticTimer += step;
+                if (slot.diagnosticTimer >= 1.0f) {
+                    slot.diagnosticTimer = 0.0f;
+                    std::string line = "revive denied for player " +
+                        std::to_string(static_cast<int>(target)) + " at (" +
+                        std::to_string(slot.current.x) + "," +
+                        std::to_string(slot.current.z) + ")";
+                    bool anyHolder = false;
+                    for (uint8_t c = 0; c < kMaxPlayers; ++c) {
+                        if (c == target) continue;
+                        const PlayerSlot& other = players_[c];
+                        if (!other.active) continue;
+                        if (!other.pendingReviveHolding) continue;
+                        anyHolder = true;
+                        const float dx = other.current.x - slot.current.x;
+                        const float dz = other.current.z - slot.current.z;
+                        line += "; player " + std::to_string(static_cast<int>(c)) +
+                            " holding on " +
+                            std::to_string(static_cast<int>(
+                                other.pendingReviveTarget)) +
+                            " at (" + std::to_string(other.current.x) + "," +
+                            std::to_string(other.current.z) + ") distance " +
+                            std::to_string(std::sqrt(dx * dx + dz * dz)) +
+                            " vs radius " + std::to_string(kReviveRadius) +
+                            (other.downed ? " [holder is downed]" : "");
+                    }
+                    if (!anyHolder) line += "; no revive intent reached the host";
+                    SGE_LOG("LogNet", EngineLog::Level::Display, line);
+                }
                 // Decay rather than reset: stepping out of range for one tick
                 // of jitter should not throw away three seconds of work.
                 slot.reviver = kInvalidPlayerId;
@@ -635,6 +680,7 @@ private:
                 if (slot.reviveProgress < 0.0f) slot.reviveProgress = 0.0f;
                 continue;
             }
+            slot.diagnosticTimer = 0.0f;
 
             slot.reviver = best;
             slot.reviveProgress += step;
@@ -834,8 +880,17 @@ private:
         PlayerSlot& slot = players_[it->second];
         // Drop inputs that arrive out of order: UDP reorders, and applying an
         // older input after a newer one would rubber-band the player.
-        if (slot.hasInput && message.input.sequence < slot.lastInput.sequence)
+        if (!std::isfinite(message.x) || !std::isfinite(message.y) ||
+            !std::isfinite(message.z)) return;
+        if (slot.hasInput && message.input.sequence <= slot.lastInput.sequence)
             return;
+        // Match the position used by the client revive prompt. Integrating
+        // one render frame of input per net tick loses movement.
+        if (!slot.downed) {
+            slot.current.x = message.x;
+            slot.current.y = message.y;
+            slot.current.z = message.z;
+        }
         slot.lastInput = message.input;
         slot.hasInput = true;
         slot.current.yaw = message.input.yaw;
@@ -883,6 +938,9 @@ private:
             slot.health = incoming.health;
             slot.downed = incoming.downed != 0;
             slot.reviver = incoming.reviver;
+            // Rides the same stale-tick discard as the rest of the life state,
+            // so an out-of-order packet cannot rewind a bar that has moved on.
+            slot.reviveProgress = incoming.reviveProgress;
         }
     }
 
@@ -901,6 +959,10 @@ private:
             snapshot.players[count].health = players_[i].health;
             snapshot.players[count].downed = players_[i].downed ? 1 : 0;
             snapshot.players[count].reviver = players_[i].reviver;
+            // Raw seconds; the receiver normalises. StepRevives is the only
+            // writer and it is host-only, so this send is the single thing that
+            // makes the number exist anywhere else.
+            snapshot.players[count].reviveProgress = players_[i].reviveProgress;
             ++count;
         }
         snapshot.playerCount = count;
@@ -1013,10 +1075,13 @@ private:
         enemyHits_.push_back(request);
     }
 
-    void SendInput(const PlayerInput& input) {
+    void SendInput(const LocalPlayerState& local) {
         if (localId_ == kInvalidPlayerId || serverPeer_ == kInvalidPeer) return;
         ClientInputMessage message;
-        message.input = input;
+        message.input = local.input;
+        message.x = local.x;
+        message.y = local.y;
+        message.z = local.z;
         message.input.sequence = ++inputSequence_;
         transport_->Send(serverPeer_, &message, sizeof(message),
                          Channel::Unreliable);

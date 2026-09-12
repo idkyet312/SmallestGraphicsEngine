@@ -107,7 +107,7 @@ while ((Get-Date) -lt $deadline) {
         $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
         if ($text -and $text -match 'welcome received; we are player') { $connected = $true; break }
     }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 1500
 }
 
 Write-Host ""

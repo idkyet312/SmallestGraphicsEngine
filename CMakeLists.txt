@@ -665,6 +665,10 @@ if(BUILD_TESTING)
         src/net/NetTransportNull.cpp)
     target_link_libraries(NetPvPTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetPvPTests COMMAND NetPvPTests)
+
+    add_executable(NetClientReviveTests tests/NetClientReviveTests.cpp)
+    target_link_libraries(NetClientReviveTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetClientReviveTests COMMAND NetClientReviveTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

@@ -59,7 +59,7 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 3, "protocol version was not bumped");
+    Check(kProtocolVersion == 5, "protocol version was not bumped");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -110,6 +110,10 @@ int main() {
         sent.players[i].downed = static_cast<uint8_t>(i == 3 ? 1 : 0);
         sent.players[i].reviver =
             static_cast<PlayerId>(i == 3 ? 1 : kInvalidPlayerId);
+        // Mid-hold, in raw seconds. Deliberately not a round number and not
+        // normalised: this field is what a client's revive bar is drawn from,
+        // and while it was missing from the wire the bar could never fill.
+        sent.players[i].reviveProgress = i == 3 ? 1.75f : 0.0f;
     }
 
     unsigned char buffer[sizeof(ServerSnapshotMessage)];
@@ -141,11 +145,17 @@ int main() {
               "downed lost");
         Check(received.players[i].reviver == sent.players[i].reviver,
               "reviver lost");
+        Check(received.players[i].reviveProgress ==
+                  sent.players[i].reviveProgress,
+              "reviveProgress lost");
     }
 
     // An input message must carry the PlayerInput through untouched, since the
     // host feeds it straight back into Camera::ApplyInput.
     ClientInputMessage inputSent;
+    inputSent.x = 123.0f;
+    inputSent.y = -4.0f;
+    inputSent.z = 56.0f;
     inputSent.input.forward = -1.0f;
     inputSent.input.strafe = 0.25f;
     inputSent.input.yaw = 270.0f;
@@ -156,6 +166,8 @@ int main() {
     std::memcpy(inputBuffer, &inputSent, sizeof(inputBuffer));
     ClientInputMessage inputReceived;
     std::memcpy(&inputReceived, inputBuffer, sizeof(inputBuffer));
+    Check(inputReceived.x == inputSent.x && inputReceived.y == inputSent.y &&
+          inputReceived.z == inputSent.z, "client position lost");
 
     Check(inputReceived.input.forward == inputSent.input.forward,
           "input forward did not round-trip");
