@@ -4117,9 +4117,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ArmsModel::Load();
 
             if (g_emptyLevelMode) {
-                AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
-                    "Drain graphics uploads and generate texture mips",
-                    "direct queue + compute queue", GunModel::Loaded());
+                // Through BanditModel rather than straight to GPUFinalize: the
+                // test level has no AI, but a multiplayer session needs the
+                // marine skinned model to build remote player bodies out of,
+                // and skipping the stage left g_marineModel invalid -- so a
+                // connected player was simply never spawned and the two ends
+                // could not see each other. BanditSpawn still spawns nothing
+                // here; it is the model load that is needed, not the squad.
+                AdvanceLevelLoading(LevelLoadStage::BanditModel,
+                    "Load character models",
+                    "marine model for networked players", GunModel::Loaded());
             } else {
                 // Authored explosive barrel. Source mesh is 2.08 m high; 0.72 keeps
                 // its in-game size aligned with existing 1.5 m gameplay collision.
@@ -4395,7 +4402,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // were the largest single cost in its load. BanditSpawn below
             // already no-ops on an invalid model, so skipping the import needs
             // no further guarding.
-            if (!g_baseMode) {
+            // The empty test level has no enemies, so it skips the bandit
+            // import and takes only the marine one below -- which it needs for
+            // networked player bodies. Paying for the enemy mesh, skeleton,
+            // three clips and physics asset on a level that spawns none would
+            // undo the point of the empty level.
+            if (!g_baseMode && !g_emptyLevelMode) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
                 std::vector<std::string> clips = {
@@ -4413,9 +4425,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 } else {
                     std::cerr << "Bandit squad failed to load\n";
                 }
+            }
 
-                // Same mesh/clip pipeline, recolored textures: the player's two
-                // marine allies.
+            // Same mesh/clip pipeline, recolored textures: the player's two
+            // marine allies -- and the body every networked player is drawn
+            // with, which is why this is loaded on the empty test level too
+            // while the enemy import above is not.
+            if (!g_baseMode) {
                 const std::string marineDir = "Content/Models/MarineAlly/";
                 const std::string marineAnimDir = marineDir + "Animations/Demo/";
                 std::vector<std::string> marineClips = {
@@ -4436,7 +4452,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Spawn squad and turret gunners",
                 g_stressTestMode ? "stress squad: enemies + 2 gunners"
                                  : "level squad: enemies + Humvee gunners",
-                g_baseMode || g_banditModel.valid);
+                g_baseMode || (g_emptyLevelMode ? g_marineModel.valid
+                                                : g_banditModel.valid));
         } else if (g_game.loading.Stage() == LevelLoadStage::BanditSpawn) {
             if (g_banditModel.valid) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
@@ -4451,14 +4468,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::cout << "Bandit squad ready: " << LiveBanditCount()
                           << " live enemies\n";
             }
-            if (g_marineModel.valid) {
+            // The empty level takes the marine model but none of its AI: it is
+            // there to be a body for networked players, not a squad.
+            if (g_marineModel.valid && !g_emptyLevelMode) {
                 SpawnMarinesFromLevel();
                 std::cout << "Marine allies ready: " << LiveMarineCount()
                           << " live marines\n";
             }
             AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
                 "Drain graphics uploads and generate texture mips",
-                "direct queue + compute queue", g_banditLoaded);
+                "direct queue + compute queue",
+                // No squad is expected on the empty level, so report the stage
+                // against what it actually had to do -- keying it to
+                // g_banditLoaded would mark every test level load as failed.
+                g_emptyLevelMode ? g_marineModel.valid : g_banditLoaded);
         } else if (g_game.loading.Stage() == LevelLoadStage::GPUFinalize) {
 
             // Flush the load/mip-generation commands now and print any D3D12
@@ -4737,7 +4760,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
-                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
+                    AnySkinnedActorsToDraw() ? &g_bandits : nullptr,
                     &mainShader);
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
@@ -4793,7 +4816,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
-                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
+                    AnySkinnedActorsToDraw() ? &g_bandits : nullptr,
                     &mainShader);
                 shadowResource = shadowMap.GetResource();
                 // Handed to next frame's scope pass, which runs before this one.
@@ -4838,7 +4861,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ? scene.GetProjectionMatrix()
             : scene.GetUnjitteredProjectionMatrix();
         if (renderedScene && !bentGTAODiagnosticActive &&
-            !g_emptyLevelMode && g_banditLoaded) {
+            AnySkinnedActorsToDraw()) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
             // Bandits and their guns are the draws that own motion PSOs, so
@@ -4864,6 +4887,37 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.EndMotionDraws(g_dx12.commandList.Get());
             mainShader.SetExtensionMotionEnabled(false);
             g_meshShader.SetExtensionMotionEnabled(false);
+            mainShader.Use(scene.wireframeMode);
+        }
+        // Fallback marker for networked players. A remote player can fail to
+        // appear for two very different reasons -- no body was spawned at all,
+        // or a body exists and is not being drawn -- and from outside the
+        // engine those look identical. An emissive sphere at every remote
+        // player's reported position separates them: a sphere with no marine
+        // under it means the body failed to spawn, no sphere at all means the
+        // position never arrived over the wire.
+        //
+        // Deliberately outside the bandit block above, which needs a non-empty
+        // g_bandits -- the case this is most needed for is exactly the one
+        // where no body was created.
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            g_netSession.Active()) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Net Player Markers", g_dx12.commandList.Get());
+            g_netSession.GetRemotePlayers(g_netRemoteScratch);
+            for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+                // Chest height above the reported feet position, so it sits
+                // where the body should be rather than buried in terrain.
+                const XMMATRIX marker =
+                    XMMatrixScaling(0.35f, 0.35f, 0.35f) *
+                    XMMatrixTranslation(remote.x, remote.y + 1.0f, remote.z);
+                mainShader.SetMatrices(marker, scene.GetViewMatrix(),
+                                       extensionProj, fogLightSpace);
+                mainShader.SetEmissiveMaterial(XMFLOAT3(0.2f, 4.0f, 0.6f),
+                                               0.9f);
+                DrawSphere(geo);
+                mainShader.NextDrawCall();
+            }
             mainShader.Use(scene.wireframeMode);
         }
         if (renderedScene && !bentGTAODiagnosticActive &&

@@ -513,6 +513,17 @@ static char g_multiplayerPort[8] = "27015";
 // never learns why the connect did not take.
 static std::string g_multiplayerStatusError;
 
+// Whether the actor list has anything worth drawing. The empty test level
+// loads no squad, so every bandit draw and shadow site is gated on
+// "!g_emptyLevelMode && g_banditLoaded" -- which also silently dropped
+// networked player bodies, because they live in g_bandits but arrive without a
+// squad behind them. One predicate rather than six edited conditions, so a new
+// draw site cannot pick up half the rule.
+static bool AnySkinnedActorsToDraw() {
+    return (!g_emptyLevelMode && g_banditLoaded) ||
+           (g_netSession.Active() && !g_bandits.empty());
+}
+
 // Extraction payout, captured once as the win screen opens. Snapshotted rather
 // than recomputed while the screen draws, because the wallet keeps moving --
 // re-reading SessionEarned() every frame would be fine today but silently

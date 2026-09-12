@@ -176,11 +176,40 @@ static void UpdateMultiplayerBodies(float frameDelta) {
     // only moves other players; on a client it moves everyone but the local
     // player, whose own position stays locally predicted.
     g_netSession.GetRemotePlayers(g_netRemoteScratch);
+    // One-shot trace of the first frame that has remote players to place, and
+    // of every spawn. Placed here because "connected but invisible" cannot be
+    // told apart from "no remote players in the snapshot" from the outside.
+    static bool tracedRemotes = false;
+    if (!tracedRemotes && !g_netRemoteScratch.empty()) {
+        tracedRemotes = true;
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+                "bodies: remotes=" + std::to_string(g_netRemoteScratch.size()) +
+                " marineModel=" + std::to_string(g_marineModel.valid ? 1 : 0) +
+                " bandits=" + std::to_string(g_bandits.size()) +
+                " firstPos=" + std::to_string(g_netRemoteScratch[0].x) + "," +
+                std::to_string(g_netRemoteScratch[0].y) + "," +
+                std::to_string(g_netRemoteScratch[0].z) +
+                " camera=" + std::to_string(scene.camera.Position.x) + "," +
+                std::to_string(scene.camera.Position.y) + "," +
+                std::to_string(scene.camera.Position.z));
+    }
     for (const net::RemotePlayer& remote : g_netRemoteScratch) {
         SkinnedEnemy* body = FindNetworkPlayerBody(remote.id);
         if (!body) {
             body = SpawnNetworkPlayerBody(remote.id);
-            if (!body) continue;
+            if (!body) {
+                SGE_LOG("LogNet", EngineLog::Level::Warning,
+                        "spawn FAILED for player " +
+                        std::to_string(static_cast<int>(remote.id)) +
+                        " (marineModel valid=" +
+                        std::to_string(g_marineModel.valid ? 1 : 0) + ")");
+                continue;
+            }
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                    "spawned body for player " +
+                    std::to_string(static_cast<int>(remote.id)) + " at " +
+                    std::to_string(remote.x) + "," + std::to_string(remote.y) +
+                    "," + std::to_string(remote.z));
             // Start exactly where the snapshot says instead of interpolating
             // in from the origin, which would drag the new body across the map.
             body->position = { remote.x, remote.y, remote.z };

@@ -161,7 +161,7 @@ static void RenderSniperScopeTexture(float now, bool hideFog) {
         // Skinned actors live outside RenderForward in the primary path.
         // Enemies are the whole point of a magnified sight, so they are drawn
         // here with their weapons, exactly as the main view draws them.
-        if (!g_emptyLevelMode && g_banditLoaded) {
+        if (AnySkinnedActorsToDraw()) {
             ProfilerDX12::Scope banditProfile(
                 g_profiler, "Scope/Bandits", g_dx12.commandList.Get());
             const XMMATRIX view = scene.GetViewMatrix();
