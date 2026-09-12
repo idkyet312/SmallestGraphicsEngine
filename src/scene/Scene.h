@@ -1332,8 +1332,13 @@ struct Scene {
 
         // Health regen. Death is final: at zero health the timer stops rather
         // than quietly healing a corpse back to fighting strength.
-        if (player.healthRegen && player.health > 0.0f &&
-            player.health < player.maxHealth) {
+        //
+        // Skipped entirely in a session: the host runs the same rule and
+        // overwrites this copy every frame, so healing here would be undone a
+        // tick later and show up as the bar stuttering. The sink being set is
+        // the test for "someone else owns my health".
+        if (!playerDamageNetworkSink && player.healthRegen &&
+            player.health > 0.0f && player.health < player.maxHealth) {
             player.regenTimer = (std::max)(0.0f, player.regenTimer - dt);
             if (player.regenTimer <= 0.0f) {
                 player.health = (std::min)(player.maxHealth,

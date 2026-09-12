@@ -20,10 +20,6 @@ static PlayerInput g_localPlayerInput;
 // Reused across frames so the per-frame snapshot read does not allocate.
 static std::vector<net::RemotePlayer> g_netRemoteScratch;
 static std::vector<net::PlayerStateChange> g_netStateChanges;
-// Edge detector for the local player standing back up. The session reports the
-// state, not the transition, and the regen clear below only applies on the
-// frame it changes.
-static bool g_wasDownedLastFrame = false;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
 
@@ -230,7 +226,6 @@ static void UpdateMultiplayerSession(float frameDelta,
         if (scene.player.downed) {
             scene.player.downed = false;
             scene.player.reviveProgress = 0.0f;
-            g_wasDownedLastFrame = false;
             if (scene.player.health <= 0.0f)
                 scene.player.health = net::kReviveHealth;
         }
@@ -266,14 +261,7 @@ static void UpdateMultiplayerSession(float frameDelta,
         scene.player.health = status.health;
         scene.player.downed = status.downed;
         scene.player.reviveProgress = status.reviveProgress;
-        // Standing back up has to clear the regen hold, or a revived player
-        // spends the first few seconds unable to recover -- DamagePlayer re-arms
-        // that timer on the hit that put them down.
-        if (!status.downed && status.health > 0.0f &&
-            scene.player.regenTimer > 0.0f && g_wasDownedLastFrame)
-            scene.player.regenTimer = 0.0f;
     }
-    g_wasDownedLastFrame = scene.player.downed;
 
     // Life-state edges. Drained every frame whether or not anything is
     // listening, so the queue cannot grow unbounded in a long session.

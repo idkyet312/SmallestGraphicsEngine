@@ -196,6 +196,67 @@ void DownedIsNotDerivedFromHealth() {
     Check(changes.empty(), "idling while downed must not queue changes");
 }
 
+void RegenRules() {
+    // Regen has to run on the HOST. It owns health and overwrites every
+    // client's copy each frame, so a client healing itself is undone a tick
+    // later -- which is exactly how this broke the first time.
+    {
+        Fixture fixture;
+        fixture.Body(0, 1);
+        Check(fixture.Status(1).health == 80.0f, "expected 80 after one hit");
+
+        // Nothing during the delay.
+        for (int i = 0; i < 60 * 4; ++i) fixture.Advance(1.0f / 60.0f);
+        Check(fixture.Status(1).health == 80.0f,
+              "regen must not start before the delay elapses");
+
+        // Then back to full.
+        for (int i = 0; i < 60 * 6; ++i) fixture.Advance(1.0f / 60.0f);
+        Check(fixture.Status(1).health == kMaxPlayerHealth,
+              "regen should return a player to full health");
+    }
+
+    // Every hit re-arms the delay, so sustained fire never lets regen start.
+    {
+        Fixture fixture;
+        for (int burst = 0; burst < 6; ++burst) {
+            fixture.Body(0, 1);
+            for (int i = 0; i < 60 * 2; ++i) fixture.Advance(1.0f / 60.0f);
+        }
+        // Six hits is past the five that down a player, so they are on the
+        // floor rather than healed back up by the gaps between them.
+        Check(fixture.Status(1).downed,
+              "repeated hits should down rather than out-heal");
+    }
+
+    // A downed player does not regenerate: healing them back up on their own
+    // would make the revive pointless.
+    {
+        Fixture fixture;
+        for (int i = 0; i < 5; ++i) fixture.Body(0, 1);
+        for (int i = 0; i < 60 * 20; ++i) fixture.Advance(1.0f / 60.0f);
+        const LocalPlayerStatus status = fixture.Status(1);
+        Check(status.downed, "a downed player must not heal themselves up");
+        Check(status.health == 0.0f, "a downed player stays at zero");
+    }
+
+    // A revived player heals from kReviveHealth rather than being stuck there.
+    {
+        Fixture fixture;
+        for (int i = 0; i < 5; ++i) fixture.Body(0, 1);
+        fixture.hostX = 0.0f;
+        fixture.session.SetPlayerPosition(1, 0.0f, 0.0f, 0.0f);
+        fixture.session.ReportReviveIntent(1, true);
+        for (int i = 0; i < 300; ++i) fixture.Advance(1.0f / 60.0f);
+        Check(!fixture.Status(1).downed, "expected a completed revive");
+
+        fixture.session.ReportReviveIntent(kInvalidPlayerId, false);
+        for (int i = 0; i < 60 * 12; ++i) fixture.Advance(1.0f / 60.0f);
+        Check(fixture.Status(1).health == kMaxPlayerHealth,
+              "a revived player should regenerate back to full");
+    }
+}
+
 void ReviveRules() {
     // A full revive: in range, holding, for the full duration.
     {
@@ -337,6 +398,7 @@ void OutOfOrderSnapshotsDoNotResurrect() {
 
 int main() {
     DamageArithmetic();
+    RegenRules();
     DownedIsNotDerivedFromHealth();
     ReviveRules();
     OutOfOrderSnapshotsDoNotResurrect();

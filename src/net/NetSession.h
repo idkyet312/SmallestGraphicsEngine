@@ -38,6 +38,12 @@ inline constexpr float kReviveRadius = 2.2f;
 // What a revived player stands up with. Deliberately well under full: getting
 // picked up should leave you vulnerable, not reset the fight.
 inline constexpr float kReviveHealth = 40.0f;
+// Out-of-combat regeneration, mirroring PlayerState's single-player numbers
+// (regenDelay 5s, then maxHealth over regenDuration 2s). The host has to run
+// this itself: it owns health, and it overwrites every client's local copy
+// each frame, so a client healing on its own would be undone a tick later.
+inline constexpr float kRegenDelaySeconds = 5.0f;
+inline constexpr float kRegenPerSecond = kMaxPlayerHealth / 2.0f;
 
 // Where a remote player is, already interpolated and ready to drive a body.
 struct RemotePlayer {
@@ -175,8 +181,10 @@ public:
         while (clock_.Consume(step)) {
             ++tick_;
             if (role_ == Role::Host) {
-                // Before the snapshot, so a revive completing this tick is
-                // carried by the snapshot it completed on rather than the next.
+                // Both before the snapshot, so a revive or a heal completing
+                // this tick is carried by the snapshot it completed on rather
+                // than the next.
+                StepRegen(step);
                 StepRevives(step);
                 SendSnapshot();
             } else {
@@ -293,6 +301,9 @@ public:
                      : (damage < kMaxPlayerHealth ? damage : kMaxPlayerHealth);
         slot.health -= applied;
         if (slot.health < 0.0f) slot.health = 0.0f;
+        // Re-armed on every hit, including the one that downs them, so being
+        // picked up does not inherit a nearly expired timer and heal instantly.
+        slot.regenTimer = kRegenDelaySeconds;
         if (slot.health > 0.0f) return;
 
         slot.downed = true;
@@ -421,6 +432,8 @@ private:
         // mid-hold must not revive anyone.
         PlayerId pendingReviveTarget = kInvalidPlayerId;
         bool pendingReviveHolding = false;
+        // Counts down after the last hit; regen starts when it reaches zero.
+        float regenTimer = 0.0f;
     };
 
     static float Clamp01(float value) {
@@ -462,6 +475,25 @@ private:
             (change.event == PlayerStateEvent::Downed ? " downed by "
                                                       : " revived by ") +
             std::to_string(change.instigator));
+    }
+
+    // Host-only, once per net tick. Out-of-combat regeneration for every
+    // player, run here rather than on each client: the host's copy is
+    // authoritative and overwrites theirs every frame, so a client healing
+    // itself would be undone a tick later and read as regen being broken.
+    //
+    // A downed player does not regenerate -- that is what being downed means,
+    // and healing them back up would make the revive pointless.
+    void StepRegen(float step) {
+        for (PlayerSlot& slot : players_) {
+            if (!slot.active || slot.downed) continue;
+            if (slot.health <= 0.0f || slot.health >= kMaxPlayerHealth) continue;
+            slot.regenTimer -= step;
+            if (slot.regenTimer > 0.0f) continue;
+            slot.regenTimer = 0.0f;
+            slot.health += kRegenPerSecond * step;
+            if (slot.health > kMaxPlayerHealth) slot.health = kMaxPlayerHealth;
+        }
     }
 
     // Host-only, once per net tick. Recomputes every downed player's revive
