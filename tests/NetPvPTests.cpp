@@ -121,6 +121,26 @@ void DamageArithmetic() {
               "a player must not shoot themselves through the PvP path");
     }
 
+    // Environment damage -- a bandit, a fall, your own grenade -- is reported
+    // with no instigator, and must land. This is the same entry point a PvP
+    // shot uses, so the self-shot rejection above must not also swallow it.
+    {
+        Fixture fixture;
+        fixture.session.ApplyHitToPlayer(kInvalidPlayerId, 1, 35.0f, false,
+                                         0, 0, 0);
+        Check(fixture.Status(1).health == 65.0f,
+              "environment damage should apply");
+        std::vector<PlayerStateChange> changes;
+        fixture.session.ApplyHitToPlayer(kInvalidPlayerId, 1, 100.0f, false,
+                                         0, 0, 0);
+        fixture.session.DrainStateChanges(changes);
+        Check(fixture.Status(1).downed, "environment damage should be able "
+                                        "to down a player");
+        Check(changes.size() == 1 &&
+                  changes[0].instigator == kInvalidPlayerId,
+              "an environment downing should credit nobody");
+    }
+
     // An inactive slot must absorb nothing rather than quietly book damage
     // against a player who is not there.
     {

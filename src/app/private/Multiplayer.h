@@ -51,16 +51,29 @@ static SkinnedEnemy* SpawnNetworkPlayerBody(net::PlayerId id) {
     body->callsign = callsign;
     body->leftArmReach = g_banditLeftArmReach;
     body->health = 100.0f;
-    // Milestone 1 does not replicate damage, so a remote body must not be
-    // killable locally -- one client shooting it would desync every other
-    // client's view of that player. Combat replication is milestone 2.
-    // Scaling incoming damage to zero routes through the existing path rather
-    // than adding a second notion of invulnerability.
+    // Still zero now that PvP exists, for a narrower reason than before:
+    // player-vs-player damage no longer goes anywhere near this -- it runs the
+    // geometry test only and lets the host apply the arithmetic. What this
+    // still blocks is every OTHER local damage source (explosions, fire,
+    // debris, vehicles), each of which would otherwise mutate a remote body's
+    // health on one machine alone. Replicating those is a later milestone; until
+    // then they must do nothing rather than desync.
     body->damageTakenScale = 0.0f;
     body->netPlayerId = id;
     SkinnedEnemy* raw = body.get();
     g_bandits.push_back(std::move(body));
     return raw;
+}
+
+// The local hit test said a round connected with another player's body. Tell
+// the host, which owns the arithmetic and hands the result back in the next
+// snapshot. Nothing is applied locally -- see the comment at the call site in
+// main.cpp for why the mutation deliberately does not happen there.
+static void ReportNetworkPlayerHit(net::PlayerId target, bool headshot,
+                                   const XMFLOAT3& impact, float bodyDamage) {
+    if (!MultiplayerActive() || target == net::kInvalidPlayerId) return;
+    g_netSession.ReportHit(target, bodyDamage, headshot,
+                           impact.x, impact.y, impact.z);
 }
 
 static void ShutdownMultiplayer() {
@@ -122,7 +135,21 @@ static void StartMultiplayerFromCommandLine(const std::string& commandLine) {
 // from the menu at all.
 static void UpdateMultiplayerSession(float frameDelta,
                                      const PlayerInput& localInput) {
-    if (!MultiplayerActive()) return;
+    if (!MultiplayerActive()) {
+        // Drop the sink as soon as there is no session, so a disconnected
+        // player's damage stops being reported into nothing and single-player
+        // is left exactly as it was.
+        if (scene.playerDamageNetworkSink) scene.playerDamageNetworkSink = {};
+        return;
+    }
+    // Installed here rather than at StartHost/StartClient because there are
+    // several ways to open a session (menu, two command-line flags) and only
+    // one place that runs every frame one is live.
+    if (!scene.playerDamageNetworkSink) {
+        scene.playerDamageNetworkSink = [](float damage) {
+            g_netSession.ReportLocalDamage(damage);
+        };
+    }
 
     net::LocalPlayerState local;
     local.input = localInput;
@@ -132,6 +159,17 @@ static void UpdateMultiplayerSession(float frameDelta,
     local.y = scene.camera.Position.y - scene.camera.PlayerHeight;
     local.z = scene.camera.Position.z;
     g_netSession.Update(frameDelta, local);
+
+    // The host owns our health in a session, so pull it back rather than
+    // letting the local copy drift. Everything that reads health -- the bar,
+    // the low-health vignette, the death gate -- then works from one number.
+    //
+    // Local damage is still applied locally first for the flash and the chip
+    // bar; this is the correction that arrives a tick later, which is why it
+    // overwrites rather than subtracts.
+    net::LocalPlayerStatus status;
+    if (g_netSession.LocalStatus(status))
+        scene.player.health = status.health;
 }
 
 // Moves and animates the remote player bodies. Gameplay-only: these need a
@@ -223,6 +261,11 @@ static void UpdateMultiplayerBodies(float frameDelta) {
         const float yawRadians = DirectX::XMConvertToRadians(remote.yaw);
         body->yaw = yawRadians;
         body->aimYaw = yawRadians;
+        // Mirror the authoritative life state onto the body. One direction
+        // only: the host decides, and a local write here would be a desync
+        // nobody else can see.
+        body->netDowned = remote.downed;
+        body->netHealth = remote.health;
         body->UpdateNetworkedPose(frameDelta, remote.moving, remote.sprinting);
     }
 

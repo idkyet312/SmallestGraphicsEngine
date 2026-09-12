@@ -152,6 +152,13 @@ public:
     // and clears the whole vector on a level reset, which would leave any such
     // map holding dangling pointers.
     uint8_t           netPlayerId = 0xFF;
+    // Presentation mirrors of the session's authoritative life state, copied in
+    // every frame by UpdateMultiplayerBodies. Never written by gameplay: the
+    // host owns these, and a local write would be a desync that only this
+    // machine can see. Kept on the actor because the render and hit-test paths
+    // already hold it and should not reach back into the session.
+    bool              netDowned = false;
+    float             netHealth = 100.0f;
     // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
     // point instead of the actor's own spawn position -- lets a marine loiter
     // near the player instead of near wherever it was placed. Left unset

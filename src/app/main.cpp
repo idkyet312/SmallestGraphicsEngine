@@ -2768,7 +2768,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::vector<BanditProjectileHit> banditHits;
                 // Player shots damage any enemy. Hostile shots damage marines
                 // and the held human shield -- never other bandits.
-                if (g_banditLoaded) {
+                // Same predicate the draw sites use: networked player bodies
+                // live in g_bandits but arrive with no AI squad behind them, so
+                // g_banditLoaded alone would make other players unshootable on
+                // the empty test level -- which is where multiplayer is tested.
+                if (AnySkinnedActorsToDraw()) {
                     for (auto& bandit : g_bandits) {
                         if (!bandit) continue;
                         if (projectile.hostile) {
@@ -2786,23 +2790,62 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             const bool shield = bandit.get() == g_heldBandit;
                             if (!shield && bandit->faction != Faction::Marine)
                                 continue;
-                        } else if (bandit->faction != Faction::Bandit) {
-                            // Player- or marine-fired shot: never hits a marine
-                            // (no friendly fire), only ever damages bandits.
+                        } else if (bandit->faction != Faction::Bandit &&
+                                   !bandit->networkControlled) {
+                            // Player- or marine-fired shot: never hits an AI
+                            // marine (no friendly fire), only ever damages
+                            // bandits -- and other players. A networked player
+                            // body wears Faction::Marine only because that is
+                            // the rendering path it borrows, not because it is
+                            // an ally, so it is excepted here by the flag that
+                            // actually means "this is a person".
                             continue;
                         }
+                        // A body already on the floor is not a target. Without
+                        // this the rest of a magazine keeps generating hit
+                        // reports the host discards, and the shooter gets a
+                        // stream of hit markers for nothing.
+                        if (bandit->networkControlled && bandit->netDowned)
+                            continue;
                         XMFLOAT3 banditHit = projectile.position;
                         std::string banditBone;
-                        const bool hitBandit = projectile.harpoon
-                            ? bandit->HitByHarpoon(
+                        bool hitBandit = false;
+                        if (bandit->networkControlled) {
+                            // Shooter-authoritative PvP. The geometry test runs
+                            // locally, because this client is the one that can
+                            // see where it aimed -- but the health mutation
+                            // does NOT happen here.
+                            //
+                            // Shoot() would do both in one call, and its
+                            // headshot path forces the damage through as
+                            // guaranteedLethal, which bypasses damageTakenScale
+                            // entirely (SkinnedEnemy.h ScaleIncomingDamage) and
+                            // would ragdoll the victim on this machine only.
+                            // BlocksProjectile is the same sweep with no
+                            // mutation. Do not "simplify" this back into a
+                            // Shoot call.
+                            bool headshot = false;
+                            hitBandit = bandit->BlocksProjectile(
+                                projectile.previousPosition,
+                                projectile.position, bulletRadius, &banditHit,
+                                &headshot, &banditBone);
+                            if (hitBandit && projectile.playerOwned) {
+                                ReportNetworkPlayerHit(
+                                    bandit->netPlayerId, headshot, banditHit,
+                                    20.0f * projectile.damageMultiplier);
+                            }
+                        } else if (projectile.harpoon) {
+                            hitBandit = bandit->HitByHarpoon(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
-                                &banditBone)
-                            : bandit->Shoot(
+                                &banditBone);
+                        } else {
+                            hitBandit = bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
                                 nullptr, 20.0f * projectile.damageMultiplier,
                                 true);
+                        }
                         if (hitBandit) {
                             const bool killed = bandit->Dead();
                             banditHits.push_back({ bandit.get(), banditHit,

@@ -408,6 +408,12 @@ struct Scene {
     std::vector<BurningMaterial> burningMaterials; // persistent prefab material fire
     std::function<void(const XMFLOAT3&, float, bool)> explosionAudioCallback;
     std::function<void(const XMFLOAT3&)> fireIgnitionAudioCallback;
+    // Set by the multiplayer layer while a session is live, so damage the local
+    // player took from the world -- a bandit, a fall, their own grenade -- also
+    // reaches the host, which is authoritative over health. Left null in
+    // single-player, which is what keeps Scene free of any networking
+    // dependency and the offline path byte-for-byte what it was.
+    std::function<void(float)> playerDamageNetworkSink;
     std::vector<ExplosiveBarrel> explosiveBarrels;
     std::vector<WeaponPickup> weaponPickups;      // walk-over weapon crates
     float projectileSpeed    = 300.0f;
@@ -1203,6 +1209,11 @@ struct Scene {
         // Restart the hold-off on every hit, including the one that kills, so a
         // revive does not inherit a nearly expired timer.
         player.regenTimer = player.regenDelay;
+
+        // Tell the host, if there is one. The local subtraction above already
+        // happened so the flash and the kick are immediate; this is what makes
+        // the authoritative copy agree a tick later.
+        if (playerDamageNetworkSink) playerDamageNetworkSink(damage);
     }
 
     // Damage with a known origin: records the direction so the HUD can show
