@@ -1,6 +1,7 @@
 #ifndef NET_SESSION_H
 #define NET_SESSION_H
 
+#include "EngineLogger.h"
 #include "FixedStepClock.h"
 #include "NetProtocol.h"
 #include "NetTransport.h"
@@ -213,6 +214,8 @@ private:
     void HandleEvent(Event& event) {
         switch (event.type) {
         case EventType::Connected:
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                "peer " + std::to_string(event.peer) + " connected");
             // The host waits for a hello before assigning a player id; a
             // client sends one as soon as the connection is up.
             if (role_ == Role::Client) {
@@ -220,9 +223,12 @@ private:
                 transport_->Send(event.peer, &hello, sizeof(hello),
                                  Channel::Reliable);
                 serverPeer_ = event.peer;
+                SGE_LOG("LogNet", EngineLog::Level::Display, "sent hello");
             }
             break;
         case EventType::Disconnected:
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                "peer " + std::to_string(event.peer) + " disconnected");
             ReleasePeer(event.peer);
             break;
         case EventType::Message:
@@ -262,6 +268,11 @@ private:
         // being told the versions differ.
         if (hello.magic != kProtocolMagic ||
             hello.version != kProtocolVersion) {
+            SGE_LOG("LogNet", EngineLog::Level::Warning,
+                "rejecting peer " + std::to_string(event.peer) +
+                ": version/magic mismatch (theirs " +
+                std::to_string(hello.version) + ", ours " +
+                std::to_string(kProtocolVersion) + ")");
             ServerReject reject;
             reject.reason = RejectReason::VersionMismatch;
             transport_->Send(event.peer, &reject, sizeof(reject),
@@ -270,12 +281,18 @@ private:
         }
         const PlayerId assigned = AllocatePlayer(event.peer);
         if (assigned == kInvalidPlayerId) {
+            SGE_LOG("LogNet", EngineLog::Level::Warning,
+                "rejecting peer " + std::to_string(event.peer) +
+                ": session full");
             ServerReject reject;
             reject.reason = RejectReason::ServerFull;
             transport_->Send(event.peer, &reject, sizeof(reject),
                              Channel::Reliable);
             return;
         }
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "hello accepted from peer " + std::to_string(event.peer) +
+            "; assigned player " + std::to_string(assigned));
         ServerWelcome welcome;
         welcome.assignedId = assigned;
         transport_->Send(event.peer, &welcome, sizeof(welcome),
@@ -295,6 +312,8 @@ private:
         localId_ = welcome.assignedId;
         players_[localId_].active = true;
         players_[localId_].id = localId_;
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "welcome received; we are player " + std::to_string(localId_));
     }
 
     void HandleInput(Event& event) {
@@ -326,6 +345,12 @@ private:
         // Older than what we already have: discard rather than rewind. This is
         // what makes out-of-order UDP delivery harmless.
         if (snapshot.tick <= lastSnapshotTick_ && lastSnapshotTick_ != 0) return;
+        // Only the first: a line every tick at 30 Hz would bury the log.
+        if (lastSnapshotTick_ == 0) {
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                "first snapshot: tick " + std::to_string(snapshot.tick) +
+                ", " + std::to_string(snapshot.playerCount) + " players");
+        }
         lastSnapshotTick_ = snapshot.tick;
 
         const uint8_t count =

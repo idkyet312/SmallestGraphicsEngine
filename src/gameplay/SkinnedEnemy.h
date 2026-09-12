@@ -147,6 +147,11 @@ public:
     // Checked at the update call site rather than inside Update, so the
     // single-player path stays exactly as it was.
     bool              networkControlled = false;
+    // Which player this body belongs to when networkControlled. Stored on the
+    // actor rather than in a side map keyed by pointer: g_bandits owns these
+    // and clears the whole vector on a level reset, which would leave any such
+    // map holding dangling pointers.
+    uint8_t           netPlayerId = 0xFF;
     // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
     // point instead of the actor's own spawn position -- lets a marine loiter
     // near the player instead of near wherever it was placed. Left unset

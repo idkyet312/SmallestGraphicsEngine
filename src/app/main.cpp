@@ -993,6 +993,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // screen, so a voice started there would never be reclaimed.
         g_greatJobAudio.Update();
         UpdateMenuMusic();
+        // Also outside that gate, and for the same class of reason: this is the
+        // only thing that polls the transport, so gating it on gameplay meant a
+        // player sitting in the menu never read a packet -- no handshake could
+        // complete, and joining from the menu was impossible. The remote bodies
+        // are still moved inside the gate, where a level actually exists.
+        UpdateMultiplayerSession(deltaTime, g_localPlayerInput);
 
         if (IsGameplayScreen() && !g_game.loading.Active() &&
             (scene.player.godMode || scene.player.health > 0.0f)) {
@@ -2037,10 +2043,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_grass.Update(deltaTime);
         }
         UpdatePlayerVelocity(scene.camera.Position, deltaTime);
-        // After the local player has finished moving for this frame, so the
-        // position that goes on the wire is the one actually rendered, and
-        // before the destruction step, which has its own fixed clock.
-        UpdateMultiplayer(deltaTime, g_localPlayerInput);
+        // Remote bodies only: the session itself is driven every frame from
+        // outside this gameplay gate, so a handshake can complete at the menu.
+        UpdateMultiplayerBodies(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this

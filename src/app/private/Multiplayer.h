@@ -15,14 +15,24 @@ static net::NetSession g_netSession;
 // here rather than passed down through the frame so the multiplayer update can
 // be a single call at one clear point in the loop.
 static PlayerInput g_localPlayerInput;
-// Remote player bodies, keyed by the id the host assigned. They live in
-// g_bandits alongside the AI actors so they are drawn, lit and shadowed by the
-// existing paths, but they are flagged networkControlled so the AI skips them.
-static std::unordered_map<net::PlayerId, SkinnedEnemy*> g_netPlayerBodies;
 // Reused across frames so the per-frame snapshot read does not allocate.
 static std::vector<net::RemotePlayer> g_netRemoteScratch;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
+
+// Remote bodies live in g_bandits alongside the AI actors, so they are drawn,
+// lit and shadowed by the paths that already exist. They are found by scanning
+// for the player id rather than through a side map of pointers: g_bandits is
+// cleared wholesale on a level reset (ResetLevelRuntime), which would leave any
+// such map holding dangling pointers to freed actors. The list is a handful of
+// entries and this runs once per remote player per frame.
+static SkinnedEnemy* FindNetworkPlayerBody(net::PlayerId id) {
+    for (const auto& actor : g_bandits) {
+        if (!actor || !actor->networkControlled) continue;
+        if (actor->netPlayerId == id) return actor.get();
+    }
+    return nullptr;
+}
 
 // Spawns the body for a player that just appeared in a snapshot. Mirrors
 // SpawnMarine: same model, same faction, so the remote player is rendered by
@@ -45,34 +55,19 @@ static SkinnedEnemy* SpawnNetworkPlayerBody(net::PlayerId id) {
     // Scaling incoming damage to zero routes through the existing path rather
     // than adding a second notion of invulnerability.
     body->damageTakenScale = 0.0f;
+    body->netPlayerId = id;
     SkinnedEnemy* raw = body.get();
     g_bandits.push_back(std::move(body));
-    g_netPlayerBodies[id] = raw;
     return raw;
 }
 
-static void RemoveNetworkPlayerBody(net::PlayerId id) {
-    const auto it = g_netPlayerBodies.find(id);
-    if (it == g_netPlayerBodies.end()) return;
-    SkinnedEnemy* body = it->second;
-    g_netPlayerBodies.erase(it);
-    for (auto entry = g_bandits.begin(); entry != g_bandits.end(); ++entry) {
-        if (entry->get() != body) continue;
-        g_bandits.erase(entry);
-        return;
-    }
-}
-
 static void ShutdownMultiplayer() {
-    for (const auto& entry : g_netPlayerBodies) {
-        SkinnedEnemy* body = entry.second;
-        for (auto it = g_bandits.begin(); it != g_bandits.end(); ++it) {
-            if (it->get() != body) continue;
-            g_bandits.erase(it);
-            break;
-        }
-    }
-    g_netPlayerBodies.clear();
+    g_bandits.erase(
+        std::remove_if(g_bandits.begin(), g_bandits.end(),
+                       [](const std::unique_ptr<SkinnedEnemy>& actor) {
+                           return actor && actor->networkControlled;
+                       }),
+        g_bandits.end());
     g_netSession.Shutdown();
 }
 
@@ -116,9 +111,15 @@ static void StartMultiplayerFromCommandLine(const std::string& commandLine) {
     }
 }
 
-// Once per frame, after the local player has moved. Feeds the session what the
-// local player did, then applies what came back to the remote bodies.
-static void UpdateMultiplayer(float frameDelta, const PlayerInput& localInput) {
+// Drives the session itself: polling, the handshake, the net tick and sending.
+//
+// Called every frame from any screen, deliberately NOT gated on gameplay.
+// NetSession::Update is the only caller of transport_->Poll(), so gating this
+// on IsGameplayScreen meant no packet was ever read while a player sat in the
+// menu -- which made the handshake impossible to complete and, with it, joining
+// from the menu at all.
+static void UpdateMultiplayerSession(float frameDelta,
+                                     const PlayerInput& localInput) {
     if (!MultiplayerActive()) return;
 
     net::LocalPlayerState local;
@@ -129,6 +130,13 @@ static void UpdateMultiplayer(float frameDelta, const PlayerInput& localInput) {
     local.y = scene.camera.Position.y - scene.camera.PlayerHeight;
     local.z = scene.camera.Position.z;
     g_netSession.Update(frameDelta, local);
+}
+
+// Moves and animates the remote player bodies. Gameplay-only: these need a
+// live level, a terrain height to stand on and a loaded marine model, none of
+// which exist at the menu.
+static void UpdateMultiplayerBodies(float frameDelta) {
+    if (!MultiplayerActive()) return;
 
     // The host owns remote players' movement: it integrates them from the
     // input they sent rather than from a position they claimed, then feeds the
@@ -137,11 +145,12 @@ static void UpdateMultiplayer(float frameDelta, const PlayerInput& localInput) {
     // because the point is to prove the pipe, and a full second mover is
     // milestone 2's problem.
     if (g_netSession.CurrentRole() == net::Role::Host) {
-        for (const auto& entry : g_netPlayerBodies) {
-            const net::PlayerId id = entry.first;
+        for (const auto& actor : g_bandits) {
+            if (!actor || !actor->networkControlled) continue;
+            const net::PlayerId id = actor->netPlayerId;
             const PlayerInput* input = g_netSession.PendingInput(id);
             if (!input) continue;
-            SkinnedEnemy* body = entry.second;
+            SkinnedEnemy* body = actor.get();
             const float yawRadians = DirectX::XMConvertToRadians(input->yaw);
             const float forwardX = std::sin(yawRadians);
             const float forwardZ = std::cos(yawRadians);
@@ -166,16 +175,13 @@ static void UpdateMultiplayer(float frameDelta, const PlayerInput& localInput) {
     // player, whose own position stays locally predicted.
     g_netSession.GetRemotePlayers(g_netRemoteScratch);
     for (const net::RemotePlayer& remote : g_netRemoteScratch) {
-        SkinnedEnemy* body = nullptr;
-        const auto it = g_netPlayerBodies.find(remote.id);
-        if (it == g_netPlayerBodies.end()) {
+        SkinnedEnemy* body = FindNetworkPlayerBody(remote.id);
+        if (!body) {
             body = SpawnNetworkPlayerBody(remote.id);
             if (!body) continue;
             // Start exactly where the snapshot says instead of interpolating
             // in from the origin, which would drag the new body across the map.
             body->position = { remote.x, remote.y, remote.z };
-        } else {
-            body = it->second;
         }
         // The host already integrated its own remote bodies above; overwriting
         // them with the snapshot it just produced would be circular.
@@ -189,14 +195,17 @@ static void UpdateMultiplayer(float frameDelta, const PlayerInput& localInput) {
         body->UpdateNetworkedPose(frameDelta, remote.moving, remote.sprinting);
     }
 
-    // Drop bodies for players that are no longer in the session.
-    for (auto it = g_netPlayerBodies.begin(); it != g_netPlayerBodies.end();) {
-        bool stillPresent = false;
-        for (const net::RemotePlayer& remote : g_netRemoteScratch)
-            if (remote.id == it->first) { stillPresent = true; break; }
-        if (stillPresent) { ++it; continue; }
-        const net::PlayerId id = it->first;
-        ++it;
-        RemoveNetworkPlayerBody(id);
-    }
+    // Drop bodies for players that are no longer in the session. Erases in one
+    // pass rather than erasing one id at a time, so the vector is never
+    // mutated while something else holds an iterator into it.
+    g_bandits.erase(
+        std::remove_if(g_bandits.begin(), g_bandits.end(),
+                       [](const std::unique_ptr<SkinnedEnemy>& actor) {
+                           if (!actor || !actor->networkControlled) return false;
+                           for (const net::RemotePlayer& remote :
+                                    g_netRemoteScratch)
+                               if (remote.id == actor->netPlayerId) return false;
+                           return true;
+                       }),
+        g_bandits.end());
 }
