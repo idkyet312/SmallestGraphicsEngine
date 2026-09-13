@@ -189,6 +189,44 @@ int main() {
           wire.back().bytes.size() == sizeof(ServerGrenadeSpawnMessage),
           "grenade spawn must use reliable wire format");
     const WireMessage spawnWire = wire.back();
+
+    // Where the thrower says its own grenade finished up. The host simulates
+    // the same throw but drifts from it on a bounce, and the blast belongs
+    // where the player who threw it watched the grenade land.
+    ClientGrenadeDetonationMessage landed;
+    landed.grenadeId = grenadeId;
+    landed.x = 12.5f; landed.y = 1.5f; landed.z = -3.25f;
+    Receive(7, landed);
+    host.Update(0.0f, local);
+    std::vector<GrenadeDetonationEvent> reports;
+    host.DrainGrenadeDetonationReports(reports);
+    Check(reports.size() == 1 && reports[0].grenadeId == grenadeId &&
+          reports[0].x == 12.5f && reports[0].y == 1.5f &&
+          reports[0].z == -3.25f,
+          "the thrower's landing position must reach the host intact");
+
+    Receive(7, landed); // reliable delivery repeating
+    host.Update(0.0f, local);
+    host.DrainGrenadeDetonationReports(reports);
+    Check(reports.empty(), "a repeated landing report must be ignored");
+
+    // Peer 8 is authenticated but did not throw this grenade. Without the
+    // ownership check it could walk anyone's blast across the map.
+    ClientGrenadeDetonationMessage stolen;
+    stolen.grenadeId = grenadeId;
+    stolen.x = 900.0f; stolen.z = 900.0f;
+    Receive(8, stolen);
+    host.Update(0.0f, local);
+    host.DrainGrenadeDetonationReports(reports);
+    Check(reports.empty(), "only the thrower may place its grenade's blast");
+
+    ClientGrenadeDetonationMessage unknown;
+    unknown.grenadeId = grenadeId + 4242;
+    Receive(7, unknown);
+    host.Update(0.0f, local);
+    host.DrainGrenadeDetonationReports(reports);
+    Check(reports.empty(), "a report for no known grenade must be dropped");
+
     host.PublishGrenadeDetonation(grenadeId, GrenadeKind::Frag, 4, 0, 8);
 
     ServerGrenadeDetonatedMessage detonation;

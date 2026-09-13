@@ -271,7 +271,7 @@ public:
             // and the Y-flip in the fit rotation turns it to face forward --
             // between them the mesh ends up needing a large positive Z to
             // bring it back into frame, unlike any of the long guns.
-            { 0.035f, -0.165f, 1.825f }, // M9 grip
+            { 0.050f, -0.110f, 1.825f }, // M9 grip
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -300,11 +300,11 @@ public:
             { 0.0f, 0.0f, 0.0f },   // M4A1
             { 0.0f, 0.0f, 0.0f },   // AK-74
             // The export points down -Z once Orient has normalised it, so the
-            // pistol faces the camera without this half-turn. A clean 180: the
-            // few degrees of skew this used to carry were correcting for the
-            // body offset it was tuned alongside, not for the mesh being off
-            // square, and they read as a canted pistol once that was fixed.
-            { 0.0f, 180.0f, 0.0f }, // M9
+            // pistol faces the camera without this half-turn. The extra third
+            // of a degree is the mesh's own skew: the slide is not quite square
+            // to its bounding box, and a clean 180 leaves the muzzle reading a
+            // hair off the sight line at this scale.
+            { 0.0f, 180.3f, 0.0f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];

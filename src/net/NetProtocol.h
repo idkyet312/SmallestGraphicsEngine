@@ -3,6 +3,7 @@
 
 #include "PlayerInput.h"
 
+#include <cstddef>
 #include <cstdint>
 
 // Fixed-width wire format for connection, player state, and authoritative
@@ -28,7 +29,11 @@ namespace net {
 // 7: world impacts and breaks name their shooter, so a receiver can tell
 //    someone else's bullet (draw the impact) from its own coming back (already
 //    drawn), and carry whether the round was player fire.
-inline constexpr uint32_t kProtocolVersion = 7;
+// 8: the host names the level it is on, so a joining client loads the same map.
+// 9: the host owns the ground. Every runtime crater and gouge is replicated as
+//    a resolved sculpt stamp, so an explosion leaves the same hole on every
+//    machine instead of each one cutting its own from its own tunables.
+inline constexpr uint32_t kProtocolVersion = 9;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -67,6 +72,10 @@ enum class MessageType : uint8_t {
     ClientGrenadeThrow,       // client -> host, reliable
     ServerGrenadeSpawn,       // host -> clients, reliable
     ServerGrenadeDetonated,   // host -> clients, reliable
+    ServerLevel,              // host -> clients, reliable
+    ServerTerrainDeform,      // host -> clients, reliable
+    ClientTerrainDeform,      // client -> host, reliable
+    ClientGrenadeDetonation,  // client -> host, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -367,6 +376,106 @@ struct ServerGrenadeDetonatedMessage {
     uint8_t padding[2] = {};
     float x = 0.0f, y = 0.0f, z = 0.0f;
 };
+
+// Where the thrower's own grenade actually came to rest.
+//
+// The host simulates every replicated grenade, but it is simulating a throw it
+// only knows the launch pose of: a bounce off a crate or a roll down a slope
+// diverges from what the player who threw it watched, and the blast -- and the
+// crater under it -- then lands somewhere they did not aim. This is that
+// player's answer, and the host detonates there rather than wherever its own
+// copy of the projectile ended up.
+//
+// Same bargain as ClientHitReport: the thrower ran the throw on its own screen,
+// the host still owns what the explosion does.
+struct ClientGrenadeDetonationMessage {
+    MessageHeader header{ MessageType::ClientGrenadeDetonation, {} };
+    uint32_t grenadeId = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+
+// Which map the host is on. Levels are not otherwise negotiated: each player
+// used to pick their own from the menu, which reads as a working session right
+// up until two people shoot at terrain that only exists on one machine.
+enum class LevelKind : uint8_t {
+    // The host is in the menus. A client that receives this stays where it is
+    // rather than unloading, because the host will name a level in a moment and
+    // a trip back to the menu in between is worse than waiting.
+    None = 0,
+    Level1,     // the built-in campaign start, no file
+    TestLevel,  // empty terrain, no gameplay actors -- the usual test bed
+    LevelFile,  // Content/Levels/<file>, which covers Base and the islands
+};
+
+// Bare file name, not a path: the two ends resolve it against their own layout
+// (repo, build/, packaged), which already differ, and sending an absolute path
+// from one machine would name a directory the other does not have.
+inline constexpr uint8_t kMaxLevelFileName = 96;
+
+struct ServerLevelMessage {
+    MessageHeader header{ MessageType::ServerLevel, {} };
+    LevelKind kind = LevelKind::None;
+    uint8_t padding[3] = {};
+    char file[kMaxLevelFileName] = {};
+};
+
+// One runtime cut in the ground: an explosion crater, or one of the furrows a
+// crashing BlackHawk ploughs.
+//
+// The *resolved* stamp crosses, not the blast that caused it. Radius, depth,
+// wall sharpness and floor fraction are all built on the sender from live
+// editor tunables (scene.explosionBlastRadius, scene.craterDepth and friends)
+// and baseHeight is a local height sample, so two machines handed the same
+// impact point would otherwise cut two different holes. This way the ground is
+// the host's, exactly, whatever either side has its dials set to.
+//
+// This is the wire twin of TerrainSculptStamp, which cannot itself be sent: it
+// carries a std::string for authored heightmap stamps. Runtime cuts are always
+// procedural, so only the numeric fields are here.
+struct TerrainDeform {
+    float x = 0.0f, z = 0.0f;
+    float radius = 0.0f;
+    float value = 0.0f;
+    float strength = 1.0f;
+    float edgeFalloff = 1.0f;
+    float baseHeight = 0.0f;
+    // The blast's own height. The stamp is flat -- it only knows XZ -- but the
+    // foliage clear and the support undermine both work in 3D and need it.
+    float impactY = 0.0f;
+    uint8_t operation = 0; // TerrainSculptOperation
+    uint8_t padding[3] = {};
+};
+
+// Reliable, and idempotent through deformId: a stamp applied twice digs the
+// hole twice as deep, and a dropped one leaves a client walking on ground the
+// host has already blown away.
+struct ServerTerrainDeformMessage {
+    MessageHeader header{ MessageType::ServerTerrainDeform, {} };
+    uint32_t deformId = 0;
+    TerrainDeform deform;
+};
+
+// A client asking for a cut it cannot make itself. Rockets, C4 and exploding
+// barrels are simulated locally on whichever machine fired them and are not
+// replicated as projectiles at all, so without this the host never learns there
+// was an explosion and nobody's ground changes -- not even the shooter's, since
+// a client digs nothing on its own. The host validates and clamps this, then
+// broadcasts it back as a ServerTerrainDeform like any cut of its own, which is
+// what keeps one authority over the ground.
+//
+// Same shooter-authoritative bargain as ClientHitReport: the client already ran
+// the blast on its own screen, and the host owns what it does to the world.
+struct ClientTerrainDeformMessage {
+    MessageHeader header{ MessageType::ClientTerrainDeform, {} };
+    TerrainDeform deform;
+};
+
+// How many cuts the host keeps to replay to someone joining mid-session.
+// Mirrors kMaxTerrainSculptStamps in LevelDefinition.h, which is where the
+// engine drops its oldest runtime stamp; this header stays free of engine
+// includes, so the number is repeated rather than shared. Keeping the two equal
+// is what stops the backlog replaying a cut the host itself has already evicted.
+inline constexpr size_t kMaxReplicatedTerrainDeforms = 1024;
 
 } // namespace net
 

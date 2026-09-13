@@ -18,6 +18,13 @@ static size_t ActiveBanditSlotCount() {
 
 bool DeploymentPlanningActive();
 
+// Both defined further down this file, after the multiplayer session object it
+// also owns. The terrain cuts below need them and come first, so they are
+// declared here the way DeploymentPlanningActive above is.
+static bool ClientOwnedByHost();
+static bool PublishOrRequestRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
+                                                float impactY);
+
 TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
     params.detailRelief = scene.terrainDetailRelief ? 1u : 0u;
@@ -300,11 +307,96 @@ static void AddExplosionBuildingHole(const XMFLOAT3& impact, float blastScale) {
     }
 }
 
+// Cuts one finished stamp into the world: height field, GPU buffer, collision,
+// foundations, grass and trees. Everything that reads the ground is downstream
+// of this, which is why it is also the single point a replicated cut re-enters
+// on a client -- the host sends the resolved stamp and the client lands here
+// with it, rather than re-deriving a crater from its own tunables.
+//
+// refreshPhysics is off for the BlackHawk furrow, which rebuilds collision once
+// for all three of its gouges rather than three times over ground they share.
+// A client replaying that furrow arrives as three separate cuts and does pay it
+// three times; a helicopter goes in rarely enough that matching ground is worth
+// more than the saving.
+static void ApplyRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
+                                     float impactY,
+                                     bool refreshPhysics = true) {
+    const bool isCrater = stamp.operation == TerrainSculptOperation::Crater;
+    // At capacity, drop the OLDEST cut rather than rejecting the new one --
+    // a barrel that explodes must always leave a hole. SetSculptStamps trims
+    // from the front too, so CPU collision and the GPU buffer stay in sync.
+    {
+        ProfilerDX12::CpuScope craterStampProfile(g_profiler, "Crater/Stamp");
+        g_game.world.AddRuntimeTerrainStamp(stamp);
+        // Incremental: pushing the whole set back would re-walk every heightmap
+        // stamp's residency, which on a baked level is what stalled the
+        // explosion. Both sides trim the oldest at capacity, so they stay in
+        // step.
+        g_terrain.AddRuntimeSculptStamp(stamp);
+    }
+    g_terrainDeformedThisFrame = true;
+    if (refreshPhysics) {
+        // Without this the Box3D heightfield keeps the pre-blast ground and
+        // debris rests on a surface that is no longer there. Only the cut's
+        // own cells are re-sampled; the lip reaches past the radius, so the
+        // patch window matches the 1.18x the cut actually spans.
+        ProfilerDX12::CpuScope craterPhysicsProfile(
+            g_profiler, "Crater/Physics");
+        g_destruction.RefreshTerrainRegion(stamp.x, stamp.z,
+                                           stamp.radius * 1.18f);
+        // Drop any brick foundation the hole just undermined. The crater floor
+        // is the new ground under it, and the flat part of the cut is what
+        // actually removes support -- past that the wall climbs back to grade,
+        // so a slab out there still has ground beneath it. Only a crater does
+        // this: a furrow's Add stamp raises no floor to undermine against.
+        //
+        // edgeFalloff rather than scene.craterFloorFraction, which is where it
+        // came from: on a client the stamp is the host's and its own dial may
+        // sit elsewhere, and undermining a different span than the hole that
+        // was actually cut is how two machines end up disagreeing about which
+        // walls are still standing.
+        if (isCrater) {
+            g_destruction.UndermineSupports(
+                { stamp.x, impactY, stamp.z },
+                stamp.radius * stamp.edgeFalloff,
+                stamp.baseHeight - stamp.value);
+        }
+    }
+    {
+        ProfilerDX12::CpuScope craterFoliageProfile(
+            g_profiler, "Crater/Foliage");
+        // Keep turf over ordinary soil cuts. Once the new floor reaches the
+        // sand layer (or lower), clear the full visible cut so blades are not
+        // left standing over exposed beach or submerged ground. A furrow keeps
+        // the tighter span it has always used: it is a shallow scrape, and
+        // clearing out to its lip strips turf the wreck never touched.
+        const float grassSpan = isCrater ? 1.18f : 0.6f;
+        if (g_grass.TerrainSandDominant(stamp.x, stamp.z)) {
+            g_grass.AddRuntimeExclusion(
+                stamp.x, stamp.z, stamp.radius * grassSpan);
+        }
+        // Trees still use a tight radius so the blast does not fell every palm
+        // out to the crater's ejecta lip.
+        g_trees.ApplyExplosion({ stamp.x, impactY, stamp.z },
+                               stamp.radius * (isCrater ? 0.5f : 0.6f));
+    }
+}
+
 // blastScale widens the hole for oversized blasts (a called-in missile strike);
 // ordinary explosions leave it at 1 and dig the usual grenade-sized crater.
+//
+// hostAuthored marks an explosion the host is running too -- a replicated
+// grenade, which it simulates and detonates on its own machine. A client must
+// stay out of those entirely: the host's cut is already on its way, and a
+// request for the same blast digs the hole a second time at a slightly
+// different spot, which is what a client's own grenade looked like. Everything
+// else a client sets off -- rocket, C4, barrel -- exists only on its machine,
+// so its request is the only word the host ever gets.
 static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
-                                      float blastScale = 1.0f) {
+                                      float blastScale = 1.0f,
+                                      bool hostAuthored = false) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return;
+    if (hostAuthored && ClientOwnedByHost()) return;
 
     // Craters must land on any island size. The sculpt evaluator works in raw
     // world XZ (no island-scale term), so the stamp itself is scale-agnostic --
@@ -345,50 +437,11 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
     heightParams.heightScale = scene.terrainHeightScale;
     crater.baseHeight = TerrainRendererDX12::HeightAt(
         heightParams, impact.x, impact.z);
-    // At capacity, drop the OLDEST crater rather than rejecting the new one --
-    // a barrel that explodes must always leave a hole. SetSculptStamps trims
-    // from the front too, so CPU collision and the GPU buffer stay in sync.
-    {
-        ProfilerDX12::CpuScope craterStampProfile(g_profiler, "Crater/Stamp");
-        g_game.world.AddRuntimeTerrainStamp(crater);
-        // Incremental: pushing the whole set back would re-walk every heightmap
-        // stamp's residency, which on a baked level is what stalled the
-        // explosion. Both sides trim the oldest at capacity, so they stay in
-        // step.
-        g_terrain.AddRuntimeSculptStamp(crater);
-    }
-    g_terrainDeformedThisFrame = true;
-    {
-        // Without this the Box3D heightfield keeps the pre-blast ground and
-        // debris rests on a surface that is no longer there. Only the crater's
-        // own cells are re-sampled; the lip reaches past the radius, so the
-        // patch window matches the 1.18x the cut actually spans.
-        ProfilerDX12::CpuScope craterPhysicsProfile(
-            g_profiler, "Crater/Physics");
-        g_destruction.RefreshTerrainRegion(impact.x, impact.z,
-                                           crater.radius * 1.18f);
-        // Drop any brick foundation the hole just undermined. The crater floor
-        // is the new ground under it, and the flat part of the cut is what
-        // actually removes support -- past that the wall climbs back to grade,
-        // so a slab out there still has ground beneath it.
-        g_destruction.UndermineSupports(
-            impact, crater.radius * scene.craterFloorFraction,
-            crater.baseHeight - crater.value);
-    }
-    {
-        ProfilerDX12::CpuScope craterFoliageProfile(
-            g_profiler, "Crater/Foliage");
-        // Keep turf over ordinary soil cuts. Once the new crater floor reaches
-        // the sand layer (or lower), clear the full visible cut so blades are
-        // not left standing over exposed beach or submerged ground.
-        if (g_grass.TerrainSandDominant(impact.x, impact.z)) {
-            g_grass.AddRuntimeExclusion(
-                impact.x, impact.z, crater.radius * 1.18f);
-        }
-        // Trees still use a tight radius so the blast does not fell every palm
-        // out to the crater's ejecta lip.
-        g_trees.ApplyExplosion(impact, crater.radius * 0.5f);
-    }
+    // The stamp is built the same way everywhere, including on a client: it is
+    // the only machine that knows which weapon went off, so it is the one that
+    // works out the shape. Who applies it is the next line's business.
+    if (PublishOrRequestRuntimeTerrainStamp(crater, impact.y))
+        ApplyRuntimeTerrainStamp(crater, impact.y);
 }
 
 // Gouges the ground where the BlackHawk went in. Three overlapping stamps laid
@@ -397,6 +450,8 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
 // impact and shallowing out ahead of it.
 static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return;
+    // Host-owned like every other cut; a client receives these three stamps.
+    if (ClientOwnedByHost()) return;
 
     // Same island-scale reasoning as the explosion crater: a fixed dimple
     // vanishes on a stretched island and the coarse outer clipmap rings cannot
@@ -428,18 +483,15 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
         stamp.operation = TerrainSculptOperation::Add;
         stamp.value = gouge.depth * scale;
         stamp.strength = 1.0f;
-        g_game.world.AddRuntimeTerrainStamp(stamp);
-        g_terrain.AddRuntimeSculptStamp(stamp);
-
-        // Match ordinary craters: the gouge only strips grass if its new floor
-        // exposes the sand layer or drops below it.
-        if (g_grass.TerrainSandDominant(stamp.x, stamp.z)) {
-            g_grass.AddRuntimeExclusion(
-                stamp.x, stamp.z, stamp.radius * 0.6f);
-        }
-        g_trees.ApplyExplosion({ stamp.x, impact.y, stamp.z },
-                               stamp.radius * 0.6f);
+        // Physics deferred: the furrow rebuilds collision once below, for all
+        // three gouges together. Grass and trees are per-stamp as before.
+        if (PublishOrRequestRuntimeTerrainStamp(stamp, impact.y))
+            ApplyRuntimeTerrainStamp(stamp, impact.y, false);
     }
+    // Nothing was cut here on a client: all three gouges went to the host, and
+    // they come back as three ordinary deforms that each rebuild their own
+    // collision. A helicopter goes in rarely enough to pay that.
+    if (ClientOwnedByHost()) return;
     // The three gouges went in above via AddRuntimeSculptStamp, which bumps the
     // revision each time; the buffer uploads once for the frame regardless.
     g_terrainDeformedThisFrame = true;
@@ -524,6 +576,41 @@ static std::string g_multiplayerStatusError;
 // both keep simulating exactly as they always did.
 static bool ClientOwnedByHost() {
     return g_netSession.CurrentRole() == net::Role::Client;
+}
+
+// Decides who gets to make this cut, and returns whether the caller should go
+// ahead and apply it here.
+//
+// Off a session, and on the host, the answer is always yes -- the host also
+// hands the finished stamp to everyone else, so a client digs the host's hole
+// exactly rather than its own approximation of it (see TerrainDeform in
+// NetProtocol.h).
+//
+// On a client the answer is no. It asks the host instead and applies nothing:
+// what it ends up drawing is the host's broadcast coming back a round trip
+// later. That request is also the only way a client's rocket, C4 or barrel is
+// ever heard about -- none of them replicate as projectiles -- so without it
+// player two's explosions leave no hole on any machine, including their own.
+static bool PublishOrRequestRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
+                                                float impactY) {
+    const net::Role role = g_netSession.CurrentRole();
+    if (role == net::Role::Offline) return true;
+    net::TerrainDeform deform;
+    deform.x = stamp.x;
+    deform.z = stamp.z;
+    deform.radius = stamp.radius;
+    deform.value = stamp.value;
+    deform.strength = stamp.strength;
+    deform.edgeFalloff = stamp.edgeFalloff;
+    deform.baseHeight = stamp.baseHeight;
+    deform.impactY = impactY;
+    deform.operation = static_cast<uint8_t>(stamp.operation);
+    if (role == net::Role::Client) {
+        g_netSession.RequestTerrainDeform(deform);
+        return false;
+    }
+    g_netSession.PublishTerrainDeform(deform);
+    return true;
 }
 
 static bool AnySkinnedActorsToDraw() {

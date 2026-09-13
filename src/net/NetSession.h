@@ -165,6 +165,13 @@ struct GrenadeDetonationEvent {
     float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
+// A cut in the ground the host has committed. The client applies it verbatim;
+// it does no crater arithmetic of its own.
+struct TerrainDeformEvent {
+    uint32_t deformId = 0;
+    TerrainDeform deform;
+};
+
 // What the local player is doing this frame, handed to the session.
 struct LocalPlayerState {
     PlayerInput input;
@@ -184,11 +191,20 @@ public:
 
     NetSession() : clock_(kNetTickSeconds, 4) {}
 
-    bool StartHost(uint16_t port, std::string* error) {
+    // `overSteam` hosts on Steam's relay network instead of a UDP port, which
+    // is the only form a friend outside this network can reach: they connect to
+    // a SteamID, and Steam routes it. It falls back to the IP transport when
+    // Steam is not running, so hosting never fails for want of a client.
+    bool StartHost(uint16_t port, std::string* error, bool overSteam = false) {
         Shutdown();
-        transport_ = MakeTransport();
+        transport_ = MakeTransport(overSteam);
         if (!transport_->Listen(port, error)) { transport_.reset(); return false; }
+        overSteam_ = overSteam && SteamTransportAvailable();
         role_ = Role::Host;
+        // Kept so the session can be described to someone outside it -- the
+        // Steam "Join Game" button needs an address and a port to hand a friend.
+        port_ = port;
+        serverAddress_.clear();
         // The host is always player 0, assigned without a handshake: it never
         // connects to itself.
         localId_ = 0;
@@ -197,18 +213,50 @@ public:
         return true;
     }
 
+    // A "steam:<id64>" host goes over the relay; anything else is an address
+    // and a port. The caller does not choose the transport -- the shape of the
+    // address does, so a connect string can travel through a command line or a
+    // friend's invite without carrying a second field saying what it is.
     bool StartClient(const std::string& host, uint16_t port,
                      std::string* error) {
         Shutdown();
-        transport_ = MakeTransport();
+        const bool steam = IsSteamAddress(host);
+        transport_ = MakeTransport(steam);
+        if (steam && !SteamTransportAvailable()) {
+            if (error) *error = "that invite needs Steam, which is not running";
+            transport_.reset();
+            return false;
+        }
         if (!transport_->Connect(host, port, error)) {
             transport_.reset();
             return false;
         }
+        overSteam_ = steam;
         role_ = Role::Client;
+        // A client passes the same host on to its own friends: "join my game"
+        // means the session, not this machine.
+        serverAddress_ = host;
+        port_ = port;
         // Stays invalid until the welcome arrives; nothing is sent before then.
         localId_ = kInvalidPlayerId;
         return true;
+    }
+
+    // Where a friend would have to connect to reach this session. Empty on an
+    // IP host, which does not know its own address; the caller supplies that.
+    const std::string& ServerAddress() const { return serverAddress_; }
+    uint16_t Port() const { return port_; }
+    bool OverSteam() const { return overSteam_; }
+
+    // The address to hand a friend: a SteamID when this session runs on the
+    // relay, empty when it does not and the caller has to find the machine's
+    // own IP. A client passes on the host it is connected to -- "join my game"
+    // means the session, and there is only one machine in it taking players.
+    std::string ConnectAddress() const {
+        if (!overSteam_) return serverAddress_;
+        if (role_ == Role::Client) return serverAddress_;
+        const uint64_t local = SteamTransportLocalId();
+        return local ? "steam:" + std::to_string(local) : std::string();
     }
 
     void Shutdown() {
@@ -226,16 +274,42 @@ public:
         worldBreaks_.clear();
         grenadeSpawns_.clear();
         grenadeDetonations_.clear();
+        grenadeOwners_.clear();
+        grenadeDetonationReports_.clear();
+        reportedGrenadeDetonations_.clear();
         acceptedGrenadeTokens_.clear();
         receivedWorldImpacts_.clear();
         receivedGrenadeIds_.clear();
         receivedGrenadeDetonations_.clear();
         receivedWorldBreaks_.clear();
+        terrainDeforms_.clear();
+        terrainDeformEvents_.clear();
+        requestedTerrainDeforms_.clear();
+        receivedTerrainDeforms_.clear();
         nextGrenadeId_ = 1;
         nextImpactId_ = 1;
+        nextDeformId_ = 1;
+        levelKind_ = LevelKind::None;
+        levelFile_.clear();
+        hasPendingLevel_ = false;
+        serverAddress_.clear();
+        port_ = 0;
+        overSteam_ = false;
         lastEnemyTick_ = 0;
         tick_ = 0;
+        serverPeer_ = kInvalidPeer;
+        disconnectPending_ = false;
+        lastError_.clear();
         clock_.Reset();
+    }
+
+    // Why the session ended, when it ended on its own rather than by being
+    // asked to. Taken rather than read: the caller shows it once, and a reason
+    // left behind would resurface on the next panel that looks for one.
+    std::string TakeLastError() {
+        std::string reason;
+        reason.swap(lastError_);
+        return reason;
     }
 
     Role CurrentRole() const { return role_; }
@@ -249,6 +323,16 @@ public:
 
         transport_->Poll(events_);
         for (Event& event : events_) HandleEvent(event);
+
+        // Torn down here rather than inside HandleEvent: Shutdown releases the
+        // transport the loop above is still walking the events of.
+        if (disconnectPending_) {
+            std::string reason;
+            reason.swap(lastError_);
+            Shutdown();
+            lastError_.swap(reason);
+            return;
+        }
 
         // Remember the local player's own state so the host's snapshot
         // includes it and a client can be told where it thinks it is.
@@ -349,6 +433,43 @@ public:
     }
 
     uint32_t Tick() const { return tick_; }
+
+    // ---- Level ---------------------------------------------------------
+    //
+    // The host's map is session state, not a per-player choice: two players on
+    // different levels share coordinates, damage and enemies that mean nothing
+    // to each other. The session carries the name; loading it is the game's job.
+    void SetHostLevel(LevelKind kind, const std::string& file) {
+        if (role_ != Role::Host) return;
+        std::string trimmed = file.substr(0, kMaxLevelFileName - 1);
+        if (kind == levelKind_ && trimmed == levelFile_) return;
+        levelKind_ = kind;
+        levelFile_ = std::move(trimmed);
+        // The craters belonged to the map being left. Replaying them to the
+        // next player who joins would cut the new level's ground at the old
+        // one's coordinates.
+        terrainDeforms_.clear();
+        SendLevelTo(kInvalidPeer); // everyone
+    }
+
+    LevelKind HostLevelKind() const { return levelKind_; }
+    const std::string& HostLevelFile() const { return levelFile_; }
+
+    // One-shot: returns true once per level the host names, so the caller can
+    // run a load -- which takes seconds -- without being asked again while it
+    // is still in progress.
+    bool TakePendingLevel(LevelKind& kind, std::string& file) {
+        if (!hasPendingLevel_) return false;
+        hasPendingLevel_ = false;
+        kind = levelKind_;
+        file = levelFile_;
+        return true;
+    }
+
+    // For a caller that took the level but could not act on it yet -- a load
+    // already running, say. The level itself is still stored, so this only puts
+    // the one-shot back.
+    void RequeuePendingLevel() { hasPendingLevel_ = true; }
 
     // ---- World destruction and grenades -----------------------------
     //
@@ -523,6 +644,27 @@ public:
         out.clear(); out.swap(grenadeSpawns_);
     }
 
+    // The thrower telling the host where its own grenade finished up. Sent once
+    // per grenade, at the moment the client's copy would have gone off; the
+    // client still waits for the host's detonation edge before anything
+    // explodes on its screen.
+    void ReportGrenadeDetonation(uint32_t grenadeId, float x, float y, float z) {
+        if (role_ != Role::Client || !transport_ || grenadeId == 0 ||
+            !Finite3(x, y, z)) return;
+        ClientGrenadeDetonationMessage message;
+        message.grenadeId = grenadeId;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Host side: where clients say their grenades ended up, for the game layer
+    // to move the authoritative projectile to before it detonates it.
+    void DrainGrenadeDetonationReports(
+            std::vector<GrenadeDetonationEvent>& out) {
+        out.clear(); out.swap(grenadeDetonationReports_);
+    }
+
     void PublishGrenadeDetonation(uint32_t grenadeId, GrenadeKind kind,
                                   float x, float y, float z,
                                   bool hostile = false) {
@@ -537,6 +679,56 @@ public:
 
     void DrainGrenadeDetonations(std::vector<GrenadeDetonationEvent>& out) {
         out.clear(); out.swap(grenadeDetonations_);
+    }
+
+    // ---- Terrain ------------------------------------------------------
+    //
+    // The ground is host-owned outright. A client builds no craters of its own,
+    // not even for its own grenade: two machines cutting from their own editor
+    // tunables produced two different holes, which is the whole reason this
+    // message exists. The cost is a round trip before your own blast digs in,
+    // the same bargain the grenade lifecycle already makes.
+    void PublishTerrainDeform(const TerrainDeform& deform) {
+        if (role_ != Role::Host || !transport_) return;
+        if (!ValidDeform(deform)) return;
+
+        ServerTerrainDeformMessage message;
+        message.deformId = nextDeformId_++;
+        message.deform = deform;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+
+        // Kept so a player joining later lands on the ground everyone else is
+        // standing on. Trimmed from the front at the same capacity
+        // RuntimeWorld::AddRuntimeTerrainStamp uses, so the backlog evicts in
+        // step with the stamps it describes rather than replaying cuts the
+        // host itself has already dropped.
+        if (terrainDeforms_.size() >= kMaxReplicatedTerrainDeforms)
+            terrainDeforms_.erase(terrainDeforms_.begin());
+        terrainDeforms_.push_back({ message.deformId, deform });
+    }
+
+    void DrainTerrainDeforms(std::vector<TerrainDeformEvent>& out) {
+        out.clear(); out.swap(terrainDeformEvents_);
+    }
+
+    // A client's own explosion. Its rocket, C4 and barrels never reach the host
+    // as projectiles, so the cut they make is the only word the host gets that
+    // anything happened to the ground. The client applies nothing here: what it
+    // draws is the host's broadcast coming back.
+    void RequestTerrainDeform(const TerrainDeform& deform) {
+        if (role_ != Role::Client || !transport_) return;
+        if (!ValidDeform(deform)) return;
+        ClientTerrainDeformMessage message;
+        message.deform = deform;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Cuts requested by clients, for the host's game layer to apply and then
+    // publish. Kept out of PublishTerrainDeform so the session never decides on
+    // its own to change the world.
+    void DrainRequestedTerrainDeforms(std::vector<TerrainDeform>& out) {
+        out.clear(); out.swap(requestedTerrainDeforms_);
     }
 
     // ---- PvP ----------------------------------------------------------
@@ -758,6 +950,23 @@ private:
     static bool ValidGrenade(GrenadeKind kind) {
         return kind == GrenadeKind::Frag || kind == GrenadeKind::Molotov ||
                kind == GrenadeKind::Vortex;
+    }
+    // These numbers drive a height field and a collision rebuild, so a NaN or a
+    // wild radius does not fail loudly -- it corrupts the ground. The ceilings
+    // are far above anything the game makes: the widest legitimate cut is
+    // explosionBlastRadius 3.5 x craterScale 3 x missileBlastScale 2, about 21
+    // metres. As with hit reporting, the clamps are here so a bug cannot wreck
+    // a session, not to stop someone determined to cheat.
+    static constexpr float kMaxDeformRadius = 64.0f;
+    static constexpr float kMaxDeformDepth = 32.0f;
+    static bool ValidDeform(const TerrainDeform& deform) {
+        return Finite3(deform.x, deform.z, deform.radius) &&
+               Finite3(deform.value, deform.strength, deform.edgeFalloff) &&
+               std::isfinite(deform.baseHeight) &&
+               std::isfinite(deform.impactY) &&
+               deform.radius > 0.0f &&
+               deform.radius <= kMaxDeformRadius &&
+               std::fabs(deform.value) <= kMaxDeformDepth;
     }
     static bool ValidWorldKind(uint8_t kind) { return kind <= 2; }
     static bool ValidWorldTarget(uint64_t entityId, uint8_t kind,
@@ -982,6 +1191,21 @@ private:
         case EventType::Disconnected:
             SGE_LOG("LogNet", EngineLog::Level::Display,
                 "peer " + std::to_string(event.peer) + " disconnected");
+            // A client has exactly one peer worth losing, and ReleasePeer
+            // below is host-side bookkeeping: peerToPlayer_ is only ever
+            // filled by AllocatePlayer, so on a client it does nothing. That
+            // left a refused or dropped connection sitting in Role::Client
+            // with no id -- which the menu renders as "Connecting..." forever.
+            //
+            // serverPeer_ is only set once the handshake starts, so a failure
+            // during the connect itself has nothing to compare against.
+            if (role_ == Role::Client &&
+                (serverPeer_ == kInvalidPeer || event.peer == serverPeer_)) {
+                lastError_ = localId_ == kInvalidPlayerId
+                                 ? "Could not reach the host."
+                                 : "Lost the connection to the host.";
+                disconnectPending_ = true;
+            }
             ReleasePeer(event.peer);
             break;
         case EventType::Message:
@@ -1036,6 +1260,18 @@ private:
             break;
         case MessageType::ServerGrenadeDetonated:
             if (role_ == Role::Client) HandleGrenadeDetonated(event);
+            break;
+        case MessageType::ServerLevel:
+            if (role_ == Role::Client) HandleLevel(event);
+            break;
+        case MessageType::ServerTerrainDeform:
+            if (role_ == Role::Client) HandleTerrainDeform(event);
+            break;
+        case MessageType::ClientTerrainDeform:
+            if (role_ == Role::Host) HandleTerrainDeformRequest(event);
+            break;
+        case MessageType::ClientGrenadeDetonation:
+            if (role_ == Role::Host) HandleGrenadeDetonationReport(event);
             break;
         default:
             break;
@@ -1135,6 +1371,79 @@ private:
         joined.id = assigned;
         transport_->Broadcast(&joined, sizeof(joined), Channel::Reliable,
                               event.peer);
+
+        // Straight after the welcome, so a player joining a session already in
+        // progress loads the host's map instead of sitting in the menu waiting
+        // for a level change that may never come -- the host is already there.
+        SendLevelTo(event.peer);
+        // And the ground as it stands. Without this a player joining a session
+        // in progress walks onto pristine terrain while everyone else is taking
+        // cover in craters that, to them, are not there.
+        SendTerrainDeformsTo(event.peer);
+    }
+
+    // Replays the cuts made so far to one joining peer. One message per stamp
+    // rather than a batch: it reuses the live handler and its dedup exactly, and
+    // the backlog is bounded, reliable, and sent behind a level load the client
+    // is already waiting on.
+    void SendTerrainDeformsTo(PeerId peer) {
+        if (role_ != Role::Host || !transport_ || peer == kInvalidPeer) return;
+        for (const TerrainDeformEvent& stored : terrainDeforms_) {
+            ServerTerrainDeformMessage message;
+            message.deformId = stored.deformId;
+            message.deform = stored.deform;
+            transport_->Send(peer, &message, sizeof(message), Channel::Reliable);
+        }
+    }
+
+    // peer == kInvalidPeer broadcasts; otherwise it answers one joining player.
+    void SendLevelTo(PeerId peer) {
+        if (role_ != Role::Host || !transport_) return;
+        ServerLevelMessage message;
+        message.kind = levelKind_;
+        // Bounded copy into a fixed field: the name came from a filesystem path
+        // and nothing upstream promises it is short.
+        const size_t length =
+            (std::min)(levelFile_.size(), size_t(kMaxLevelFileName - 1));
+        std::memcpy(message.file, levelFile_.data(), length);
+        message.file[length] = '\0';
+        if (peer == kInvalidPeer)
+            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+        else
+            transport_->Send(peer, &message, sizeof(message), Channel::Reliable);
+    }
+
+    void HandleLevel(Event& event) {
+        if (event.payload.size() < sizeof(ServerLevelMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerLevelMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.kind != LevelKind::None &&
+            message.kind != LevelKind::Level1 &&
+            message.kind != LevelKind::TestLevel &&
+            message.kind != LevelKind::LevelFile) return;
+        // The wire field is a char array from another process: treat it as
+        // bytes, not as a string that is promised to be terminated.
+        message.file[kMaxLevelFileName - 1] = '\0';
+        const std::string file(message.file);
+        // A file name is all that may cross: anything with a separator or a
+        // parent reference in it is a path, and a path from the network is a
+        // way to point this machine at a file the host chose.
+        if (message.kind == LevelKind::LevelFile &&
+            (file.empty() || file.find('/') != std::string::npos ||
+             file.find('\\') != std::string::npos ||
+             file.find("..") != std::string::npos)) {
+            SGE_LOG("LogNet", EngineLog::Level::Warning,
+                "ignoring level '" + file + "': not a bare file name");
+            return;
+        }
+        if (message.kind == levelKind_ && file == levelFile_) return;
+        levelKind_ = message.kind;
+        levelFile_ = file;
+        hasPendingLevel_ = true;
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "host is on level " + std::to_string(int(levelKind_)) +
+            (file.empty() ? std::string() : " (" + file + ")"));
     }
 
     void HandleWelcome(Event& event) {
@@ -1435,6 +1744,9 @@ private:
             (uint64_t(it->second) << 32) | message.clientToken;
         if (!acceptedGrenadeTokens_.insert(tokenKey).second) return;
         const uint32_t id = AllocateGrenadeId();
+        // Remembered so the thrower, and only the thrower, can later say where
+        // this grenade finished up.
+        grenadeOwners_[id] = it->second;
         GrenadeSpawnEvent spawn{ id, message.clientToken, it->second,
                                  message.kind, false, message.x, message.y,
                                  message.z, message.velocityX,
@@ -1484,6 +1796,62 @@ private:
         grenadeDetonations_.push_back({ message.grenadeId, message.kind,
                                         message.hostile != 0, message.x,
                                         message.y, message.z });
+    }
+
+    void HandleGrenadeDetonationReport(Event& event) {
+        if (event.payload.size() < sizeof(ClientGrenadeDetonationMessage)) return;
+        const auto peer = peerToPlayer_.find(event.peer);
+        if (peer == peerToPlayer_.end()) return;
+        ClientGrenadeDetonationMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.grenadeId == 0 ||
+            !Finite3(message.x, message.y, message.z)) return;
+        // Only the player who threw it may say where it landed. Without this a
+        // client could walk anyone else's grenade -- including the host's --
+        // across the map and drop the blast at its own choice of coordinates.
+        const auto owner = grenadeOwners_.find(message.grenadeId);
+        if (owner == grenadeOwners_.end() || owner->second != peer->second)
+            return;
+        // One report per grenade. Reliable delivery can repeat, and the host
+        // must not be told twice to move a blast it has already run.
+        if (!reportedGrenadeDetonations_.insert(message.grenadeId).second)
+            return;
+        grenadeDetonationReports_.push_back({ message.grenadeId,
+                                              GrenadeKind::Frag, false,
+                                              message.x, message.y,
+                                              message.z });
+    }
+
+    void HandleTerrainDeformRequest(Event& event) {
+        if (event.payload.size() < sizeof(ClientTerrainDeformMessage)) return;
+        // Authenticated peers only, like world damage: a machine that has not
+        // completed the handshake must not be able to reshape the map.
+        if (peerToPlayer_.find(event.peer) == peerToPlayer_.end()) return;
+        ClientTerrainDeformMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (!ValidDeform(message.deform)) return;
+        requestedTerrainDeforms_.push_back(message.deform);
+    }
+
+    void HandleTerrainDeform(Event& event) {
+        if (event.payload.size() < sizeof(ServerTerrainDeformMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerTerrainDeformMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.deformId == 0) return;
+        const TerrainDeform& deform = message.deform;
+        // Same clamping bargain as every other event: these numbers drive a
+        // height field and a physics rebuild, so a NaN radius from a bad packet
+        // would corrupt the ground rather than fail loudly.
+        if (!Finite3(deform.x, deform.z, deform.radius) ||
+            !Finite3(deform.value, deform.strength, deform.edgeFalloff) ||
+            !std::isfinite(deform.baseHeight) ||
+            !std::isfinite(deform.impactY) ||
+            deform.radius <= 0.0f) return;
+        // The join backlog and the live broadcast overlap for a cut made while
+        // a player was connecting, so the same id arrives twice by design.
+        if (!receivedTerrainDeforms_.insert(message.deformId).second) return;
+        terrainDeformEvents_.push_back({ message.deformId, deform });
     }
 
     void SendInput(const LocalPlayerState& local) {
@@ -1551,6 +1919,13 @@ private:
     std::vector<WorldBreakEvent> worldBreaks_;
     std::vector<GrenadeSpawnEvent> grenadeSpawns_;
     std::vector<GrenadeDetonationEvent> grenadeDetonations_;
+    // Host only: which player threw each live replicated grenade, and where
+    // they say it ended up. The kind and hostile fields of the report events go
+    // unused -- the host already knows both from the spawn -- but reusing the
+    // event type keeps one shape for a grenade blast position.
+    std::unordered_map<uint32_t, PlayerId> grenadeOwners_;
+    std::vector<GrenadeDetonationEvent> grenadeDetonationReports_;
+    std::unordered_set<uint32_t> reportedGrenadeDetonations_;
     // Reliable does not mean a caller cannot retry a send. Retain these keys
     // beyond queue draining so delayed duplicates cannot create another body or
     // replay a destruction edge on a later frame.
@@ -1559,8 +1934,34 @@ private:
     std::unordered_set<uint32_t> receivedGrenadeIds_;
     std::unordered_set<uint32_t> receivedGrenadeDetonations_;
     std::unordered_set<uint64_t> receivedWorldBreaks_;
+    std::unordered_set<uint32_t> receivedTerrainDeforms_;
+    // On the host, every cut it has published, for replay to a joining peer. On
+    // a client, terrainDeformEvents_ is what arrived and has yet to be applied.
+    // Only one is ever populated on a given machine.
+    std::vector<TerrainDeformEvent> terrainDeforms_;
+    std::vector<TerrainDeformEvent> terrainDeformEvents_;
+    // Host only: cuts clients have asked for, waiting to be applied and then
+    // published back out as the host's own.
+    std::vector<TerrainDeform> requestedTerrainDeforms_;
     uint32_t nextGrenadeId_ = 1;
     uint32_t nextImpactId_ = 1;
+    uint32_t nextDeformId_ = 1;
+    // The map everyone is on. On the host this is what it publishes; on a
+    // client it is the last thing the host said, and the pending flag is the
+    // one-shot that makes the game load it.
+    LevelKind levelKind_ = LevelKind::None;
+    std::string levelFile_;
+    bool hasPendingLevel_ = false;
+    std::string serverAddress_;
+    uint16_t port_ = 0;
+    // Whether this session is riding Steam's relay rather than a UDP port.
+    // Decides what a friend is handed to join with, which is the only thing
+    // above the transport that can tell the difference.
+    bool overSteam_ = false;
+    // Set when the session ended by itself, and read by the menu so a client
+    // that never got in says why instead of waiting on a host that is gone.
+    std::string lastError_;
+    bool disconnectPending_ = false;
     uint32_t lastEnemyTick_ = 0;
     // Scratch for the per-client nearest-enemy sort, kept so the send does not
     // allocate once per client per tick.

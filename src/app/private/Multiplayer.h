@@ -25,6 +25,81 @@ static std::vector<net::WorldBreakEvent> g_netWorldBreakScratch;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
 
+// Levels used to be each player's own choice, which reads as a working session
+// right up until two people shoot at terrain only one of them has. The host's
+// map is now the session's map: it publishes what it is on, and a client loads
+// to match -- on join, and again whenever the host moves.
+static void PublishHostLevel() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Host) return;
+    // Called every frame rather than hooked into each level-start site: there
+    // are six of those and they all end up writing g_activeLevelKind, so
+    // watching the result is the version that cannot be forgotten. SetHostLevel
+    // sends only on a change.
+    g_netSession.SetHostLevel(g_activeLevelKind, g_activeLevelFile);
+}
+
+// Resolves a level file the way the rest of the game does. The three roots are
+// not interchangeable guesses: the repo, a build/ run and a packaged install
+// each keep Content/Levels somewhere different.
+static std::filesystem::path FindNetworkLevelFile(const std::string& file) {
+    const std::filesystem::path candidates[] = {
+        std::filesystem::path("Content/Levels") / file,
+        std::filesystem::path("levels") / file,
+        std::filesystem::path("build/Content/Levels") / file,
+    };
+    std::error_code error;
+    for (const std::filesystem::path& candidate : candidates)
+        if (std::filesystem::exists(candidate, error)) return candidate;
+    return {};
+}
+
+static void FollowHostLevel(HWND hwnd) {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Client) return;
+    net::LevelKind kind = net::LevelKind::None;
+    std::string file;
+    if (!g_netSession.TakePendingLevel(kind, file)) return;
+    if (kind == g_activeLevelKind && file == g_activeLevelFile) return;
+    // A host sitting in its own menus is not a reason to tear this player's
+    // level down. It will name one shortly, and being dropped to the menu in
+    // between is worse than arriving a moment late.
+    if (kind == net::LevelKind::None) return;
+    // A load in progress owns the screen. Put the request back rather than
+    // starting a second one on top of it.
+    if (g_game.loading.Active()) {
+        g_netSession.RequeuePendingLevel();
+        return;
+    }
+    switch (kind) {
+    case net::LevelKind::Level1:
+        StartLevelOne(hwnd, true);
+        break;
+    case net::LevelKind::TestLevel:
+        StartLevelOne(hwnd, true, false, true, nullptr, true);
+        break;
+    case net::LevelKind::LevelFile: {
+        const std::filesystem::path path = FindNetworkLevelFile(file);
+        if (path.empty()) {
+            // Naming the file is the whole diagnostic: the host has a level
+            // this machine does not, and no amount of retrying fixes that.
+            SGE_LOG("LogNet", EngineLog::Level::Warning,
+                "host is on '" + file + "', which is not in Content/Levels here");
+            g_mainMenuLevelStatus = "Host is playing " + file +
+                                    ", which is missing from Content/Levels.";
+            return;
+        }
+        StartCustomLevel(hwnd, path);
+        break;
+    }
+    default:
+        return;
+    }
+    SGE_LOG("LogNet", EngineLog::Level::Display,
+        "following host onto level " + std::to_string(int(kind)) +
+        (file.empty() ? std::string() : " (" + file + ")"));
+}
+
 static void DamageBulletPrefabEntity(uint64_t entityId, float damage,
                                       const XMFLOAT3& hit, bool remoteCharge,
                                       bool playerOwned) {
@@ -410,7 +485,76 @@ static void UpdateClientEnemies(float frameDelta) {
 // host's detonation edge arrives.
 static std::vector<net::GrenadeSpawnEvent> g_netGrenadeSpawns;
 static std::vector<net::GrenadeDetonationEvent> g_netGrenadeDetonations;
+// Host only: where clients say their own grenades finished up.
+static std::vector<net::GrenadeDetonationEvent> g_netGrenadeDetonationReports;
 static uint32_t g_nextGrenadeClientToken = 1;
+
+// Ground the host has cut, waiting to be applied here. Reused across frames so
+// the drain does not allocate, like the other scratch vectors above.
+static std::vector<net::TerrainDeformEvent> g_netTerrainDeforms;
+static std::vector<net::TerrainDeform> g_netRequestedTerrainDeforms;
+
+static TerrainSculptStamp StampFromNetworkDeform(
+        const net::TerrainDeform& deform, bool& valid) {
+    TerrainSculptStamp stamp;
+    stamp.x = deform.x;
+    stamp.z = deform.z;
+    stamp.radius = deform.radius;
+    stamp.value = deform.value;
+    stamp.strength = deform.strength;
+    stamp.edgeFalloff = deform.edgeFalloff;
+    stamp.baseHeight = deform.baseHeight;
+    // The wire carries the operation as a byte. Only the shapes a runtime cut
+    // actually uses are accepted -- Heightmap is excluded because it names a
+    // texture file, which is a std::string that never crosses and would leave
+    // the stamp pointing at nothing. Anything else is dropped rather than cast
+    // blind into the evaluator.
+    const auto operation =
+        static_cast<TerrainSculptOperation>(deform.operation);
+    valid = operation == TerrainSculptOperation::Crater ||
+            operation == TerrainSculptOperation::Add ||
+            operation == TerrainSculptOperation::Flatten;
+    stamp.operation = valid ? operation : TerrainSculptOperation::Add;
+    return stamp;
+}
+
+// Moves cut ground between machines, in both directions.
+//
+// On a client: applies what the host has committed. A client digs nothing of
+// its own, so this is the only thing that changes its terrain.
+//
+// On the host: applies what a client asked for, then publishes it as its own.
+// That request is how a client's rocket, C4 or exploding barrel is heard about
+// at all -- none of them replicate as projectiles, so before this the host
+// never learned a client had blown anything up and the hole appeared on neither
+// machine.
+static void ApplyNetworkTerrainDeforms() {
+    if (!MultiplayerActive()) return;
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.DrainRequestedTerrainDeforms(g_netRequestedTerrainDeforms);
+        for (const net::TerrainDeform& deform : g_netRequestedTerrainDeforms) {
+            bool valid = false;
+            const TerrainSculptStamp stamp =
+                StampFromNetworkDeform(deform, valid);
+            if (!valid) continue;
+            ApplyRuntimeTerrainStamp(stamp, deform.impactY);
+            // Straight back out, including to the client that asked: it applied
+            // nothing locally and is waiting for this. Publishing also puts the
+            // cut in the join backlog, so a later arrival gets it too.
+            g_netSession.PublishTerrainDeform(deform);
+        }
+        return;
+    }
+    if (g_netSession.CurrentRole() != net::Role::Client) return;
+    g_netSession.DrainTerrainDeforms(g_netTerrainDeforms);
+    for (const net::TerrainDeformEvent& event : g_netTerrainDeforms) {
+        bool valid = false;
+        const TerrainSculptStamp stamp =
+            StampFromNetworkDeform(event.deform, valid);
+        if (!valid) continue;
+        ApplyRuntimeTerrainStamp(stamp, event.deform.impactY);
+    }
+}
 
 static net::GrenadeKind NetworkGrenadeKind(const Projectile& p) {
     return p.molotov ? net::GrenadeKind::Molotov
@@ -465,6 +609,27 @@ static void UpdateNetworkGrenades() {
         p.netClientToken = spawn.clientToken;
         p.netAuthoritative = g_netSession.CurrentRole() == net::Role::Host;
         scene.projectiles.push_back(p);
+    }
+
+    // The thrower has told the host where its grenade ended up. Move the
+    // authoritative projectile there and let it go off this frame rather than
+    // burning the rest of a fuse the client has already finished: the host's
+    // own copy of the throw has drifted by now, and the blast belongs where the
+    // player who threw it watched the grenade come to rest.
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.DrainGrenadeDetonationReports(g_netGrenadeDetonationReports);
+        for (const net::GrenadeDetonationEvent& report :
+                 g_netGrenadeDetonationReports) {
+            Projectile* p = FindNetworkGrenade(report.grenadeId);
+            if (!p || !p->active) continue;
+            ReleaseGrenadePhysicsBody(*p);
+            p->position = p->previousPosition =
+                { report.x, report.y, report.z };
+            p->velocity = {};
+            p->fuse = 0.0f;
+            p->active = false;
+            p->detonate = true;
+        }
     }
 
     g_netSession.DrainGrenadeDetonations(g_netGrenadeDetonations);
@@ -536,6 +701,54 @@ static void ShutdownMultiplayer() {
 // Parses -host [port] / -join <address> [port] out of the command line and
 // starts the session. A failure is reported and then ignored: not being able
 // to host is a reason to stay single-player, not a reason to refuse to launch.
+// "address:port", "address port" or just "address". Steam hands back whatever
+// string the host put in its `connect` rich presence, so this parses the shape
+// this game writes rather than assuming a well-formed pair.
+static bool JoinFromConnectString(const std::string& connect) {
+    constexpr uint16_t kDefaultPort = 27015;
+    std::string address = connect;
+    // Steam launches the game with the connect value as arguments, so the
+    // leading "+connect" is still attached when it arrives that way.
+    const size_t flag = address.find("+connect");
+    if (flag != std::string::npos) address.erase(0, flag + 8);
+    const size_t first = address.find_first_not_of(" \t\"");
+    if (first == std::string::npos) return false;
+    address.erase(0, first);
+    const size_t last = address.find_last_not_of(" \t\"");
+    address.erase(last + 1);
+
+    uint16_t port = kDefaultPort;
+    // "steam:<id64>" is one token with a colon in it, not an address and a
+    // port: the relay has no port to dial, and splitting here would hand the
+    // transport half a SteamID.
+    const size_t separator = net::IsSteamAddress(address)
+        ? std::string::npos : address.find_last_of(": ");
+    if (separator != std::string::npos) {
+        const int parsed = std::atoi(address.c_str() + separator + 1);
+        if (parsed > 0 && parsed <= 65535) {
+            port = static_cast<uint16_t>(parsed);
+            address.erase(separator);
+        }
+    }
+    if (address.empty()) return false;
+
+    std::string error;
+    if (!g_netSession.StartClient(address, port, &error)) {
+        SGE_LOG("LogNet", EngineLog::Level::Warning,
+            "join from Steam failed (" + address + ":" +
+            std::to_string(port) + "): " + error);
+        // The invite arrives while the player is looking at the menu, so the
+        // menu is where the failure has to appear; without this an invite that
+        // cannot be honoured is indistinguishable from one that never came.
+        g_multiplayerStatusError = "Could not join: " + error;
+        return false;
+    }
+    g_multiplayerStatusError.clear();
+    SGE_LOG("LogNet", EngineLog::Level::Display,
+        "joining " + address + ":" + std::to_string(port) + " from Steam");
+    return true;
+}
+
 static void StartMultiplayerFromCommandLine(const std::string& commandLine) {
     std::vector<std::string> arguments;
     std::istringstream stream(commandLine);
@@ -545,29 +758,78 @@ static void StartMultiplayerFromCommandLine(const std::string& commandLine) {
     for (size_t i = 0; i < arguments.size(); ++i) {
         const std::string& argument = arguments[i];
         std::string error;
-        if (argument == "-host") {
+        // How a friend's "Join Game" arrives when the game was not already
+        // running: Steam launches it with the host's connect string appended.
+        if (argument == "+connect") {
+            if (i + 1 >= arguments.size()) {
+                std::cerr << "+connect needs an address\n";
+                return;
+            }
+            JoinFromConnectString(arguments[i + 1]);
+            return;
+        }
+        // -host is the direct UDP form, which is what the LAN test script and
+        // a hand-typed address need. -host-steam puts the session on Steam's
+        // relay instead, where a friend joins by SteamID and neither end needs
+        // a reachable address.
+        if (argument == "-host" || argument == "-host-steam") {
+            const bool overSteam = argument == "-host-steam";
             uint16_t port = kDefaultPort;
             if (i + 1 < arguments.size() && arguments[i + 1][0] != '-')
                 port = static_cast<uint16_t>(std::atoi(arguments[++i].c_str()));
-            if (g_netSession.StartHost(port, &error))
-                std::cout << "Hosting on port " << port << "\n";
-            else
+            if (g_netSession.StartHost(port, &error, overSteam)) {
+                // Logged rather than only printed: which transport a session
+                // actually got is the first thing worth knowing when a friend
+                // cannot reach it, and -host-steam falls back to IP silently
+                // when Steam is not running.
+                const std::string where = g_netSession.OverSteam()
+                    ? "Steam as " + g_netSession.ConnectAddress()
+                    : "port " + std::to_string(port);
+                std::cout << "Hosting on " << where << "\n";
+                SGE_LOG("LogNet", EngineLog::Level::Display,
+                    "hosting on " + where);
+            } else {
                 std::cerr << "Failed to host: " << error << "\n";
+                SGE_LOG("LogNet", EngineLog::Level::Warning,
+                    "failed to host: " + error);
+            }
             return;
         }
         if (argument == "-join") {
             if (i + 1 >= arguments.size()) {
                 std::cerr << "-join needs an address\n";
+                SGE_LOG("LogNet", EngineLog::Level::Warning,
+                    "-join needs an address");
                 return;
             }
-            const std::string address = arguments[++i];
+            std::string address = arguments[++i];
+            // Quotes and stray whitespace survive a copy-paste out of a chat
+            // window, and ParseSteamId rejects any non-digit outright -- so a
+            // pasted id with a trailing quote failed for a reason that looked
+            // nothing like the cause. Trimmed here the way the Steam invite
+            // path already trims it.
+            const size_t first = address.find_first_not_of(" \t\"");
+            if (first != std::string::npos) {
+                address.erase(0, first);
+                address.erase(address.find_last_not_of(" \t\"") + 1);
+            }
             uint16_t port = kDefaultPort;
             if (i + 1 < arguments.size() && arguments[i + 1][0] != '-')
                 port = static_cast<uint16_t>(std::atoi(arguments[++i].c_str()));
-            if (g_netSession.StartClient(address, port, &error))
+            // Logged, not just printed: the console this writes to belongs to
+            // AllocConsole and is gone with the process, which left a failed
+            // command-line join as the one path in this file with no trace.
+            if (g_netSession.StartClient(address, port, &error)) {
                 std::cout << "Joining " << address << ":" << port << "\n";
-            else
+                SGE_LOG("LogNet", EngineLog::Level::Display,
+                    "joining " + address + ":" + std::to_string(port));
+            } else {
                 std::cerr << "Failed to join: " << error << "\n";
+                SGE_LOG("LogNet", EngineLog::Level::Warning,
+                    "failed to join " + address + ":" + std::to_string(port) +
+                    ": " + error);
+                g_multiplayerStatusError = "Could not join: " + error;
+            }
             return;
         }
     }
@@ -582,6 +844,15 @@ static void StartMultiplayerFromCommandLine(const std::string& commandLine) {
 // from the menu at all.
 static void UpdateMultiplayerSession(float frameDelta,
                                      const PlayerInput& localInput) {
+    // A session can end without anyone here asking it to -- the host quit, or
+    // the connection never came up at all. The reason is taken once and shown
+    // in the menu; the actors it leaves behind are the same ones an explicit
+    // disconnect has to clear, so the same cleanup runs.
+    std::string ended = g_netSession.TakeLastError();
+    if (!ended.empty()) {
+        g_multiplayerStatusError = std::move(ended);
+        ShutdownMultiplayer();
+    }
     if (!MultiplayerActive()) {
         // Drop the sink as soon as there is no session, so a disconnected
         // player's damage stops being reported into nothing and single-player

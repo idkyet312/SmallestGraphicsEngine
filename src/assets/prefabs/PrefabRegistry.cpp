@@ -13,6 +13,7 @@
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <nlohmann/json.hpp>
+#include "CookedAssetPaths.h"
 #include "EngineLogger.h"
 #ifdef _WIN32
 #include <Windows.h>
@@ -371,7 +372,14 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             throw std::runtime_error("model path must be project-relative without '..'");
         if (prefab.basePrefabId.empty() && !PrefabRegistry::IsSupportedModel(prefab.modelPath))
             throw std::runtime_error("model must be .fbx, .glb, or .gltf");
-        if (prefab.basePrefabId.empty() && !std::filesystem::exists(prefab.modelPath))
+        // A cooked-only package ships the .sgeasset and drops the source mesh:
+        // CookedAssetLoader::LoadForSource skips its staleness check when the
+        // source is absent and serves the cooked blob, so demanding the source
+        // here is what turned a trimmed package into a level full of "missing
+        // prefab" warnings while the art it needed was sitting in Content/Cooked.
+        if (prefab.basePrefabId.empty() &&
+            !std::filesystem::exists(prefab.modelPath) &&
+            SGE::Cooked::FindAssetForSource(prefab.modelPath).empty())
             throw std::runtime_error("model does not exist: " + Generic(prefab.modelPath));
         if (prefab.collision != "none" && prefab.collision != "box" &&
             prefab.collision != "mesh")

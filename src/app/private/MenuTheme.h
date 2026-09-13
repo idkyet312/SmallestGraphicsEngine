@@ -310,14 +310,57 @@ static void RenderMultiplayerMenu() {
     // Status first: it is the only part of the panel that matters once a
     // session is live, and it is what the player is waiting on while joining.
     if (!offline) {
-        if (role == net::Role::Host) {
+        if (role == net::Role::Host && g_netSession.OverSteam()) {
+            // No port: the session is reached by SteamID, and that id is the
+            // only thing a friend can act on. It is shown rather than merely
+            // alluded to because "Join Game" on a profile launches whatever
+            // app the AppID names -- and while this build borrows 480, that
+            // reaches only a friend who already has the game running. Pasting
+            // the address into ADDRESS is the path that always works.
+            ImGui::TextColored(UITheme::kAccent, "Hosting on Steam");
+            const std::string invite = g_netSession.ConnectAddress();
+            if (invite.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(UITheme::kWarning,
+                                   "Steam did not report an account id, so "
+                                   "there is no address to hand out.");
+                ImGui::PopTextWrapPos();
+            } else {
+                // ImGui edits through the buffer even when it is read-only,
+                // so the session's string is copied rather than exposed.
+                char shown[64] = {};
+                std::snprintf(shown, sizeof(shown), "%s", invite.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                ImGui::InputText("##mpinvite", shown, sizeof(shown),
+                                 ImGuiInputTextFlags_ReadOnly);
+                if (ImGui::SmallButton("COPY INVITE"))
+                    ImGui::SetClipboardText(invite.c_str());
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(UITheme::kTextDim,
+                                   "Send this to a friend to paste into "
+                                   "ADDRESS. Join Game on your Steam profile "
+                                   "only reaches them while they already have "
+                                   "the game running.");
+                ImGui::PopTextWrapPos();
+            }
+        } else if (role == net::Role::Host) {
             ImGui::TextColored(UITheme::kAccent, "Hosting on port %s",
                                g_multiplayerPort);
         } else if (g_netSession.LocalId() == net::kInvalidPlayerId) {
             // The client is connected at the socket level but has not been
             // given an id yet, so it is mid-handshake rather than in.
-            ImGui::TextColored(UITheme::kTextDim, "Connecting to %s:%s...",
-                               g_multiplayerJoinAddress, g_multiplayerPort);
+            //
+            // Asked of the session rather than read off the menu's own field:
+            // a join started from the command line never touched that buffer,
+            // and showing its default made the panel name the wrong host.
+            const std::string target = g_netSession.ConnectAddress();
+            if (g_netSession.OverSteam())
+                ImGui::TextColored(UITheme::kTextDim, "Connecting to %s...",
+                                   target.c_str());
+            else
+                ImGui::TextColored(UITheme::kTextDim, "Connecting to %s:%d...",
+                                   target.c_str(),
+                                   static_cast<int>(g_netSession.Port()));
         } else {
             ImGui::TextColored(UITheme::kAccent, "Connected as player %d",
                                static_cast<int>(g_netSession.LocalId()) + 1);
@@ -348,7 +391,8 @@ static void RenderMultiplayerMenu() {
                              g_multiplayerJoinAddress,
                              sizeof(g_multiplayerJoinAddress));
     ImGui::TextColored(UITheme::kTextDim,
-                       "The host's address. 127.0.0.1 is this machine.");
+                       "The host's address. 127.0.0.1 is this machine, and "
+                       "steam:<id> joins over Steam.");
     ImGui::EndDisabled();
 
     // atoi rather than a parse with error reporting: the field is digits-only
@@ -361,7 +405,21 @@ static void RenderMultiplayerMenu() {
     ImGui::Dummy(ImVec2(0.0f, 18.0f));
 
     if (offline) {
-        if (UIPrimaryButton("HOST", 44.0f)) {
+        // Steam first when it is there: it is the only one of the two that a
+        // friend outside this network can actually reach, and it needs nothing
+        // typed. The IP button stays for LAN and for a machine with no Steam.
+        const bool steamReady = net::SteamTransportAvailable();
+        if (steamReady) {
+            if (UIPrimaryButton("HOST ON STEAM", 44.0f)) {
+                g_multiplayerStatusError.clear();
+                std::string error;
+                if (!g_netSession.StartHost(port, &error, /*overSteam=*/true))
+                    g_multiplayerStatusError = "Could not host: " + error;
+            }
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        }
+        if (steamReady ? UIMenuButton("HOST ON THIS NETWORK", 44.0f)
+                       : UIPrimaryButton("HOST", 44.0f)) {
             g_multiplayerStatusError.clear();
             std::string error;
             if (!g_netSession.StartHost(port, &error))
@@ -387,13 +445,12 @@ static void RenderMultiplayerMenu() {
         g_showMultiplayerMenu = false;
 
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    // Said plainly because it is the one part of milestone 1 that will
-    // otherwise read as a bug: the session survives the menu, but each player
-    // still picks their own level.
+    // The level is the host's to pick now: a client is told which map to load
+    // and follows, on join and on every change after it.
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextColored(UITheme::kTextDim,
-                       "Stay connected while you start a level. Both players "
-                       "must start the same one.");
+                       "Stay connected while the host starts a level. Everyone "
+                       "else loads the same map automatically.");
     ImGui::PopTextWrapPos();
 }
 

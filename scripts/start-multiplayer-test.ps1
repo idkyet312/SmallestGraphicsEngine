@@ -14,6 +14,10 @@ param(
     # Where the client connects. Left as loopback for a same-machine test; pass
     # the host's LAN address to drive this from a second PC.
     [string]$Address = '127.0.0.1',
+    # Level the host loads on startup, e.g. Content/Levels/Base.json. The client
+    # is deliberately not given one: it is told which map to load by the host,
+    # and starting it with its own would be testing nothing.
+    [string]$Level = '',
     # Skip the build and use whatever is already in build/.
     [switch]$NoBuild,
     # Start only the host, and wait. For the second machine in a LAN test, where
@@ -61,7 +65,14 @@ function Start-Instance {
 }
 
 Write-Host "Starting host on port $Port..." -ForegroundColor Cyan
-$hostProcess = Start-Instance @('-host', "$Port")
+# --level leads: everything else is a flag the multiplayer parser scans for, and
+# this way the host is already in the map by the time the client finishes
+# connecting -- which is the case worth testing, since the client has to be told
+# where to go rather than being there first.
+$hostArguments = @()
+if ($Level) { $hostArguments += "--level=$Level" }
+$hostArguments += @('-host', "$Port")
+$hostProcess = Start-Instance $hostArguments
 
 # Wait for the socket, not for a fixed sleep. The host has to finish booting --
 # shaders, DXR, scene assets -- before it binds, and how long that takes varies
@@ -131,8 +142,8 @@ if ($connected) {
             Write-Host -ForegroundColor DarkGray
     }
     Write-Host ""
-    Write-Host "Now pick the SAME level in both windows (TEST LEVEL is the usual one)." -ForegroundColor Yellow
-    Write-Host "Level choice is not synchronised -- each player starts their own."
+    Write-Host "Start a level in the HOST window; the client follows on its own." -ForegroundColor Yellow
+    Write-Host "Pass -Level <path> to have the host load one at startup instead."
 } else {
     Write-Host "No handshake within $TimeoutSeconds seconds." -ForegroundColor Red
     Write-Host "Both instances are still running; check build\logs\GraphicEngine.log."

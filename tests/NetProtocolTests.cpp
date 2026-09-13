@@ -47,6 +47,10 @@ int main() {
                   "ServerGrenadeSpawnMessage must stay memcpy-able");
     static_assert(std::is_trivially_copyable<ServerGrenadeDetonatedMessage>::value,
                   "ServerGrenadeDetonatedMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<TerrainDeform>::value,
+                  "TerrainDeform must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerTerrainDeformMessage>::value,
+                  "ServerTerrainDeformMessage must stay memcpy-able");
 
     // Dispatch reads the header before it knows the payload type, so the header
     // must be at offset 0 of every message.
@@ -74,12 +78,14 @@ int main() {
                   "header must lead");
     static_assert(offsetof(ServerGrenadeDetonatedMessage, header) == 0,
                   "header must lead");
+    static_assert(offsetof(ServerTerrainDeformMessage, header) == 0,
+                  "header must lead");
 
     // The version must be bumped whenever a struct in the file changes shape.
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 7, "protocol version was not bumped");
+    Check(kProtocolVersion == 9, "protocol version was not bumped");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -334,6 +340,54 @@ int main() {
         Check(enemiesReceived.enemies[i].dead == enemiesSent.enemies[i].dead,
               "enemy dead flag lost");
     }
+
+    // A terrain cut through raw bytes. Every field here drives either the
+    // height field or a physics rebuild, so one silently lost in the copy would
+    // not fail -- it would dig a subtly different hole on the receiving machine,
+    // which is the exact failure this message exists to prevent.
+    ServerTerrainDeformMessage deformSent;
+    deformSent.deformId = 4242u;
+    deformSent.deform.x = -137.5f;
+    deformSent.deform.z = 918.25f;
+    deformSent.deform.radius = 6.75f;
+    deformSent.deform.value = 2.5f;
+    deformSent.deform.strength = 2.25f;
+    deformSent.deform.edgeFalloff = 0.45f;
+    deformSent.deform.baseHeight = 31.125f;
+    deformSent.deform.impactY = 32.5f;
+    deformSent.deform.operation = 3; // Crater
+
+    unsigned char deformBuffer[sizeof(ServerTerrainDeformMessage)];
+    std::memcpy(deformBuffer, &deformSent, sizeof(deformBuffer));
+    ServerTerrainDeformMessage deformReceived;
+    std::memcpy(&deformReceived, deformBuffer, sizeof(deformBuffer));
+
+    Check(deformReceived.header.type == MessageType::ServerTerrainDeform,
+          "terrain deform type did not round-trip");
+    Check(deformReceived.deformId == deformSent.deformId,
+          "terrain deform id did not round-trip");
+    Check(deformReceived.deform.x == deformSent.deform.x &&
+              deformReceived.deform.z == deformSent.deform.z,
+          "terrain deform position did not round-trip");
+    Check(deformReceived.deform.radius == deformSent.deform.radius,
+          "terrain deform radius did not round-trip");
+    Check(deformReceived.deform.value == deformSent.deform.value,
+          "terrain deform depth did not round-trip");
+    Check(deformReceived.deform.strength == deformSent.deform.strength,
+          "terrain deform wall sharpness did not round-trip");
+    Check(deformReceived.deform.edgeFalloff == deformSent.deform.edgeFalloff,
+          "terrain deform floor fraction did not round-trip");
+    Check(deformReceived.deform.baseHeight == deformSent.deform.baseHeight,
+          "terrain deform base height did not round-trip");
+    Check(deformReceived.deform.impactY == deformSent.deform.impactY,
+          "terrain deform impact height did not round-trip");
+    Check(deformReceived.deform.operation == deformSent.deform.operation,
+          "terrain deform operation did not round-trip");
+
+    // The join backlog sends one of these per stamp, up to the cap, so it must
+    // stay a small message rather than something that fragments.
+    Check(sizeof(ServerTerrainDeformMessage) < 1200,
+          "terrain deform is too large for a single unfragmented datagram");
 
     // Both snapshots must fit comfortably in a normal MTU, or every send
     // fragments. The enemy one is the message that grows with kMaxReplicatedEnemies,

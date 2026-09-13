@@ -89,6 +89,10 @@ struct Projectile {
     uint32_t netClientToken = 0;
     bool     netAuthoritative = false;
     bool     netAwaitingDetonation = false;
+    // Set once the thrower has told the host where this grenade finished up.
+    // The report is a one-shot: the client's copy sits on its detonate frame
+    // until the host's edge arrives, and would otherwise send every frame.
+    bool     netDetonationReported = false;
     // Called-in strike rather than a thrown frag. It shares the grenade blast
     // path but scales every radius by missileBlastScale, so the strike can be
     // tuned without moving what a hand grenade does.

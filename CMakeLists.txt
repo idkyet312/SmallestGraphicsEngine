@@ -442,6 +442,38 @@ if(GameNetworkingSockets_FOUND)
         COMMENT "Copying GameNetworkingSockets next to the executable")
 endif()
 
+# Steamworks redistributable. Nothing links against it: src/app/private/
+# SteamPresence.h resolves the flat API with LoadLibrary at startup, so the
+# engine builds and runs identically whether or not this file exists. Copied
+# next to the exe because that is the directory LoadLibrary searches first.
+# Steamworks headers, used for types and interface declarations only: nothing
+# links steam_api64.lib. The accessors are resolved from the DLL at runtime
+# (src/net/NetTransportSteam.cpp), which keeps the game launchable without Steam
+# and keeps the Steamworks flat exports from colliding with the identically
+# named ones in the standalone GameNetworkingSockets build.
+set(SGE_STEAM_INCLUDE "${CMAKE_SOURCE_DIR}/thirdparty/Steam/include")
+if(EXISTS "${SGE_STEAM_INCLUDE}/steamworks/isteamnetworkingsockets.h")
+    target_sources(GraphicEngine PRIVATE src/net/NetTransportSteam.cpp)
+    target_include_directories(GraphicEngine PRIVATE "${SGE_STEAM_INCLUDE}")
+    target_compile_definitions(GraphicEngine PRIVATE SGE_WITH_STEAM_SOCKETS=1)
+    message(STATUS "Steam P2P transport enabled (thirdparty/Steam/include)")
+else()
+    message(STATUS
+        "Steamworks headers absent; Steam P2P transport off (IP only)")
+endif()
+
+set(SGE_STEAM_API_DLL "${CMAKE_SOURCE_DIR}/thirdparty/Steam/steam_api64.dll")
+if(EXISTS "${SGE_STEAM_API_DLL}")
+    add_custom_command(TARGET GraphicEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SGE_STEAM_API_DLL}"
+            $<TARGET_FILE_DIR:GraphicEngine>
+        COMMENT "Copying steam_api64.dll next to the executable")
+else()
+    message(STATUS
+        "thirdparty/Steam/steam_api64.dll not present; building without Steam")
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(VirtualShadowPagesTests tests/VirtualShadowPagesTests.cpp)
@@ -676,6 +708,18 @@ if(BUILD_TESTING)
         tests/NetWorldReplicationTests.cpp)
     target_link_libraries(NetWorldReplicationTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetWorldReplicationTests COMMAND NetWorldReplicationTests)
+
+    # The host's level reaching a joining client, and what a client refuses to
+    # be told to load.
+    add_executable(NetLevelSyncTests tests/NetLevelSyncTests.cpp)
+    target_link_libraries(NetLevelSyncTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetLevelSyncTests COMMAND NetLevelSyncTests)
+
+    # Craters and furrows reaching a client, once each, including the backlog a
+    # player joining mid-session is handed.
+    add_executable(NetTerrainSyncTests tests/NetTerrainSyncTests.cpp)
+    target_link_libraries(NetTerrainSyncTests PRIVATE SGEProjectHeaders)
+    add_test(NAME NetTerrainSyncTests COMMAND NetTerrainSyncTests)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

@@ -146,6 +146,8 @@ using namespace DirectX;
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
 #include "private/Multiplayer.h"
+// After Multiplayer.h: the status line it sends says whether this is a session.
+#include "private/SteamPresence.h"
 #include "private/WindowInput.h"
 #include "private/Boot.h"
 #include "private/EnemyDeathSmoke.h"
@@ -170,6 +172,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     freopen_s(&fp, "CONOUT$", "w", stderr);
 
     EngineLog::ScopedSession logSession("GraphicEngine");
+    // Before the window and the device: the Steam client wants to hear from a
+    // process early, and this way the log line that says whether Steam is there
+    // sits at the top of the session rather than buried in the boot spam.
+    InitSteam();
     g_assetWatcher.Start();
 
     std::cout << "GraphicEngine DX12 Starting..." << std::endl;
@@ -899,6 +905,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // *after* a stall; this covers the stall frame itself.
         deltaTime = (std::min)(deltaTime, 0.1f);
 
+        // Cheap and unconditional: it is how the overlay gets a chance to open,
+        // and it does nothing at all when Steam was not found at startup.
+        UpdateSteam();
+
         if (g_dx12.fence)
             g_retiredPrefabResources.Collect(
                 g_dx12.fence->GetCompletedValue());
@@ -923,6 +933,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     "Asset change detected; prefab cache reloading");
             }
         }
+
+        // Level follow, outside the gameplay gate on purpose: a client that is
+        // told to load is almost always sitting in the menu when it hears it.
+        PublishHostLevel();
+        FollowHostLevel(hwnd);
 
         if (g_game.commands.Consume(GameCommand::EditorStopPlay)) {
             StopEditorPlaytest();
@@ -2064,6 +2079,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         UpdateMultiplayerBodies(deltaTime);
         UpdateNetworkWorldImpacts();
         UpdateNetworkGrenades();
+        // Before the frame's physics and draws so a client stands on the same
+        // ground the host does this frame, rather than a frame behind it.
+        ApplyNetworkTerrainDeforms();
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this
@@ -2359,8 +2377,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (projectile.grenade && !projectile.missile &&
                             !projectile.remoteCharge && MultiplayerActive()) {
                             if (g_netSession.CurrentRole() == net::Role::Client &&
-                                !projectile.netAuthoritative)
+                                !projectile.netAuthoritative) {
+                                // This machine threw it and has just watched it
+                                // come to rest. Tell the host where, so the
+                                // blast -- and the crater under it -- goes off
+                                // where the thrower saw the grenade, not where
+                                // the host's own simulation of the same throw
+                                // happened to put it after a bounce.
+                                if (!projectile.netDetonationReported &&
+                                    projectile.netGrenadeId != 0) {
+                                    projectile.netDetonationReported = true;
+                                    g_netSession.ReportGrenadeDetonation(
+                                        projectile.netGrenadeId,
+                                        projectile.position.x,
+                                        projectile.position.y,
+                                        projectile.position.z);
+                                }
                                 continue;
+                            }
                             if (g_netSession.CurrentRole() == net::Role::Host)
                                 g_netSession.PublishGrenadeDetonation(
                                     projectile.netGrenadeId,
@@ -2474,7 +2508,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // so it only ever missed the ground and wall cuts
                         // because this one gate named the grenade alone.
                         if (projectile.grenade || projectile.rocket) {
-                            AddExplosionTerrainCrater(center, blastScale);
+                            // A replicated grenade is the host's projectile: it
+                            // runs the blast on its own machine and sends the
+                            // cut it made. A client asking for a second one for
+                            // the same explosion digs the hole twice.
+                            AddExplosionTerrainCrater(
+                                center, blastScale,
+                                /*hostAuthored=*/projectile.netGrenadeId != 0);
                             AddExplosionBuildingHole(center, blastScale);
                         }
                         {
@@ -4564,7 +4604,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // marine allies -- and the body every networked player is drawn
             // with, which is why this is loaded on the empty test level too
             // while the enemy import above is not.
-            if (!g_baseMode) {
+            // The base skips the ally squad -- it is a hub, not a fight. In a
+            // session it cannot: this is the mesh every networked player is
+            // drawn with, and without it a friend who follows you into the base
+            // is connected, replicated and invisible.
+            if (!g_baseMode || MultiplayerActive()) {
                 const std::string marineDir = "Content/Models/MarineAlly/";
                 const std::string marineAnimDir = marineDir + "Animations/Demo/";
                 std::vector<std::string> marineClips = {
@@ -4576,6 +4620,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     marineDir + "SK_Bandit.FBX", marineClips, g_dx12.device, g_dx12.commandList);
                 mm.ragdoll = T3DPhysicsAsset::Load(marineDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (mm.valid) {
+                    // The marine's kit has single-sided shells -- webbing,
+                    // straps, the jacket's open front -- that vanish from
+                    // whichever side the camera happens to be on, and a friendly
+                    // body is looked at from every angle rather than only down
+                    // the sights. The importer already double-sides hair and
+                    // eyelashes; this widens it to the whole body.
+                    //
+                    // Set on the model, so it covers every marine drawn from it:
+                    // the AI squad and the other players alike. The bandit loads
+                    // the same mesh through its own materials and keeps the
+                    // cheaper single-sided draw.
+                    const auto doubleSideAll = [](const auto& self,
+                            const std::shared_ptr<SceneNode>& node) -> void {
+                        if (!node) return;
+                        if (node->mesh) {
+                            for (MeshPrimitive& primitive : node->mesh->primitives)
+                                if (primitive.material)
+                                    primitive.material->doubleSided = true;
+                        }
+                        for (const auto& child : node->children) self(self, child);
+                    };
+                    doubleSideAll(doubleSideAll, mm.node);
+                    for (const auto& material : mm.materialKeepAlive)
+                        if (material) material->doubleSided = true;
                     g_marineModel = std::move(mm);
                 } else {
                     std::cerr << "Marine allies failed to load\n";
@@ -6639,6 +6707,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // down once they have all released their voices.
     AudioDevice::Shutdown();
     g_profiler.Shutdown();
+    // Told before the process goes: a client left to notice the exit on its own
+    // can leave the game showing as running for a while afterwards.
+    ShutdownSteam();
     CleanupDX12();
     return (int)msg.wParam;
 }

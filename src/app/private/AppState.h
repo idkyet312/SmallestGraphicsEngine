@@ -863,6 +863,12 @@ static bool                 g_editorVisualRefreshRequested = false;
 static bool                 g_editorFullReconcileRequested = false;
 static bool                 g_editorFullReconcileInFlight = false;
 static std::string          g_activeCustomLevelName;
+// What map this machine is on, said the way the session says it. The host
+// publishes this; a client is told the host's and loads to match. Named by file
+// rather than by path because the two ends resolve Content/Levels differently
+// -- repo, build/, packaged -- and a path from one is meaningless on the other.
+static net::LevelKind       g_activeLevelKind = net::LevelKind::None;
+static std::string          g_activeLevelFile;
 static std::string          g_mainMenuLevelStatus;
 static XMFLOAT3&            g_primaryHumveeSpawn = g_game.vehicles.primaryHumveeSpawn;
 static float&               g_primaryHumveeYaw = g_game.vehicles.primaryHumveeYaw;

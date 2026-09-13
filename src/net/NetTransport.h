@@ -85,6 +85,33 @@ std::unique_ptr<NetTransport> MakeNullTransport();
 std::unique_ptr<NetTransport> MakeGNSTransport();
 #endif
 
+// Peer-to-peer over Steam's relay network, addressed by SteamID rather than by
+// host:port. Built when the Steamworks headers are present; whether it can
+// actually be used is a runtime question -- the player may have no Steam -- so
+// SteamTransportAvailable answers that, and the IP transport remains the
+// fallback for LAN and direct connections.
+#ifdef SGE_WITH_STEAM_SOCKETS
+std::unique_ptr<NetTransport> MakeSteamTransport();
+bool SteamTransportAvailable();
+// This machine's SteamID, which is the address a friend connects to. Zero when
+// Steam is not running.
+uint64_t SteamTransportLocalId();
+// Fed every callback the app's Steam pump dequeues. Connection state is a
+// process-wide callback, so this is the only way it reaches the transport.
+void SteamTransportHandleCallback(int callbackId, const void* data, int bytes);
+#else
+inline bool SteamTransportAvailable() { return false; }
+inline uint64_t SteamTransportLocalId() { return 0; }
+inline void SteamTransportHandleCallback(int, const void*, int) {}
+#endif
+
+// An address is a SteamID when it is marked as one. Callers pass addresses
+// around as strings -- command line, rich presence, a menu field -- and this is
+// the one place that decides which transport a given string means.
+inline bool IsSteamAddress(const std::string& address) {
+    return address.rfind("steam:", 0) == 0;
+}
+
 // The factory the game should call. Keeps the "is networking compiled in"
 // question in one place instead of at every call site.
 inline std::unique_ptr<NetTransport> MakeTransport() {
@@ -93,6 +120,18 @@ inline std::unique_ptr<NetTransport> MakeTransport() {
 #else
     return MakeNullTransport();
 #endif
+}
+
+// Steam when asked for and available, the compiled-in default otherwise. A
+// request for Steam that cannot be honoured falls back rather than failing:
+// hosting over IP still works for anyone on the same network.
+inline std::unique_ptr<NetTransport> MakeTransport(bool preferSteam) {
+    if (preferSteam && SteamTransportAvailable()) {
+#ifdef SGE_WITH_STEAM_SOCKETS
+        return MakeSteamTransport();
+#endif
+    }
+    return MakeTransport();
 }
 
 } // namespace net

@@ -109,6 +109,10 @@ static void OpenMainMenu() {
     g_game.world.Prefabs().ResetGameplayState();
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
+    // No level any more: a host that walks out to the menu says so, rather than
+    // leaving clients believing they are still sharing a map with it.
+    g_activeLevelKind = net::LevelKind::None;
+    g_activeLevelFile.clear();
     g_game.session.StopTimer();
     // Bank the wallet on the way out. Extraction already saves, but abandoning
     // a run mid-mission reaches the menu through here instead -- without this,
@@ -552,6 +556,13 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     }
     g_game.session.SetScreen(GameScreen::Level1);
     g_customLevelMode = !stressTest && !emptyLevel;
+    // The network identity of this level. Every start funnels through here, so
+    // this is the one place that cannot be forgotten; StartCustomLevel fills in
+    // the file name afterwards, since only the caller with the path knows it.
+    g_activeLevelKind = customLevel ? net::LevelKind::LevelFile
+                      : emptyLevel  ? net::LevelKind::TestLevel
+                                    : net::LevelKind::Level1;
+    g_activeLevelFile.clear();
     if (customLevel) {
         g_customLevelMode = true;
         g_game.world.ReplaceLevel(*customLevel);
@@ -619,7 +630,14 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.selectedGrenade = g_game.mission.Loadout().grenade;
     if (g_emptyLevelMode)
         GunModel::DisableLoadoutRestriction();
-    scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
+    // The test level is where two machines are stood side by side to check that
+    // they agree about the world, so both players start in the middle of it and
+    // in sight of each other rather than 10 m off centre. Height is sampled
+    // rather than assumed: the island has relief at the origin on some terrain
+    // styles, and a fixed 5 m would bury the spawn inside a rise.
+    scene.camera = Camera(emptyLevel
+        ? XMFLOAT3(0.0f, GroundHeightAt(0.0f, 0.0f) + 2.0f, 0.0f)
+        : XMFLOAT3(0.0f, 5.0f, 10.0f));
     // Fresh camera, so the player's sensitivity has to be pushed back in.
     ApplyGameSettings();
     scene.gun.visible = true;
@@ -706,6 +724,10 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
     }
     g_mainMenuLevelStatus.clear();
     StartLevelOne(hwnd, godMode, false, false, &loaded.level);
+    // After the start, which cleared it: this is the only caller that knows
+    // which file the definition came out of, and the file name is what a
+    // joining player needs to load the same map.
+    g_activeLevelFile = path.filename().string();
 }
 
 // Island 1 -- the campaign map, authored as Islandv10.json. The menu name and
@@ -784,25 +806,50 @@ static void StartBase(HWND hwnd) {
         "Base not found (Base.json missing from Content/Levels).";
 }
 
+// --level=<path>, or --level <path>, anywhere in the command line.
+//
+// Position used to matter: the argument had to lead, and everything after it
+// was taken as the path. That made --level mutually exclusive with every other
+// flag, which is exactly wrong for `--level=<map> -host 27015` -- a host that
+// launches straight into the map its friends will be pulled onto.
+//
+// Quotes are honoured so a path with spaces still arrives in one piece; an
+// unquoted one does not, which is the same deal every other argument gets.
 static std::filesystem::path StartupLevelPath(const char* commandLine) {
     if (!commandLine) return {};
-    std::string argument(commandLine);
-    const size_t first = argument.find_first_not_of(" \t");
-    if (first == std::string::npos) return {};
-    argument.erase(0, first);
+    std::vector<std::string> tokens;
+    std::string current;
+    bool quoted = false;
+    bool has = false;
+    for (const char* c = commandLine; *c; ++c) {
+        if (*c == '"') { quoted = !quoted; has = true; continue; }
+        if (!quoted && (*c == ' ' || *c == '\t')) {
+            if (has) tokens.push_back(current);
+            current.clear();
+            has = false;
+            continue;
+        }
+        current.push_back(*c);
+        has = true;
+    }
+    if (has) tokens.push_back(current);
 
     constexpr const char* prefix = "--level";
-    if (argument.rfind(prefix, 0) != 0) return {};
-    argument.erase(0, std::strlen(prefix));
-    const size_t value = argument.find_first_not_of(" \t=");
-    if (value == std::string::npos) return {};
-    argument.erase(0, value);
-
-    if (argument.size() >= 2 && argument.front() == '"' &&
-        argument.back() == '"') {
-        argument = argument.substr(1, argument.size() - 2);
+    const size_t prefixLength = std::strlen(prefix);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].rfind(prefix, 0) != 0) continue;
+        std::string value = tokens[i].substr(prefixLength);
+        const size_t start = value.find_first_not_of("=");
+        value = start == std::string::npos ? std::string()
+                                           : value.substr(start);
+        // "--level <path>": the value is the next token, unless that is
+        // another flag, in which case the path was simply left off.
+        if (value.empty() && i + 1 < tokens.size() && tokens[i + 1][0] != '-')
+            value = tokens[i + 1];
+        if (value.empty()) return {};
+        return std::filesystem::path(value);
     }
-    return std::filesystem::path(argument);
+    return {};
 }
 
 static void StartDDGICornellTest(HWND hwnd) {

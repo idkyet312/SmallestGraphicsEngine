@@ -19,6 +19,19 @@ param(
     # archive that will start but fail to find most meshes; it is for testing
     # the packaging itself, not for redistribution.
     [switch]$SkipModels,
+    # Ships the cooked .sgeasset for a mesh and leaves the source FBX/GLB behind.
+    # Unlike -SkipModels this produces a package that plays: the engine reads the
+    # cooked asset and only falls back to the import when there is no cook. See
+    # the selection block below for the handful of assets whose loaders bypass
+    # the cooked cache and so keep their source.
+    [switch]$CookedOnly,
+    # Levels the package ships. Content/Levels holds two dozen maps, most of
+    # them authoring history and test scenes; a build sent to someone else wants
+    # the ones the game can actually reach from its own menus. These three are
+    # what the engine names in code -- the hub, the island the travel board
+    # flies to, and the training range. Level 1 and the test level need no entry
+    # here: both are built into the exe rather than loaded from a file.
+    [string[]]$Levels = @('Base.json', 'Islandv10.json', 'TrainingRange.json'),
     [switch]$NoZip
 )
 
@@ -26,8 +39,17 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-$stage = Join-Path $repo "$OutputDir\SmallestGraphicsEngine"
-$zipPath = Join-Path $repo "$OutputDir\SmallestGraphicsEngine.zip"
+$outputRoot = if ([IO.Path]::IsPathRooted($OutputDir)) { [IO.Path]::GetFullPath($OutputDir) } else { [IO.Path]::GetFullPath((Join-Path $repo $OutputDir)) }
+$finalStage = Join-Path $outputRoot "SmallestGraphicsEngine"
+# Build in a uniquely named sibling. The previous package remains available if
+# copying, pruning, or validation fails; it is swapped only after all checks pass.
+$stage = Join-Path (Split-Path -Parent $finalStage) ("SmallestGraphicsEngine.restage-{0}-{1}" -f $PID, (Get-Date -Format 'yyyyMMddHHmmss'))
+$zipPath = Join-Path $outputRoot "SmallestGraphicsEngine.zip"
+
+if (-not $stage.StartsWith($outputRoot + [IO.Path]::DirectorySeparatorChar, 'OrdinalIgnoreCase') -or
+    -not $finalStage.StartsWith($outputRoot + [IO.Path]::DirectorySeparatorChar, 'OrdinalIgnoreCase')) {
+    throw "Refusing to stage outside the output directory: $stage"
+}
 
 Write-Host "Staging to $stage" -ForegroundColor Cyan
 
@@ -69,23 +91,50 @@ if (-not (Test-Path $exe)) {
 Copy-Item $exe $stage
 
 # -- Runtime DLLs -------------------------------------------------------------
-# Direct imports of the exe, then the libraries assimp itself pulls in.
-$dlls = @(
-    'meshoptimizer.dll',
-    'assimp-vc143-mt.dll',
-    'miniz.dll',
-    # assimp's transitive set
-    'poly2tri.dll',
-    'minizip.dll',
-    'zlib1.dll',
-    'kubazip.dll',
-    'pugixml.dll'
-)
-foreach ($dll in $dlls) {
-    $src = Join-Path $repo "build\$dll"
-    if (Test-Path $src) { Copy-Item $src $stage }
-    else { Write-Warning "Missing runtime DLL: $dll" }
+# Walked, not listed. A hand-maintained list goes stale the moment a dependency
+# gains one of its own, and the failure is invisible on the build machine: vcpkg
+# puts its bin directory on PATH, so a DLL missing from the package still
+# resolves locally and only fails on the recipient's machine, at startup, with a
+# dialog naming a file they have never heard of. That is exactly how
+# libcrypto-3-x64.dll -- OpenSSL, pulled in by GameNetworkingSockets for
+# connection encryption -- shipped missing.
+#
+# The walk is transitive from the exe: every dependent that exists in build/ is
+# ours and ships, everything else is a system DLL and does not.
+$dumpbin = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' `
+    -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+if (-not $dumpbin) {
+    throw "dumpbin.exe not found. It ships with Visual Studio's C++ tools and is how this script discovers which DLLs to package."
 }
+
+function Get-Dependents {
+    param([string]$Binary)
+    $output = & $dumpbin.FullName /DEPENDENTS $Binary 2>$null
+    $names = @()
+    foreach ($line in $output) {
+        if ($line -match '^\s{4}([\w\.\-\+]+\.dll)\s*$') { $names += $Matches[1] }
+    }
+    return $names
+}
+
+$buildDir = Join-Path $repo 'build'
+$pending = [System.Collections.Queue]::new()
+$pending.Enqueue($exe)
+$shipped = @{}
+while ($pending.Count -gt 0) {
+    foreach ($name in (Get-Dependents $pending.Dequeue())) {
+        $key = $name.ToLower()
+        if ($shipped.ContainsKey($key)) { continue }
+        $src = Join-Path $buildDir $name
+        # Not in build/ means the system provides it (d3d12, dxgi, XAudio2, the
+        # CRT forwarders); those must not be packaged.
+        if (-not (Test-Path $src)) { continue }
+        Copy-Item $src $stage -Force
+        $shipped[$key] = $true
+        $pending.Enqueue($src)
+    }
+}
+Write-Host ("  {0} runtime DLLs (walked from the exe)" -f $shipped.Count) -ForegroundColor DarkGray
 
 # dxcompiler/dxil are the DirectX shader compiler. Not a link-time import --
 # the engine compiles HLSL at runtime -- so dumpbin does not list them, but
@@ -93,6 +142,26 @@ foreach ($dll in $dlls) {
 foreach ($dll in @('dxcompiler.dll', 'dxil.dll')) {
     $src = Join-Path $repo "build\$dll"
     if (Test-Path $src) { Copy-Item $src $stage }
+}
+
+# Steam, also not a link-time import: the engine loads it by name at startup and
+# runs without it. Shipping it is what makes the game show up as played, and
+# what the Steam-relayed multiplayer transport needs; a recipient with no Steam
+# is unaffected either way.
+$steamDll = Join-Path $repo 'build\steam_api64.dll'
+if (Test-Path $steamDll) {
+    Copy-Item $steamDll $stage
+    # A build launched by hand rather than from a Steam library has no AppID,
+    # and Steam refuses to talk to a process it cannot identify. 480 is Valve's
+    # public test app, which is what an unreleased game can use: it makes the
+    # session real, at the cost of Steam calling it Spacewar. Replace the
+    # contents with the real AppID once there is one -- and delete the file
+    # entirely for a build shipped through Steam, which supplies its own.
+    $appId = if ($env:SGE_STEAM_APPID) { $env:SGE_STEAM_APPID } else { '480' }
+    Set-Content (Join-Path $stage 'steam_appid.txt') $appId -Encoding ascii -NoNewline
+    Write-Host "  steam_api64.dll (app $appId)" -ForegroundColor DarkGray
+} else {
+    Write-Warning "steam_api64.dll not in build/: the package will run without Steam."
 }
 
 # -- Visual C++ runtime -------------------------------------------------------
@@ -128,188 +197,161 @@ foreach ($d in $dataDirs) {
 # the generic build-first rule above made a fresh package drop Islandv10 even
 # though the level was present in the repository. Keep the simple levels/
 # package layout, but always populate it from the canonical tree.
-$levelSrc = Join-Path $repo 'Content\Levels'
-if (-not (Test-Path $levelSrc)) {
-    $levelSrc = Join-Path $repo 'build\Content\Levels'
-}
-if (-not (Test-Path $levelSrc)) {
+#
+# Only the levels named in -Levels ship, each with its sidecars: a map's splat
+# texture is a separate file beside it, and a level without its splat loads with
+# the wrong terrain materials. Both roots are searched per level because they
+# have drifted apart -- Base.json lives in the repo and Base_splat.png only in
+# build/Content/Levels -- and the newest copy wins where both have a file.
+$levelRoots = @((Join-Path $repo 'Content\Levels'),
+                (Join-Path $repo 'build\Content\Levels')) |
+              Where-Object { Test-Path $_ }
+if (-not $levelRoots) {
     throw "No level directory found. Expected Content/Levels or build/Content/Levels."
 }
-Write-Host "  levels (Content/Levels)" -ForegroundColor DarkGray
-Copy-Item $levelSrc (Join-Path $stage 'levels') -Recurse -Force
-
-# Content is the bulk of the package. Cooked and Models are both loaded at
-# runtime -- Cooked by the prefab/barrel loader, Models by a long list of
-# hardcoded paths in main.cpp -- so neither can be dropped without breaking
-# the build in ways that only appear once a level loads.
-#
-# Each subdirectory is taken from build/Content or from Content, whichever
-# exists -- chosen PER SUBDIRECTORY rather than once for the whole tree.
-# build/Content is a partial mirror maintained by the shader/content copy step,
-# so a blanket "prefer build/" silently shipped its stale Cooked/ and dropped
-# the newly cooked Tower and Turret, which the cooker had written to the repo
-# copy. Where both exist, the newer one wins.
-$contentRepo = Join-Path $repo 'Content'
-$contentBuild = Join-Path $repo 'build\Content'
-$contentDst = Join-Path $stage 'Content'
-New-Item -ItemType Directory -Path $contentDst -Force | Out-Null
-
-$subNames = @{}
-foreach ($root in @($contentRepo, $contentBuild)) {
-    if (-not (Test-Path $root)) { continue }
-    foreach ($sub in (Get-ChildItem $root -Directory)) { $subNames[$sub.Name] = $true }
+# Staged twice on purpose. The engine resolves a level through a candidate list
+# that tries Content/Levels before levels/, and both layouts exist in the wild
+# (repo run, packaged run); a handful of JSON costs nothing next to the art.
+$levelTargets = @((Join-Path $stage 'levels'),
+                  (Join-Path $stage 'Content\Levels'))
+foreach ($target in $levelTargets) {
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
 }
-
-foreach ($name in ($subNames.Keys | Sort-Object)) {
-    if ($SkipModels -and $name -eq 'Models') {
-        Write-Warning "Skipping Content/Models (-SkipModels): the package will not be playable."
-        continue
+foreach ($name in $Levels) {
+    $stem = [IO.Path]::GetFileNameWithoutExtension($name)
+    $found = $false
+    # Newest wins per file name, not repo-first. The roots hold the same map at
+    # different ages: the editor writes wherever the game was run from, so a hub
+    # edited in a build/ run leaves the repo copy behind. Repo-first shipped that
+    # stale copy -- a package whose Base.json was the old flat hub while its
+    # Base_splat.png came from build/, i.e. a mismatched pair that loaded the
+    # wrong map from the menu while the editor, listing Content/Levels, showed
+    # the right one.
+    $newest = @{}
+    foreach ($root in $levelRoots) {
+        foreach ($file in (Get-ChildItem $root -File -Filter "$stem*" -ErrorAction SilentlyContinue)) {
+            $key = $file.Name.ToLower()
+            if (-not $newest.ContainsKey($key) -or
+                $file.LastWriteTimeUtc -gt $newest[$key].LastWriteTimeUtc) {
+                $newest[$key] = $file
+            }
+            if ($file.Name -eq $name) { $found = $true }
+        }
     }
-    $fromRepo = Join-Path $contentRepo $name
-    $fromBuild = Join-Path $contentBuild $name
-    $src = $null
-    if ((Test-Path $fromRepo) -and (Test-Path $fromBuild)) {
-        # Newest file anywhere under each candidate. Comparing the directory's
-        # own timestamp is not enough: copying into a subfolder does not touch
-        # the parent, so a stale tree can look current.
-        $repoTime = (Get-ChildItem $fromRepo -Recurse -File -ErrorAction SilentlyContinue |
-                     Measure-Object LastWriteTimeUtc -Maximum).Maximum
-        $buildTime = (Get-ChildItem $fromBuild -Recurse -File -ErrorAction SilentlyContinue |
-                      Measure-Object LastWriteTimeUtc -Maximum).Maximum
-        $src = if ($null -ne $repoTime -and ($null -eq $buildTime -or $repoTime -ge $buildTime)) {
-            $fromRepo
-        } else { $fromBuild }
-    } elseif (Test-Path $fromRepo) { $src = $fromRepo }
-    else { $src = $fromBuild }
-
-    $origin = if ($src -eq $fromRepo) { 'repo' } else { 'build' }
-    Write-Host "  Content/$name ($origin)" -ForegroundColor DarkGray
-    Copy-Item $src (Join-Path $contentDst $name) -Recurse -Force
+    if (-not $found) {
+        throw "Level '$name' was not found in Content/Levels or build/Content/Levels."
+    }
+    # Both staging layouts get the same bytes. They are two spellings of one
+    # level, and the engine picks Content/Levels first; letting them differ is
+    # how a package ends up playing a different map than it shows.
+    foreach ($file in $newest.Values) {
+        foreach ($target in $levelTargets) {
+            Copy-Item $file.FullName (Join-Path $target $file.Name) -Force
+        }
+    }
+    Write-Host "  levels/$name" -ForegroundColor DarkGray
+}
+# Baked DDGI probe data, named by a hash of the level rather than by its file
+# name, so there is no way to ship a subset. It is a few KB per level.
+$ddgiSrc = Join-Path $repo 'Content\Levels\.ddgi'
+if (Test-Path $ddgiSrc) {
+    foreach ($target in $levelTargets) {
+        Copy-Item $ddgiSrc (Join-Path $target '.ddgi') -Recurse -Force
+    }
 }
 
-# -- Prune unreferenced source art from the staged copy ------------------------
-# Content/Models accumulated directories that nothing loads: earlier versions of
-# meshes that were replaced, and imports that were tried and abandoned. They are
-# kept in the repo -- deleting source art is the author's call, not the
-# packager's -- but there is no reason to ship them.
-#
-# The keep set is DISCOVERED, not hand-written. Find-AssetReferences scans the
-# engine source, shaders, prefabs and level data for the three ways a model
-# directory gets referenced, and keeps every directory it finds. See that script
-# for what those three forms are and why the third one needs a filesystem check.
-#
-# This used to be a literal array maintained by hand, and it went stale exactly
-# the way such lists do: the tower and turret were added to prefabs, nobody
-# updated the array, and both were silently pruned from the package while
-# working perfectly in the repo. The array had also drifted the other way,
-# keeping Skyboxes (the live sky EXRs load from Content/Textures/Sky instead)
-# and naming gun.glb/gun.obj, which no longer exist.
-#
-# assetcache/registry.json still carries entries for some pruned directories.
-# That is harmless: registry lookups resolve a GUID to a path inside catch(...)
-# and return empty on a miss, so a stale entry is never loaded.
-#
-# Pruning affects the PACKAGE ONLY -- the repo copy is never touched.
+# Select before copying so abandoned source art never consumes staging space.
+# The canonical tree wins per file; build-only assets remain available.
 . (Join-Path $PSScriptRoot 'Find-AssetReferences.ps1')
-
-# Measure-Object returns an object with no Sum property when the pipeline is
-# empty, which throws under StrictMode rather than yielding 0. An empty
-# directory in the staging tree is ordinary, so handle it here instead of at
-# each call site.
-function Get-DirectorySize {
-    param([string]$Path)
-    $measured = Get-ChildItem $Path -Recurse -File -ErrorAction SilentlyContinue |
-                Measure-Object Length -Sum
-    if ($measured -and $null -ne $measured.Sum) { return [long]$measured.Sum }
-    return [long]0
-}
-
-Write-Host "Scanning for asset references..." -ForegroundColor Cyan
 $referenced = Get-ReferencedModelDirs -Repo $repo
-$keepModelDirs = @($referenced.Keys)
-Write-Host ("  {0} referenced Models directories" -f $keepModelDirs.Count) -ForegroundColor DarkGray
-
-# A scan that finds almost nothing means the heuristics broke (a moved source
-# tree, a renamed Content root), not that the game stopped using art. Shipping
-# that result would produce a package with no meshes, so fail instead -- a
-# packaging error is recoverable, a silently empty release is not.
-if ($keepModelDirs.Count -lt 10) {
-    throw "Asset reference scan found only $($keepModelDirs.Count) referenced directories, which indicates the scan failed rather than a genuinely small asset set. Refusing to prune. Run ./scripts/Find-AssetReferences.ps1 to inspect."
-}
-# Loose files sitting directly under Models/, discovered the same way: a
-# filename is kept only if it appears inside a quoted string somewhere that
-# loads it. Hoisted out of the block below because the Cooked/ prune needs it
-# too. The rest (crate, h1, level, ship, test and a stray displacement map) are
-# scratch imports that nothing opens.
-$keepModelFiles = @(Get-ReferencedModelFiles -Repo $repo)
-
-$stagedModels = Join-Path $contentDst 'Models'
-if (Test-Path $stagedModels) {
-    $freed = 0
-    foreach ($dir in (Get-ChildItem $stagedModels -Directory)) {
-        if ($keepModelDirs -contains $dir.Name) { continue }
-        $bytes = Get-DirectorySize $dir.FullName
-        # Count the bytes only once the delete succeeds, and keep going if one
-        # directory is locked -- a single stuck file should not cost the whole
-        # package. The warning names it so the shipped size can be explained.
-        try {
-            Remove-Item $dir.FullName -Recurse -Force -ErrorAction Stop
-            $freed += $bytes
-            Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $dir.Name, ($bytes / 1MB)) -ForegroundColor DarkYellow
-        } catch {
-            Write-Warning "Could not prune Models/$($dir.Name): $($_.Exception.Message)"
+$keepLoose = @(Get-ReferencedModelFiles -Repo $repo)
+$buildModels = Join-Path $repo 'build\Content\Models'
+$sourceText = (Get-ChildItem (Join-Path $repo 'src') -Recurse -File -Include *.h,*.cpp |
+    ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+if (Test-Path $buildModels) {
+    foreach ($dir in (Get-ChildItem -LiteralPath $buildModels -Directory)) {
+        if ($sourceText -match ('(?i)Models[/\\]+' + [regex]::Escape($dir.Name) + '[/\\]')) {
+            $referenced[$dir.Name] = [System.Collections.Generic.List[string]]::new()
         }
-    }
-    # Loose files under Models/ get the same treatment, against the set
-    # discovered above.
-    foreach ($file in (Get-ChildItem $stagedModels -File)) {
-        if ($keepModelFiles -contains $file.Name) { continue }
-        try {
-            Remove-Item $file.FullName -Force -ErrorAction Stop
-            $freed += $file.Length
-            Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $file.Name, ($file.Length / 1MB)) -ForegroundColor DarkYellow
-        } catch {
-            Write-Warning "Could not prune Models/$($file.Name): $($_.Exception.Message)"
-        }
-    }
-    Write-Host ("  pruning freed {0:N2} GB" -f ($freed / 1GB)) -ForegroundColor Green
-}
-
-# Cooked/ mirrors Models/, so the same keep set applies. A cook run from before
-# a mesh was dropped leaves its .sgeasset behind -- the cooker writes new blobs
-# but never deletes stale ones -- and those would otherwise ship. ship.sgeasset
-# alone is 270 MB of an asset nothing loads.
-$stagedCooked = Join-Path $contentDst 'Cooked\Models'
-if (Test-Path $stagedCooked) {
-    $cookedFreed = 0
-    foreach ($dir in (Get-ChildItem $stagedCooked -Directory)) {
-        if ($keepModelDirs -contains $dir.Name) { continue }
-        $bytes = Get-DirectorySize $dir.FullName
-        try {
-            Remove-Item $dir.FullName -Recurse -Force -ErrorAction Stop
-            $cookedFreed += $bytes
-            Write-Host ("  pruned Cooked/Models/{0} ({1:N0} MB)" -f $dir.Name, ($bytes / 1MB)) -ForegroundColor DarkYellow
-        } catch {
-            Write-Warning "Could not prune Cooked/Models/$($dir.Name): $($_.Exception.Message)"
-        }
-    }
-    # Loose .sgeasset blobs cooked from loose sources (ship.glb -> ship.sgeasset).
-    # Matched on the source stem, since the extension always differs.
-    $keepStems = @($keepModelFiles | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) })
-    foreach ($file in (Get-ChildItem $stagedCooked -File)) {
-        if ($keepStems -contains [IO.Path]::GetFileNameWithoutExtension($file.Name)) { continue }
-        try {
-            Remove-Item $file.FullName -Force -ErrorAction Stop
-            $cookedFreed += $file.Length
-            Write-Host ("  pruned Cooked/Models/{0} ({1:N0} MB)" -f $file.Name, ($file.Length / 1MB)) -ForegroundColor DarkYellow
-        } catch {
-            Write-Warning "Could not prune Cooked/Models/$($file.Name): $($_.Exception.Message)"
-        }
-    }
-    if ($cookedFreed -gt 0) {
-        Write-Host ("  cooked pruning freed {0:N2} GB" -f ($cookedFreed / 1GB)) -ForegroundColor Green
     }
 }
+if ($referenced.Count -lt 10) { throw 'Asset reference discovery failed.' }
+$keepStems = @($keepLoose | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) })
+$contentDst = Join-Path $stage 'Content'
+$copyPlan = @{}
+foreach ($root in @((Join-Path $repo 'Content'), (Join-Path $repo 'build\Content'))) {
+    if (-not (Test-Path $root)) { continue }
+    foreach ($file in (Get-ChildItem -LiteralPath $root -Recurse -File)) {
+        $relative = $file.FullName.Substring($root.Length + 1)
+        $parts = $relative.Split('\')
+        if ($parts[0] -eq 'Levels') { continue }
+        if ($file.Name -match '(?i)(\.tmp|\.bak|\.orig(?:\..*)?)$') { continue }
+        $modelOffset = -1
+        if ($parts[0] -eq 'Models') {
+            if ($SkipModels) { continue }
+            $modelOffset = 1
+        } elseif ($parts.Count -gt 2 -and $parts[0] -eq 'Cooked' -and $parts[1] -eq 'Models') {
+            $modelOffset = 2
+        }
+        if ($modelOffset -ge 0) {
+            if ($parts.Count -gt ($modelOffset + 1)) {
+                if (-not $referenced.ContainsKey($parts[$modelOffset])) { continue }
+            } elseif ($modelOffset -eq 1) {
+                if ($keepLoose -notcontains $file.Name) { continue }
+            } elseif ($keepStems -notcontains $file.BaseName) { continue }
+        }
+        if (-not $copyPlan.ContainsKey($relative)) { $copyPlan[$relative] = $file }
+    }
+}
+# -CookedOnly drops a source mesh whose cooked twin is already in the plan.
+# CookedAssetLoader::LoadForSource skips its staleness check when the source is
+# absent and serves the .sgeasset, and PrefabRegistry accepts a prefab whose
+# model resolves to a cooked asset, so the import is only ever reached for a
+# mesh with no cook. Measured at 1.1 GB off a 7.1 GB package.
+#
+# The exceptions are the call sites that deliberately bypass the cooked cache
+# and therefore need their source: SkinnedFBXImporter parses the mesh out of the
+# FBX (the bandit, the marine, the player arms), GLBImporter skips the cache
+# whenever a skeleton is requested (both Black Hawk airframes), and FBXImporter
+# skips it when the caller passes loadMaterials=false or diffuseAndNormalOnly
+# (the AK/RPG/palm/dandelion viewmodels and the Humvee). Textures are never
+# dropped here -- several are loaded by path through ResolveTexturePath.
+if ($CookedOnly) {
+    $sourceRequired = @(
+        'MainPlayer', 'MilitaryMercenaryBandit', 'MarineAlly', 'Arms',
+        'BlackHawk', 'NewBlackHawk', 'Humvee', 'palmtree', 'fbx_Dandelion',
+        'RPG7', 'ak47'
+    )
+    $meshPattern = '(?i)\.(glb|gltf|fbx|obj)$'
+    $dropped = 0
+    $droppedBytes = [long]0
+    foreach ($relative in @($copyPlan.Keys)) {
+        $parts = $relative.Split('\')
+        if ($parts[0] -ne 'Models' -or $parts.Count -lt 2) { continue }
+        if ($relative -notmatch $meshPattern) { continue }
+        if ($sourceRequired -contains $parts[1]) { continue }
+        $cooked = 'Cooked\' + [IO.Path]::ChangeExtension($relative, '.sgeasset')
+        if (-not $copyPlan.ContainsKey($cooked)) { continue }
+        $droppedBytes += $copyPlan[$relative].Length
+        $copyPlan.Remove($relative)
+        ++$dropped
+    }
+    Write-Host ("  cooked-only: dropped {0} source meshes ({1:N2} GB)" -f `
+        $dropped, ($droppedBytes / 1GB)) -ForegroundColor DarkGray
+}
+$requiredBytes = [long](($copyPlan.Values | Measure-Object Length -Sum).Sum)
+$drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($stage))
+if ($drive.AvailableFreeSpace -lt ($requiredBytes + 512MB)) {
+    throw "Insufficient staging space: selected content requires $requiredBytes bytes plus 512 MB reserve."
+}
+Write-Host ("  selected {0} content files ({1:N2} GB)" -f $copyPlan.Count, ($requiredBytes / 1GB))
+foreach ($relative in ($copyPlan.Keys | Sort-Object)) {
+    $destination = Join-Path $contentDst $relative
+    New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+    Copy-Item -LiteralPath $copyPlan[$relative].FullName -Destination $destination
+}
+# Retain source meshes and their textures: importer and animation paths may
+# bypass cooked loading, and texture names can be assembled at runtime.
 
 # -- Launcher and readme ------------------------------------------------------
 # A .bat rather than asking the user to run the exe directly: it pins the
@@ -327,6 +369,15 @@ start "" "GraphicEngine.exe"
 cd /d "%~dp0"
 start "" "GraphicEngine.exe" --level "levels\Islandv10.json"
 '@ | Set-Content (Join-Path $stage 'Play Islandv10.bat') -Encoding ascii
+
+# Hosting from a .bat rather than the menu because a tester joining a session
+# usually wants to be in a level already: the client follows the host onto
+# whatever map it is on, and a host still sitting in the menu has none to give.
+@'
+@echo off
+cd /d "%~dp0"
+start "" "GraphicEngine.exe" --level "levels\Islandv10.json" -host-steam
+'@ | Set-Content (Join-Path $stage 'Host on Steam.bat') -Encoding ascii
 
 @'
 Smallest Graphics Engine
@@ -347,6 +398,50 @@ Requirements
 The Visual C++ runtime is included in this folder, so no separate
 redistributable install is needed.
 
+What is in this build
+---------------------
+  TEST LEVEL    empty terrain, no gameplay actors -- fastest thing to load
+  LEVEL 1       the built-in map
+  ENTER BASE    the hub; the travel board there flies to Island 1
+  Island 1      Islandv10, also reachable directly via Play Islandv10.bat
+  Training Range
+
+Other maps in the authoring tree are left out of this package.
+
+Multiplayer (two players)
+-------------------------
+MULTIPLAYER on the main menu. One player hosts, the other joins; the host picks
+the level and everyone else loads the same map automatically, on join and on
+every change after it.
+
+  HOST ON STEAM          needs Steam running. The panel then shows a
+                         steam:<id> address with a COPY INVITE button; send
+                         that to a friend and they paste it into ADDRESS.
+                         Works from anywhere -- Steam relays the connection,
+                         so no port forwarding.
+  HOST ON THIS NETWORK   direct UDP on the port shown. Only reachable by
+                         someone on the same network unless that port is
+                         forwarded.
+  JOIN                   an address for a direct host (127.0.0.1 is this
+                         machine), or steam:<id> for a Steam host.
+
+Host on Steam.bat does the Steam version in one step, starting on Islandv10.
+
+Steam
+-----
+If Steam is running, the game registers with it and shows as played. It
+currently identifies itself as Valve's public test app (480), so Steam will
+name it Spacewar until the game has its own app ID -- that is expected, not a
+fault in the build. Without Steam, everything except Steam-relayed multiplayer
+works exactly the same.
+
+That borrowed app ID has one consequence worth knowing. "Join Game" on your
+Steam profile tells the friend's Steam client to launch app 480, which on their
+machine is Spacewar and not this game -- so if they are not already running it,
+the button does nothing. Send them the steam:<id> address from the HOST ON
+STEAM panel instead; pasting it into ADDRESS always works. Once they do have
+the game open, Join Game reaches them normally.
+
 Controls
 --------
   WASD          move
@@ -362,6 +457,58 @@ Controls
   Esc           menu
 '@ | Set-Content (Join-Path $stage 'README.txt') -Encoding ascii
 
+# -- Verify the package can resolve its own imports ----------------------------
+# Every DLL in the staged folder is re-walked, and each dependent must be either
+# in the folder or a genuine system DLL. This is the check the build machine
+# cannot do by running the exe: PATH hides a missing dependency locally, so the
+# only honest test is name-by-name against the package's own contents.
+$systemDirs = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
+$stagedBinaries = @($exe) + (Get-ChildItem $stage -Filter *.dll -File |
+                             ForEach-Object { $_.FullName })
+$unresolved = @{}
+foreach ($binary in $stagedBinaries) {
+    foreach ($name in (Get-Dependents $binary)) {
+        if (Test-Path (Join-Path $stage $name)) { continue }
+        $inSystem = $false
+        foreach ($dir in $systemDirs) {
+            if (Test-Path (Join-Path $dir $name)) { $inSystem = $true; break }
+        }
+        # api-ms-win-* are the CRT's API sets, resolved by the loader from the
+        # OS rather than from a file on disk.
+        if ($inSystem -or $name -like 'api-ms-win-*') { continue }
+        $unresolved[$name] = [IO.Path]::GetFileName($binary)
+    }
+}
+if ($unresolved.Count -gt 0) {
+    foreach ($name in $unresolved.Keys) {
+        Write-Warning "$name is imported by $($unresolved[$name]) and is not in the package."
+    }
+    throw "The package is missing $($unresolved.Count) runtime DLL(s); it would fail to start on a machine without them on PATH."
+}
+Write-Host "  every import resolves inside the package" -ForegroundColor DarkGray
+
+# Asset validation must pass before replacing a previous distribution.
+& py -3 (Join-Path $PSScriptRoot 'validate-package-assets.py') $stage --repo $repo --manifest (Join-Path $stage 'asset-manifest.sha256')
+if ($LASTEXITCODE -ne 0) { throw 'Package asset validation failed; previous distribution preserved.' }
+
+# -- Commit the validated stage ------------------------------------------------
+# Keep the prior package as a sibling backup so a failed copy or later review
+# can be recovered without reconstructing the old content.
+$backupStage = "$finalStage.previous-$(Get-Date -Format 'yyyyMMddHHmmss')"
+if (Test-Path $finalStage) {
+    Move-Item -LiteralPath $finalStage -Destination $backupStage -Force
+}
+try {
+    Move-Item -LiteralPath $stage -Destination $finalStage -Force
+    $stage = $finalStage
+    Write-Host "  committed validated package; previous copy: $backupStage" -ForegroundColor Green
+} catch {
+    if ((Test-Path $backupStage) -and -not (Test-Path $finalStage)) {
+        Move-Item -LiteralPath $backupStage -Destination $finalStage -Force
+    }
+    throw
+}
+
 # -- Report and zip -----------------------------------------------------------
 $size = (Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum
 Write-Host ("Staged {0:N2} GB to {1}" -f ($size / 1GB), $stage) -ForegroundColor Green
@@ -376,3 +523,4 @@ if (-not $NoZip) {
     $zipSize = (Get-Item $zipPath).Length
     Write-Host ("Wrote {0} ({1:N2} GB)" -f $zipPath, ($zipSize / 1GB)) -ForegroundColor Green
 }
+
