@@ -163,6 +163,11 @@ public:
     // layer to pick the raised hold; meaningless on an AI actor, which decides
     // that from its own awareness.
     bool              netAiming = false;
+    // Last position this body was placed at by a snapshot, for measuring how
+    // fast it is travelling. Only meaningful for a networked body: an AI actor
+    // moves itself and already knows its own speed.
+    DirectX::XMFLOAT3 netPreviousPosition_{};
+    bool              netHasPreviousPosition_ = false;
     // Stable network identity for an AI actor, assigned at spawn and never
     // reused within a session. Deliberately not the index in g_bandits: that
     // vector is compacted when bodies are removed, which would renumber every
@@ -349,7 +354,36 @@ public:
         }
         EaseDownedRoll(dt, false);
         PlayClip(moving ? (sprinting ? "Run" : "Walk") : "Idle");
-        anim.Advance(dt);
+
+        // Play the cycle at the rate the body is actually travelling instead of
+        // the clip's authored speed. A networked body is moved by snapshots, so
+        // nothing here had measured how fast it was going and the legs ran at
+        // 1.0 whatever the ground covered. These clips are authored for a
+        // bandit's 1.8 m/s while a player walks 5 and sprints past 7, so a
+        // remote player crossed open ground at nearly three times the pace of
+        // their own legs.
+        //
+        // Speed comes from the position delta because that is the only honest
+        // source: the snapshot carries where they are, not how fast.
+        const float inverseDt = dt > 1e-5f ? 1.0f / dt : 0.0f;
+        const float dx = position.x - netPreviousPosition_.x;
+        const float dz = position.z - netPreviousPosition_.z;
+        const float travelled = std::sqrt(dx * dx + dz * dz) * inverseDt;
+        // First frame after a spawn or a teleport has no previous position
+        // worth differencing -- it would read as an enormous speed.
+        const float speed = netHasPreviousPosition_ ? travelled : 0.0f;
+        netPreviousPosition_ = position;
+        netHasPreviousPosition_ = true;
+
+        const float referenceSpeed = moveSpeed * (sprinting ? 1.65f : 1.0f);
+        // Ceiling well above the AI's 1.15: that one exists because a bandit
+        // never outruns its own clip by much, which is not true of a sprinting
+        // player. The floor keeps a body crawling along a wall from stepping in
+        // slow motion.
+        const float playbackRate = speed > 0.01f && referenceSpeed > 0.01f
+            ? (std::max)(0.75f, (std::min)(2.2f, speed / referenceSpeed))
+            : 1.0f;
+        anim.Advance(dt * playbackRate);
         ComputePose(dt);
     }
 

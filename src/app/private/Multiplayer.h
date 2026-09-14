@@ -1266,6 +1266,19 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                                  DirectX::XMConvertToRadians(remote.yaw);
         body->yaw = yawRadians;
         body->aimYaw = yawRadians;
+        // Look angle, so the body points its weapon where its owner is aiming
+        // instead of levelling it at the horizon whatever the player does. Only
+        // yaw was applied before, which read fine on flat ground and wrongly
+        // everywhere else -- someone shooting down from a roof or up at a
+        // gunship still held the rifle flat.
+        //
+        // Camera pitch is degrees and positive up; aimPitch is radians and
+        // positive up, so the sign carries straight across. Clamped to the same
+        // +/-0.55 rad the AI aim uses: that is what the rig's spine and gun IK
+        // are built for, and a player can pitch nearly +/-90, which would tear
+        // the pose apart.
+        body->aimPitch = (std::max)(-0.55f, (std::min)(0.55f,
+            DirectX::XMConvertToRadians(remote.pitch)));
         // Mirror the authoritative life state onto the body. One direction
         // only: the host decides, and a local write here would be a desync
         // nobody else can see.
