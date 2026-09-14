@@ -15,6 +15,7 @@
 #include "GunAudio.h"   // AudioDevice/AudioBus -- the Audio Mix sliders
 #include "UISearchFilter.h"  // settings-search text matching
 #include "MoneySystem.h"     // wallet readout + floating payout popups
+#include "RankSystem.h"      // rank badge, XP bar and promotion banner
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -84,6 +85,10 @@ bool CommTowerObjectiveStatus(float& health, float& maxHealth);
 // popups both read the same object -- a snapshotted int would have to be
 // re-published every time anything awarded money.
 MoneySystem& PlayerMoney();
+
+// The career rank, on the same terms and for the same reason: the XP bar and
+// the promotion banner both read live state that moves mid-frame.
+RankSystem& PlayerRank();
 
 // Aircraft objective status for the HUD. Unlike the tower this one moves, so it
 // reports the airframe's current world position for a tracking marker alongside
@@ -987,6 +992,147 @@ inline void RenderPlayerHUD(const Scene& scene) {
     // equipment row now carries the selected grenade alongside the rest of the
     // loadout, so a separate readout in the middle of the screen was saying the
     // same thing twice and taking the centre of the view to do it.
+
+    // ---- Rank --------------------------------------------------------------
+    //
+    // Rank, level and progress to the next one, stacked above the wallet on the
+    // right. The two feeds are deliberately drawn in opposite directions: cash
+    // payouts fall away below the balance, experience rises above the bar, so a
+    // frame that pays both does not interleave two columns of numbers that mean
+    // different things. Same drain-once-per-frame contract as the wallet --
+    // amounts come from the system, the animation is UI state.
+    {
+        struct FloatingXp {
+            int amount = 0;
+            const char* label = "";
+            float age = 0.0f;
+        };
+        constexpr float kXpLifetime = 2.2f;
+        constexpr size_t kMaxFloatingXp = 6;
+        static std::vector<FloatingXp> floatingXp;
+        // The promotion banner outlives the award that caused it, so it is held
+        // separately rather than being one more row in the feed.
+        static std::string levelUpText;
+        static float levelUpAge = 0.0f;
+        constexpr float kLevelUpLifetime = 3.2f;
+
+        RankSystem& rank = PlayerRank();
+        for (const XpAward& award : rank.DrainAwards()) {
+            if (floatingXp.size() >= kMaxFloatingXp)
+                floatingXp.erase(floatingXp.begin());
+            floatingXp.push_back(FloatingXp{ award.amount, award.label, 0.0f });
+        }
+        // Only the last crossing is shown when an award jumps several levels at
+        // once: three banners queued behind each other would still be playing
+        // long after the tower that earned them stopped burning.
+        for (const LevelUpEvent& event : rank.DrainLevelUps()) {
+            char banner[96];
+            if (event.rankChanged)
+                snprintf(banner, sizeof(banner), "PROMOTED  %s",
+                         PlayerRankName(event.tier));
+            else
+                snprintf(banner, sizeof(banner), "LEVEL %d", event.level);
+            levelUpText = banner;
+            levelUpAge = 0.0f;
+        }
+
+        const float xpDelta = (std::min)(0.1f, io.DeltaTime);
+        for (FloatingXp& entry : floatingXp) entry.age += xpDelta;
+        floatingXp.erase(
+            std::remove_if(floatingXp.begin(), floatingXp.end(),
+                [&](const FloatingXp& entry) {
+                    return entry.age >= kXpLifetime;
+                }),
+            floatingXp.end());
+
+        const float rankRight = io.DisplaySize.x - kHudMargin;
+        // Two rows above the balance at baseline - 74: the bar sits directly
+        // over it and the name over that, so the whole career readout reads as
+        // one block without crowding the weapon name to its left.
+        const float xpBarY = baseline - 92.0f;
+        constexpr float kBarWidth = 132.0f;
+        constexpr float kBarHeight = 4.0f;
+
+        char rankLine[96];
+        snprintf(rankLine, sizeof(rankLine), "%s  -  LVL %d", rank.RankLabel(),
+                 rank.Level());
+        const ImVec2 rankSize = hudTextSize(rankLine);
+        hudText(ImVec2(rankRight - rankSize.x, xpBarY - 18.0f * kHudTextScale),
+                IM_COL32(255, 255, 255, 230), rankLine);
+
+        // Progress bar. XpForNextLevel never returns zero, including at the
+        // cap, so this needs no max-level special case -- a capped player simply
+        // draws a full bar.
+        const float fraction = (std::max)(0.0f, (std::min)(1.0f,
+            static_cast<float>(rank.XpIntoLevel()) /
+            static_cast<float>(rank.XpForNextLevel())));
+        const ImVec2 xpBarMin(rankRight - kBarWidth, xpBarY);
+        const ImVec2 xpBarMax(rankRight, xpBarY + kBarHeight);
+        draw->AddRectFilled(xpBarMin, xpBarMax, IM_COL32(24, 30, 38, 190));
+        draw->AddRectFilled(xpBarMin,
+                            ImVec2(xpBarMin.x + kBarWidth * fraction, xpBarMax.y),
+                            IM_COL32(255, 255, 255, 235));
+        draw->AddRect(xpBarMin, xpBarMax, IM_COL32(255, 255, 255, 120));
+
+        // The award feed sits under the crosshair, centred, rather than in the
+        // corner over the bar it feeds. A payout is something the player earned
+        // by looking at a thing and shooting it, so it belongs where they were
+        // already looking -- the corner version was only ever read after the
+        // fact. The bar and the rank line stay where they are: those are
+        // standing state, not events.
+        //
+        // Full font size rather than the corner's 0.78 scale, with a dropped
+        // shadow: this lands over whatever the player happens to be aiming at,
+        // which is as likely to be a white wall as a dark interior.
+        const float feedCentreX = io.DisplaySize.x * 0.5f;
+        // Centred across the screen but NOT down it: sitting on the crosshair
+        // would put text over the thing being shot. Parked just under it, the
+        // way the shooters this is modelled on do it.
+        const float feedBaseY = io.DisplaySize.y * 0.60f;
+        const float feedLineHeight = ImGui::GetTextLineHeight() * 1.15f;
+        int xpSlot = 0;
+        for (auto entry = floatingXp.rbegin(); entry != floatingXp.rend();
+             ++entry, ++xpSlot) {
+            const float t = entry->age / kXpLifetime;
+            const float rise = 18.0f * (1.0f - (1.0f - t) * (1.0f - t));
+            const int alpha = static_cast<int>(
+                255.0f * (std::max)(0.0f, (std::min)(1.0f, (1.0f - t) * 2.0f)));
+            if (alpha <= 0) continue;
+
+            char line[96];
+            snprintf(line, sizeof(line), "%s  %d", entry->label,
+                     entry->amount);
+            const ImVec2 lineSize = ImGui::CalcTextSize(line);
+            const float lineX = feedCentreX - lineSize.x * 0.5f;
+            // Newest at the bottom, older rows pushed up the stack, so a burst
+            // of kills reads in the order it happened.
+            const float lineY = feedBaseY -
+                static_cast<float>(xpSlot) * feedLineHeight - rise;
+            draw->AddText(ImVec2(lineX + 1.0f, lineY + 1.0f),
+                          IM_COL32(0, 0, 0, alpha * 3 / 4), line);
+            draw->AddText(ImVec2(lineX, lineY),
+                          IM_COL32(255, 255, 255, alpha), line);
+        }
+
+        // Promotion banner, centred well above the bottom band so it lands in
+        // the player's eyeline rather than in the corner they only glance at.
+        if (!levelUpText.empty()) {
+            levelUpAge += xpDelta;
+            if (levelUpAge >= kLevelUpLifetime) {
+                levelUpText.clear();
+            } else {
+                const float t = levelUpAge / kLevelUpLifetime;
+                // Held at full opacity for the first half, then faded: a linear
+                // fade from frame one made it look like it was already leaving.
+                const int alpha = static_cast<int>(255.0f * (std::max)(0.0f,
+                    (std::min)(1.0f, (1.0f - t) * 2.0f)));
+                const ImVec2 bannerSize = hudTextSize(levelUpText.c_str());
+                hudText(ImVec2((io.DisplaySize.x - bannerSize.x) * 0.5f,
+                               baseline - 168.0f),
+                        IM_COL32(255, 214, 120, alpha), levelUpText.c_str());
+            }
+        }
+    }
 
     // ---- Money -------------------------------------------------------------
     //

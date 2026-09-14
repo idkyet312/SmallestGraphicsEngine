@@ -128,8 +128,10 @@ static bool HitAATurretSegment(const XMFLOAT3& start, const XMFLOAT3& end,
 }
 
 // Wrecks the emplacement: cooks off the ammo boxes and leaves it burning.
+// `fromPlayer` gates the payout only; the turret takes the damage and the
+// mission records the wreck either way.
 static void DamageAATurret(size_t turretIndex, float damage,
-                           const XMFLOAT3& hit) {
+                           const XMFLOAT3& hit, bool fromPlayer) {
     const VehicleSystem::DamageResult result =
         g_game.vehicles.DamageAATurret(turretIndex, damage);
     if (!result.applied) return;
@@ -142,13 +144,14 @@ static void DamageAATurret(size_t turretIndex, float damage,
     scene.SpawnSmokeBurst(center, 2.2f, 2.4f);
     AddExplosionTerrainCrater(base);
     if (g_destruction.IsInitialized()) {
+        if (fromPlayer) CreditPlayerDestruction();
         g_destruction.ApplyExplosion(center, 6.0f, 45.0f, 10.0f);
         g_destruction.ApplyRagdollExplosion(center, 6.0f, 90.0f);
     }
     g_pendingExplosionAudio.push_back({ 0.0f, 0.95f, 0.80f, false });
     if (g_game.session.TimerRunning()) {
         g_game.mission.RecordDestruction();
-        g_game.money.Award(MoneyEvent::PropDestroyed);
+        if (fromPlayer) AwardCombatEvent(MoneyEvent::PropDestroyed);
     }
     SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
 }
@@ -740,6 +743,7 @@ static void CallInReinforcementWave() {
 // PlaceEscapeBoatOnBearing, so a second aircraft resolving later leaves the
 // first one's boat where it is.
 static void OnObjectivePlaneResolved() {
+    if (g_netSession.CurrentRole() == net::Role::Client) return;
     VehicleSystem& vehicles = g_game.vehicles;
     // Nothing to do once the exfil is out there: the boat would not move
     // anyway, and re-running this would call in a wave per aircraft.

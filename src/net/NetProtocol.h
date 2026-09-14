@@ -51,7 +51,14 @@ namespace net {
 //     objectives a charge is the only thing allowed to destroy -- the comm
 //     tower, the objective aircraft -- replicate instead of collapsing on the
 //     machine that set the charge and standing on every other one.
-inline constexpr uint32_t kProtocolVersion = 15;
+// 17: enemy snapshots name the player who killed the body. Without it a client
+//     could only be told an enemy was dead, never by whom, so every machine
+//     paid itself for every death anywhere on the map. EnemySnapshot grows
+//     from 32 to 36 bytes -- `id` is a uint16, so id+moving+dead already
+//     filled the four bytes before the first float and alignment re-pads. At
+//     16 enemies that is 576 bytes of payload, still inside one datagram.
+// 16: host-authoritative exfil boat state.
+inline constexpr uint32_t kProtocolVersion = 17;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -291,6 +298,16 @@ struct EnemySnapshot {
     // animation sticking.
     uint8_t moving = 0;
     uint8_t dead = 0;
+    // Who brought this body down, or kInvalidPlayerId for anything that was not
+    // a player -- AI crossfire, a rotor, falling debris. Only the machine this
+    // names pays out for the kill, which is what stops four players each
+    // banking the same body.
+    //
+    // This one does not come free: `id` is a uint16, so id+moving+dead already
+    // filled the four bytes before the first float and there was no spare byte
+    // to claim. The struct goes 32 -> 36 bytes. Sized against the datagram in
+    // the changelog above rather than left to be discovered later.
+    PlayerId killer = kInvalidPlayerId;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // Radians, matching SkinnedEnemy. Both are sent because the upper body aims
     // independently of the legs, and a client that guessed one from the other
@@ -332,10 +349,19 @@ struct EnemyHelicopterSnapshot {
 // Index 0 is the primary helicopter, index 1 the secondary/patrol gunship.
 inline constexpr uint8_t kEnemyHelicopterCount = 2;
 
+struct EscapeBoatSnapshot {
+    uint8_t active = 0;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f;
+    float bobTime = 0.0f;
+};
+
 struct ServerVehicleStateMessage {
     MessageHeader header{ MessageType::ServerVehicleState, {} };
     uint32_t tick = 0;
     EnemyHelicopterSnapshot helicopters[kEnemyHelicopterCount];
+    EscapeBoatSnapshot escapeBoat;
 };
 
 // One round leaving a player's muzzle. Carried purely so everyone else can see

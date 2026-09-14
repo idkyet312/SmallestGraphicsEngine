@@ -85,7 +85,17 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 15, "protocol version was not bumped");
+    Check(kProtocolVersion == 17, "protocol version was not bumped");
+
+    // `killer` cost four bytes per enemy, not zero: id is a uint16, so the flag
+    // bytes were already full and alignment re-padded to the next float. Pinned
+    // so the next flag added here is a deliberate decision about datagram size
+    // rather than a surprise -- the first three uint8s after `id` are free, the
+    // fourth is not.
+    static_assert(offsetof(EnemySnapshot, x) == 8,
+                  "EnemySnapshot layout changed unexpectedly");
+    static_assert(sizeof(EnemySnapshot) == 36,
+                  "EnemySnapshot size changed unexpectedly");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -315,6 +325,8 @@ int main() {
         enemiesSent.enemies[i].health = 100.0f - i;
         enemiesSent.enemies[i].moving = static_cast<uint8_t>(i % 2);
         enemiesSent.enemies[i].dead = static_cast<uint8_t>(i == 5 ? 1 : 0);
+        enemiesSent.enemies[i].killer =
+            i == 5 ? static_cast<PlayerId>(2) : kInvalidPlayerId;
     }
 
     unsigned char enemyBuffer[sizeof(ServerEnemySnapshotMessage)];
@@ -337,6 +349,9 @@ int main() {
         Check(enemiesReceived.enemies[i].health ==
                   enemiesSent.enemies[i].health,
               "enemy health lost");
+        Check(enemiesReceived.enemies[i].killer ==
+                  enemiesSent.enemies[i].killer,
+              "enemy killer lost");
         Check(enemiesReceived.enemies[i].dead == enemiesSent.enemies[i].dead,
               "enemy dead flag lost");
     }

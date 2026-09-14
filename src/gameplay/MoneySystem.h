@@ -17,6 +17,7 @@
 // a preference.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -176,11 +177,33 @@ public:
                                   (std::max)(static_cast<int64_t>(0), totalEarned));
     }
 
+    // Difficulty's grip on the wallet. Set from the deployment dial, and applied
+    // to every payout including the marine-lost debit -- the stakes move
+    // together, so a run fought against triple-damage enemies is worth more and
+    // costs more. Clamped to the same range the slider offers so a bad value
+    // cannot zero a career's income or inflate it without bound.
+    void SetRewardMultiplier(float multiplier) {
+        rewardMultiplier_ = (std::max)(0.25f, (std::min)(3.0f, multiplier));
+    }
+    float RewardMultiplier() const { return rewardMultiplier_; }
+
 private:
+    // Scales a payout by the difficulty multiplier. A non-zero award never
+    // rounds away to nothing: an event the player was told about has to move
+    // the balance, or the popup is lying about what it did.
+    int ScaleReward(int amount) const {
+        if (amount == 0 || rewardMultiplier_ == 1.0f) return amount;
+        const int scaled = static_cast<int>(
+            std::lround(static_cast<double>(amount) * rewardMultiplier_));
+        if (scaled != 0) return scaled;
+        return amount > 0 ? 1 : -1;
+    }
+
     // Applies one payout and queues it for the HUD. Clamped at zero, and the
     // queued amount is the clamped one so the popup never promises a debit that
     // was not actually taken.
     int AwardAmount(int amount, MoneyEvent event, const char* label) {
+        amount = ScaleReward(amount);
         if (amount == 0) return 0;
         if (amount < 0 && balance_ + amount < 0)
             amount = static_cast<int>(-balance_);
@@ -198,6 +221,9 @@ private:
     int64_t balance_ = kStartingBalance;
     int64_t totalEarned_ = 0;
     int64_t sessionEarned_ = 0;
+    // A run setting, not a run counter: BeginRun deliberately leaves it alone,
+    // because the difficulty a run was armed at has to survive into the run.
+    float rewardMultiplier_ = 1.0f;
     std::vector<MoneyAward> pending_;
 };
 

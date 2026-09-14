@@ -36,6 +36,84 @@ static std::vector<std::unique_ptr<SkinnedEnemy>>& g_bandits =
     g_enemySystem.actors;
 static SkinnedEnemy*&       g_heldBandit = g_enemySystem.held;
 static size_t&              g_heldBarrelIndex = g_game.combat.heldBarrelIndex;
+
+// How long the player still owns whatever the destruction backend breaks.
+//
+// DrainBreakPoints hands back bare positions -- a chunk does not know what
+// broke it, and a building keeps shedding for seconds after the blast that
+// started it, so neither a per-call flag nor a same-frame one would work. This
+// is a window instead: armed by damage the player caused, and read by the batch
+// payout. It is a heuristic and it is allowed to be wrong in one direction --
+// a bandit grenade inside the window will be paid for -- which is the price of
+// not threading an owner through the whole destruction backend.
+static float g_playerDestructionCredit = 0.0f;
+static constexpr float kPlayerDestructionCreditSeconds = 2.5f;
+
+static void CreditPlayerDestruction() {
+    g_playerDestructionCredit = kPlayerDestructionCreditSeconds;
+}
+
+// One payout, both ledgers. Every cash award in the game also earns experience,
+// so routing them through here keeps the two tables from drifting apart as new
+// award sites appear -- the failure mode with two adjacent calls is a site that
+// pays money and quietly grants no rank.
+//
+// Lives here, not beside PlayerMoney() in Objectives.h, because the award sites
+// in EnemyVehicles.h, EnemySpawning.h and Combat.h are all included ahead of it.
+//
+// A lost marine is the one asymmetry: it debits the wallet and earns nothing.
+// Experience is a record of what the player did and never runs backwards.
+// How much difficulty is worth. The enemy-damage dial is the only difficulty
+// setting the game has, so it is the one that pays: at 70% strength, so the easy
+// end is not punished into pointlessness and the hard end does not cut the rank
+// ladder down with it. Pivoted on 1.00x, so the tuned baseline still pays 1.00x
+// whatever the slope is.
+//
+//   0.25x enemy damage -> 0.48x rewards
+//   1.00x              -> 1.00x   (the balance the levels were tuned at)
+//   3.00x              -> 2.40x
+//
+// God mode caps it at 1.0 rather than zeroing it: an invulnerable player still
+// earns at the normal rate, they just cannot buy a bonus with a cheat.
+static float CurrentRewardMultiplier() {
+    float multiplier = 0.3f + 0.7f * scene.enemyDamageMultiplier;
+    if (scene.player.godMode) multiplier = (std::min)(1.0f, multiplier);
+    return multiplier;
+}
+
+// Pushed into both career systems rather than read by them: the wallet and the
+// rank ladder know nothing about the scene, and this keeps the factor in one
+// place so the deploy screen, the HUD and the extraction report cannot disagree
+// about what a run is worth.
+static void ApplyRewardMultiplier() {
+    const float multiplier = CurrentRewardMultiplier();
+    g_game.money.SetRewardMultiplier(multiplier);
+    g_game.rank.SetRewardMultiplier(multiplier);
+}
+
+static void AwardCombatEvent(MoneyEvent event, int count = 1) {
+    // Wrecking the map pays nothing. RecordDestruction at every call site is
+    // untouched, so demolition still moves the mission grade and the bonus it
+    // buys -- it just no longer prints cash and experience per fracture, which
+    // one collapsing building could drain dozens of in a single frame.
+    // Objective structures are unaffected: the comm tower and the parked
+    // aircraft pay through their own events.
+    if (event == MoneyEvent::PropDestroyed) return;
+    g_game.money.Award(event, count);
+    switch (event) {
+    case MoneyEvent::EnemyKilled:
+        g_game.rank.Award(XpEvent::EnemyKilled, count);
+        break;
+    case MoneyEvent::CommTowerDestroyed:
+        g_game.rank.Award(XpEvent::CommTowerDestroyed, count);
+        break;
+    case MoneyEvent::ObjectivePlaneDestroyed:
+        g_game.rank.Award(XpEvent::ObjectivePlaneDestroyed, count);
+        break;
+    default:
+        break;
+    }
+}
 // Authored C4 brick, replacing the procedural boxes the charge used to be
 // drawn as. Shared by the viewmodel, the thrown charge and the placed one.
 std::shared_ptr<SceneNode>  g_c4Model;
@@ -440,6 +518,11 @@ constexpr float              kBoatDeckHalfBeam = 1.5f;
 constexpr float              kBoatDeckHalfLength = 4.5f;
 constexpr float              kBoatHullHeight = 1.1f;
 constexpr float              kBoatDeckOffset = 0.10f;
+// Crew stand this much above the deck the player walks on. The bandit rig's
+// origin sits slightly inside the boots, so an actor placed exactly on the deck
+// plane reads as sunk into it. Lifting the actors alone leaves the walkable
+// surface and the hull collision where they are.
+constexpr float              kBoatCrewRise = 0.20f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;

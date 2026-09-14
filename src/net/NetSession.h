@@ -74,6 +74,9 @@ struct RemoteEnemy {
     float health = 0.0f;
     bool moving = false;
     bool dead = false;
+    // Who the host says killed it, or kInvalidPlayerId for an AI or hazard
+    // death. The only thing a client can key a payout off.
+    PlayerId killer = kInvalidPlayerId;
 };
 
 // A demolition charge another player planted, and the order to fire one
@@ -119,6 +122,7 @@ struct HostEnemyState {
     float health = 0.0f;
     bool moving = false;
     bool dead = false;
+    PlayerId killer = kInvalidPlayerId;
 };
 
 // A hit a client reported on one of the host's enemies, drained by the host and
@@ -317,6 +321,9 @@ public:
             hostHelicopters_[i] = EnemyHelicopterState{};
             remoteHelicopters_[i] = EnemyHelicopterState{};
         }
+        hostEscapeBoat_ = {};
+        remoteEscapeBoat_ = {};
+        remoteVehicleTick_ = 0;
         hasHostHelicopters_ = false;
         hasRemoteHelicopters_ = false;
         enemyHits_.clear();
@@ -1044,10 +1051,12 @@ public:
 
     // Host-side: the gunships as they stand this tick. Stored and sent with the
     // next snapshot rather than sent here, so the send stays on the net tick.
-    void PublishVehicles(const EnemyHelicopterState* helicopters) {
+    void PublishVehicles(const EnemyHelicopterState* helicopters,
+                         const EscapeBoatSnapshot& escapeBoat = {}) {
         if (role_ != Role::Host || !helicopters) return;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i)
             hostHelicopters_[i] = helicopters[i];
+        hostEscapeBoat_ = escapeBoat;
         hasHostHelicopters_ = true;
     }
 
@@ -1136,6 +1145,10 @@ public:
     // Client-side: the gunship state the host last sent, or nullptr before the
     // first one arrives -- which is the signal to leave the local craft alone
     // rather than snapping it to an all-zero pose at the origin.
+    const EscapeBoatSnapshot* RemoteEscapeBoat() const {
+        return hasRemoteHelicopters_ ? &remoteEscapeBoat_ : nullptr;
+    }
+
     const EnemyHelicopterState* RemoteVehicles() const {
         return hasRemoteHelicopters_ ? remoteHelicopters_ : nullptr;
     }
@@ -1875,6 +1888,7 @@ private:
         if (!hasHostHelicopters_ || !transport_) return;
         ServerVehicleStateMessage message;
         message.tick = tick_;
+        message.escapeBoat = hostEscapeBoat_;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             const EnemyHelicopterState& source = hostHelicopters_[i];
             EnemyHelicopterSnapshot& out = message.helicopters[i];
@@ -1981,6 +1995,11 @@ private:
         if (event.payload.size() < sizeof(ServerVehicleStateMessage)) return;
         ServerVehicleStateMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (hasRemoteHelicopters_ &&
+            static_cast<int32_t>(message.tick - remoteVehicleTick_) <= 0) return;
+        const auto& boat = message.escapeBoat;
+        if (boat.active > 1 || !Finite3(boat.x, boat.y, boat.z) ||
+            !std::isfinite(boat.yaw) || !std::isfinite(boat.bobTime)) return;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             const EnemyHelicopterSnapshot& in = message.helicopters[i];
             // Unreliable, so a corrupt or partial packet must not be allowed to
@@ -2001,6 +2020,8 @@ private:
             out.roll = in.roll;
             out.health = in.health;
         }
+        remoteEscapeBoat_ = message.escapeBoat;
+        remoteVehicleTick_ = message.tick;
         hasRemoteHelicopters_ = true;
     }
 
@@ -2047,6 +2068,7 @@ private:
                 out.health = source.health;
                 out.moving = source.moving ? 1 : 0;
                 out.dead = source.dead ? 1 : 0;
+                out.killer = source.killer;
             }
             transport_->Send(peer, &message, sizeof(message),
                              Channel::Unreliable);
@@ -2080,6 +2102,7 @@ private:
             enemy.health = incoming.health;
             enemy.moving = incoming.moving != 0;
             enemy.dead = incoming.dead != 0;
+            enemy.killer = incoming.killer;
             remoteEnemies_.push_back(enemy);
         }
     }
@@ -2366,6 +2389,9 @@ private:
     std::vector<RemoteChargeDetonate> chargeDetonations_;
     EnemyHelicopterState hostHelicopters_[kEnemyHelicopterCount]{};
     EnemyHelicopterState remoteHelicopters_[kEnemyHelicopterCount]{};
+    EscapeBoatSnapshot hostEscapeBoat_{};
+    EscapeBoatSnapshot remoteEscapeBoat_{};
+    uint32_t remoteVehicleTick_ = 0;
     bool hasHostHelicopters_ = false;
     bool hasRemoteHelicopters_ = false;
     std::vector<EnemyHitRequest> enemyHits_;

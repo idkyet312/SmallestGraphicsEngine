@@ -151,10 +151,15 @@ static void UpdateHumveeImpacts(float dt) {
             const DestructionDebrisHazard vehicleImpact = {
                 worldMin, worldMax, position, velocity, 1200.0f,
                 speed >= 7.0f };
+            // Running someone down only counts when the player is the one at the
+            // wheel. An AI-driven Humvee flattening a bandit is not their kill.
+            const bool playerDriving =
+                g_drivingHumvee && g_activeHumveeIndex == vehicleIndex;
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
                 XMFLOAT3 impact;
-                if (!bandit->ApplyDebrisImpact(vehicleImpact, &impact)) continue;
+                if (!bandit->ApplyDebrisImpact(vehicleImpact, &impact,
+                                               playerDriving)) continue;
                 XMFLOAT3 normal;
                 XMStoreFloat3(&normal,
                     XMVector3Normalize(-XMLoadFloat3(&velocity)));

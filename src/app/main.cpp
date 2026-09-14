@@ -401,6 +401,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // so there is no ownership to carry in. A wallet written by an older build
     // still has its item section; LoadMoney simply ignores it now.
     LoadMoney(g_game.money);
+    // Career progression, in its own file so deleting a wallet to reset the
+    // economy does not also wipe a rank that took twenty missions to earn.
+    LoadProfile(g_game.rank);
     LoadMenuFonts();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1114,6 +1117,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             lastTime = gameTimer.GetElapsed();
         }
 
+        // Refreshed every tick rather than latched at deploy: the dial is still
+        // reachable mid-run from the debug panel, and a payout that disagreed
+        // with the number on screen would be the kind of bug nobody can
+        // reproduce.
+        ApplyRewardMultiplier();
         g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
@@ -1792,7 +1800,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (BoatDeckSupports(
                                 bandit->position, bandit->position.y,
                                 boatPose, 0.20f, 0.48f))
-                            groundY = (std::max)(groundY, BoatDeckY(boatPose));
+                            groundY = (std::max)(
+                                groundY,
+                                BoatDeckY(boatPose) + kBoatCrewRise);
                     }
                     // Prefab surfaces the heightfield cannot describe: a
                     // watchtower deck, a container roof, a walkway. Only ever
@@ -2228,6 +2238,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_gunAudio.PlayAt(shot.origin.x, shot.origin.y, shot.origin.z,
                                   0.275f, pitch, 70.0f);
             }
+            // Aged here rather than in the frame preamble so it runs on exactly
+            // the same ticks as the drain it gates -- a window that decayed on
+            // frames where nothing was drained would close early.
+            g_playerDestructionCredit =
+                (std::max)(0.0f, g_playerDestructionCredit - deltaTime);
             // Smoke and a rate-limited break sound at actual fracture points.
             const auto breakPoints = g_destruction.DrainBreakPoints();
             if (g_game.session.TimerRunning() && !breakPoints.empty()) {
@@ -2236,8 +2251,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // One award for the whole batch rather than one per fracture:
                 // a collapsing building drains dozens of break points in a
                 // single frame, and a popup per chunk would bury the HUD.
-                g_game.money.Award(MoneyEvent::PropDestroyed,
-                                   static_cast<int>(breakPoints.size()));
+                //
+                // Paid only while the player still owns the damage. A chunk
+                // carries no provenance of its own, so this is the credit
+                // window rather than real attribution -- see AppState.h.
+                if (g_playerDestructionCredit > 0.0f)
+                    AwardCombatEvent(MoneyEvent::PropDestroyed,
+                                     static_cast<int>(breakPoints.size()));
             }
             for (const XMFLOAT3& bp : breakPoints) {
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
@@ -2550,7 +2570,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             // ordinary props apart but leaves the tower alone.
                             DamagePrefabsInRadius(
                                 center, scene.vortexRadius, 1000000.0f, false,
-                                !projectile.hostile);
+                                projectile.playerOwned);
                             projectile.active = false;
                             projectile.detonate = false;
                             continue;
@@ -2586,7 +2606,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             const float dz = barrel.position.z - center.z;
                             if (dx*dx + dy*dy + dz*dz <=
                                 blastRadius * blastRadius)
-                                DetonateBarrel(i);
+                                DetonateBarrel(i, projectile.playerOwned);
                         }
                         if (g_banditLoaded &&
                             (!MultiplayerActive() ||
@@ -2594,7 +2614,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             for (auto& bandit : g_bandits) {
                                 if (bandit) bandit->ApplyExplosion(
                                     center, enemyRadius,
-                                    enemyDamage, enemyPush);
+                                    enemyDamage, enemyPush,
+                                    projectile.playerOwned);
                             }
                             PlayBanditDeathEvents();
                         }
@@ -2606,7 +2627,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             const float reach = enemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
-                                DamageHelicopter(
+                                DamageNetworkedHelicopter(
+                                    0,
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : enemyDamage * falloff,
                                     g_helicopterPosition);
@@ -2621,7 +2643,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             const float reach = enemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
-                                DamageSecondaryHelicopter(
+                                DamageNetworkedHelicopter(
+                                    1,
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : enemyDamage * falloff,
                                     g_secondaryHelicopterPosition);
@@ -2679,7 +2702,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     : (c4Blast
                                            ? VehicleSystem::AATurretMaxHealth
                                            : enemyDamage) * falloff;
-                                DamageAATurret(ti, damage, turret);
+                                DamageAATurret(ti, damage, turret,
+                                               projectile.playerOwned);
                             }
                         }
                         // Grenades hurt the player too. Previously only enemies
@@ -2711,6 +2735,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         }
                         // Run after Bandit damage. Newly killed enemies have
                         // ragdolls now, so same blast launches their limbs too.
+                        if (projectile.playerOwned) CreditPlayerDestruction();
                         g_destruction.ApplyExplosion(
                             center, blastRadius, destructionBlastDamage,
                             blastImpulse);
@@ -2733,7 +2758,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 g_profiler, "Blast/PrefabDamage");
                             DamagePrefabsInRadius(
                                 center, blastRadius, blastDamage, c4Blast,
-                                !projectile.hostile);
+                                projectile.playerOwned);
                         }
                         // A charge stuck to the mast is a demolition, and one
                         // charge is enough. The radius pass above cannot do it:
@@ -2748,7 +2773,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 DamageObjectivePrefabEntity(
                                     riggedTower, blastDamage, center,
                                     /*remoteCharge=*/true,
-                                    !projectile.hostile);
+                                    projectile.playerOwned);
                         }
                         // The aircraft needs the same volume treatment, and for
                         // the same reason: the radius pass measures to the
@@ -2773,7 +2798,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     : ObjectivePlaneRocketDamage(hitPlane);
                                 DamageObjectivePrefabEntity(
                                     hitPlane, planeDamage, center, c4Blast,
-                                    !projectile.hostile);
+                                    projectile.playerOwned);
                             }
                         }
                         projectile.active = false;
@@ -3008,13 +3033,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             hitBandit = bandit->HitByHarpoon(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
-                                &banditBone);
+                                &banditBone, projectile.playerOwned);
                         } else {
                             hitBandit = bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
                                 nullptr, 20.0f * projectile.damageMultiplier,
-                                true);
+                                true, projectile.playerOwned);
                         }
                         if (hitBandit) {
                             const bool killed = bandit->Dead();
@@ -3043,7 +3068,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             scene.StopLaserBeamAt(banditHit.position);
                         if ((projectile.laser || projectile.flame) &&
                             banditHit.enemy && !banditHit.enemy->Dead())
-                            banditHit.enemy->Ignite(6.5f);
+                            banditHit.enemy->Ignite(6.5f, projectile.playerOwned);
                         if (projectile.harpoon && banditHit.enemy &&
                             banditHit.enemy->Dead() &&
                             projectile.harpoonPiercedCount < 6) {
@@ -3232,7 +3257,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // Armoured mount: rings like the comm tower's lattice.
                     PlayMetalHitAudio(turretHit, 0.9f);
                     DamageAATurret(shotTurretIndex,
-                                   34.0f * projectile.damageMultiplier, turretHit);
+                                   34.0f * projectile.damageMultiplier, turretHit,
+                                   projectile.playerOwned);
                     if (projectile.laser) scene.StopLaserBeamAt(turretHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(turretHit);
                     stopProjectileAt(turretHit);
@@ -3295,13 +3321,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (g_heldBarrelIndex == barrelIndex)
                             g_heldBarrelIndex = SIZE_MAX;
                     }
+                    // Latched on every round that lands, not only the one that
+                    // sets it off: the shot that starts the fuse is what earns
+                    // the barrel, and the detonation arrives three seconds later
+                    // with nothing left to ask.
+                    if (projectile.playerOwned) barrel.litByPlayer = true;
                     if (projectile.flame && !barrel.burning) {
                         barrel.burning = true;
                         barrel.fuse = 3.0f;
                         barrel.fireFxCooldown = 0.0f;
                     }
                     if (barrel.hits >= 4) {
-                        DetonateBarrel(barrelIndex);
+                        DetonateBarrel(barrelIndex, projectile.playerOwned);
                     } else if (barrel.hits == 2 && !barrel.burning) {
                         barrel.burning = true;
                         barrel.fuse = 3.0f;
@@ -3402,7 +3433,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 protectedOwner,
                                 34.0f * projectile.damageMultiplier, hit,
                                 /*remoteCharge=*/true,
-                                !projectile.hostile);
+                                projectile.playerOwned);
                         }
                         // A round that is not a charge still rings off the steel.
                         if (!projectile.remoteCharge)
@@ -3440,6 +3471,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             hit, scene.destructionDamageRadius);
                     } else if (!projectile.harpoon ||
                                projectile.harpoonPiercedCount == 0) {
+                        if (projectile.playerOwned) CreditPlayerDestruction();
                         g_destruction.ApplyRadialDamage(
                             hit, scene.destructionDamageRadius,
                             projectile.harpoon ? 2.5f :
@@ -3603,11 +3635,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
             }
         }
+        ApplyNetworkEscapeBoat();
+
         // Exfil. Reaching the boat ends the run, but only once the mission is
         // actually done -- otherwise the boat would be a way to skip the
         // objective it was meant to make harder. Levels with no tower authored
         // have nothing to gate on, so there the boat is a straight way out.
-        if (g_game.session.Screen() == GameScreen::Level1 &&
+        //
+        // The base is excluded outright. It is the hub the player walks out of
+        // to pick a destination, it authors no comm tower and no aircraft, so
+        // the planeless branch below would call an exfil in on the first frame
+        // -- parking a boat off the hub that ends a run nobody started.
+        if (g_game.session.Screen() == GameScreen::Level1 && !g_baseMode &&
             !g_emptyLevelMode && g_game.session.TimerRunning() &&
             scene.player.health > 0.0f) {
             const bool objectiveMet =
@@ -3630,7 +3669,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // no-op and the boat stays put.
             const bool levelHasAircraft =
                 g_game.mission.Stats().objectivePlanesTotal > 0;
-            if (objectiveMet && !levelHasAircraft &&
+            if (g_netSession.CurrentRole() != net::Role::Client &&
+                objectiveMet && !levelHasAircraft &&
                 !g_game.vehicles.EscapeBoatReady())
                 g_game.vehicles.PlaceEscapeBoatOnBearing(
                     RandomUnit() * XM_2PI, 0.0f, CurrentEscapeBoatDistance());

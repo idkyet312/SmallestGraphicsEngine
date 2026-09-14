@@ -52,10 +52,15 @@ static void CollapseCommTower(const XMFLOAT3& base) {
     }
     // Shove the surroundings: nearby structures shed chunks, ragdolls and
     // standing bandits are thrown clear.
+    // A tower only ever comes down to a charge the player placed, so the debris
+    // it sheds is theirs as well.
+    CreditPlayerDestruction();
     g_destruction.ApplyExplosion(mid, 9.0f, 4.0f, 200.0f);
     g_destruction.ApplyRagdollExplosion(mid, 9.0f, 130.0f);
+    // Credited to the player unconditionally: CommTowerDamageAllowed means the
+    // only way a tower ever reaches this function is a charge the player placed.
     for (const auto& bandit : g_bandits)
-        if (bandit) bandit->ApplyExplosion(base, 8.0f, 320.0f, 9.0f);
+        if (bandit) bandit->ApplyExplosion(base, 8.0f, 320.0f, 9.0f, true);
     g_pendingExplosionAudio.push_back({ 0.0f, 1.0f, 0.72f, false });
 }
 
@@ -74,6 +79,11 @@ static void CollapseCommTower(const XMFLOAT3& base) {
 // cannot include GameRuntime.h without dragging the whole runtime into every
 // panel that draws a checkbox.
 MoneySystem& PlayerMoney() { return g_game.money; }
+
+// Career rank, handed over the same way and for the same reason: the HUD draws
+// a live XP bar and the promotion banners, so a snapshotted level would have to
+// be republished every time anything awarded experience.
+RankSystem& PlayerRank() { return g_game.rank; }
 
 bool CommTowerObjectiveStatus(float& health, float& maxHealth) {
     const PrefabRuntimeState& prefabs = g_game.world.Prefabs();
@@ -839,6 +849,12 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
                                bool fromPlayer = true, bool localShot = true) {
     if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
     if (!ObjectivePlaneDamageAllowed(entityId, fromPlayer)) return;
+    // `fromPlayer` says a player caused this and gates what may be damaged;
+    // `localShot` says it was this machine's player and gates what is paid for.
+    // A teammate's round downing the objective plane must land for everyone and
+    // earn only the person who fired it.
+    const bool credit = fromPlayer && localShot;
+    if (credit) CreditPlayerDestruction();
     const bool isObjectivePlane = IsObjectivePlaneEntity(entityId);
     XMFLOAT3 towerBase{};
     const bool isCommTower = FindCommTower(entityId, towerBase);
@@ -871,12 +887,17 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
         if (localShot) scene.TriggerHitMarker(result.destroyed);
     }
     if (result.destroyed) {
+        // The mission records the wreck however it happened -- the destruction
+        // score is about the map, not about who did it -- but the payout is
+        // gated on the player having caused the damage. A bandit grenade that
+        // levels a shack still counts toward the grade and still earns nothing.
         if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
-            g_game.money.Award(MoneyEvent::PropDestroyed);
+            if (credit) AwardCombatEvent(MoneyEvent::PropDestroyed);
             if (isCommTower) {
                 g_game.mission.RecordCommTowerDestroyed();
-                g_game.money.Award(MoneyEvent::CommTowerDestroyed);
+                if (credit)
+                    AwardCombatEvent(MoneyEvent::CommTowerDestroyed);
                 // Levelling the tower is what brings the reinforcements: the
                 // garrison notices the moment it goes off the air.
                 CallInReinforcementWave();
@@ -901,7 +922,8 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
             scene.SpawnSmokeBurst(hit, 2.4f, 0.9f);
             if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordObjectivePlaneDestroyed();
-                g_game.money.Award(MoneyEvent::ObjectivePlaneDestroyed);
+                if (credit)
+                    AwardCombatEvent(MoneyEvent::ObjectivePlaneDestroyed);
             }
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft destroyed");
@@ -926,9 +948,16 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     }
 }
 
+// `fromPlayer` means "a player, somewhere, caused this" and gates what may be
+// damaged; `localShot` means "this machine's player" and gates what is paid for.
+// In a session a teammate's blast must still be allowed to level the objective
+// while earning this client nothing.
 static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
                                   float damage, bool fromRemoteCharge,
-                                  bool fromPlayer = true) {
+                                  bool fromPlayer = true,
+                                  bool localShot = true) {
+    const bool credit = fromPlayer && localShot;
+    if (credit) CreditPlayerDestruction();
     const auto results = g_game.combat.DamagePrefabsInRadius(
         g_game.world, center, radius, damage,
         [fromRemoteCharge, fromPlayer](uint64_t entityId) {
@@ -948,8 +977,10 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordDestruction();
                 g_game.mission.RecordCommTowerDestroyed();
-                g_game.money.Award(MoneyEvent::PropDestroyed);
-                g_game.money.Award(MoneyEvent::CommTowerDestroyed);
+                if (credit) {
+                    AwardCombatEvent(MoneyEvent::PropDestroyed);
+                    AwardCombatEvent(MoneyEvent::CommTowerDestroyed);
+                }
                 CallInReinforcementWave();
             }
             g_commTowerMusicSwell = true;
@@ -960,7 +991,7 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
         }
         if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
-            g_game.money.Award(MoneyEvent::PropDestroyed);
+            if (credit) AwardCombatEvent(MoneyEvent::PropDestroyed);
         }
         // An aircraft caught in a blast goes down the same way one shot out of
         // the sky does: crash it rather than rebuilding it out of existence.
@@ -972,7 +1003,8 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             scene.SpawnSmokeBurst(result.effectPosition, 2.4f, 0.9f);
             if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordObjectivePlaneDestroyed();
-                g_game.money.Award(MoneyEvent::ObjectivePlaneDestroyed);
+                if (credit)
+                    AwardCombatEvent(MoneyEvent::ObjectivePlaneDestroyed);
             }
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft destroyed");

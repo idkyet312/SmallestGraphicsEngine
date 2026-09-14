@@ -523,9 +523,13 @@ static XMFLOAT3 BoatTurretMountWorld() {
     // visibly half-sunk through the boat. Use the same kBoatDeckOffset that
     // BoatDeckY and the deck collision use, so the gunner stands on exactly the
     // surface the player walks on rather than on a second, disagreeing height.
+    //
+    // Plus kBoatCrewRise, the same lift every other actor on the deck gets, so
+    // the rig sits on the planking instead of inside it.
     const float sx = std::sin(g_boatYaw), cz = std::cos(g_boatYaw);
     return { g_boatPosition.x + sx * 0.4f,
-             g_boatPosition.y - g_boatSinkDepth + kBoatDeckOffset,
+             g_boatPosition.y - g_boatSinkDepth + kBoatDeckOffset +
+                 kBoatCrewRise,
              g_boatPosition.z + cz * 0.4f };
 }
 

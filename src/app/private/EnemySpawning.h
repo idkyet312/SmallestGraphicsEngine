@@ -78,14 +78,23 @@ static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
 
 static void PlayBanditDeathEvents() {
     for (auto& bandit : g_bandits) {
-        if (!bandit || !bandit->ConsumeDeathEvent()) continue;
+        bool playerCredit = false;
+        if (!bandit || !bandit->ConsumeDeathEvent(&playerCredit)) continue;
         // Payout rides on the same one-shot death event the audio uses, so a
         // body cannot be paid for twice however it was killed -- rifle, rotor,
         // debris and fire all funnel through here.
+        //
+        // What it will not do is pay for a body the player did not drop. The
+        // credit comes from the damage call that landed the kill, so a marine's
+        // rifle, the enemy gunship's rotor, falling debris and a fire that
+        // spread on its own all still ragdoll and still make noise -- they just
+        // earn nothing. A lost marine is the exception: that debit lands however
+        // they died, because the casualty is the player's either way.
         if (g_game.session.TimerRunning()) {
-            g_game.money.Award(bandit->faction == Faction::Marine
-                                   ? MoneyEvent::FriendlyLost
-                                   : MoneyEvent::EnemyKilled);
+            if (bandit->faction == Faction::Marine)
+                AwardCombatEvent(MoneyEvent::FriendlyLost);
+            else if (playerCredit)
+                AwardCombatEvent(MoneyEvent::EnemyKilled);
         }
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,

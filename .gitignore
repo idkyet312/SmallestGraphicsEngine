@@ -122,3 +122,7 @@ Content/Textures/Stamps/
 # one player's balance and armory unlocks, not source -- committing it would
 # hand every clone the same wallet and conflict on every play session.
 wallet.ini
+
+# Career progression the game writes at runtime (ProfileSavePath). Same story
+# as the wallet: one player's experience and rank, not source.
+profile.ini

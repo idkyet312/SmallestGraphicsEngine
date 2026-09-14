@@ -249,6 +249,49 @@ int main() {
         CHECK(loaded.TotalEarned() == 5000 - MoneySystem::kStartingBalance);
     }
 
+    // Difficulty scales the payout, and it scales the penalty with it: a run
+    // fought against triple-damage enemies is worth more and costs more, so the
+    // stakes move together rather than only the upside.
+    {
+        MoneySystem money;
+        CHECK(money.RewardMultiplier() == 1.0f);
+        money.SetRewardMultiplier(2.0f);
+        CHECK(money.Award(MoneyEvent::EnemyKilled) ==
+              MoneySystem::kEnemyKillReward * 2);
+        CHECK(money.AwardMissionBonus(10) ==
+              MoneySystem::kMissionBonusPerScorePoint * 10 * 2);
+        CHECK(money.Award(MoneyEvent::FriendlyLost) ==
+              MoneySystem::kFriendlyLostPenalty * 2);
+    }
+
+    // Clamped to the range the slider offers at both ends.
+    {
+        MoneySystem money;
+        money.SetRewardMultiplier(-5.0f);
+        CHECK(money.RewardMultiplier() == 0.25f);
+        money.SetRewardMultiplier(99.0f);
+        CHECK(money.RewardMultiplier() == 3.0f);
+    }
+
+    // Spending is not a payout. SetBalance moves money without going through
+    // the award path, so a purchase costs its price whatever the dial says --
+    // scaling it would quietly make a rifle cheaper on hard.
+    {
+        MoneySystem money;
+        money.SetRewardMultiplier(3.0f);
+        money.SetBalance(MoneySystem::kStartingBalance - 500,
+                         money.TotalEarned());
+        CHECK(money.Balance() == MoneySystem::kStartingBalance - 500);
+    }
+
+    // A run setting, not a run counter: BeginRun leaves it alone.
+    {
+        MoneySystem money;
+        money.SetRewardMultiplier(2.5f);
+        money.BeginRun();
+        CHECK(money.RewardMultiplier() == 2.5f);
+    }
+
     std::filesystem::remove(MoneySavePath());
     if (failures == 0) std::cout << "MoneySystemTests passed\n";
     return failures == 0 ? 0 : 1;

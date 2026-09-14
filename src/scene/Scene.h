@@ -252,6 +252,11 @@ struct ExplosiveBarrel {
     float vortexHoldTime = 0.0f;
     XMFLOAT3 vortexCenter = { 0.0f, 0.0f, 0.0f };
     bool burning = false;
+    // Whether the local player is the one who set this barrel going -- a round
+    // into it, a flame, or a blast they caused. Carried on the barrel because
+    // the detonation can arrive seconds later on a fuse, with nothing left in
+    // scope to ask, and because a chain inherits it from the barrel that lit it.
+    bool litByPlayer = false;
     float fuse = 0.0f;
     float fireFxCooldown = 0.0f;
 };

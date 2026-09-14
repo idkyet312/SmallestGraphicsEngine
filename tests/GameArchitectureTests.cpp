@@ -6,6 +6,7 @@
 #include "GameRuntime.h"
 #include "GameSession.h"
 #include "MissionSystem.h"
+#include "RankSystem.h"
 #include "CombatSystem.h"
 #include "VehicleSystem.h"
 #include "DeploymentPlanner.h"
@@ -190,6 +191,21 @@ int main() {
     CHECK(runtime.mission.Loadout().weapons[0] == 4);
     CHECK(runtime.mission.Loadout().weapons[1] == 7);
     CHECK(runtime.mission.Stats().shotsFired == 0);
+
+    // Career state survives a level reset. Money and rank are the two things a
+    // replayed level must not cost the player -- only their per-run counters
+    // are cleared, which is what keeps the extraction screen honest without
+    // rolling the career back with it.
+    runtime.money.Award(MoneyEvent::EnemyKilled);
+    runtime.rank.Award(XpEvent::EnemyKilled);
+    const int64_t bankedMoney = runtime.money.Balance();
+    const int64_t bankedXp = runtime.rank.TotalXp();
+    runtime.ResetLevelState();
+    CHECK(runtime.money.Balance() == bankedMoney);
+    CHECK(runtime.money.SessionEarned() == 0);
+    CHECK(runtime.rank.TotalXp() == bankedXp);
+    CHECK(runtime.rank.LifetimeKills() == 1);
+    CHECK(runtime.rank.SessionXp() == 0);
 
     MissionLoadout loadout;
     loadout.SelectWeapon(0, 2);

@@ -498,7 +498,26 @@ static void PublishHostVehicles() {
     secondary.roll = vehicles.secondaryHelicopterRoll;
     secondary.health = vehicles.secondaryHelicopterHealth;
 
-    g_netSession.PublishVehicles(state);
+    net::EscapeBoatSnapshot boat;
+    boat.active = vehicles.escapeBoatActive ? 1 : 0;
+    boat.x = vehicles.escapeBoatPosition.x;
+    boat.y = vehicles.escapeBoatPosition.y;
+    boat.z = vehicles.escapeBoatPosition.z;
+    boat.yaw = vehicles.escapeBoatYaw;
+    boat.bobTime = vehicles.escapeBoatBobTime;
+    g_netSession.PublishVehicles(state, boat);
+}
+
+static void ApplyNetworkEscapeBoat() {
+    if (g_netSession.CurrentRole() != net::Role::Client) return;
+    VehicleSystem& vehicles = g_game.vehicles;
+    const auto* boat = g_netSession.RemoteEscapeBoat();
+    // Clients wait for the host's choice, including when joining mid-mission.
+    vehicles.escapeBoatActive = boat && boat->active != 0;
+    if (!boat) return;
+    vehicles.escapeBoatPosition = { boat->x, boat->y, boat->z };
+    vehicles.escapeBoatYaw = boat->yaw;
+    vehicles.escapeBoatBobTime = boat->bobTime;
 }
 
 // Client-side. Runs after the local vehicle update rather than instead of it:
@@ -698,6 +717,13 @@ static void PublishHostEnemies() {
         state.health = actor->health;
         state.dead = actor->Dead();
         state.moving = actor->NetworkMoving();
+        // SkinnedEnemy marks its own player kills with a placeholder rather than
+        // a real id, because it has no business knowing about net players. This
+        // is where it becomes this host's id; a client's reported kill has
+        // already been stamped with the true shooter by ApplyReportedEnemyHits.
+        state.killer = actor->netKiller == SkinnedEnemy::kLocalPlayerKiller
+            ? g_netSession.LocalId()
+            : actor->netKiller;
         g_hostEnemyScratch.push_back(state);
     }
     g_netSession.PublishEnemies(g_hostEnemyScratch);
@@ -732,15 +758,24 @@ static void ApplyReportedEnemyHits() {
         if (!enemy || enemy->Dead()) continue;
         const XMFLOAT3 impact{ hit.hitX, hit.hitY, hit.hitZ };
         const XMFLOAT3 direction{ hit.dirX, hit.dirY, hit.dirZ };
+        // The host pays itself only for its own reported rounds -- its own shots
+        // come back through this same queue with its own id on them, so the
+        // comparison covers both machines with one rule.
+        const bool localKill = hit.shooter == g_netSession.LocalId();
         if (hit.headshot) {
             // The client's hit test found a head. Reproducing that here as a
             // guaranteed-lethal hit keeps the one-headshot rule identical on
             // both machines rather than re-testing geometry the client already
             // resolved against the position it could see.
-            enemy->KillFromNetworkHeadshot(direction, impact);
+            enemy->KillFromNetworkHeadshot(direction, impact, localKill);
         } else {
-            enemy->ApplyNetworkBodyDamage(hit.damage, direction, impact);
+            enemy->ApplyNetworkBodyDamage(hit.damage, direction, impact,
+                                          localKill);
         }
+        // Stamped after the damage so it only names a shooter who actually
+        // finished the body, and published from here rather than from the kill
+        // itself because only the session knows the reporter's id.
+        if (enemy->Dead()) enemy->netKiller = hit.shooter;
     }
 }
 
@@ -774,8 +809,13 @@ static void UpdateClientEnemies(float frameDelta) {
             // Kill locally so the ragdoll, the death audio and the payout all
             // run through the paths that already exist, rather than a second
             // notion of "dead" the rest of the game does not know about.
+            // Only the player the host named banks it. Everyone else gets the
+            // ragdoll and the audio and nothing on the ledger.
             if (!body->Dead())
-                body->KillFromNetwork({ 0.0f, 0.0f, 0.0f }, body->position);
+                body->KillFromNetwork(
+                    { 0.0f, 0.0f, 0.0f }, body->position,
+                    remote.killer != net::kInvalidPlayerId &&
+                        remote.killer == g_netSession.LocalId());
             continue;
         }
         body->UpdateNetworkedPose(frameDelta, remote.moving, false);

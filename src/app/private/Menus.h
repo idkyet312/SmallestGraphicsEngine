@@ -207,6 +207,57 @@ static void RenderMainMenu(HWND hwnd) {
         ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f), "FUNDS");
     }
 
+    // Career rank on the line below, with the bar to the next level. Same
+    // placement argument as the balance: it is part of the menu frame, so it
+    // stays visible with settings open.
+    {
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        // White rather than the warning amber every other accent uses: the rank
+        // reads with the bar and the XP line under it, and those are white.
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s",
+                           g_game.rank.RankLabel());
+        ImGui::SameLine(0.0f, 8.0f);
+        ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f), "LVL %d",
+                           g_game.rank.Level());
+
+        const int level = g_game.rank.Level();
+        const float fraction =
+            static_cast<float>(g_game.rank.XpIntoLevel()) /
+            static_cast<float>(g_game.rank.XpForNextLevel());
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        const ImVec2 barPos = ImGui::GetCursorScreenPos();
+        constexpr float kMenuBarWidth = 188.0f;
+        constexpr float kMenuBarHeight = 5.0f;
+        ImDrawList* rankDraw = ImGui::GetWindowDrawList();
+        rankDraw->AddRectFilled(barPos,
+                                ImVec2(barPos.x + kMenuBarWidth,
+                                       barPos.y + kMenuBarHeight),
+                                IM_COL32(255, 255, 255, 34));
+        rankDraw->AddRectFilled(barPos,
+                                ImVec2(barPos.x + kMenuBarWidth * fraction,
+                                       barPos.y + kMenuBarHeight),
+                                IM_COL32(255, 255, 255, 220));
+        ImGui::Dummy(ImVec2(kMenuBarWidth, kMenuBarHeight));
+
+        // The remaining number, not the total: at the cap there is nothing left
+        // to earn toward, so it says so rather than showing a full bar with a
+        // meaningless "0 XP TO LVL 51" under it.
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        if (level >= RankSystem::kMaxLevel) {
+            ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f),
+                               "MAX RANK  -  %lld KILLS",
+                               static_cast<long long>(g_game.rank.LifetimeKills()));
+        } else {
+            char remainingText[32];
+            RankSystem::Format(remainingText, sizeof(remainingText),
+                               g_game.rank.XpForNextLevel() -
+                                   g_game.rank.XpIntoLevel());
+            ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f),
+                               "%s XP TO LVL %d", remainingText, level + 1);
+        }
+    }
+
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
 
     // Settings replace the menu body below the title, keeping the wordmark and
@@ -304,6 +355,55 @@ static void RenderMainMenu(HWND hwnd) {
             ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
         ImGui::EndPopup();
     }
+    // Career reset, pinned to the bottom corner of the column. Deliberately not
+    // a row in the list above: it undoes every mission ever flown, and a row
+    // sitting between TEST LEVEL and QUIT is a row that gets hit by accident.
+    // Two clicks for the same reason -- the first arms it, the second wipes.
+    {
+        static bool resetArmed = false;
+        const float footerHeight = ImGui::GetFrameHeightWithSpacing();
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() - footerHeight - 10.0f);
+        ImGui::SetCursorPosX(14.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                              ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              resetArmed ? ImVec4(1.0f, 0.45f, 0.35f, 1.0f)
+                                         : ImVec4(0.52f, 0.56f, 0.54f, 1.0f));
+        if (ImGui::Button(resetArmed ? "CONFIRM RESET" : "RESET PROGRESS")) {
+            if (resetArmed) {
+                g_game.money.ResetCareer();
+                g_game.rank.ResetCareer();
+                // Written straight through: a player who resets and then kills
+                // the process from the taskbar must not find the old career
+                // back on the next launch.
+                SaveCareer();
+                resetArmed = false;
+            } else {
+                resetArmed = true;
+            }
+        }
+        ImGui::PopStyleColor(4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Experience back to 0, funds back to %lld.",
+                              static_cast<long long>(
+                                  MoneySystem::kStartingBalance));
+        if (resetArmed) {
+            ImGui::SameLine(0.0f, 8.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                  ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                  ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.52f, 0.56f, 0.54f, 1.0f));
+            if (ImGui::Button("CANCEL")) resetArmed = false;
+            ImGui::PopStyleColor(4);
+        }
+    }
+
     ImGui::End();
 }
 
@@ -1405,11 +1505,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ? "Laser cutter, flamethrower and harpoon gun are stocked."
             : "Development weapons are hidden from the armory and weapon cycle.");
     };
-    // Difficulty cheats. God mode and the enemy damage scale are debug switches
-    // rather than plan choices, so they are drawn from the DEBUG section at the
-    // bottom of the panel instead of inline here.
-    const auto drawDifficultyControls = [&]() {
-    ImGui::SeparatorText("DIFFICULTY");
+    // God mode is a cheat, so it stays in the DEBUG section at the foot of the
+    // panel. The enemy-damage dial is not -- it is a real plan choice that now
+    // decides what the run pays, so it has its own section up with the rest of
+    // the loadout, where a player will actually meet it.
+    const auto drawGodModeControls = [&]() {
     // Per-run choice rather than a launcher-level mode. Applied straight to the
     // live player state because StartLevelOne has already run by the time this
     // screen is up -- its godMode parameter set the value this toggle edits.
@@ -1429,14 +1529,19 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     else
         ImGui::TextDisabled(
             "Ammo is limited to your two weapons. Reload with R.");
+    ImGui::TextDisabled("Rewards are capped at x1.00 while god mode is on.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    };
 
+    const auto drawDifficultyControls = [&]() {
     // Enemy lethality. Scales incoming fire, grenades and molotovs only --
     // falls, crashes and your own grenades are unaffected, so this stays a
     // statement about the enemy rather than a global fragility slider.
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::SliderFloat("Enemy damage##DeploymentEnemyDamage",
-                       &scene.enemyDamageMultiplier, 0.25f, 3.0f, "x%.2f");
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::SetNextItemWidth(340.0f);
+    ImGui::SliderFloat("##DeploymentEnemyDamage",
+                       &scene.enemyDamageMultiplier, 0.25f, 3.0f,
+                       "ENEMY DAMAGE  x%.2f");
     {
         // Quote the practical consequence rather than the raw factor: rifle
         // chip damage is the number the player actually feels, and shots-to-kill
@@ -1445,15 +1550,32 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         const int shots = perShot > 0.0f
             ? static_cast<int>(std::ceil(scene.player.maxHealth / perShot))
             : 0;
+        ImGui::SetCursorPosX(45.0f);
         if (scene.player.godMode)
-            ImGui::TextDisabled("No effect while god mode is on.");
+            ImGui::TextColored(UITheme::kTextDim,
+                               "No effect on you while god mode is on.");
         else
-            ImGui::TextDisabled(
+            ImGui::TextColored(UITheme::kTextDim,
                 "%.1f damage per rifle hit -- %d to drop you from full health.",
                 perShot, shots);
+
+        // The other half of the bargain, and the reason this is not a debug
+        // switch: a harder run is worth more. Coloured only when it is actually
+        // above the tuned baseline, so the default reads as neutral rather than
+        // as a bonus the player is already collecting.
+        const float rewards = CurrentRewardMultiplier();
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(rewards > 1.0f ? UITheme::kWarning : UITheme::kTextDim,
+                           "Cash and experience  x%.2f", rewards);
     }
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
     };
+
+    // How hard the run is, and therefore what it is worth. Open by default: it
+    // is the one setting that changes both halves of the bargain, and it spent
+    // long enough buried in DEBUG where nobody found it.
+    if (deploySection("DIFFICULTY", /*defaultOpen=*/true))
+        drawDifficultyControls();
 
     // Time of day. Applied live as it is picked rather than waiting for DEPLOY,
     // so the planning fly-through shows the light the run will actually be
@@ -1848,14 +1970,14 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     }
 
     // Everything that is a development switch rather than a plan choice, in one
-    // place at the foot of the panel: render diagnostics, the difficulty cheats,
-    // the fog tuning sliders and the development weapon stock. Closed by default,
-    // and last so it never sits between the player and the DEPLOY button.
+    // place at the foot of the panel: render diagnostics, god mode, the fog
+    // tuning sliders and the development weapon stock. Closed by default, and
+    // last so it never sits between the player and the DEPLOY button.
     if (deploySection("DEBUG")) {
         if (ImGui::CollapsingHeader("Render diagnostics"))
             drawRenderDiagnostics();
-        if (ImGui::CollapsingHeader("Difficulty"))
-            drawDifficultyControls();
+        if (ImGui::CollapsingHeader("God mode"))
+            drawGodModeControls();
         if (ImGui::CollapsingHeader("Volumetric fog"))
             drawVolumetricFogControls();
         if (ImGui::CollapsingHeader("Weapon stock"))
@@ -1950,177 +2072,506 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::End();
 }
 
+// The extraction report. Built the way the rest of the game's screens are --
+// unplated over a hand-drawn backdrop, the real title face for the hero, and
+// UISectionLabel/UIPrimaryButton rather than stock ImGui furniture -- and laid
+// out in two columns, because the content stopped fitting one when progression
+// arrived and the panel started silently scrolling.
+//
+// It is also the only animated screen in the game: figures count up, sections
+// arrive on a short stagger, and the career bar sweeps from where the run
+// started to where it ended. All of it hangs off g_winScreenAge, and all of it
+// is presentation -- the numbers were banked in OpenWinScreen, and nothing
+// drawn here can change them.
 static void RenderWinScreen(HWND hwnd) {
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0, 0), display, IM_COL32(0, 22, 12, 215));
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    const float panelHeight = (std::min)(640.0f, display.y - 20.0f);
-    ImGui::SetNextWindowSize(ImVec2(580.0f, panelHeight), ImGuiCond_Always);
-    ImGui::Begin("Win Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse);
+    const ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 display = io.DisplaySize;
+    // Real seconds and clamped, so a hitch on the first frame does not skip the
+    // whole animation. Same contract as the HUD's floating payouts.
+    g_winScreenAge += (std::min)(0.1f, io.DeltaTime);
+
     const MissionReport& report = g_game.mission.Report();
     const MissionLoadout& loadout = g_game.mission.Loadout();
     const MissionRunStats& stats = g_game.mission.Stats();
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    // Extracting with the mast still up is not a clean run, so the banner says
-    // so rather than congratulating a player who skipped the primary objective.
     const bool primaryFailed = report.primaryObjectivePresent &&
                                !report.primaryObjectiveComplete;
-    const char* won = primaryFailed ? "OBJECTIVE FAILED" : "MISSION COMPLETE";
-    const float winWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (winWidth - ImGui::CalcTextSize(won).x) * 0.5f);
-    ImGui::TextColored(primaryFailed ? ImVec4(1.0f, 0.42f, 0.20f, 1.0f)
-                                     : UITheme::kAccent,
-                       "%s", won);
 
-    // Rank as the hero element, with the score as a filled track beneath it.
-    // The bar is what turns "68 / 100" into something readable at a glance --
-    // the number alone gave no sense of how close the next grade was.
-    const char* rank = MissionRankName(report.rank);
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    ImGui::SetWindowFontScale(2.6f);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (winWidth - ImGui::CalcTextSize(rank).x) * 0.5f);
-    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s", rank);
-    ImGui::SetWindowFontScale(1.0f);
+    // ---- Backdrop ----------------------------------------------------------
+    //
+    // Layered the way the main menu builds its own: a corner gradient for depth,
+    // then a vignette top and bottom so the panel sits in a pool of dark rather
+    // than on a flat wash. A failed primary tints the whole thing red.
+    ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
+    if (primaryFailed) {
+        backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
+            IM_COL32(26, 8, 6, 238), IM_COL32(34, 12, 10, 238),
+            IM_COL32(14, 5, 4, 244), IM_COL32(10, 4, 3, 244));
+    } else {
+        backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
+            IM_COL32(8, 20, 16, 238), IM_COL32(16, 34, 30, 238),
+            IM_COL32(5, 13, 11, 244), IM_COL32(4, 10, 9, 244));
+    }
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, 0), ImVec2(display.x, display.y * 0.22f),
+        IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, display.y * 0.76f), ImVec2(display.x, display.y),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 190), IM_COL32(0, 0, 0, 190));
 
+    // ---- Animation helpers -------------------------------------------------
+    //
+    // One eased 0..1 ramp per section, started at a stagger so the report
+    // assembles itself instead of appearing all at once. Ease-out, matching the
+    // HUD's floating payouts: most of the travel happens early, so the eye
+    // catches the motion while the value is still worth reading.
+    constexpr float kStageSeconds = 0.42f;
+    const auto stage = [&](float delay) {
+        const float t = (std::max)(0.0f,
+            (std::min)(1.0f, (g_winScreenAge - delay) / kStageSeconds));
+        return 1.0f - (1.0f - t) * (1.0f - t);
+    };
+    // Counts a figure up over its stage. Snaps to the target at the end rather
+    // than easing into it asymptotically -- a payout that stopped one short of
+    // what the wallet says would be a bug report.
+    const auto countUp = [&](int64_t target, float delay) -> int64_t {
+        const float t = stage(delay);
+        if (t >= 1.0f) return target;
+        return static_cast<int64_t>(static_cast<double>(target) * t);
+    };
+    const auto fade = [](ImVec4 colour, float t) {
+        colour.w *= t;
+        return colour;
+    };
+
+    // ---- Panel -------------------------------------------------------------
+    //
+    // Unplated: NoBackground plus one rounded rect drawn by hand, so the frame
+    // is ours rather than the default window chrome every other screen dropped.
+    const float panelWidth = (std::min)(920.0f, display.x - 48.0f);
+    const float panelHeight = (std::min)(780.0f, display.y - 48.0f);
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(30.0f, 24.0f));
+    ImGui::Begin("Win Screen", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
     {
-        char scoreText[32];
-        snprintf(scoreText, sizeof(scoreText), "%d / 100", report.totalScore);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (winWidth - ImGui::CalcTextSize(scoreText).x) * 0.5f);
-        ImGui::TextUnformatted(scoreText);
+        // Drawn on the window list behind the content: the panel fades up over
+        // the first half second, which is what makes the screen feel like it
+        // arrives rather than cuts in.
+        const float entry = stage(0.0f);
+        const ImVec2 panelMin = ImGui::GetWindowPos();
+        const ImVec2 panelMax(panelMin.x + panelWidth, panelMin.y + panelHeight);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(panelMin, panelMax,
+                            IM_COL32(9, 14, 12, static_cast<int>(242 * entry)),
+                            10.0f);
+        draw->AddRect(panelMin, panelMax,
+                      IM_COL32(70, 92, 80, static_cast<int>(170 * entry)),
+                      10.0f, 0, 1.5f);
+        // Accent rail down the left edge, red when the mast is still standing.
+        const ImU32 rail = primaryFailed
+            ? IM_COL32(224, 86, 62, static_cast<int>(235 * entry))
+            : IM_COL32(38, 178, 82, static_cast<int>(235 * entry));
+        draw->AddRectFilled(ImVec2(panelMin.x, panelMin.y + 10.0f),
+                            ImVec2(panelMin.x + 3.0f, panelMax.y - 10.0f),
+                            rail, 2.0f);
+    }
 
-        ImDrawList* winDraw = ImGui::GetWindowDrawList();
+    const float contentWidth = ImGui::GetContentRegionAvail().x;
+    const auto centerCursor = [&](const char* text, float width) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (width - ImGui::CalcTextSize(text).x) * 0.5f);
+    };
+
+    // ---- Header ------------------------------------------------------------
+    {
+        const float t = stage(0.05f);
+        const char* banner = primaryFailed ? "OBJECTIVE FAILED"
+                                           : "MISSION COMPLETE";
+        // Letter-spaced by hand, the way the main menu sets its wordmark: at
+        // this size the default tracking reads as a word rather than a stamp.
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float tracking = ImGui::GetFontSize() * 0.30f;
+        float bannerWidth = 0.0f;
+        for (const char* c = banner; *c; ++c) {
+            const char glyph[2] = { *c, 0 };
+            bannerWidth += ImGui::CalcTextSize(glyph).x + tracking;
+        }
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (contentWidth - bannerWidth) * 0.5f);
+        const ImVec2 pen = ImGui::GetCursorScreenPos();
+        const ImU32 tint = primaryFailed
+            ? IM_COL32(240, 126, 96, static_cast<int>(245 * t))
+            : IM_COL32(150, 226, 172, static_cast<int>(245 * t));
+        float penX = pen.x;
+        for (const char* c = banner; *c; ++c) {
+            const char glyph[2] = { *c, 0 };
+            draw->AddText(ImVec2(penX, pen.y), tint, glyph);
+            penX += ImGui::CalcTextSize(glyph).x + tracking;
+        }
+        ImGui::Dummy(ImVec2(bannerWidth, ImGui::GetTextLineHeight()));
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
+
+    // ---- Grade + score track -----------------------------------------------
+    {
+        const float t = stage(0.18f);
+        const char* grade = MissionRankName(report.rank);
+        // The real 68px face, not the body font scaled up. Scaling a baked
+        // bitmap is what softened the wordmark before this project stopped
+        // doing it; the fallback path is the only one that still scales.
+        const bool titleFont = g_menuTitleFont != nullptr;
+        if (titleFont) ImGui::PushFont(g_menuTitleFont);
+        else ImGui::SetWindowFontScale(3.6f);
+        const ImVec4 gradeColour = primaryFailed
+            ? ImVec4(0.93f, 0.42f, 0.30f, 1.0f)
+            : ImVec4(1.0f, 0.82f, 0.24f, 1.0f);
+        centerCursor(grade, contentWidth);
+        ImGui::TextColored(fade(gradeColour, t), "%s", grade);
+        if (titleFont) ImGui::PopFont();
+        else ImGui::SetWindowFontScale(1.0f);
+
+        char scoreText[48];
+        snprintf(scoreText, sizeof(scoreText), "%lld / 100",
+                 static_cast<long long>(countUp(report.totalScore, 0.30f)));
+        centerCursor(scoreText, contentWidth);
+        ImGui::TextColored(fade(UITheme::kText, t), "%s", scoreText);
+
+        // The track fills on its own stage, so the number and the bar agree at
+        // every frame instead of the bar arriving finished under a rolling
+        // count.
+        const float fillT = stage(0.30f);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 cursor = ImGui::GetCursorScreenPos();
-        const float trackWidth = winWidth * 0.62f;
-        const float trackX = cursor.x + (winWidth - trackWidth) * 0.5f;
+        const float trackWidth = contentWidth * 0.52f;
+        const float trackX = cursor.x + (contentWidth - trackWidth) * 0.5f;
         const float scoreFraction = (std::max)(0.0f, (std::min)(1.0f,
-            static_cast<float>(report.totalScore) / 100.0f));
-        winDraw->AddRectFilled(ImVec2(trackX, cursor.y + 3.0f),
-                               ImVec2(trackX + trackWidth, cursor.y + 9.0f),
-                               IM_COL32(6, 10, 8, 215), 3.0f);
+            static_cast<float>(report.totalScore) / 100.0f)) * fillT;
+        draw->AddRectFilled(ImVec2(trackX, cursor.y + 4.0f),
+                            ImVec2(trackX + trackWidth, cursor.y + 11.0f),
+                            IM_COL32(6, 10, 8, 215), 3.5f);
         if (scoreFraction > 0.0f)
-            winDraw->AddRectFilled(
-                ImVec2(trackX, cursor.y + 3.0f),
-                ImVec2(trackX + trackWidth * scoreFraction, cursor.y + 9.0f),
-                IM_COL32(255, 209, 61, 245), 3.0f);
+            draw->AddRectFilled(
+                ImVec2(trackX, cursor.y + 4.0f),
+                ImVec2(trackX + trackWidth * scoreFraction, cursor.y + 11.0f),
+                IM_COL32(255, 209, 61, 245), 3.5f);
+        // Grade thresholds as ticks on the track: "how far off an A was I" is
+        // the question a bar is there to answer and a bare number cannot.
+        const int kGradeThresholds[] = { 45, 60, 75, 90 };
+        for (int threshold : kGradeThresholds) {
+            const float x = trackX + trackWidth * (threshold / 100.0f);
+            draw->AddRectFilled(ImVec2(x, cursor.y + 4.0f),
+                                ImVec2(x + 1.0f, cursor.y + 11.0f),
+                                IM_COL32(255, 255, 255, 60));
+        }
+        ImGui::Dummy(ImVec2(0.0f, 18.0f));
+
+        // Run conditions on one line under the track: how long it took, and
+        // what the difficulty dial made it worth.
+        const int totalMilliseconds = static_cast<int>(
+            report.elapsedSeconds * 1000.0f + 0.5f);
+        char conditions[160];
+        snprintf(conditions, sizeof(conditions),
+                 "%02d:%02d.%03d          DIFFICULTY x%.2f          "
+                 "REWARDS x%.2f",
+                 totalMilliseconds / 60000, (totalMilliseconds / 1000) % 60,
+                 totalMilliseconds % 1000, g_winScreenDifficulty,
+                 g_winScreenRewardMultiplier);
+        centerCursor(conditions, contentWidth);
+        ImGui::TextColored(
+            fade(g_winScreenRewardMultiplier > 1.0f ? UITheme::kWarning
+                                                    : UITheme::kTextDim, t),
+            "%s", conditions);
         ImGui::Dummy(ImVec2(0.0f, 14.0f));
     }
 
-    // ---- Payout ------------------------------------------------------------
+    // Right-aligns a value against the current region. Replaces the old
+    // space-padded format strings, which only lined up because the body font
+    // happened to be monospace and broke the moment it was not.
+    const auto valueRow = [](const char* label, const char* value,
+                             const ImVec4& labelTint, const ImVec4& valueTint) {
+        const float rowRight = ImGui::GetCursorPosX() +
+                               ImGui::GetContentRegionAvail().x;
+        ImGui::TextColored(labelTint, "%s", label);
+        ImGui::SameLine(rowRight - ImGui::CalcTextSize(value).x);
+        ImGui::TextColored(valueTint, "%s", value);
+    };
+
+    // ---- Two columns -------------------------------------------------------
     //
-    // What the run was worth, sitting directly under the grade because the
-    // grade is what sets the bonus. Split into "earned in the field" and
-    // "bonus from the grade" so it is obvious that shooting things and scoring
-    // well are two separate income streams, then the new career balance.
-    ImGui::SeparatorText("PAYOUT");
+    // Performance on the left, what it bought on the right. Two child regions
+    // rather than ImGui columns, so the taller side cannot drag the other's
+    // rows out of line and neither scrolls.
+    constexpr float kGutter = 26.0f;
+    const float columnWidth = (contentWidth - kGutter) * 0.5f;
+    const float columnHeight = ImGui::GetContentRegionAvail().y - 68.0f;
+
+    ImGui::BeginChild("WinLeft", ImVec2(columnWidth, columnHeight), false,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
     {
-        const int64_t fieldEarnings = g_winScreenPayout - g_winScreenMissionBonus;
-        const auto moneyRow = [](const char* label, int64_t amount,
-                                 const ImVec4& tint) {
-            char text[32];
-            MoneySystem::Format(text, sizeof(text), amount);
-            ImGui::TextUnformatted(label);
-            const float textWidth = ImGui::CalcTextSize(text).x;
-            ImGui::SameLine(ImGui::GetContentRegionMax().x - textWidth);
-            ImGui::TextColored(tint, "%s", text);
+        const float t = stage(0.42f);
+        ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, t));
+        UISectionLabel("PERFORMANCE");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+        // Each category with what it scored out of what it was worth, over a
+        // hairline fill. A category that banked nothing is dimmed, so the ones
+        // worth improving are the ones that stand out.
+        const auto scoreRow = [&](const char* label, const char* detail,
+                                  int earned, int available) {
+            char value[32];
+            snprintf(value, sizeof(value), "%d / %d", earned, available);
+            const ImVec4 tint = earned <= 0 ? UITheme::kTextDim : UITheme::kText;
+            valueRow(label, value, fade(tint, t), fade(tint, t));
+            if (detail && *detail) {
+                ImGui::TextColored(fade(UITheme::kTextDim, t * 0.8f),
+                                   "    %s", detail);
+            }
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            const ImVec2 cursor = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            const float fraction = available > 0
+                ? (std::max)(0.0f, (std::min)(1.0f,
+                      static_cast<float>(earned) /
+                      static_cast<float>(available))) * t
+                : 0.0f;
+            draw->AddRectFilled(cursor,
+                                ImVec2(cursor.x + width, cursor.y + 2.0f),
+                                IM_COL32(255, 255, 255, 22));
+            if (fraction > 0.0f)
+                draw->AddRectFilled(
+                    cursor,
+                    ImVec2(cursor.x + width * fraction, cursor.y + 2.0f),
+                    IM_COL32(255, 209, 61, static_cast<int>(200 * t)));
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
         };
-        moneyRow("Field earnings", fieldEarnings,
-                 ImVec4(0.86f, 0.90f, 0.88f, 1.0f));
+
+        char detail[96];
+        scoreRow("Time", nullptr, report.timeScore, 15);
+        snprintf(detail, sizeof(detail), "%.1f%%  --  %u of %u rounds on target",
+                 report.accuracyPercent, stats.shotsHit, stats.shotsFired);
+        scoreRow("Accuracy", detail, report.accuracyScore, 20);
+        snprintf(detail, sizeof(detail), "%u of %u marines lost",
+                 report.casualties, stats.friendliesDeployed);
+        scoreRow("Casualties", detail, report.casualtyScore, 15);
+        snprintf(detail, sizeof(detail), "%u of %u complete",
+                 report.optionalObjectivesCompleted,
+                 report.optionalObjectivesTotal);
+        scoreRow("Optional", detail, report.optionalScore, 15);
+        snprintf(detail, sizeof(detail), "%u events", report.destructionEvents);
+        scoreRow("Destruction", detail, report.destructionScore, 10);
+        if (report.primaryObjectivePresent)
+            snprintf(detail, sizeof(detail), "%u of %u comm towers down",
+                     report.commTowersDestroyed, report.commTowersTotal);
+        else
+            snprintf(detail, sizeof(detail), "no comm tower on this map");
+        scoreRow("Primary", detail, report.primaryScore,
+                 MissionSystem::kPrimaryObjectiveScore);
+
+        const float objectivesT = stage(0.56f);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              fade(UITheme::kTextDim, objectivesT));
+        UISectionLabel("OBJECTIVES");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        const auto objective = [&](bool complete, const char* label) {
+            ImGui::TextColored(
+                fade(complete ? ImVec4(0.35f, 0.86f, 0.45f, 1.0f)
+                              : UITheme::kTextDim, objectivesT),
+                "%s  %s", complete ? "[X]" : "[ ]", label);
+        };
+        if (report.primaryObjectivePresent)
+            objective(report.primaryObjectiveComplete,
+                      "Blackout - level the comm tower");
+        if (report.objectivePlanesTotal > 0) {
+            char aircraft[96];
+            snprintf(aircraft, sizeof(aircraft), "Aircraft - %u of %u downed%s",
+                     report.objectivePlanesDestroyed,
+                     report.objectivePlanesTotal,
+                     report.objectivePlanesEscaped > 0 ? "  (ESCAPED)" : "");
+            objective(report.objectivePlanesEscaped == 0 &&
+                          report.objectivePlanesDestroyed ==
+                              report.objectivePlanesTotal,
+                      aircraft);
+        }
+        objective(report.usedBothWeapons, "Versatility - use both weapons");
+        objective(report.usedSelectedGrenade, "Grenadier - throw your grenade");
+        objective(report.demolitionObjective,
+                  "Demolition - 5 destruction events");
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine(0.0f, kGutter);
+    ImGui::BeginChild("WinRight", ImVec2(columnWidth, columnHeight), false,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
+    {
+        // ---- Payout --------------------------------------------------------
+        const float t = stage(0.50f);
+        ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, t));
+        UISectionLabel("PAYOUT");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+        const int64_t fieldEarnings =
+            g_winScreenPayout - g_winScreenMissionBonus;
+        const auto moneyRow = [&](const char* label, int64_t amount,
+                                  float delay, const ImVec4& tint) {
+            char text[32];
+            MoneySystem::Format(text, sizeof(text), countUp(amount, delay));
+            valueRow(label, text, fade(UITheme::kTextDim, t), fade(tint, t));
+        };
+        moneyRow("Field earnings", fieldEarnings, 0.52f, UITheme::kText);
         char bonusLabel[64];
         snprintf(bonusLabel, sizeof(bonusLabel), "Mission bonus (%d x %d)",
                  report.totalScore, MoneySystem::kMissionBonusPerScorePoint);
-        moneyRow(bonusLabel, g_winScreenMissionBonus,
-                 ImVec4(0.86f, 0.90f, 0.88f, 1.0f));
+        moneyRow(bonusLabel, g_winScreenMissionBonus, 0.60f, UITheme::kText);
         ImGui::Separator();
-        moneyRow("TOTAL THIS RUN", g_winScreenPayout,
+        moneyRow("TOTAL THIS RUN", g_winScreenPayout, 0.68f,
                  ImVec4(1.0f, 0.82f, 0.24f, 1.0f));
-        moneyRow("Funds", g_game.money.Balance(), UITheme::kTextDim);
+        moneyRow("Funds", g_game.money.Balance(), 0.68f, UITheme::kTextDim);
+
+        // ---- Progression ---------------------------------------------------
+        //
+        // Its own section rather than four more rows under PAYOUT: cash is
+        // spent on the next deployment and experience is not, and running them
+        // together made the grade bonus look like it was counted twice.
+        const float xpT = stage(0.72f);
+        ImGui::Dummy(ImVec2(0.0f, 14.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, xpT));
+        UISectionLabel("PROGRESSION");
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+        const int64_t fieldXp = g_winScreenXpEarned - g_winScreenXpBonus;
+        const auto xpRow = [&](const char* label, int64_t amount, float delay,
+                               const ImVec4& tint) {
+            char text[32];
+            RankSystem::Format(text, sizeof(text), countUp(amount, delay));
+            char value[48];
+            snprintf(value, sizeof(value), "%s XP", text);
+            valueRow(label, value, fade(UITheme::kTextDim, xpT),
+                     fade(tint, xpT));
+        };
+        xpRow("Field experience", fieldXp, 0.74f, UITheme::kText);
+        char xpBonusLabel[64];
+        snprintf(xpBonusLabel, sizeof(xpBonusLabel), "Mission bonus (%d x %d)",
+                 report.totalScore, RankSystem::kMissionBonusPerScorePoint);
+        xpRow(xpBonusLabel, g_winScreenXpBonus, 0.82f, UITheme::kText);
+        ImGui::Separator();
+        xpRow("TOTAL THIS RUN", g_winScreenXpEarned, 0.90f,
+              ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+
+        // Career standing, with the bar sweeping from where the run started to
+        // where it finished.
+        const float careerT = stage(0.98f);
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        ImGui::TextColored(fade(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), careerT), "%s",
+                           g_game.rank.RankLabel());
+        ImGui::SameLine(0.0f, 8.0f);
+        ImGui::TextColored(fade(UITheme::kTextDim, careerT), "LVL %d",
+                           g_game.rank.Level());
+
+        {
+            const float sweep = stage(1.05f);
+            const float span =
+                static_cast<float>(g_game.rank.XpForNextLevel());
+            const float endFraction = (std::max)(0.0f, (std::min)(1.0f,
+                static_cast<float>(g_game.rank.XpIntoLevel()) / span));
+            // Where the bar stood when the run armed. Only meaningful when the
+            // run stayed inside one level; a promotion sweeps from empty
+            // instead, which is what the crossing actually looked like -- the
+            // alternative is a bar that appears to run backwards.
+            const float startFraction =
+                g_winScreenLevelAfter > g_winScreenLevelBefore
+                    ? 0.0f
+                    : (std::max)(0.0f, (std::min)(1.0f,
+                          static_cast<float>(g_game.rank.XpIntoLevel() -
+                                             g_winScreenXpEarned) / span));
+            const float fraction =
+                startFraction + (endFraction - startFraction) * sweep;
+
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            const ImVec2 barPos = ImGui::GetCursorScreenPos();
+            const float barWidth = ImGui::GetContentRegionAvail().x;
+            constexpr float kBarHeight = 7.0f;
+            draw->AddRectFilled(
+                barPos, ImVec2(barPos.x + barWidth, barPos.y + kBarHeight),
+                IM_COL32(255, 255, 255, static_cast<int>(34 * careerT)), 3.0f);
+            if (fraction > 0.0f)
+                draw->AddRectFilled(
+                    barPos,
+                    ImVec2(barPos.x + barWidth * fraction,
+                           barPos.y + kBarHeight),
+                    IM_COL32(255, 255, 255, static_cast<int>(235 * careerT)),
+                    3.0f);
+            ImGui::Dummy(ImVec2(barWidth, kBarHeight + 4.0f));
+        }
+
+        if (g_game.rank.Level() < RankSystem::kMaxLevel) {
+            char remaining[32];
+            RankSystem::Format(remaining, sizeof(remaining),
+                               g_game.rank.XpForNextLevel() -
+                                   g_game.rank.XpIntoLevel());
+            ImGui::TextColored(fade(UITheme::kTextDim, careerT),
+                               "%s XP to level %d", remaining,
+                               g_game.rank.Level() + 1);
+        } else {
+            ImGui::TextColored(fade(UITheme::kTextDim, careerT),
+                               "Maximum rank reached");
+        }
+
+        // The stinger, last and loudest. Pulsed rather than static so it reads
+        // as an event on a screen that is otherwise settling down.
+        if (g_winScreenTierAfter != g_winScreenTierBefore ||
+            g_winScreenLevelAfter > g_winScreenLevelBefore) {
+            const float promoT = stage(1.25f);
+            const float pulse = 0.78f + 0.22f * std::sin(
+                static_cast<float>(ImGui::GetTime()) * 3.4f);
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+            if (g_winScreenTierAfter != g_winScreenTierBefore) {
+                ImGui::TextColored(
+                    fade(ImVec4(1.0f, 0.84f, 0.47f, 1.0f), promoT * pulse),
+                    "PROMOTED");
+                ImGui::TextColored(
+                    fade(ImVec4(1.0f, 0.84f, 0.47f, 1.0f), promoT),
+                    "%s  ->  %s", PlayerRankName(g_winScreenTierBefore),
+                    PlayerRankName(g_winScreenTierAfter));
+            } else {
+                ImGui::TextColored(fade(UITheme::kAccent, promoT * pulse),
+                                   "LEVEL %d  ->  %d", g_winScreenLevelBefore,
+                                   g_winScreenLevelAfter);
+            }
+        }
+
+        // ---- Deployment ----------------------------------------------------
+        const float kitT = stage(1.10f);
+        ImGui::Dummy(ImVec2(0.0f, 12.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, kitT));
+        UISectionLabel("DEPLOYMENT");
+        ImGui::PopStyleColor();
+        ImGui::TextColored(fade(UITheme::kText, kitT), "%s + %s",
+                           GunModel::WeaponName(loadout.weapons[0]),
+                           GunModel::WeaponName(loadout.weapons[1]));
+        ImGui::TextColored(fade(UITheme::kTextDim, kitT), "%s | %s | %s",
+                           GrenadeTypeName(loadout.grenade),
+                           GearTypeName(loadout.gear),
+                           LevelInsertionModeName(loadout.insertion));
     }
+    ImGui::EndChild();
 
-    ImGui::SeparatorText("DEPLOYMENT");
-    ImGui::Text("%s + %s", GunModel::WeaponName(loadout.weapons[0]),
-                GunModel::WeaponName(loadout.weapons[1]));
-    ImGui::TextDisabled("%s | %s | %s", GrenadeTypeName(loadout.grenade),
-                        GearTypeName(loadout.gear),
-                        LevelInsertionModeName(loadout.insertion));
-
-    const int totalMilliseconds = static_cast<int>(
-        report.elapsedSeconds * 1000.0f + 0.5f);
-    const int minutes = totalMilliseconds / 60000;
-    const int seconds = (totalMilliseconds / 1000) % 60;
-    const int milliseconds = totalMilliseconds % 1000;
-    ImGui::SeparatorText("SCORE BREAKDOWN");
-    // Right-aligns the "N / M" column against the panel edge. The old fixed
-    // SameLine(410) was measured for one exact window width and padding, so any
-    // change to either left the column floating mid-row.
-    const auto scoreColumn = [](int earned, int available) {
-        char text[24];
-        snprintf(text, sizeof(text), "%d / %d", earned, available);
-        const float textWidth = ImGui::CalcTextSize(text).x;
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - textWidth);
-        // Dim a category that scored nothing, so the ones worth improving stand
-        // out from the ones already banked.
-        if (earned <= 0) ImGui::TextDisabled("%s", text);
-        else ImGui::TextUnformatted(text);
-    };
-    ImGui::Text("Time             %02d:%02d.%03d", minutes, seconds, milliseconds);
-    scoreColumn(report.timeScore, 15);
-    ImGui::Text("Accuracy         %.1f%%  (%u / %u)", report.accuracyPercent,
-                stats.shotsHit, stats.shotsFired);
-    scoreColumn(report.accuracyScore, 20);
-    ImGui::Text("Casualties       %u / %u", report.casualties,
-                stats.friendliesDeployed);
-    scoreColumn(report.casualtyScore, 15);
-    ImGui::Text("Optional         %u / %u", report.optionalObjectivesCompleted,
-                report.optionalObjectivesTotal);
-    scoreColumn(report.optionalScore, 15);
-    ImGui::Text("Destruction      %u events", report.destructionEvents);
-    scoreColumn(report.destructionScore, 10);
-    if (report.objectivePlanesTotal > 0) {
-        if (report.objectivePlanesEscaped > 0)
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
-                "Aircraft         %u / %u downed, %u ESCAPED",
-                report.objectivePlanesDestroyed, report.objectivePlanesTotal,
-                report.objectivePlanesEscaped);
-        else
-            ImGui::Text("Aircraft         %u / %u downed",
-                        report.objectivePlanesDestroyed,
-                        report.objectivePlanesTotal);
-    }
-    if (report.primaryObjectivePresent) {
-        ImGui::Text("Comm towers      %u / %u down", report.commTowersDestroyed,
-                    report.commTowersTotal);
-    } else {
-        ImGui::Text("Comm towers      none on this map");
-    }
-    scoreColumn(report.primaryScore, MissionSystem::kPrimaryObjectiveScore);
-
-    const auto objective = [](bool complete, const char* label) {
-        ImGui::TextColored(complete
-                ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
-                : ImVec4(0.58f, 0.62f, 0.60f, 1.0f),
-            "%s  %s", complete ? "[X]" : "[ ]", label);
-    };
-    if (report.primaryObjectivePresent) {
-        ImGui::SeparatorText("PRIMARY OBJECTIVE");
-        objective(report.primaryObjectiveComplete,
-                  "Operation Blackout - level the comm tower");
-    }
-
-    ImGui::SeparatorText("OPTIONAL OBJECTIVES");
-    objective(report.usedBothWeapons, "Field versatility - use both weapons");
-    objective(report.usedSelectedGrenade, "Grenadier - throw selected grenade");
-    objective(report.demolitionObjective, "Demolition - cause 5 destruction events");
-
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    // Split the row from the live content width instead of two 215 px halves at
-    // a hardcoded inset, so the pair stays centred if the panel is ever resized.
+    // ---- Actions -----------------------------------------------------------
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
     {
         const float rowWidth = ImGui::GetContentRegionAvail().x;
         const float halfWidth =
@@ -2131,14 +2582,14 @@ static void RenderWinScreen(HWND hwnd) {
         const bool replay = ImGui::Button(
             g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1"
                                             : "REPLAY CUSTOM LEVEL",
-            ImVec2(halfWidth, 44.0f));
+            ImVec2(halfWidth, 46.0f));
         ImGui::PopStyleColor(3);
         if (replay) RestartActiveLevel(hwnd);
         ImGui::SameLine();
         // A finished run ends by flying home, not by dropping out to the menu.
         // The base is where the payout above is actually spent, so send the
         // player straight there; the menu is still one Escape away from it.
-        if (ImGui::Button("RETURN TO BASE", ImVec2(halfWidth, 44.0f)))
+        if (ImGui::Button("RETURN TO BASE", ImVec2(halfWidth, 46.0f)))
             StartBase(hwnd);
     }
     ImGui::End();

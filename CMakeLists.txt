@@ -497,6 +497,10 @@ if(BUILD_TESTING)
     target_link_libraries(MoneySystemTests PRIVATE SGEProjectHeaders)
     add_test(NAME MoneySystemTests COMMAND MoneySystemTests)
 
+    add_executable(RankSystemTests tests/RankSystemTests.cpp)
+    target_link_libraries(RankSystemTests PRIVATE SGEProjectHeaders)
+    add_test(NAME RankSystemTests COMMAND RankSystemTests)
+
     add_executable(UISearchFilterTests tests/UISearchFilterTests.cpp)
     target_link_libraries(UISearchFilterTests PRIVATE SGEProjectHeaders)
     add_test(NAME UISearchFilterTests COMMAND UISearchFilterTests)

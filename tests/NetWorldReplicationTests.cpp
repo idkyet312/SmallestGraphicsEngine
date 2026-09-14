@@ -165,6 +165,26 @@ int main() {
     client.DrainWorldBreaks(breaks);
     Check(breaks.empty(), "truncated world break must be rejected");
 
+    // Player 2's RPG hits must reach the host for both gunships, exactly once.
+    for (uint64_t airframe = 0; airframe < kEnemyHelicopterCount; ++airframe) {
+        client.ReportWorldImpact(airframe, 500.0f, 1.0f, 2.0f, 3.0f,
+                                 /*kind=*/3, 0.0f, 0.0f,
+                                 static_cast<uint32_t>(100 + airframe));
+        Check(wire.back().channel == Channel::Reliable &&
+              wire.back().bytes.size() == sizeof(ClientWorldImpactMessage),
+              "client helicopter damage must use reliable impact reporting");
+        ClientWorldImpactMessage rocketHit;
+        std::memcpy(&rocketHit, wire.back().bytes.data(), sizeof(rocketHit));
+        Receive(7, rocketHit);
+        Receive(7, rocketHit);
+        host.Update(0.0f, local);
+        host.DrainWorldImpacts(impacts);
+        Check(impacts.size() == 1 && impacts[0].shooter == 1 &&
+              impacts[0].kind == 3 && impacts[0].entityId == airframe &&
+              impacts[0].damage == 500.0f,
+              "host must receive player 2's helicopter damage exactly once");
+    }
+
     // A client throw is one request/token, even if reliable delivery repeats.
     ClientGrenadeThrowMessage throwMessage;
     throwMessage.clientToken = 77;
@@ -292,4 +312,75 @@ int main() {
           spawns[1].kind == GrenadeKind::Molotov &&
           spawns[2].kind == GrenadeKind::Vortex,
           "client must receive all hostile grenade kinds");
+
+    // Escape boat state is host-authoritative and travels beside the vehicle
+    // snapshots, including the inactive state used to clear a client's boat.
+    EnemyHelicopterState helicopters[kEnemyHelicopterCount]{};
+    EscapeBoatSnapshot boat;
+    boat.active = 1;
+    boat.x = 11.0f; boat.y = 2.0f; boat.z = -7.0f;
+    boat.yaw = 0.75f; boat.bobTime = 3.5f;
+    const size_t vehicleStart = wire.size();
+    host.PublishVehicles(helicopters, boat);
+    host.Update(NetSession::kNetTickSeconds, local);
+    Check(wire.size() > vehicleStart &&
+          wire.back().bytes.size() == sizeof(ServerVehicleStateMessage),
+          "host must transmit published vehicle state");
+    ServerVehicleStateMessage vehicleMessage;
+    std::memcpy(&vehicleMessage, wire.back().bytes.data(),
+                sizeof(vehicleMessage));
+    Check(vehicleMessage.escapeBoat.active == 1 &&
+          vehicleMessage.escapeBoat.x == boat.x &&
+          vehicleMessage.escapeBoat.bobTime == boat.bobTime,
+          "host vehicle packet must carry escape boat state");
+    Receive(3, vehicleMessage);
+    client.Update(0.0f, local);
+    const EscapeBoatSnapshot* remoteBoat = client.RemoteEscapeBoat();
+    Check(remoteBoat && remoteBoat->active == 1 && remoteBoat->x == boat.x &&
+          remoteBoat->yaw == boat.yaw,
+          "client must receive the host escape boat");
+
+    // A later join receives the host's current active state on its first tick.
+    NetSession lateClient;
+    Check(lateClient.StartClient("host", 27110, nullptr), "late client failed");
+    ServerWelcome lateWelcome;
+    lateWelcome.assignedId = 2;
+    Receive(4, lateWelcome);
+    Receive(4, vehicleMessage);
+    lateClient.Update(0.0f, local);
+    remoteBoat = lateClient.RemoteEscapeBoat();
+    Check(remoteBoat && remoteBoat->active == 1 && remoteBoat->z == boat.z,
+          "late client must receive current active boat state");
+
+    boat = {};
+    host.PublishVehicles(helicopters, boat);
+    host.Update(NetSession::kNetTickSeconds, local);
+    std::memcpy(&vehicleMessage, wire.back().bytes.data(),
+                sizeof(vehicleMessage));
+    Receive(3, vehicleMessage);
+    client.Update(0.0f, local);
+    remoteBoat = client.RemoteEscapeBoat();
+    Check(remoteBoat && remoteBoat->active == 0,
+          "inactive host boat must reset the client state");
+
+    // Older snapshots and malformed boat values cannot move an already known
+    // craft or poison the replicated state.
+    ServerVehicleStateMessage stale = vehicleMessage;
+    stale.tick = vehicleMessage.tick - 1;
+    stale.escapeBoat.active = 1; stale.escapeBoat.x = 999.0f;
+    Receive(3, stale);
+    client.Update(0.0f, local);
+    Check(client.RemoteEscapeBoat()->active == 0,
+          "stale vehicle packet must be rejected");
+    ServerVehicleStateMessage invalid = vehicleMessage;
+    invalid.tick = vehicleMessage.tick + 1;
+    invalid.escapeBoat.active = 1;
+    invalid.escapeBoat.x = std::numeric_limits<float>::quiet_NaN();
+    Receive(3, invalid);
+    client.Update(0.0f, local);
+    Check(client.RemoteEscapeBoat()->active == 0,
+          "nonfinite boat packet must be rejected");
+    client.Shutdown();
+    Check(client.RemoteEscapeBoat() == nullptr,
+          "stopping a client must clear remote boat state");
 }

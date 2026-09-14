@@ -678,15 +678,38 @@ static void GrabOrThrowObject() {
     GrabOrThrowBandit();
 }
 
+// A barrel going off beside a gunship. The host owns the airframe's health, so
+// in a session this is reported and the outcome comes back in the vehicle
+// state; offline it is applied where it happened.
+//
+// Applying it locally was worth nothing in multiplayer: the vehicle state
+// overwrites a client's copy of that health every tick, so 120 points came off
+// and the host's next snapshot put them straight back. Same shape as
+// DamageNetworkedHelicopter, spelled out again because that lives in
+// Multiplayer.h, which is included after this file.
+static void ReportBarrelHelicopterDamage(uint8_t airframe, float damage,
+                                         const XMFLOAT3& hit) {
+    if (g_netSession.Active()) {
+        g_netSession.ReportWorldImpact(airframe, damage, hit.x, hit.y, hit.z,
+                                       /*kind=*/3);
+        return;
+    }
+    if (airframe == 0) DamageHelicopter(damage, hit);
+    else DamageSecondaryHelicopter(damage, hit);
+}
+
 static void SpawnBarrelExplosionFX(const XMFLOAT3& center) {
     scene.SpawnExplosionFX(
         { center.x, center.y + 1.1f, center.z }, 5.5f);
 }
 
-static void DetonateBarrel(size_t firstBarrel) {
+// `fromPlayer` credits the whole chain, not just the barrel that was hit: the
+// player lined up the row, so the barrels it takes with it are their doing.
+static void DetonateBarrel(size_t firstBarrel, bool fromPlayer) {
     if (firstBarrel >= scene.explosiveBarrels.size() ||
         !scene.explosiveBarrels[firstBarrel].active) return;
 
+    fromPlayer = fromPlayer || scene.explosiveBarrels[firstBarrel].litByPlayer;
     if (g_heldBarrelIndex == firstBarrel) g_heldBarrelIndex = SIZE_MAX;
     std::vector<size_t> pending{ firstBarrel };
     DestroyExplosiveBarrelBody(scene.explosiveBarrels[firstBarrel]);
@@ -700,7 +723,8 @@ static void DetonateBarrel(size_t firstBarrel) {
         SpawnBarrelExplosionFX(center);
 
         for (auto& bandit : g_bandits) {
-            if (bandit) bandit->ApplyExplosion(center, 6.5f, 500.0f, 12.0f);
+            if (bandit)
+                bandit->ApplyExplosion(center, 6.5f, 500.0f, 12.0f, fromPlayer);
         }
         PlayBanditDeathEvents();
         if (!g_helicopterDead && g_helicopterModel) {
@@ -712,8 +736,9 @@ static void DetonateBarrel(size_t firstBarrel) {
             // registers as a near-full-strength hit.
             const float reach = 11.5f;
             if (distance < reach)
-                DamageHelicopter(120.0f * (1.0f - distance / reach),
-                                 g_helicopterPosition);
+                ReportBarrelHelicopterDamage(
+                    0, 120.0f * (1.0f - distance / reach),
+                    g_helicopterPosition);
         }
         if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead &&
             g_helicopterModel) {
@@ -723,8 +748,8 @@ static void DetonateBarrel(size_t firstBarrel) {
             const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
             const float reach = 11.5f;
             if (distance < reach)
-                DamageSecondaryHelicopter(
-                    120.0f * (1.0f - distance / reach),
+                ReportBarrelHelicopterDamage(
+                    1, 120.0f * (1.0f - distance / reach),
                     g_secondaryHelicopterPosition);
         }
         // Blast takes the emplacement too, so C4 or a rocket is a valid answer
@@ -738,9 +763,11 @@ static void DetonateBarrel(size_t firstBarrel) {
             const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
             const float reach = 9.0f;
             if (distance < reach)
-                DamageAATurret(i, 320.0f * (1.0f - distance / reach), turret);
+                DamageAATurret(i, 320.0f * (1.0f - distance / reach), turret,
+                               fromPlayer);
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
+            if (fromPlayer) CreditPlayerDestruction();
             g_destruction.ApplyExplosion(center, 5.0f, 3.0f, 180.0f);
             g_destruction.ApplyRagdollExplosion(center, 6.5f, 110.0f);
         }
@@ -769,10 +796,13 @@ static void DetonateBarrel(size_t firstBarrel) {
             pending.push_back(i);
         }
     }
+    // Destruction is recorded either way -- the mission score counts what was
+    // wrecked on the map -- but only a chain the player started pays out.
     if (g_game.session.TimerRunning() && !pending.empty()) {
         g_game.mission.RecordDestruction(static_cast<uint32_t>(pending.size()));
-        g_game.money.Award(MoneyEvent::PropDestroyed,
-                           static_cast<int>(pending.size()));
+        if (fromPlayer)
+            AwardCombatEvent(MoneyEvent::PropDestroyed,
+                             static_cast<int>(pending.size()));
     }
 }
 
@@ -912,7 +942,7 @@ static void UpdateExplosiveBarrels(float dt) {
             }
             if (impact) {
                 barrel.position = impactPoint;
-                DetonateBarrel(i);
+                DetonateBarrel(i, barrel.litByPlayer);
                 continue;
             }
         }
@@ -920,7 +950,7 @@ static void UpdateExplosiveBarrels(float dt) {
         barrel.fuse -= dt;
         barrel.fireFxCooldown -= dt;
         if (barrel.fuse <= 0.0f) {
-            DetonateBarrel(i);
+            DetonateBarrel(i, barrel.litByPlayer);
             continue;
         }
         if (barrel.fireFxCooldown > 0.0f) continue;

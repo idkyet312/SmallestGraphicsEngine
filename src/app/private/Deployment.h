@@ -82,12 +82,18 @@ static void ClearMissionRentals() {
         scene.player.weapons.EquipAttachment(weapon, id);
 }
 
-// Saves the wallet. Rentals are deliberately NOT persisted: kit is hired for one
-// mission, so what was carried last time says nothing about what the player has
-// now, and writing it would make it survive the restart that is supposed to
-// clear it. The balance is the only career state.
+// Saves the wallet and the rank profile. Rentals are deliberately NOT
+// persisted: kit is hired for one mission, so what was carried last time says
+// nothing about what the player has now, and writing it would make it survive
+// the restart that is supposed to clear it. The balance and career experience
+// are the only career state.
+//
+// Both files are written here rather than at their own call sites so the five
+// places that bank a career (extraction, abandon, a squad purchase, window
+// close) stay one call each and cannot bank one number without the other.
 static void SaveCareer() {
     SaveMoney(g_game.money);
+    SaveProfile(g_game.rank);
 }
 
 // Single purchase point, so every buy button in the storefront goes through the

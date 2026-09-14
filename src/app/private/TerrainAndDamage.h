@@ -630,6 +630,31 @@ static bool AnySkinnedActorsToDraw() {
 static int g_winScreenMissionBonus = 0;
 static int64_t g_winScreenPayout = 0;
 
+// The same snapshot for experience, plus what the whole run did to the player's
+// standing. "Before" is the level held when the run armed, not the level held a
+// moment before the grade bonus landed: kills during the mission promote too,
+// and the screen is reporting the deployment, not its last award. It is derived
+// rather than captured at BeginRun -- career total minus session earnings is
+// exactly the career as it stood when the run started.
+static int g_winScreenXpBonus = 0;
+static int64_t g_winScreenXpEarned = 0;
+static int g_winScreenLevelBefore = 1;
+static int g_winScreenLevelAfter = 1;
+static PlayerRankTier g_winScreenTierBefore = PlayerRankTier::Private;
+static PlayerRankTier g_winScreenTierAfter = PlayerRankTier::Private;
+// What the difficulty dial was worth on this run, snapshotted with the rest so
+// the report cannot disagree with the numbers above it if the dial is moved
+// while the screen is still up.
+static float g_winScreenRewardMultiplier = 1.0f;
+static float g_winScreenDifficulty = 1.0f;
+
+// Seconds the extraction screen has been up, and the only animation clock in
+// the menus. A float advanced while drawing rather than an ImGui::GetTime()
+// stamp taken at open, because OpenWinScreen does not always run inside a
+// NewFrame pair. Reset there; aged in RenderWinScreen off a clamped delta, the
+// same way the HUD ages its floating payouts.
+static float g_winScreenAge = 0.0f;
+
 // Push the settings into the systems that actually consume them.
 //
 // Camera::MouseSensitivity is a member of the camera object, and the camera is

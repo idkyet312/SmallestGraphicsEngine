@@ -425,22 +425,25 @@ public:
     // same ragdoll, death event and payout as the host's own.
     void ApplyNetworkBodyDamage(float damage,
                                 const DirectX::XMFLOAT3& direction,
-                                const DirectX::XMFLOAT3& impact) {
+                                const DirectX::XMFLOAT3& impact,
+                                bool fromPlayer = false) {
         if (dead_) return;
         const float applied = ScaleIncomingDamage(damage);
         health -= applied;
         RegisterThreat(applied);
         if (health <= 0.0f)
             Kill(direction, impact, 1.0f, false,
-                 RagdollImpactSource::Bullet, {});
+                 RagdollImpactSource::Bullet, {}, fromPlayer);
     }
 
     // As above for a headshot, which is lethal regardless of remaining health.
     void KillFromNetworkHeadshot(const DirectX::XMFLOAT3& direction,
-                                 const DirectX::XMFLOAT3& impact) {
+                                 const DirectX::XMFLOAT3& impact,
+                                 bool fromPlayer = false) {
         if (dead_) return;
         health = 0.0f;
-        Kill(direction, impact, 1.0f, true, RagdollImpactSource::Bullet, {});
+        Kill(direction, impact, 1.0f, true, RagdollImpactSource::Bullet, {},
+             fromPlayer);
     }
 
     // Client-side: the host says this actor is dead, so drop it the same way a
@@ -449,10 +452,12 @@ public:
     // game would have to learn about. Kill itself is private, and should stay
     // that way: this is the one narrow door the network is allowed through.
     void KillFromNetwork(const DirectX::XMFLOAT3& direction,
-                         const DirectX::XMFLOAT3& impact) {
+                         const DirectX::XMFLOAT3& impact,
+                         bool fromPlayer = false) {
         if (dead_) return;
         health = 0.0f;
-        Kill(direction, impact, 1.0f, false, RagdollImpactSource::Bullet, {});
+        Kill(direction, impact, 1.0f, false, RagdollImpactSource::Bullet, {},
+             fromPlayer);
     }
 
     // Whether this actor should read as moving on another machine. Taken from
@@ -918,8 +923,10 @@ public:
         if (dead_ || !held_) return false;
         const DirectX::XMFLOAT3 impact = {
             position.x, position.y + footOffset + 1.15f, position.z };
+        // Throwing a held body is a direct player input, so the credit is not
+        // a parameter -- there is no other way to reach this.
         Kill(direction, impact, strength, true,
-             RagdollImpactSource::Throw, "pelvis");
+             RagdollImpactSource::Throw, "pelvis", true);
         return true;
     }
 
@@ -1324,7 +1331,8 @@ public:
                DirectX::XMFLOAT3* hitPoint = nullptr,
                bool* headshot = nullptr,
                float bodyDamage = 20.0f,
-               bool allowHeadshotKill = true) {
+               bool allowHeadshotKill = true,
+               bool fromPlayer = false) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
         bool hitHead = false;
@@ -1342,7 +1350,7 @@ public:
         RegisterThreat(appliedDamage);
         if (health <= 0.0f)
             Kill(direction, impact, 1.0f, false,
-                 RagdollImpactSource::Bullet, hitBody);
+                 RagdollImpactSource::Bullet, hitBody, fromPlayer);
         return true;
     }
 
@@ -1350,7 +1358,8 @@ public:
                       const DirectX::XMFLOAT3& end,
                       const DirectX::XMFLOAT3& direction, float radius,
                       DirectX::XMFLOAT3* hitPoint = nullptr,
-                      std::string* hitBone = nullptr) {
+                      std::string* hitBone = nullptr,
+                      bool fromPlayer = false) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
         std::string struckBody;
@@ -1364,7 +1373,7 @@ public:
         // Harpoons always transition directly into the authored physics pose.
         // The projectile attachment takes ownership of movement immediately.
         Kill(direction, impact, 6.0f, false,
-             RagdollImpactSource::Harpoon, struckBody);
+             RagdollImpactSource::Harpoon, struckBody, fromPlayer);
         return true;
     }
 
@@ -1486,7 +1495,8 @@ public:
     }
 
     bool ApplyExplosion(const DirectX::XMFLOAT3& center, float radius,
-                        float damage, float pushSpeed) {
+                        float damage, float pushSpeed,
+                        bool fromPlayer = false) {
         using namespace DirectX;
         if (dead_ || held_ || !visible || radius <= 0.0f) return false;
         const XMVECTOR blast = XMLoadFloat3(&center);
@@ -1509,7 +1519,7 @@ public:
             XMFLOAT3 impactPosition;
             XMStoreFloat3(&impactPosition, body);
             Kill(direction, impactPosition, 1.0f, false,
-                 RagdollImpactSource::Explosion, "pelvis");
+                 RagdollImpactSource::Explosion, "pelvis", fromPlayer);
         } else {
             knockbackVelocity_.x += direction.x * pushSpeed * falloff;
             knockbackVelocity_.z += direction.z * pushSpeed * falloff;
@@ -1527,7 +1537,8 @@ public:
     }
 
     bool ApplyDebrisImpact(const DestructionDebrisHazard& debris,
-                           DirectX::XMFLOAT3* hitPoint = nullptr) {
+                           DirectX::XMFLOAT3* hitPoint = nullptr,
+                           bool fromPlayer = false) {
         using namespace DirectX;
         if (dead_ || held_ || !visible || debrisHitCooldown_ > 0.0f) return false;
 
@@ -1572,7 +1583,7 @@ public:
         debrisHitCooldown_ = 0.45f;
         if (health <= 0.0f) {
             Kill(direction, impact, 1.0f, debris.lethalImpact,
-                 RagdollImpactSource::Debris);
+                 RagdollImpactSource::Debris, {}, fromPlayer);
         } else {
             const float push = (std::min)(7.0f, speed * 0.65f);
             knockbackVelocity_.x += direction.x * push;
@@ -1581,13 +1592,30 @@ public:
         return true;
     }
 
+    // Who gets credit for this body on the wire. kNoKiller until something
+    // kills it; kLocalPlayerKiller when this machine's player did, which the
+    // host rewrites to a real id before publishing. A client reads it back off
+    // the snapshot and pays out only when it names them.
+    static constexpr uint8_t kNoKiller = 0xFF;
+    static constexpr uint8_t kLocalPlayerKiller = 0xFE;
+    uint8_t netKiller = kNoKiller;
+
     bool Dead() const { return dead_; }
     uint32_t RagdollId() const { return ragdollId_; }
 
-    bool Ignite(float duration = 5.5f) {
+    // `fromPlayer` is latched rather than applied, because the kill arrives
+    // seconds later in UpdateBurning with nothing left in scope to ask. It
+    // only ever climbs: a body the player set alight stays credited even if an
+    // ownerless patch tops the burn up afterwards.
+    //
+    // Fire that spreads body-to-body carries no credit at all -- the patch
+    // SpawnCarriedFire drops has no owner, so the chain of custody ends after
+    // one hop, and the player is not paid for a blaze that spread on its own.
+    bool Ignite(float duration = 5.5f, bool fromPlayer = false) {
         if (dead_ || !visible || duration <= 0.0f) return false;
         const bool newlyIgnited = burnTime_ <= 0.0f;
         burnTime_ = (std::max)(burnTime_, duration);
+        if (fromPlayer) burnCreditedToPlayer_ = true;
         if (newlyIgnited) burnSpreadCooldown_ = 0.55f;
         return newlyIgnited;
     }
@@ -1601,7 +1629,8 @@ public:
         const DirectX::XMFLOAT3 upward{ 0.0f, 1.0f, 0.0f };
         const DirectX::XMFLOAT3 impact{
             position.x, position.y + footOffset + 1.0f, position.z };
-        Kill(upward, impact, 0.35f);
+        Kill(upward, impact, 0.35f, false, RagdollImpactSource::Bullet, {},
+             burnCreditedToPlayer_);
         burnTime_ = 0.0f;
         return true;
     }
@@ -1636,9 +1665,14 @@ public:
         return pending;
     }
 
-    bool ConsumeDeathEvent() {
+    // Hands the payout credit out with the event rather than through a second
+    // getter: one consume means the two can never disagree about which death
+    // they are describing.
+    bool ConsumeDeathEvent(bool* playerCredit = nullptr) {
         const bool pending = deathEventPending_;
+        if (playerCredit) *playerCredit = pending && killCreditPending_;
         deathEventPending_ = false;
+        killCreditPending_ = false;
         return pending;
     }
 
@@ -1729,16 +1763,27 @@ public:
     const std::vector<DirectX::XMFLOAT4X4>& Palette() const { return paletteCPU_; }
 
 private:
+    // `playerCredit` says the local player caused this death, and it defaults
+    // to false on purpose: a route nobody thought about pays nothing rather
+    // than paying wrongly. Only the call sites that can actually see a player
+    // behind the damage pass true.
     void Kill(const DirectX::XMFLOAT3& impulseDirection,
               const DirectX::XMFLOAT3& impactPosition,
               float impulseMultiplier = 1.0f,
               bool lethalImpact = false,
               RagdollImpactSource source = RagdollImpactSource::Bullet,
-              const std::string& struckBone = {}) {
+              const std::string& struckBone = {},
+              bool playerCredit = false) {
         using namespace DirectX;
         dead_ = true;
         held_ = false;
         deathEventPending_ = true;
+        killCreditPending_ = playerCredit;
+        // Sticky, unlike the one-shot above, because the host publishes this
+        // long after the death event has been consumed. kLocalPlayerKiller is a
+        // placeholder: SkinnedEnemy has no business knowing net player ids, so
+        // the host swaps it for its own id as it fills the snapshot.
+        if (playerCredit) netKiller = kLocalPlayerKiller;
         laserCharge_ = 0.0f;
         std::vector<XMFLOAT4X4> globals = poseGlobals_;
         if (globals.empty()) anim.ComputeGlobalMatrices(model.skeleton, globals);
@@ -1874,6 +1919,12 @@ private:
     bool spottedEventPending_ = false;
     bool attackEventPending_ = false;
     bool deathEventPending_ = false;
+    // Rides alongside the death event and is cleared with it, so a payout can
+    // never be read twice or read after the event has been consumed.
+    bool killCreditPending_ = false;
+    // Set when the local player personally lit this body, so the delayed burn
+    // death can still be credited. Never cleared by Ignite: see the note there.
+    bool burnCreditedToPlayer_ = false;
     uint32_t ragdollId_ = UINT32_MAX;
     int handBone_ = -1;
     int headBone_ = -1;
