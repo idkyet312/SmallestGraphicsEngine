@@ -140,13 +140,29 @@ struct HarpoonTetherFX {
 // the renderer can size the streak from the ground covered since the last
 // frame, which is how the bullet tracer measures its own.
 struct RemoteTracerFX {
+    // Visual speed, and deliberately nothing like the 300 m/s the round it
+    // stands for actually flies. At weapon speed a tracer moves 5 m per frame
+    // at 60 Hz and is gone across 180 m in a third of a second -- correct, and
+    // unreadable, which is why shooters draw tracers far slower than their own
+    // bullets. At 140 it covers 2.3 m a frame and the eye can follow it out.
+    //
+    // The round itself is unaffected: damage was settled on the shooter's
+    // machine and reported from there. This is the streak only.
+    static constexpr float kSpeed = 140.0f;
+    // Drawn length. Fixed rather than "ground covered this frame" like the
+    // bullet tracer, which at this speed would leave a 2 m stub: a longer bolt
+    // is what reads as a tracer, and consecutive frames overlap into a
+    // continuous streak instead of a dotted line.
+    static constexpr float kLength = 7.0f;
+
     XMFLOAT3 origin = {};
     XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
-    float speed = 0.0f;
+    float speed = kSpeed;
     float distance = 0.0f;
-    float previousDistance = 0.0f;
     float life = 0.0f;
-    float maxLife = 0.6f;
+    // Long enough to carry the streak ~180 m, matching the reach it had at the
+    // old speed so nothing lost range by slowing down.
+    float maxLife = 1.3f;
 };
 
 struct PinnedHarpoonFX {
@@ -2838,7 +2854,6 @@ struct Scene {
     // to sit behind the same gate, so both live beside the network drain.
     void UpdateRemoteTracers(float dt) {
         for (RemoteTracerFX& tracer : remoteTracers) {
-            tracer.previousDistance = tracer.distance;
             tracer.distance += tracer.speed * dt;
             tracer.life += dt;
         }
@@ -2850,16 +2865,14 @@ struct Scene {
             remoteTracers.end());
     }
 
-    // The visible half of another player's shot. Travels at the same speed a
-    // local round does, so a tracer crossing the field reads at the rate every
-    // other bullet in the game does.
+    // The visible half of another player's shot.
     void SpawnRemoteTracer(const XMFLOAT3& origin, const XMFLOAT3& direction) {
         const XMVECTOR forward = XMLoadFloat3(&direction);
         if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) return;
         RemoteTracerFX tracer;
         tracer.origin = origin;
         XMStoreFloat3(&tracer.direction, XMVector3Normalize(forward));
-        tracer.speed = projectileSpeed;
+        tracer.speed = RemoteTracerFX::kSpeed;
         remoteTracers.push_back(tracer);
     }
 

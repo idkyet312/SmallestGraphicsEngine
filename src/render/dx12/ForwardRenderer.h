@@ -3581,11 +3581,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
         const XMVECTOR origin = XMLoadFloat3(&tracer.origin);
         const XMVECTOR head = origin + fwd * tracer.distance;
-        // Ground covered this frame, clamped exactly as the bullet tracer
-        // clamps its own: visible at high refresh rates, and a frame hitch
-        // cannot stretch it into a beam across the map.
-        const float moved = tracer.distance - tracer.previousDistance;
-        const float len = (std::min)(5.0f, (std::max)(1.2f, moved));
+        // A fixed bolt trailing the head, not the frame's travel. The bullet
+        // tracer sizes itself from how far it moved because it flies at weapon
+        // speed and that distance IS the streak; this one is slowed to be
+        // readable, so the same rule would draw a 2 m stub. Clipped to how far
+        // the tracer has actually gone, so it emerges from the muzzle rather
+        // than starting 7 m behind the gun.
+        const float len = (std::min)(RemoteTracerFX::kLength,
+                                     (std::max)(0.6f, tracer.distance));
         const XMVECTOR center = head - fwd * (len * 0.5f);
 
         XMMATRIX tracerBasis = XMMatrixIdentity();
