@@ -1063,6 +1063,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // fire must not wait on the gameplay gate either.
         ReportLocalShots();
         PresentRemoteShots(deltaTime);
+        UpdateNetworkCharges();
 
         // A downed player keeps simulating. Their health is zero, but they are
         // not out: remote bodies have to keep moving so they can watch a
@@ -2824,7 +2825,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             -projectile.direction.x,
                             -projectile.direction.y,
                             -projectile.direction.z };
-                        scene.StickRemoteCharge(chargeHit, normal);
+                        // Owned by whoever planted it, so a detonator fires
+                        // only its own player's charges. Placed locally right
+                        // away rather than waiting for the round trip -- the
+                        // planter watched it land -- and reported so it appears
+                        // on every other machine too.
+                        const uint8_t chargeOwner = MultiplayerActive()
+                            ? static_cast<uint8_t>(g_netSession.LocalId())
+                            : uint8_t{ 0xFF };
+                        scene.StickRemoteCharge(chargeHit, normal, chargeOwner);
+                        if (MultiplayerActive())
+                            g_netSession.ReportChargeStuck(
+                                chargeHit.x, chargeHit.y, chargeHit.z,
+                                normal.x, normal.y, normal.z);
                         projectile.active = false;
                     }
                     continue;

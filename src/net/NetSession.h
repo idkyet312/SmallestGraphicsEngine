@@ -76,6 +76,19 @@ struct RemoteEnemy {
     bool dead = false;
 };
 
+// A demolition charge another player planted, and the order to fire one
+// player's charges. Both are plain events: the charge is placed once and then
+// sits, and the detonator fires whatever its owner has out.
+struct RemoteChargeStuck {
+    PlayerId owner = kInvalidPlayerId;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+};
+
+struct RemoteChargeDetonate {
+    PlayerId owner = kInvalidPlayerId;
+};
+
 // A round another player fired, for presentation only. Never carries damage:
 // what a shot hits is settled by the hit-report path, and a receiver that acted
 // on this would apply the same round twice.
@@ -298,6 +311,8 @@ public:
         hostEnemies_.clear();
         remoteEnemies_.clear();
         remoteShots_.clear();
+        chargeSticks_.clear();
+        chargeDetonations_.clear();
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             hostHelicopters_[i] = EnemyHelicopterState{};
             remoteHelicopters_[i] = EnemyHelicopterState{};
@@ -1067,6 +1082,57 @@ public:
         out.swap(remoteShots_);
     }
 
+    // A charge this machine's player just stuck to something. The host places
+    // it and tells everyone; a client asks the host to. Either way the charge
+    // appears on every machine from the one committed event, so nobody is
+    // holding a charge the others cannot see.
+    void ReportChargeStuck(float x, float y, float z,
+                           float nx, float ny, float nz) {
+        if (!Active() || !transport_ || localId_ == kInvalidPlayerId ||
+            !Finite3(x, y, z) || !Finite3(nx, ny, nz)) return;
+        if (role_ == Role::Host) {
+            chargeSticks_.push_back({ localId_, x, y, z, nx, ny, nz });
+            ServerChargeStuckMessage message;
+            message.owner = localId_;
+            message.x = x; message.y = y; message.z = z;
+            message.nx = nx; message.ny = ny; message.nz = nz;
+            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientChargeStuckMessage message;
+        message.x = x; message.y = y; message.z = z;
+        message.nx = nx; message.ny = ny; message.nz = nz;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // This machine's player pressed the detonator.
+    void ReportChargeDetonate() {
+        if (!Active() || !transport_ || localId_ == kInvalidPlayerId) return;
+        if (role_ == Role::Host) {
+            chargeDetonations_.push_back({ localId_ });
+            ServerChargeDetonateMessage message;
+            message.owner = localId_;
+            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientChargeDetonateMessage message;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    void DrainChargeSticks(std::vector<RemoteChargeStuck>& out) {
+        out.clear();
+        out.swap(chargeSticks_);
+    }
+
+    void DrainChargeDetonations(std::vector<RemoteChargeDetonate>& out) {
+        out.clear();
+        out.swap(chargeDetonations_);
+    }
+
     // Client-side: the gunship state the host last sent, or nullptr before the
     // first one arrives -- which is the signal to leave the local craft alone
     // rather than snapping it to an all-zero pose at the origin.
@@ -1443,6 +1509,18 @@ private:
         case MessageType::ServerVehicleState:
             if (role_ == Role::Client) HandleVehicleState(event);
             break;
+        case MessageType::ClientChargeStuck:
+            if (role_ == Role::Host) HandleClientChargeStuck(event);
+            break;
+        case MessageType::ServerChargeStuck:
+            if (role_ == Role::Client) HandleServerChargeStuck(event);
+            break;
+        case MessageType::ClientChargeDetonate:
+            if (role_ == Role::Host) HandleClientChargeDetonate(event);
+            break;
+        case MessageType::ServerChargeDetonate:
+            if (role_ == Role::Client) HandleServerChargeDetonate(event);
+            break;
         case MessageType::ClientShotFired:
             if (role_ == Role::Host) HandleClientShotFired(event);
             break;
@@ -1810,6 +1888,55 @@ private:
             out.health = source.health;
         }
         transport_->Broadcast(&message, sizeof(message), Channel::Unreliable);
+    }
+
+    void HandleClientChargeStuck(Event& event) {
+        if (event.payload.size() < sizeof(ClientChargeStuckMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        ClientChargeStuckMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (!Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.nx, message.ny, message.nz)) return;
+        chargeSticks_.push_back({ it->second, message.x, message.y, message.z,
+                                  message.nx, message.ny, message.nz });
+        ServerChargeStuckMessage out;
+        out.owner = it->second;
+        out.x = message.x; out.y = message.y; out.z = message.z;
+        out.nx = message.nx; out.ny = message.ny; out.nz = message.nz;
+        transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+    }
+
+    void HandleServerChargeStuck(Event& event) {
+        if (event.payload.size() < sizeof(ServerChargeStuckMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerChargeStuckMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        // The planter already stuck its own charge when it landed.
+        if (message.owner == localId_) return;
+        if (!Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.nx, message.ny, message.nz)) return;
+        chargeSticks_.push_back({ message.owner, message.x, message.y,
+                                  message.z, message.nx, message.ny,
+                                  message.nz });
+    }
+
+    void HandleClientChargeDetonate(Event& event) {
+        if (event.payload.size() < sizeof(ClientChargeDetonateMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        chargeDetonations_.push_back({ it->second });
+        ServerChargeDetonateMessage out;
+        out.owner = it->second;
+        transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+    }
+
+    void HandleServerChargeDetonate(Event& event) {
+        if (event.payload.size() < sizeof(ServerChargeDetonateMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerChargeDetonateMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        chargeDetonations_.push_back({ message.owner });
     }
 
     void HandleClientShotFired(Event& event) {
@@ -2235,6 +2362,8 @@ private:
     std::vector<HostEnemyState> hostEnemies_;
     std::vector<RemoteEnemy> remoteEnemies_;
     std::vector<RemoteShot> remoteShots_;
+    std::vector<RemoteChargeStuck> chargeSticks_;
+    std::vector<RemoteChargeDetonate> chargeDetonations_;
     EnemyHelicopterState hostHelicopters_[kEnemyHelicopterCount]{};
     EnemyHelicopterState remoteHelicopters_[kEnemyHelicopterCount]{};
     bool hasHostHelicopters_ = false;

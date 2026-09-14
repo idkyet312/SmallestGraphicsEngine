@@ -56,8 +56,17 @@ static void ProcessInput(HWND) {
         // blast it queues is not resolved until the projectile pass later this
         // frame -- by which time the charge that authorised the demolition is
         // already gone. See CommTowerDamageAllowed.
-        MarkCommTowersRiggedForDemolition();
-        scene.DetonateRemoteCharges();
+        // In a session the press is reported and nothing happens here. The
+        // committed order comes back and fires this player's charges on every
+        // machine at once, including this one -- detonating locally as well
+        // would blow them twice on the presser's screen, and on a client would
+        // queue a blast that damages a world the host has not agreed to.
+        if (MultiplayerActive()) {
+            g_netSession.ReportChargeDetonate();
+        } else {
+            MarkCommTowersRiggedForDemolition();
+            scene.DetonateRemoteCharges();
+        }
     }
     scene.c4DetonateHeld = c4DetonateRequested;
 

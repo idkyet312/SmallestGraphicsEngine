@@ -360,6 +360,8 @@ static void UpdateNetworkWorldImpacts() {
 }
 
 static std::vector<net::RemoteShot> g_netRemoteShots;
+static std::vector<net::RemoteChargeStuck> g_netChargeSticks;
+static std::vector<net::RemoteChargeDetonate> g_netChargeDetonations;
 // Last shot count this machine has already put on the wire. Compared rather
 // than hooked, so Scene stays unaware that a session exists.
 static uint32_t g_netLastReportedShot = 0;
@@ -410,6 +412,42 @@ static void PresentRemoteShots(float deltaTime) {
         scene.SpawnWeaponSmoke(muzzle, direction, 0.55f);
         g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.8f,
                           0.98f + ((float)std::rand() / RAND_MAX) * 0.05f);
+    }
+}
+
+// Demolition charges, both halves. A charge used to be planted and fired
+// entirely locally: nobody else could see one stuck to a wall, and pressing the
+// detonator brought the target down on the presser's screen alone.
+//
+// The blast itself stays host-authoritative, like every other explosion here.
+// Only the host queues the blast projectile -- that is what damages the world
+// and reports the damage -- and the result reaches everyone through the
+// world-break path already carrying craters and broken props. Clients drop the
+// charges and show the burst so the explosion is not silent and invisible where
+// it happens.
+static void UpdateNetworkCharges() {
+    if (!MultiplayerActive()) return;
+    g_netSession.DrainChargeSticks(g_netChargeSticks);
+    for (const net::RemoteChargeStuck& stuck : g_netChargeSticks) {
+        // The planter placed its own the moment the charge landed; this is
+        // everyone else catching up.
+        if (stuck.owner == g_netSession.LocalId()) continue;
+        scene.StickRemoteCharge({ stuck.x, stuck.y, stuck.z },
+                                { stuck.nx, stuck.ny, stuck.nz },
+                                static_cast<uint8_t>(stuck.owner));
+    }
+
+    const bool authoritative =
+        g_netSession.CurrentRole() == net::Role::Host;
+    g_netSession.DrainChargeDetonations(g_netChargeDetonations);
+    for (const net::RemoteChargeDetonate& fired : g_netChargeDetonations) {
+        // Rigged towers are recorded before the charges are cleared, for the
+        // same reason the local detonator does it: the blast is not resolved
+        // until the projectile pass later this frame, by which point the charge
+        // that authorised the demolition is gone.
+        if (authoritative) MarkCommTowersRiggedForDemolition();
+        scene.DetonateRemoteChargesFor(static_cast<uint8_t>(fired.owner),
+                                       authoritative);
     }
 }
 

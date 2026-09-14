@@ -34,6 +34,10 @@ namespace net {
 //    a resolved sculpt stamp, so an explosion leaves the same hole on every
 //    machine instead of each one cutting its own from its own tunables.
 // 10: each player publishes their insertion helicopter for remote rendering.
+// 15: demolition charges are session state. Where one is planted and the
+//     moment its owner fires it both replicate, so a charge rigged by one
+//     player is on the wall for everyone and brings the target down for
+//     everyone rather than only for whoever pressed the detonator.
 // 14: players publish whether they are aiming, so a remote body raises its
 //     weapon into a sighted hold instead of carrying it lowered whatever its
 //     owner is doing.
@@ -47,7 +51,7 @@ namespace net {
 //     objectives a charge is the only thing allowed to destroy -- the comm
 //     tower, the objective aircraft -- replicate instead of collapsing on the
 //     machine that set the charge and standing on every other one.
-inline constexpr uint32_t kProtocolVersion = 14;
+inline constexpr uint32_t kProtocolVersion = 15;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -93,6 +97,10 @@ enum class MessageType : uint8_t {
     ServerVehicleState,       // host -> clients, unreliable, every net tick
     ClientShotFired,          // client -> host, unreliable
     ServerShotFired,          // host -> clients, unreliable
+    ClientChargeStuck,        // client -> host, reliable
+    ServerChargeStuck,        // host -> clients, reliable
+    ClientChargeDetonate,     // client -> host, reliable
+    ServerChargeDetonate,     // host -> clients, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -347,6 +355,35 @@ struct ServerShotFiredMessage {
     uint8_t padding[3] = {};
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+};
+
+// A demolition charge has stuck to something. Reliable: a charge is placed once
+// and then sits there, so a dropped packet would leave it invisible on one
+// machine and standing on the wall on every other.
+struct ClientChargeStuckMessage {
+    MessageHeader header{ MessageType::ClientChargeStuck, {} };
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+};
+
+struct ServerChargeStuckMessage {
+    MessageHeader header{ MessageType::ServerChargeStuck, {} };
+    PlayerId owner = kInvalidPlayerId;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+};
+
+// The detonator. Carries no position -- it fires every charge its owner has
+// planted, which is what the button does locally.
+struct ClientChargeDetonateMessage {
+    MessageHeader header{ MessageType::ClientChargeDetonate, {} };
+};
+
+struct ServerChargeDetonateMessage {
+    MessageHeader header{ MessageType::ServerChargeDetonate, {} };
+    PlayerId owner = kInvalidPlayerId;
+    uint8_t padding[3] = {};
 };
 
 // A client's round connected with an enemy. Same shooter-authoritative bargain

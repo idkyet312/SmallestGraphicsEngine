@@ -174,6 +174,10 @@ struct PinnedHarpoonFX {
 struct RemoteCharge {
     XMFLOAT3 position = {};
     XMFLOAT3 normal = { 0.0f, 1.0f, 0.0f };
+    // Who planted it. A detonator only fires its owner's charges, so two
+    // players can rig separate targets and blow them independently. 0xFF is
+    // "this machine's own", which is what an offline game plants.
+    uint8_t owner = 0xFF;
 };
 
 struct FirePatch {
@@ -2309,7 +2313,8 @@ struct Scene {
         gunRecoilBack = (std::min)(0.08f, gunRecoilBack + 0.035f);
     }
 
-    void StickRemoteCharge(const XMFLOAT3& position, const XMFLOAT3& normal) {
+    void StickRemoteCharge(const XMFLOAT3& position, const XMFLOAT3& normal,
+                           uint8_t owner = 0xFF) {
         if (remoteCharges.size() >= 12) remoteCharges.erase(remoteCharges.begin());
         RemoteCharge charge;
         charge.position = {
@@ -2317,20 +2322,41 @@ struct Scene {
             position.y + normal.y * 0.035f,
             position.z + normal.z * 0.035f };
         charge.normal = normal;
+        charge.owner = owner;
         remoteCharges.push_back(charge);
     }
 
-    void DetonateRemoteCharges() {
+    // Fires one player's charges. `spawnBlast` is what separates the machine
+    // that owns the explosion from the ones merely watching it: the blast
+    // projectile is what damages the world and reports that damage, so only the
+    // authoritative machine may queue it. Everyone else drops the charges and
+    // shows the burst, and receives the damage through the same world-break
+    // path every other explosion already uses.
+    void DetonateRemoteChargesFor(uint8_t owner, bool spawnBlast) {
         for (const RemoteCharge& charge : remoteCharges) {
-            Projectile blast = {};
-            blast.position = blast.previousPosition = charge.position;
-            blast.grenade = true;
-            blast.remoteCharge = true;
-            blast.detonate = true;
-            blast.active = false;
-            projectiles.push_back(blast);
+            if (charge.owner != owner) continue;
+            if (spawnBlast) {
+                Projectile blast = {};
+                blast.position = blast.previousPosition = charge.position;
+                blast.grenade = true;
+                blast.remoteCharge = true;
+                blast.detonate = true;
+                blast.active = false;
+                projectiles.push_back(blast);
+            } else {
+                SpawnExplosionFX(charge.position, 5.5f);
+            }
         }
-        remoteCharges.clear();
+        remoteCharges.erase(
+            std::remove_if(remoteCharges.begin(), remoteCharges.end(),
+                [owner](const RemoteCharge& charge) {
+                    return charge.owner == owner;
+                }),
+            remoteCharges.end());
+    }
+
+    void DetonateRemoteCharges() {
+        DetonateRemoteChargesFor(0xFF, true);
     }
 
     void ShootFlameBurst() {
