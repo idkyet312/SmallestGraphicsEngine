@@ -33,25 +33,22 @@ static bool ArmoryAttachmentOwned(const std::string& id) {
     return g_ownedAttachments.find(id) != g_ownedAttachments.end();
 }
 
-// Drops every rental, so the next trip to the armory charges for the kit again.
-// Called as the deploy screen opens rather than as a run ends: a mission that is
-// restarted from its own planning screen must not bill twice for the same
-// deployment, and opening the screen is the one point that is reached exactly
-// once per attempt at buying a loadout.
+// Strips the player back to what is issued rather than bought: the demolition
+// charge in both weapon slots, a frag, and no gear or attachments. Shared by
+// the deploy screen and by walking into the base, which are the two points
+// where a kit stops being paid for.
 //
-// Standard-issue items are unaffected -- they are priced at zero, so the Owned
-// helpers above return true for them without consulting these masks at all.
-static void ClearMissionRentals() {
+// Does NOT touch the base kit -- callers decide whether kit bought at a counter
+// survives, because arriving at the base and leaving it for a mission want
+// opposite answers.
+static void IssueStandardKit() {
     g_ownedWeapons = 0;
     g_ownedGrenades = 0;
     g_ownedGear = 0;
     g_ownedAttachments.clear();
-    // Clearing the paid-for flags is only half of it: the loadout keeps whatever
-    // was equipped last mission, so without this the player would still be
-    // holding a weapon they no longer have a rental for and would deploy with it
-    // free. Reset to standard issue, which is the kit that costs nothing.
     MissionLoadout& loadout = g_game.mission.Loadout();
-    loadout.weapons = { MissionLoadout::kDefaultPrimaryWeapon, 1 };
+    loadout.weapons = { MissionLoadout::kIssuedChargeWeapon,
+                        MissionLoadout::kIssuedChargeWeapon };
     loadout.grenade = GrenadeType::Frag;
     loadout.gear = GearType::None;
     // Attachments hang off the weapon instances rather than the loadout, so
@@ -61,11 +58,45 @@ static void ClearMissionRentals() {
              slot < static_cast<uint8_t>(SGE::AttachmentSlot::Count); ++slot)
             scene.player.weapons.RemoveAttachment(
                 weapon, static_cast<SGE::AttachmentSlot>(slot));
+}
+
+// Empties the player's hands as they walk into the base. Kit is hired for one
+// mission, so coming home ends the hire: the counter sells the next loadout out
+// of the balance the last run earned, which is the whole shape of the economy
+// now that no firearm is standard issue.
+static void IssueBaseKit() {
+    IssueStandardKit();
+    // A kit bought at the counter and then abandoned without deploying is not
+    // owed back on the next visit -- it was never charged to a mission.
+    g_baseKitPending = false;
+    g_baseKitFitted.clear();
+    GunModel::ConfigureLoadout(MissionLoadout::kIssuedChargeWeapon,
+                               MissionLoadout::kIssuedChargeWeapon);
+    scene.selectedGrenade = GrenadeType::Frag;
+}
+
+// Drops every rental, so the next trip to the armory charges for the kit again.
+// Called as the deploy screen opens rather than as a run ends: a mission that is
+// restarted from its own planning screen must not bill twice for the same
+// deployment, and opening the screen is the one point that is reached exactly
+// once per attempt at buying a loadout.
+//
+// Standard-issue items are unaffected -- they are priced at zero, so the Owned
+// helpers above return true for them without consulting these masks at all.
+static void ClearMissionRentals() {
+    // Clearing the paid-for flags is only half of it: the loadout keeps whatever
+    // was equipped last mission, so without this the player would still be
+    // holding a weapon they no longer have a rental for and would deploy with it
+    // free. IssueStandardKit resets to the empty kit -- the charge in both
+    // slots -- which is the only firearm-free state now that the AK-74 is
+    // priced like everything else.
+    IssueStandardKit();
+    MissionLoadout& loadout = g_game.mission.Loadout();
 
     // Kit hired at the base was bought FOR this deployment, so it survives the
     // reset above and comes back paid for. Restored after the wipe rather than
     // guarded around it so a slot the player never outfitted at the counter
-    // still falls back to standard issue.
+    // still falls back to the issued charge.
     if (!g_baseKitPending) return;
     g_baseKitPending = false;
     loadout = g_baseKitLoadout;

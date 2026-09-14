@@ -715,6 +715,15 @@ static void UpdateImpactDecals(float dt) {
 }
 
 GunAudio                    g_gunAudio;
+// The M9 has a report of its own -- a pistol shot rather than the rifle crack
+// every other slot borrows from g_gunAudio.
+GunAudio                    g_m9Audio;
+// Same for the R700: a bolt-action report of its own.
+GunAudio                    g_r700Audio;
+// And the shotgun: a shell, not a rifle round.
+GunAudio                    g_shotgunAudio;
+// And the AK-74, the first rifle slot with a report of its own.
+GunAudio                    g_ak74Audio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;

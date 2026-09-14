@@ -554,8 +554,12 @@ public:
 
     // The two chosen weapons. C4 is carried on top of these -- see
     // LoadoutAllows/CycleWeapon, which treat it as always available.
+    // Both slots start on the charge: nothing is issued free any more, so the
+    // player's hands are empty until the armory sells them something. See
+    // MissionLoadout::Empty, which is the same state on the mission side.
     static std::array<int, 2>& LoadoutWeapons() {
-        static std::array<int, 2> weapons{{ kDefaultWeapon, 1 }};
+        static std::array<int, 2> weapons{
+            { kRemoteChargeWeapon, kRemoteChargeWeapon }};
         return weapons;
     }
     static bool& LoadoutRestricted() {
@@ -570,7 +574,12 @@ public:
         return weapon == weapons[0] || weapon == weapons[1];
     }
     static bool ConfigureLoadout(int primary, int secondary) {
-        if (primary == secondary || !WeaponLoaded(primary) ||
+        // Duplicate slots stall the weapon cycle, so they are rejected -- with
+        // the one exception of the charge in both, which is the empty kit a
+        // player who bought nothing deploys with.
+        const bool emptyKit = primary == kRemoteChargeWeapon &&
+                              secondary == kRemoteChargeWeapon;
+        if ((primary == secondary && !emptyKit) || !WeaponLoaded(primary) ||
             !WeaponLoaded(secondary))
             return false;
         LoadoutWeapons() = {{ primary, secondary }};

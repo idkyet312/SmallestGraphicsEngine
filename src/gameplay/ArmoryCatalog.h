@@ -12,10 +12,18 @@
 // (the deploy screen), which keeps this header free of game state and testable
 // on its own.
 //
-// Ordering the tiers: the issued rifle is free so a player who spends their
-// whole balance can still deploy armed. Everything above it is priced against
-// the kill reward (MoneySystem::kEnemyKillReward, 120) -- a mid-tier weapon is
-// roughly a dozen kills, the RPG is a comm tower.
+// Ordering the tiers: every firearm is bought, including the AK-74 that used to
+// be handed out free as "standard issue". The starting balance
+// (MoneySystem::kStartingBalance, 2000) is the first loadout's budget rather
+// than pocket money on top of a free rifle, so the opening choice is a real one
+// -- one good weapon, or two cheap ones. Prices are set against the kill reward
+// (MoneySystem::kEnemyKillReward, 120): a mid-tier weapon is roughly a dozen
+// kills, the RPG is a comm tower.
+//
+// The remote charge (slot 5) stays at zero and stays the exception. It is
+// demolition kit issued on every mission rather than a weapon choice -- see
+// GunModel::kRemoteChargeWeapon -- and pricing it would make a demolition
+// objective unreachable for a player who spent their balance on rifles.
 
 #include <cstdint>
 
@@ -38,7 +46,7 @@ struct ArmoryCatalog {
         3100,   // 7  Mako Harpoon Gun (debug)
         3000,   // 8  R700 Suppressed (retired)
         1500,   // 9  M4A1
-        0,      // 10 AK-74 (standard issue)
+        800,    // 10 AK-74
         700,    // 11 M9
     };
 
@@ -55,13 +63,15 @@ struct ArmoryCatalog {
         "Flamethrower. Development hardware.",
         "Harpoon launcher. Development hardware.",
         "Retired from service.",
-        "Carbine. Flatter recoil than the issue rifle and faster to aim.",
-        "Standard issue rifle. Drawn from stores at no cost.",
+        "Carbine. Flatter recoil than the AK and faster to aim.",
+        "Battle rifle. Heavy round, steady cadence, takes every rail.",
         "Sidearm. Draws and reloads faster than any rifle, and hits softer.",
     };
 
     static constexpr int kGrenadeCount = 3;
-    // Frag is the issued grenade and free for the same reason the AK-74 is.
+    // Frag stays free, on the same terms as the remote charge: it is the
+    // issued grenade rather than a purchase, so a player who spent everything
+    // on a rifle still has something to throw.
     static constexpr int kGrenadePrices[kGrenadeCount] = { 0, 450, 1200 };
     static constexpr const char* kGrenadeNames[kGrenadeCount] = {
         "Frag Grenade", "Molotov Cocktail", "Vortex Grenade"

@@ -47,6 +47,15 @@ struct WeaponDefinition {
 
     std::string viewModelAsset;
     std::string hudIconAsset;
+    // One shot per trigger pull. Held-trigger auto-fire skips a weapon marked
+    // this way and the click handler fires it instead, so the cadence is the
+    // player's finger rather than fireIntervalSeconds -- the interval still
+    // applies as the floor between shots, it just stops being the whole story.
+    //
+    // Last member on purpose: the definition table below is positional
+    // aggregate initialisation, so a field added anywhere else would silently
+    // shift every value after it in all twelve rows.
+    bool semiAutomatic = false;
 };
 
 struct AttachmentModifier {
@@ -108,6 +117,9 @@ struct ResolvedWeaponStats {
     bool suppressed = false;
     bool redDotSight = false;
     bool laserSight = false;
+    // Carried through from the definition. No attachment changes it: a can on
+    // the muzzle does not make a self-loading pistol fire from a held trigger.
+    bool semiAutomatic = false;
 };
 
 class WeaponCustomizationSystem {
@@ -179,10 +191,15 @@ public:
             // trades reach and magazine for the fastest draw in the armory:
             // half the reload time of the rifles and the lowest damage, so it
             // is a backup rather than a competitor to a primary.
+            //
+            // Semi-automatic, and the only weapon in the table that is: it is a
+            // self-loading pistol, so holding the trigger fires once. The final
+            // `true` is the semiAutomatic flag -- the rest of the table leaves
+            // it defaulted off and keeps firing from a held trigger.
             { "m9", "M9", 11, 15, 60, 120, 1.05f, 0.12f, 0.8f,
               240.0f, 0.62f, 0.26f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 26.0f, 1.4f, false,
-              "Content/Models/MainPlayer/Guns/m9/M9.glb", "" },
+              "Content/Models/MainPlayer/Guns/m9/M9.glb", "", true },
         }};
 
         const uint32_t ak = 1u << 0;
@@ -345,6 +362,7 @@ public:
         result.adsFovDegrees = definition->adsFovDegrees;
         result.penetrationPower = definition->penetrationPower;
         result.suppressed = definition->suppressed;
+        result.semiAutomatic = definition->semiAutomatic;
 
         std::array<const AttachmentDefinition*,
             static_cast<size_t>(AttachmentSlot::Count)> ordered{};

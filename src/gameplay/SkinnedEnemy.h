@@ -43,7 +43,20 @@ extern float g_enemyVisionScale;
 
 // A loud, momentary sound (gunfire, explosion) enemies can hear through walls.
 // Populated fresh each frame by main.cpp and drained by every enemy's Update.
-struct EnemyNoiseEvent { DirectX::XMFLOAT3 position; float radius; };
+// Player-originated shots carry a source bit so a heard shot can select the
+// player as the combat target even when another hostile is closer.
+struct EnemyNoiseEvent {
+    DirectX::XMFLOAT3 position;
+    float radius;
+    bool playerOwned = false;
+
+    bool AudibleAt(const DirectX::XMFLOAT3& listener) const {
+        const float dx = position.x - listener.x;
+        const float dy = position.y - listener.y;
+        const float dz = position.z - listener.z;
+        return dx * dx + dy * dy + dz * dz <= radius * radius;
+    }
+};
 extern std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 
 // Pushed by an enemy the instant it takes damage, so squadmates within radius
@@ -206,6 +219,15 @@ public:
         lastKnownTarget_ = target;
     }
 
+    void ForcePlayerGunshotTarget(const DirectX::XMFLOAT3& target) {
+        ForceCombatTarget(target);
+        playerGunshotMemoryTimer_ = 4.0f;
+    }
+
+    bool PlayerGunshotMemoryActive() const {
+        return playerGunshotMemoryTimer_ > 0.0f;
+    }
+
     // TEMP DEBUG: exposes the rifle firing gate so the ImGui panel can show
     // why an actor is or is not shooting. Remove once marine fire is verified.
     bool DebugPreparingShot() const { return preparingShot_; }
@@ -232,6 +254,7 @@ public:
     // quote a distance without duplicating the constant.
     static constexpr float BaseVisionRange() { return kVisionRange; }
     static float AlertBroadcastRadius() { return kAlertBroadcastRadius; }
+    static constexpr float GunshotHearingRadius() { return kGunshotHearingRadius; }
     float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
 
     // Optional authored patrol path. Leave unset and an enemy wanders in a
@@ -511,6 +534,8 @@ public:
 
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
         if (dead_) return;
+        playerGunshotMemoryTimer_ =
+            (std::max)(0.0f, playerGunshotMemoryTimer_ - dt);
         const DirectX::XMFLOAT3 locomotionStart = position;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
@@ -962,8 +987,15 @@ public:
         // anywhere on the island, through terrain. It keeps its advantages --
         // no forward cone (the turret traverses) and a much longer reach than a
         // man on foot, since it is elevated behind a mounted optic -- but it now
-        // has to actually be able to see you.
+        // has to actually be able to see you or hear a nearby gunshot.
         if (turretGunner) {
+            // Turrets traverse freely when they see a target, but hearing is
+            // still what lets a nearby shot wake one behind cover. Keep this
+            // before the visual range gate so the turret does not lose the
+            // shared gunshot channel used by infantry.
+            for (const EnemyNoiseEvent& noise : g_enemyNoiseEvents) {
+                if (noise.AudibleAt(position)) return true;
+            }
             if (distSq > kTurretGunnerVisionRange * kTurretGunnerVisionRange)
                 return false;
             if (distSq <= 1e-6f) return true;
@@ -986,16 +1018,22 @@ public:
             }
         }
         for (const EnemyNoiseEvent& noise : g_enemyNoiseEvents) {
-            const float nx = noise.position.x - position.x;
-            const float nz = noise.position.z - position.z;
-            const float radius = noise.radius;
-            if (nx * nx + nz * nz <= radius * radius) return true;
+            if (noise.AudibleAt(position)) return true;
         }
         for (const EnemyAlertEvent& alert : g_enemyAlertEvents) {
             const float ax = alert.position.x - position.x;
             const float az = alert.position.z - position.z;
             const float radius = alert.radius;
             if (ax * ax + az * az <= radius * radius) return true;
+        }
+        return false;
+    }
+
+    bool HeardPlayerGunshot() const {
+        if (dead_ || held_) return false;
+        for (const EnemyNoiseEvent& noise : g_enemyNoiseEvents) {
+            if (!noise.playerOwned) continue;
+            if (noise.AudibleAt(position)) return true;
         }
         return false;
     }
@@ -1942,6 +1980,7 @@ private:
     DirectX::XMFLOAT3 lastKnownTarget_{ 0.0f, 0.0f, 0.0f };
     float alertTimer_ = 0.0f;
     float combatMemoryTimer_ = 0.0f;
+    float playerGunshotMemoryTimer_ = 0.0f;
     bool spawnCaptured_ = false;
     DirectX::XMFLOAT3 spawnPosition_{ 0.0f, 0.0f, 0.0f };
     std::vector<DirectX::XMFLOAT3> patrolRoute_;
@@ -1957,6 +1996,7 @@ private:
     static constexpr float kTurretGunnerVisionRange = 70.0f;
     static constexpr float kVisionHalfFovCos = 0.173648f; // cos(80 deg): 160 deg cone
     static constexpr float kAlertBroadcastRadius = 19.0f;
+    static constexpr float kGunshotHearingRadius = 40.0f;
 
     // Applies damageTakenScale to an incoming hit.
     //

@@ -710,14 +710,19 @@ static bool DrawArmoryRow(const char* name, const char* blurb, int price,
     // The row is one selectable spanning the full width with the text drawn
     // over it, so the whole card is the click target rather than a button
     // tucked at one end.
-    constexpr float kRowHeight = 46.0f;
+    constexpr float kRowHeight = 52.0f;
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
     const float rowWidth = ImGui::GetContentRegionAvail().x;
+    const ImVec4 rowBase = equipped ? ImVec4(0.18f, 0.18f, 0.18f, 1.0f)
+                                    : ImVec4(0.075f, 0.082f, 0.075f, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Header,
-                          equipped ? UITheme::kAccentDim
-                                   : UITheme::kControlHeld);
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UITheme::kControlHover);
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, UITheme::kAccentDim);
+                          rowBase);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+                          equipped ? ImVec4(0.25f, 0.25f, 0.25f, 1.0f)
+                                   : UITheme::kControlHover);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,
+                          equipped ? ImVec4(0.31f, 0.31f, 0.31f, 1.0f)
+                                   : UITheme::kAccentDim);
     // Equipped rows stay highlighted; unaffordable ones are inert so the
     // player cannot commit to something the balance will refuse.
     ImGui::BeginDisabled(!affordable);
@@ -728,24 +733,31 @@ static bool DrawArmoryRow(const char* name, const char* blurb, int price,
     ImGui::PopStyleColor(3);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRect(rowStart, ImVec2(rowStart.x + rowWidth,
+                                   rowStart.y + kRowHeight),
+                  IM_COL32(108, 116, 100, affordable ? 150 : 70), 0.0f, 0, 1.0f);
+    draw->AddRectFilled(rowStart, ImVec2(rowStart.x + 3.0f,
+                                         rowStart.y + kRowHeight),
+                        equipped ? IM_COL32(255, 255, 255, 255)
+                                 : IM_COL32(118, 128, 107, 150));
+    draw->PushClipRect(rowStart, ImVec2(rowStart.x + rowWidth,
+                                        rowStart.y + kRowHeight), true);
     const float textX = rowStart.x + 10.0f;
     // Dim the whole card when it is out of reach, so "cannot afford" reads
     // at a glance instead of only from the price.
     const ImVec4& nameColor = !affordable ? UITheme::kTextDim
-                            : equipped    ? UITheme::kAccent
+                            : equipped    ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
                                           : UITheme::kText;
-    draw->AddText(ImVec2(textX, rowStart.y + 6.0f),
-                  ImGui::GetColorU32(nameColor), name);
 
     // Price, right-aligned. Owned items show their status rather than a
     // number -- the money is already spent, and repeating the price would
     // read as a charge that is about to happen again.
     char priceText[32];
     const char* rightText = priceText;
-    ImVec4 rightColor = UITheme::kWarning;
+    ImVec4 rightColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
     if (equipped) {
         rightText = "EQUIPPED";
-        rightColor = UITheme::kAccent;
+        rightColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
     } else if (owned) {
         rightText = price > 0 ? "OWNED" : "ISSUED";
         rightColor = UITheme::kTextDim;
@@ -754,9 +766,15 @@ static bool DrawArmoryRow(const char* name, const char* blurb, int price,
         if (!affordable) rightColor = ImVec4(0.75f, 0.32f, 0.28f, 1.0f);
     }
     const float rightWidth = ImGui::CalcTextSize(rightText).x;
+    draw->PushClipRect(rowStart,
+        ImVec2((std::max)(rowStart.x, rowStart.x + rowWidth - rightWidth - 24.0f),
+               rowStart.y + kRowHeight), true);
+    draw->AddText(ImVec2(textX + 2.0f, rowStart.y + 7.0f),
+                  ImGui::GetColorU32(nameColor), name);
+    draw->PopClipRect();
     draw->AddText(
-        ImVec2(rowStart.x + rowWidth - rightWidth - 10.0f,
-               rowStart.y + 6.0f),
+        ImVec2(rowStart.x + rowWidth - rightWidth - 12.0f,
+               rowStart.y + 7.0f),
         ImGui::GetColorU32(rightColor), rightText);
 
     // Second line: the shop copy, or why the row cannot be taken. The
@@ -765,8 +783,9 @@ static bool DrawArmoryRow(const char* name, const char* blurb, int price,
     const char* subText = blurb;
     if (equipped && equippedNote) subText = equippedNote;
     else if (!affordable) subText = "Insufficient funds.";
-    draw->AddText(ImVec2(textX, rowStart.y + 25.0f),
+    draw->AddText(ImVec2(textX + 2.0f, rowStart.y + 29.0f),
                   ImGui::GetColorU32(UITheme::kTextDim), subText);
+    draw->PopClipRect();
 
     ImGui::PopID();
     return pressed && affordable;
@@ -1146,10 +1165,13 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
 
     // Mission briefing. Left-hand side, where the zone markers already refuse to
     // take clicks past display.x - 430, so it never fights the planning panel.
-    // Drawn only when the level actually carries a tower: on a map without one
-    // there is no objective to brief, and a hardcoded dossier would be a lie.
+    // Drawn only when the level actually carries an objective: on a map with
+    // neither a mast nor an aircraft there is nothing to brief, and a hardcoded
+    // dossier would be a lie. Each objective the map authors writes its own
+    // dossier, so the airfield does not inherit the relay operation's copy.
     const uint32_t standingTowers = CountStandingCommTowers();
-    if (standingTowers > 0) {
+    const uint32_t objectivePlanes = CountObjectivePlanes();
+    if (standingTowers > 0 || objectivePlanes > 0) {
         ImGui::SetNextWindowPos(ImVec2(24.0f, 110.0f),
                                 ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(430.0f, (std::max)(180.0f, display.y - 146.0f)), ImGuiCond_Always);
@@ -1161,34 +1183,94 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(0.45f, 0.52f, 0.48f, 1.0f),
                            "CLASSIFIED // EYES ONLY");
         ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextColored(UITheme::kText, "OPERATION BLACKOUT");
+        ImGui::TextColored(UITheme::kText, standingTowers > 0
+            ? "OPERATION BLACKOUT" : "OPERATION GROUNDSWELL");
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0.0f, 4.0f));
-        ImGui::TextColored(UITheme::kText, "SITUATION");
-        ImGui::TextWrapped(
-            "The garrison on this island is not fighting alone. A hardened relay "
-            "mast on the ridge ties their patrols to the mainland battery. "
-            "Every movement we make is called in the moment it is seen, and the "
-            "guns answer within the minute.");
-        ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(UITheme::kText, "PRIMARY OBJECTIVE");
-        if (standingTowers == 1) {
-            ImGui::TextWrapped("Destroy the communications tower.");
-        } else {
-            ImGui::TextWrapped("Destroy all %u communications towers.",
-                               standingTowers);
+        if (standingTowers > 0) {
+            ImGui::TextColored(UITheme::kText, "SITUATION");
+            ImGui::TextWrapped(
+                "The garrison on this island is not fighting alone. A hardened relay "
+                "mast on the ridge ties their patrols to the mainland battery. "
+                "Every movement we make is called in the moment it is seen, and the "
+                "guns answer within the minute.");
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "PRIMARY OBJECTIVE");
+            if (standingTowers == 1) {
+                ImGui::TextWrapped("Destroy the communications tower.");
+            } else {
+                ImGui::TextWrapped("Destroy all %u communications towers.",
+                                   standingTowers);
+            }
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "EXECUTION");
+            ImGui::TextWrapped(
+                "The lattice shrugs off small arms. Plant remote C4 on the mast and "
+                "clear the base before you trigger it. Nothing lighter will bring "
+                "the structure down.");
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "EXFIL");
+            ImGui::TextWrapped(
+                "Hold the island once the mast is down. Without the relay the "
+                "battery is firing blind.");
         }
-        ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(UITheme::kText, "EXECUTION");
-        ImGui::TextWrapped(
-            "The lattice shrugs off small arms. Plant remote C4 on the mast and "
-            "clear the base before you trigger it. Nothing lighter will bring "
-            "the structure down.");
-        ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(UITheme::kText, "EXFIL");
-        ImGui::TextWrapped(
-            "Hold the island once the mast is down. Without the relay the "
-            "battery is firing blind.");
+        // The airfield dossier. The deadline quoted here is the real one:
+        // kObjectivePlaneHoldSeconds is what the runtime counts down before the
+        // aircraft starts its roll, so the briefing and the simulation cannot
+        // disagree about how long the player has.
+        if (objectivePlanes > 0) {
+            if (standingTowers > 0) {
+                ImGui::Dummy(ImVec2(0.0f, 8.0f));
+                ImGui::Separator();
+                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            }
+            ImGui::TextColored(UITheme::kText, "SITUATION");
+            ImGui::TextWrapped(
+                "The strip on the north side of this island is not a civilian "
+                "field. A transport is standing on the apron with its ground "
+                "crew around it, loaded and fuelled, and the garrison is "
+                "holding the perimeter until it is away. Whatever is in the "
+                "hold leaves the theatre the moment those wheels come up.");
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "PRIMARY OBJECTIVE");
+            if (objectivePlanes == 1) {
+                ImGui::TextWrapped("Destroy the transport aircraft on the ground.");
+            } else {
+                ImGui::TextWrapped("Destroy all %u transport aircraft on the ground.",
+                                   objectivePlanes);
+            }
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "TIME ON TARGET");
+            ImGui::TextWrapped(
+                "The aircraft begins its takeoff roll %d seconds after you are "
+                "on the ground, and it is clear of the map about %d seconds "
+                "after that. Once it is airborne there is nothing to shoot at "
+                "and the mission is a failure -- the clock is the objective as "
+                "much as the airframe is.",
+                static_cast<int>(kObjectivePlaneHoldSeconds),
+                static_cast<int>(kObjectivePlaneTakeoffSeconds));
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "EXECUTION");
+            ImGui::TextWrapped(
+                "The airframe is thin-skinned but large: rifle fire will not "
+                "put it down in the time you have. Bring the RPG and shoot it "
+                "on the apron, or stick remote C4 to the fuselage and clear the "
+                "blast before you trigger it. The fuel silo and the barrels on "
+                "the car park will do the rest of the work if the aircraft is "
+                "close enough to them.");
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "OPPOSITION");
+            ImGui::TextWrapped(
+                "Emplaced turret over the approach, a watch tower on the "
+                "perimeter and vehicle patrols working the apron roads. Expect "
+                "the field to come alive the moment the first shot is heard, "
+                "and expect the crew to try to get the aircraft moving early.");
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            ImGui::TextColored(UITheme::kText, "EXFIL");
+            ImGui::TextWrapped(
+                "Break contact once the wreck is burning. There is nothing on "
+                "this field worth holding after the transport is down.");
+        }
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::Separator();
         ImGui::TextWrapped("Mission grade weights this objective at %d of 100.",
@@ -1307,6 +1389,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // does whichever applies.
     if (deploySection("ARMORY", true)) {
 
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+
     {
         char balanceText[32];
         MoneySystem::Format(balanceText, sizeof(balanceText),
@@ -1315,16 +1400,24 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // DEPLOY button because it is the number every price below is checked
         // against -- a player scanning a row for affordability should not have
         // to look to the other end of the panel.
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, UITheme::kPanelRaised);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.045f, 0.052f, 0.047f, 1.0f));
         ImGui::BeginChild("ArmoryWallet", ImVec2(0.0f, 42.0f), true);
-        ImGui::TextColored(UITheme::kTextDim, "OPERATING FUNDS");
-        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "// QUARTERMASTER");
+        ImGui::SameLine(0.0f, 18.0f);
+        ImGui::TextColored(UITheme::kTextDim, "AVAILABLE FUNDS");
+        ImGui::SameLine(0.0f, 12.0f);
         const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
         ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
-        ImGui::TextColored(UITheme::kWarning, "%s", balanceText);
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", balanceText);
         ImGui::EndChild();
         ImGui::PopStyleColor();
     }
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "ARMOURY MANIFEST");
+    ImGui::SameLine(0.0f, 8.0f);
+    ImGui::TextColored(UITheme::kTextDim, "ISSUE / FIT / DEPLOY");
+    ImGui::Separator();
 
     const auto armoryRow = [&](const char* name, const char* blurb, int price,
                                bool owned, bool equipped,
@@ -1338,7 +1431,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // player sets first and the rows then fill.
     static int armorySlot = 0;
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextColored(UITheme::kTextDim, "SMALL ARMS");
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "01  SMALL ARMS");
     {
         const auto slotTab = [&](const char* label, int slot) {
             const bool active = armorySlot == slot;
@@ -1389,7 +1482,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // stocks it for every weapon it fits, which is how a quartermaster's shelf
     // works and avoids charging twice for the same part.
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextColored(UITheme::kTextDim, "WEAPON ATTACHMENTS");
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "02  RAIL SYSTEMS");
     const auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
         ImGui::PushID(slotLabel);
         ImGui::TextDisabled("%s -- %s", slotLabel,
@@ -1437,7 +1530,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
 
     // ---- Grenades ----------------------------------------------------------
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextColored(UITheme::kTextDim, "ORDNANCE");
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "03  ORDNANCE");
     for (int index = 0; index < ArmoryCatalog::kGrenadeCount; ++index) {
         const GrenadeType type = static_cast<GrenadeType>(index);
         const int price = ArmoryCatalog::kGrenadePrices[index];
@@ -1456,7 +1549,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
 
     // ---- Gear --------------------------------------------------------------
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextColored(UITheme::kTextDim, "FIELD GEAR");
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "04  FIELD GEAR");
     for (int index = 0; index < ArmoryCatalog::kGearCount; ++index) {
         const GearType type = static_cast<GearType>(index);
         const int price = ArmoryCatalog::kGearPrices[index];
@@ -1491,6 +1584,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::TextDisabled("Remote C4 is issued free on every mission.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::PopStyleVar(2);
     }
 
     // Stocking the development weapons is a debug switch, not a purchase, so it
@@ -2104,12 +2198,12 @@ static void RenderWinScreen(HWND hwnd) {
     ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
     if (primaryFailed) {
         backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
-            IM_COL32(26, 8, 6, 238), IM_COL32(34, 12, 10, 238),
-            IM_COL32(14, 5, 4, 244), IM_COL32(10, 4, 3, 244));
+            IM_COL32(30, 12, 9, 244), IM_COL32(48, 17, 12, 244),
+            IM_COL32(12, 6, 5, 250), IM_COL32(8, 4, 4, 250));
     } else {
         backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
-            IM_COL32(8, 20, 16, 238), IM_COL32(16, 34, 30, 238),
-            IM_COL32(5, 13, 11, 244), IM_COL32(4, 10, 9, 244));
+            IM_COL32(18, 24, 21, 244), IM_COL32(31, 37, 31, 244),
+            IM_COL32(8, 11, 10, 250), IM_COL32(5, 7, 7, 250));
     }
     backdrop->AddRectFilledMultiColor(
         ImVec2(0, 0), ImVec2(display.x, display.y * 0.22f),
@@ -2147,14 +2241,16 @@ static void RenderWinScreen(HWND hwnd) {
 
     // ---- Panel -------------------------------------------------------------
     //
-    // Unplated: NoBackground plus one rounded rect drawn by hand, so the frame
-    // is ours rather than the default window chrome every other screen dropped.
-    const float panelWidth = (std::min)(920.0f, display.x - 48.0f);
-    const float panelHeight = (std::min)(780.0f, display.y - 48.0f);
+    // NoBackground lets the squared report frame and its accent rail own the
+    // screen instead of inheriting default window chrome.
+    const float panelWidth = (std::min)(1040.0f, (std::max)(520.0f, display.x - 40.0f));
+    const float panelHeight = (std::min)(780.0f, (std::max)(420.0f, display.y - 32.0f));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(30.0f, 24.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(panelWidth < 700.0f ? 18.0f : 30.0f,
+                               panelHeight < 600.0f ? 16.0f : 24.0f));
     ImGui::Begin("Win Screen", nullptr,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -2171,14 +2267,16 @@ static void RenderWinScreen(HWND hwnd) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         draw->AddRectFilled(panelMin, panelMax,
                             IM_COL32(9, 14, 12, static_cast<int>(242 * entry)),
-                            10.0f);
+                            2.0f);
         draw->AddRect(panelMin, panelMax,
-                      IM_COL32(70, 92, 80, static_cast<int>(170 * entry)),
-                      10.0f, 0, 1.5f);
+                      primaryFailed
+                          ? IM_COL32(151, 55, 39, static_cast<int>(200 * entry))
+                          : IM_COL32(113, 124, 99, static_cast<int>(200 * entry)),
+                      2.0f, 0, 1.0f);
         // Accent rail down the left edge, red when the mast is still standing.
         const ImU32 rail = primaryFailed
             ? IM_COL32(224, 86, 62, static_cast<int>(235 * entry))
-            : IM_COL32(38, 178, 82, static_cast<int>(235 * entry));
+            : IM_COL32(255, 255, 255, static_cast<int>(235 * entry));
         draw->AddRectFilled(ImVec2(panelMin.x, panelMin.y + 10.0f),
                             ImVec2(panelMin.x + 3.0f, panelMax.y - 10.0f),
                             rail, 2.0f);
@@ -2193,12 +2291,12 @@ static void RenderWinScreen(HWND hwnd) {
     // ---- Header ------------------------------------------------------------
     {
         const float t = stage(0.05f);
-        const char* banner = primaryFailed ? "OBJECTIVE FAILED"
-                                           : "MISSION COMPLETE";
+        const char* banner = primaryFailed ? "AFTER ACTION REPORT // FAILED"
+                                           : "AFTER ACTION REPORT";
         // Letter-spaced by hand, the way the main menu sets its wordmark: at
         // this size the default tracking reads as a word rather than a stamp.
         ImDrawList* draw = ImGui::GetWindowDrawList();
-        const float tracking = ImGui::GetFontSize() * 0.30f;
+        const float tracking = ImGui::GetFontSize() * 0.22f;
         float bannerWidth = 0.0f;
         for (const char* c = banner; *c; ++c) {
             const char glyph[2] = { *c, 0 };
@@ -2209,7 +2307,7 @@ static void RenderWinScreen(HWND hwnd) {
         const ImVec2 pen = ImGui::GetCursorScreenPos();
         const ImU32 tint = primaryFailed
             ? IM_COL32(240, 126, 96, static_cast<int>(245 * t))
-            : IM_COL32(150, 226, 172, static_cast<int>(245 * t));
+            : IM_COL32(255, 255, 255, static_cast<int>(245 * t));
         float penX = pen.x;
         for (const char* c = banner; *c; ++c) {
             const char glyph[2] = { *c, 0 };
@@ -2232,7 +2330,7 @@ static void RenderWinScreen(HWND hwnd) {
         else ImGui::SetWindowFontScale(3.6f);
         const ImVec4 gradeColour = primaryFailed
             ? ImVec4(0.93f, 0.42f, 0.30f, 1.0f)
-            : ImVec4(1.0f, 0.82f, 0.24f, 1.0f);
+            : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
         centerCursor(grade, contentWidth);
         ImGui::TextColored(fade(gradeColour, t), "%s", grade);
         if (titleFont) ImGui::PopFont();
@@ -2256,12 +2354,12 @@ static void RenderWinScreen(HWND hwnd) {
             static_cast<float>(report.totalScore) / 100.0f)) * fillT;
         draw->AddRectFilled(ImVec2(trackX, cursor.y + 4.0f),
                             ImVec2(trackX + trackWidth, cursor.y + 11.0f),
-                            IM_COL32(6, 10, 8, 215), 3.5f);
+                IM_COL32(28, 32, 27, 240), 1.0f);
         if (scoreFraction > 0.0f)
             draw->AddRectFilled(
                 ImVec2(trackX, cursor.y + 4.0f),
                 ImVec2(trackX + trackWidth * scoreFraction, cursor.y + 11.0f),
-                IM_COL32(255, 209, 61, 245), 3.5f);
+                IM_COL32(255, 255, 255, 245), 1.0f);
         // Grade thresholds as ticks on the track: "how far off an A was I" is
         // the question a bar is there to answer and a bare number cannot.
         const int kGradeThresholds[] = { 45, 60, 75, 90 };
@@ -2286,7 +2384,7 @@ static void RenderWinScreen(HWND hwnd) {
                  g_winScreenRewardMultiplier);
         centerCursor(conditions, contentWidth);
         ImGui::TextColored(
-            fade(g_winScreenRewardMultiplier > 1.0f ? UITheme::kWarning
+            fade(g_winScreenRewardMultiplier > 1.0f ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
                                                     : UITheme::kTextDim, t),
             "%s", conditions);
         ImGui::Dummy(ImVec2(0.0f, 14.0f));
@@ -2306,17 +2404,27 @@ static void RenderWinScreen(HWND hwnd) {
 
     // ---- Two columns -------------------------------------------------------
     //
-    // Performance on the left, what it bought on the right. Two child regions
-    // rather than ImGui columns, so the taller side cannot drag the other's
-    // rows out of line and neither scrolls.
+    // Independent child regions keep the two report columns aligned while
+    // allowing dense sections to scroll on short displays.
     constexpr float kGutter = 26.0f;
     const float columnWidth = (contentWidth - kGutter) * 0.5f;
-    const float columnHeight = ImGui::GetContentRegionAvail().y - 68.0f;
+    // Reserve enough room for the action strip even at 720p. The body panels
+    // may become denser, but replay/home must never fall below the window.
+    const float columnHeight = (std::max)(220.0f,
+                                          ImGui::GetContentRegionAvail().y -
+                                              86.0f);
 
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
     ImGui::BeginChild("WinLeft", ImVec2(columnWidth, columnHeight), false,
-                      ImGuiWindowFlags_NoScrollbar |
-                      ImGuiWindowFlags_NoScrollWithMouse);
+                      ImGuiWindowFlags_None);
     {
+        const ImVec2 childMin = ImGui::GetWindowPos();
+        const ImVec2 childMax = ImVec2(childMin.x + columnWidth,
+                                       childMin.y + columnHeight);
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            childMin, childMax, IM_COL32(18, 23, 20, 220), 1.0f);
+        ImGui::GetWindowDrawList()->AddRect(
+            childMin, childMax, IM_COL32(58, 67, 56, 180), 1.0f, 0, 1.0f);
         const float t = stage(0.42f);
         ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, t));
         UISectionLabel("PERFORMANCE");
@@ -2351,7 +2459,7 @@ static void RenderWinScreen(HWND hwnd) {
                 draw->AddRectFilled(
                     cursor,
                     ImVec2(cursor.x + width * fraction, cursor.y + 2.0f),
-                    IM_COL32(255, 209, 61, static_cast<int>(200 * t)));
+                    IM_COL32(255, 255, 255, static_cast<int>(200 * t)));
             ImGui::Dummy(ImVec2(0.0f, 10.0f));
         };
 
@@ -2369,11 +2477,22 @@ static void RenderWinScreen(HWND hwnd) {
         scoreRow("Optional", detail, report.optionalScore, 15);
         snprintf(detail, sizeof(detail), "%u events", report.destructionEvents);
         scoreRow("Destruction", detail, report.destructionScore, 10);
-        if (report.primaryObjectivePresent)
+        // Named for what this map actually authored. The primary score covers
+        // masts and aircraft together, so a fixed "comm towers" line would read
+        // as 0 of 0 on the airfield while the score beside it said 25.
+        if (report.commTowersTotal > 0 && report.objectivePlanesTotal > 0)
+            snprintf(detail, sizeof(detail), "%u of %u targets down",
+                     report.commTowersDestroyed + report.objectivePlanesDestroyed,
+                     report.commTowersTotal + report.objectivePlanesTotal);
+        else if (report.commTowersTotal > 0)
             snprintf(detail, sizeof(detail), "%u of %u comm towers down",
                      report.commTowersDestroyed, report.commTowersTotal);
+        else if (report.objectivePlanesTotal > 0)
+            snprintf(detail, sizeof(detail), "%u of %u aircraft down",
+                     report.objectivePlanesDestroyed,
+                     report.objectivePlanesTotal);
         else
-            snprintf(detail, sizeof(detail), "no comm tower on this map");
+            snprintf(detail, sizeof(detail), "no primary target on this map");
         scoreRow("Primary", detail, report.primaryScore,
                  MissionSystem::kPrimaryObjectiveScore);
 
@@ -2390,8 +2509,11 @@ static void RenderWinScreen(HWND hwnd) {
                               : UITheme::kTextDim, objectivesT),
                 "%s  %s", complete ? "[X]" : "[ ]", label);
         };
-        if (report.primaryObjectivePresent)
-            objective(report.primaryObjectiveComplete,
+        // Keyed to the towers rather than to primaryObjectivePresent, which now
+        // also covers aircraft: the airframes already have their own row below
+        // and would otherwise be checked off twice, once under a mast's name.
+        if (report.commTowersTotal > 0)
+            objective(report.commTowersDestroyed >= report.commTowersTotal,
                       "Blackout - level the comm tower");
         if (report.objectivePlanesTotal > 0) {
             char aircraft[96];
@@ -2410,12 +2532,20 @@ static void RenderWinScreen(HWND hwnd) {
                   "Demolition - 5 destruction events");
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     ImGui::SameLine(0.0f, kGutter);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
     ImGui::BeginChild("WinRight", ImVec2(columnWidth, columnHeight), false,
-                      ImGuiWindowFlags_NoScrollbar |
-                      ImGuiWindowFlags_NoScrollWithMouse);
+                      ImGuiWindowFlags_None);
     {
+        const ImVec2 childMin = ImGui::GetWindowPos();
+        const ImVec2 childMax = ImVec2(childMin.x + columnWidth,
+                                       childMin.y + columnHeight);
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            childMin, childMax, IM_COL32(18, 23, 20, 220), 1.0f);
+        ImGui::GetWindowDrawList()->AddRect(
+            childMin, childMax, IM_COL32(58, 67, 56, 180), 1.0f, 0, 1.0f);
         // ---- Payout --------------------------------------------------------
         const float t = stage(0.50f);
         ImGui::PushStyleColor(ImGuiCol_Text, fade(UITheme::kTextDim, t));
@@ -2438,7 +2568,7 @@ static void RenderWinScreen(HWND hwnd) {
         moneyRow(bonusLabel, g_winScreenMissionBonus, 0.60f, UITheme::kText);
         ImGui::Separator();
         moneyRow("TOTAL THIS RUN", g_winScreenPayout, 0.68f,
-                 ImVec4(1.0f, 0.82f, 0.24f, 1.0f));
+                 ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
         moneyRow("Funds", g_game.money.Balance(), 0.68f, UITheme::kTextDim);
 
         // ---- Progression ---------------------------------------------------
@@ -2541,10 +2671,10 @@ static void RenderWinScreen(HWND hwnd) {
             ImGui::Dummy(ImVec2(0.0f, 8.0f));
             if (g_winScreenTierAfter != g_winScreenTierBefore) {
                 ImGui::TextColored(
-                    fade(ImVec4(1.0f, 0.84f, 0.47f, 1.0f), promoT * pulse),
+                    fade(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), promoT * pulse),
                     "PROMOTED");
                 ImGui::TextColored(
-                    fade(ImVec4(1.0f, 0.84f, 0.47f, 1.0f), promoT),
+                    fade(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), promoT),
                     "%s  ->  %s", PlayerRankName(g_winScreenTierBefore),
                     PlayerRankName(g_winScreenTierAfter));
             } else {
@@ -2569,6 +2699,7 @@ static void RenderWinScreen(HWND hwnd) {
                            LevelInsertionModeName(loadout.insertion));
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     // ---- Actions -----------------------------------------------------------
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
@@ -2576,14 +2707,15 @@ static void RenderWinScreen(HWND hwnd) {
         const float rowWidth = ImGui::GetContentRegionAvail().x;
         const float halfWidth =
             (rowWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.90f, 0.90f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.78f, 0.78f, 0.78f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.10f, 0.08f, 1.0f));
         const bool replay = ImGui::Button(
             g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1"
                                             : "REPLAY CUSTOM LEVEL",
             ImVec2(halfWidth, 46.0f));
-        ImGui::PopStyleColor(3);
+        ImGui::PopStyleColor(4);
         if (replay) RestartActiveLevel(hwnd);
         ImGui::SameLine();
         // A finished run ends by flying home, not by dropping out to the menu.

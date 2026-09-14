@@ -41,23 +41,42 @@ struct MissionLoadout {
     static constexpr int kWeaponCount = 12;
     static constexpr size_t kWeaponSlotCount = 2;
 
-    // AK-74 (10) is the standard-issue rifle. Slot 0 is the retired AK-47 and
+    // AK-74 (10) is the AK the armory sells. Slot 0 is the retired AK-47 and
     // is no longer offered -- see GunModel::kHiddenWeapon. Kept as a literal
     // for the same reason kWeaponCount is: this header does not include the
     // weapon model tables.
     static constexpr int kDefaultPrimaryWeapon = 10;
 
-    std::array<int, kWeaponSlotCount> weapons{{ kDefaultPrimaryWeapon, 1 }};
+    // The remote demolition charge, the one thing issued rather than bought --
+    // see GunModel::kRemoteChargeWeapon and the note in ArmoryCatalog. It is
+    // also what an empty slot holds: no firearm is free any more, so a loadout
+    // nobody has spent on is a player carrying only the charge rather than a
+    // player carrying a rifle they never paid for.
+    static constexpr int kIssuedChargeWeapon = 5;
+
+    std::array<int, kWeaponSlotCount> weapons{
+        { kIssuedChargeWeapon, kIssuedChargeWeapon }};
     GrenadeType grenade = GrenadeType::Frag;
     // Empty by default: the slot is an opt-in, and NVG is only worth a pick on
     // the dark times of day.
     GearType gear = GearType::None;
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
 
+    // Two distinct weapons, or the empty kit. The slots have to differ because
+    // the weapon cycle stalls between duplicates -- except when both hold the
+    // issued charge, which is the "bought nothing" state and must stay
+    // deployable: a player whose balance cannot reach a rifle has to be able to
+    // go out and earn one.
     bool Valid() const {
         return weapons[0] >= 0 && weapons[0] < kWeaponCount &&
                weapons[1] >= 0 && weapons[1] < kWeaponCount &&
-               weapons[0] != weapons[1];
+               (weapons[0] != weapons[1] || Empty());
+    }
+
+    // True while the player has bought nothing and carries only the charge.
+    bool Empty() const {
+        return weapons[0] == kIssuedChargeWeapon &&
+               weapons[1] == kIssuedChargeWeapon;
     }
 
     bool ContainsWeapon(int weapon) const {
@@ -251,9 +270,20 @@ public:
                        stats.objectivePlanesTotal);
         report.objectivePlanesEscaped =
             (std::min)(stats.objectivePlanesEscaped, stats.objectivePlanesTotal);
-        report.primaryObjectivePresent = stats.commTowersTotal > 0;
+        // The primary objective is whatever the map authored as the mission:
+        // relay masts, aircraft on the ground, or both on a map that carries
+        // the two. Counted together rather than as separate categories so a
+        // level with one kind of target grades exactly the way a level with the
+        // other does -- before this, an airfield map reported no primary
+        // objective at all and was handed the full 25 points for free while the
+        // briefing was telling the player the aircraft was the mission.
+        const uint32_t primaryTotal =
+            stats.commTowersTotal + stats.objectivePlanesTotal;
+        const uint32_t primaryDone =
+            report.commTowersDestroyed + report.objectivePlanesDestroyed;
+        report.primaryObjectivePresent = primaryTotal > 0;
         report.primaryObjectiveComplete = !report.primaryObjectivePresent ||
-            report.commTowersDestroyed >= report.commTowersTotal;
+            primaryDone >= primaryTotal;
         report.optionalObjectivesCompleted =
             static_cast<uint32_t>(report.usedBothWeapons) +
             static_cast<uint32_t>(report.usedSelectedGrenade) +
@@ -280,14 +310,14 @@ public:
                 static_cast<float>(stats.destructionEvents) /
                 static_cast<float>(kDestructionScoreTarget))));
         // The primary objective is the mission. It scores partial credit per
-        // tower so a two-tower map still rewards the first one, and pays out in
+        // target so a two-tower map still rewards the first one, and pays out in
         // full on levels that authored none -- there the other categories are
         // the whole grade and withholding 25 points would cap every run at a C.
         report.primaryScore = report.primaryObjectivePresent
             ? static_cast<int>(std::lround(
                   static_cast<float>(kPrimaryObjectiveScore) *
-                  static_cast<float>(report.commTowersDestroyed) /
-                  static_cast<float>(report.commTowersTotal)))
+                  static_cast<float>(primaryDone) /
+                  static_cast<float>(primaryTotal)))
             : kPrimaryObjectiveScore;
         report.totalScore = report.timeScore + report.accuracyScore +
             report.casualtyScore + report.optionalScore +

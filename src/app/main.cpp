@@ -277,6 +277,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     scene.cacheFarShadowCascades =
         GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
+    g_m9Audio.Initialize("Content/Audio/PlayerGuns/M9/9mm-pistol-shot.mp3");
+    g_r700Audio.Initialize("Content/Audio/PlayerGuns/r700/sniper-rifle.mp3");
+    g_shotgunAudio.Initialize("Content/Audio/PlayerGuns/Shotgun/shotgun.mp3");
+    g_ak74Audio.Initialize("Content/Audio/PlayerGuns/ak74/ak74.mp3");
     g_rpgFireAudio.Initialize("Content/Audio/rpg_fire.wav");
     // Lives under build/Sounds like the RPG explosion above, not models/audio --
     // that tree is CMake-synced from source, this one ships in the build dir.
@@ -1480,6 +1484,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             AudioDevice::SetListener(listenerPos, listenerFront, listenerUp);
         }
         g_gunAudio.Update();
+        g_m9Audio.Update();
+        g_r700Audio.Update();
+        g_shotgunAudio.Update();
+        g_ak74Audio.Update();
         g_rpgFireAudio.Update();
         for (GunAudio& step : g_footstepAudio) step.Update();
         g_breathingAudio.Update();
@@ -1700,11 +1708,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     attackingInsertionVehicle = distanceSq <= spotRange * spotRange &&
                         BanditHasLineOfSight(*bandit, insertionVehicleTarget);
                 }
+                // A nearby player shot is a direct challenge: investigate and
+                // aim at the shooter even if a marine happens to be closer.
+                // The regular line-of-sight gate below still prevents firing
+                // through the wall that carried the sound.
+                const bool heardPlayerGunshot =
+                    bandit->faction == Faction::Bandit &&
+                    !attackingInsertionVehicle &&
+                    bandit->HeardPlayerGunshot();
+                if (heardPlayerGunshot)
+                    bandit->ForcePlayerGunshotTarget(scene.camera.Position);
                 const XMFLOAT3 target = attackingInsertionVehicle
                     ? insertionVehicleTarget
-                    : NearestHostileTarget(
-                        *bandit, scene.camera.Position,
-                        liveMarinePositions, liveBanditPositions);
+                    : ((heardPlayerGunshot ||
+                        bandit->PlayerGunshotMemoryActive())
+                        ? scene.camera.Position
+                        : NearestHostileTarget(
+                            *bandit, scene.camera.Position,
+                            liveMarinePositions, liveBanditPositions));
                 if (attackingInsertionVehicle)
                     bandit->ForceCombatTarget(target);
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
@@ -1715,7 +1736,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     : (cameraDistanceSq > 30.0f * 30.0f ? (1.0f / 30.0f) : 0.0f);
                 float& updateDebt = banditUpdateDebt[bandit.get()];
                 updateDebt += deltaTime;
-                const bool updateBandit = updateInterval == 0.0f ||
+                const bool updateBandit = heardPlayerGunshot ||
+                    updateInterval == 0.0f ||
                     updateDebt >= updateInterval;
                 const float banditDeltaTime = updateBandit ? updateDebt : 0.0f;
                 if (updateBandit) updateDebt = 0.0f;
@@ -1994,7 +2016,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // from its flank went unheard. Marines now turn and engage
                     // when a firefight starts nearby.
                     g_enemyNoiseEvents.push_back(
-                        { shotOrigin, SkinnedEnemy::AlertBroadcastRadius() });
+                        { shotOrigin, SkinnedEnemy::GunshotHearingRadius() });
                     // Positional: an enemy shooting from the left is heard on
                     // the left. The distance falloff that used to be computed
                     // here by hand now comes from the emitter's rolloff curve.
@@ -3950,10 +3972,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Before UpdatePrefabLods: LOD selection reads the draw transform, so
         // the aircraft has to be moved for this frame first or it would pick a
         // level of detail for where it was rather than where it is.
-        if (IsSceneScreen()) UpdateObjectivePlanes(deltaTime);
+        if (IsSceneScreen() && !g_game.loading.Active())
+            UpdateObjectivePlanes(deltaTime);
         // Same ordering reason as the aircraft above: a shoved container has
         // to reach its new pose before LOD selection reads the transform.
-        if (IsSceneScreen()) UpdatePrefabRigidBodies();
+        if (IsSceneScreen() && !g_game.loading.Active())
+            UpdatePrefabRigidBodies();
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         // Adaptive Forward Extensions quality. Driven from the delayed GPU
@@ -6516,7 +6540,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Travel smoke stages. Each waits for the prefab rebuild to settle and
         // then exercises the real entry points rather than a copy of them, so a
         // regression in the shipping path is what this fails on.
-        if (g_travelSmokeEnabled && !g_prefabRebuildRequested &&
+        static const bool travelSmokeAirfield =
+            GetEnvironmentVariableA("SGE_TRAVEL_TEST_AIRFIELD",
+                                    nullptr, 0) > 0;
+        if (g_travelSmokeEnabled && !g_game.loading.Active() &&
+            !g_prefabRebuildRequested &&
             ++g_travelSmokeFrames > 8) {
             if (g_travelSmokeStage == 0) {
                 // Stage 1: the placement compiled into a boarding point at all.
@@ -6575,19 +6603,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (!allResolved) PostQuitMessage(7);
                 else g_travelSmokeStage = 3;
             } else if (g_travelSmokeStage == 3) {
-                // Stage 4: fly. Training Range is the cheapest destination to
-                // load and is not the map already running, so a successful swap
-                // is unambiguous.
+                // Stage 4: fly. Training Range remains the default because it
+                // is the cheapest destination to load; the optional airfield
+                // route reproduces the larger map travel path.
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     "Travel smoke stage 4: departing");
-                TravelToDestination(hwnd, kTravelDestinations[1]);
+                TravelToDestination(hwnd, kTravelDestinations[
+                    travelSmokeAirfield ? 1 : 2]);
                 g_travelSmokeStage = 4;
                 g_travelSmokeFrames = 0;
             } else if (g_travelSmokeStage == 4 && g_travelSmokeFrames > 30) {
                 // Stage 5: the swap landed. The board must be closed and the new
-                // level's own prefabs compiled -- the Training Range has no
-                // boarding point, so the list emptying is the proof the level
-                // actually changed.
+                // level's own prefabs compiled. The Training Range has no
+                // boarding point, while the airfield is identified by its
+                // loaded level file.
                 //
                 // The cursor is deliberately not asserted free here. The
                 // Training Range is a player_choice map, so StartLevelOne hands
@@ -6598,7 +6627,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // going back down.
                 const bool closed = !g_travelScreenOpen;
                 const bool boardReleased = !g_travelCursorReleased;
-                const bool swapped = g_prefabTravelPoints.empty();
+                const bool swapped = travelSmokeAirfield
+                    ? g_activeLevelFile == "BigIslandv33.json"
+                    : g_prefabTravelPoints.empty();
                 const bool passed = closed && boardReleased && swapped;
                 SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display
                                               : EngineLog::Level::Error,
@@ -6634,6 +6665,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Budget snapshot once geometry has actually rendered, which is the only
         // point the material and descriptor counters mean anything.
         if (g_collisionSmokeEnabled && g_collisionSmokeChecked &&
+            IsSceneScreen() && !g_game.loading.Active() &&
             ++g_collisionBudgetFrames == 240) {
             std::string budgets = "Material budget after render: VB materials " +
                 std::to_string(visBuffer.BindlessMaterialCount()) + "/" +
@@ -6822,6 +6854,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_rpgFireAudio.Shutdown();
     for (GunAudio& step : g_footstepAudio) step.Shutdown();
     g_breathingAudio.Shutdown();
+    g_ak74Audio.Shutdown();
+    g_shotgunAudio.Shutdown();
+    g_r700Audio.Shutdown();
+    g_m9Audio.Shutdown();
     g_gunAudio.Shutdown();
     // Last: every effect above shares this one device, so it can only be torn
     // down once they have all released their voices.

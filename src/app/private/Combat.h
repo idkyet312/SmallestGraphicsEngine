@@ -55,23 +55,36 @@ static bool ShootPlayerWeapon() {
         // what the shot sounds like, not what it does. Quieter and pitched up:
         // a can takes the bass out of a report, leaving a flat crack rather
         // than the boom the unsuppressed rifle makes.
+        //
+        // Unsuppressed sits near unity now that this plays a sniper sample
+        // rather than rifle_shot.wav: the old 0.70 existed to drag a generic
+        // rifle crack down into a boom, and applying it to a report already
+        // mastered as one drops it an octave into a cannon.
         scene.ShootSniperProjectile(weaponStats);
-        const float pitch = (weaponStats.suppressed ? 1.24f : 0.70f) +
+        const float pitch = (weaponStats.suppressed ? 1.20f : 0.98f) +
             ((float)std::rand() / RAND_MAX) * 0.04f;
-        g_gunAudio.Play(weaponStats.suppressed ? 0.34f : 1.0f, pitch);
+        g_r700Audio.Play(weaponStats.suppressed ? 0.34f : 1.0f, pitch);
     } else if (GunModel::RPGSelected()) {
         scene.ShootRocket();
         const float pitch = 0.68f + ((float)std::rand() / RAND_MAX) * 0.05f;
         g_rpgFireAudio.Play(1.0f, pitch);
     } else if (GunModel::ShotgunSelected()) {
         scene.ShootShotgun();
-        const float pitch = 0.78f + ((float)std::rand() / RAND_MAX) * 0.08f;
-        g_gunAudio.Play(0.96f, pitch);
+        // Near unity, same reasoning as the R700 above: 0.78 was pulling
+        // rifle_shot.wav down into a shell blast, and the sample now is one.
+        const float pitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
+        g_shotgunAudio.Play(0.96f, pitch);
     } else {
         scene.ShootProjectile(weaponStats);
         const float pitch = (weaponStats.suppressed ? 1.18f : 0.96f) +
             ((float)std::rand() / RAND_MAX) * 0.08f;
-        g_gunAudio.Play(weaponStats.suppressed ? 0.30f : 0.82f, pitch);
+        // The M9 and the AK-74 each fire their own sample; the rest of this
+        // path still shares rifle_shot.wav. The suppressed drop applies to all
+        // three, so a canned weapon reads as one whichever it is.
+        GunAudio& report = GunModel::M9Selected()   ? g_m9Audio
+                         : GunModel::AK74Selected() ? g_ak74Audio
+                                                    : g_gunAudio;
+        report.Play(weaponStats.suppressed ? 0.30f : 0.82f, pitch);
     }
     const uint32_t projectileCount = static_cast<uint32_t>(
         scene.projectiles.size() - projectileStart);
@@ -79,10 +92,9 @@ static bool ShootPlayerWeapon() {
         scene.projectiles[index].playerOwned = true;
     if (g_game.session.TimerRunning())
         g_game.mission.RecordWeaponFired(slot, projectileCount);
-    // Gunfire is loud enough for nearby enemies to hear through walls, even
-    // ones that can't currently see the player. Same radius as the squad-alert
-    // broadcast so "heard the shot" and "saw a squadmate get hit" read as the
-    // same kind of event.
+    // Gunfire carries farther than a squadmate's pain callout, so nearby
+    // enemies can hear through walls even when they cannot currently see the
+    // player. Suppression scales this dedicated 40m hearing radius.
     //
     // The suppressed SVD cuts that radius hard. This is the whole weapon: it
     // fires the same round for the same damage as the standard rifle, and buys
@@ -93,10 +105,18 @@ static bool ShootPlayerWeapon() {
     // Not silent, deliberately. A suppressed rifle is still loud enough to
     // notice from close by, so a man standing next to the one you drop will
     // still turn -- picking targets on the edge of a group remains the skill.
-    const float noiseRadius = SkinnedEnemy::AlertBroadcastRadius() *
+    const float noiseRadius = SkinnedEnemy::GunshotHearingRadius() *
         weaponStats.noiseRadiusMultiplier;
-    g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius });
+    g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius, true });
     return true;
+}
+
+// True when the weapon in the player's hands fires once per trigger pull. The
+// held-trigger path skips these; WM_LBUTTONDOWN fires them instead, so the rate
+// of fire is how fast the player can click with the interval as its floor.
+static bool PlayerWeaponSemiAutomatic() {
+    return scene.player.ResolveWeaponStats(GunModel::SelectedWeapon())
+        .semiAutomatic;
 }
 
 static float PlayerFireInterval() {

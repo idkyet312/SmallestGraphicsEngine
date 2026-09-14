@@ -19,9 +19,17 @@ static void ApplyVirtualInput() {
             virtualInput.lookY * virtualInput.lookSpeed * thumbstickLookMultiplier * deltaTime);
     }
 
+    // The on-screen pad's trigger is a held flag, so a semi-automatic weapon
+    // needs the press edge or holding the button would empty the magazine the
+    // way the mouse used to. Tracked here rather than on the pad: the pad
+    // reports what the finger is doing and does not know what is in the hands.
+    static bool virtualShootWasHeld = false;
+    const bool virtualShootPressed = virtualInput.shoot && !virtualShootWasHeld;
+    virtualShootWasHeld = virtualInput.shoot;
     if (virtualInput.shoot) {
         scene.fireCooldown -= deltaTime;
-        if (scene.fireCooldown <= 0.0f && ShootPlayerWeapon())
+        if ((!PlayerWeaponSemiAutomatic() || virtualShootPressed) &&
+            scene.fireCooldown <= 0.0f && ShootPlayerWeapon())
             scene.fireCooldown = PlayerFireInterval();
     }
 
@@ -266,7 +274,11 @@ static void ProcessInput(HWND) {
     scene.fireCooldown -= deltaTime;
     const bool mouseHeld = (FocusedKeyState(VK_LBUTTON) & 0x8000) != 0;
     if (!mouseHeld) g_suppressFireUntilMouseRelease = false;
-    if (scene.autoFire && mouseHeld && !g_suppressFireUntilMouseRelease &&
+    // A semi-automatic weapon is excluded here even when auto-fire is on: the
+    // setting is about holding the trigger on a weapon that can take it, and
+    // the pistol cannot. Its shots come from WM_LBUTTONDOWN instead.
+    if (scene.autoFire && !PlayerWeaponSemiAutomatic() && mouseHeld &&
+        !g_suppressFireUntilMouseRelease &&
         !ImGui::GetIO().WantCaptureMouse && !scene.player.downed &&
         scene.fireCooldown <= 0.0f && ShootPlayerWeapon()) {
         scene.fireCooldown = PlayerFireInterval();
@@ -489,10 +501,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 lastX = (float)(r.right-r.left)/2;
                 lastY = (float)(r.bottom-r.top)/2;
                 firstMouse = true;
-            } else if (!scene.autoFire && !g_insertionChoicePending) {
+            } else if ((!scene.autoFire || PlayerWeaponSemiAutomatic()) &&
+                       !g_insertionChoicePending) {
                 // Auto-fire handles shooting in ProcessInput while held; only
-                // fire on click when auto-fire is off.
-                ShootPlayerWeapon();
+                // fire on click when auto-fire is off, or when the weapon is
+                // semi-automatic and the held-trigger path skipped it.
+                //
+                // The cooldown is honoured here too. Without it a player who
+                // can click faster than the pistol cycles would outrun its
+                // fire interval, which is the one thing the held-trigger path
+                // was already preventing for every other weapon.
+                if (scene.fireCooldown <= 0.0f && ShootPlayerWeapon())
+                    scene.fireCooldown = PlayerFireInterval();
             }
         }
         return 0;

@@ -477,11 +477,20 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
                 textures[source.metallicRoughnessTexture];
         material->uploadHeaps.insert(material->uploadHeaps.end(),
             textureUploads.begin(), textureUploads.end());
+        // Every texture gets a copy recorded above, including authored maps
+        // that no material references after cooking. Keep those destinations
+        // alive until the loading queue drain, just like their upload heaps;
+        // otherwise the local `textures` vector releases an unused resource
+        // while the open command list still contains its CopyTextureRegion.
+        material->uploadHeaps.insert(material->uploadHeaps.end(),
+            textures.begin(), textures.end());
         materials.push_back(std::move(material));
     }
     if (materials.empty()) {
         auto material = std::make_shared<SceneMaterial>();
         material->uploadHeaps = textureUploads;
+        material->uploadHeaps.insert(material->uploadHeaps.end(),
+            textures.begin(), textures.end());
         materials.push_back(std::move(material));
     }
 

@@ -178,6 +178,21 @@ static uint32_t CountStandingCommTowers() {
     return count;
 }
 
+// Aircraft authored as an objective on the level right now. Read from the level
+// rather than from g_objectivePlanes for the same reason the tower count is:
+// the deployment briefing runs before the run arms its runtime state, so the
+// runtime list is still empty at the point the dossier has to say what the
+// mission is.
+static uint32_t CountObjectivePlanes() {
+    uint32_t count = 0;
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (entity.enabled && entity.type == LevelEntityType::Prefab &&
+            entity.prefabId == kObjectivePlanePrefabId)
+            ++count;
+    }
+    return count;
+}
+
 // Stands the AA gun up beside the first comm tower on the level: the emplacement
 // is there to defend the relay, so it belongs with it rather than at some
 // unrelated authored point. Levels without a tower get no gun.

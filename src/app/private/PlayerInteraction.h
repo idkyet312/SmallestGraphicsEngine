@@ -294,26 +294,35 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(560.0f, 620.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2((std::min)(640.0f, display.x - 32.0f),
+                                   (std::min)(720.0f, display.y - 32.0f)),
+                             ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     ImGui::Begin("##armory_shop", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
 
-    ImGui::TextColored(UITheme::kAccent, "%s", shop.displayName.c_str());
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "// ARMOURY  /  %s", shop.displayName.c_str());
+    ImGui::TextColored(UITheme::kTextDim, "AVAILABLE FUNDS");
     ImGui::SameLine();
     char balanceText[32];
     MoneySystem::Format(balanceText, sizeof(balanceText),
                         g_game.money.Balance());
     const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
     ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
-    ImGui::TextColored(UITheme::kWarning, "%s", balanceText);
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", balanceText);
     ImGui::Separator();
+    ImGui::TextWrapped("FIELD ISSUE COUNTER // SELECT SLOT, THEN SELECT STOCK");
 
     // Which carried slot a purchase racks into. Same idea as the deploy
     // screen's slot tabs: a row cannot know whether the player means it as a
     // primary or a secondary, so the slot is a mode set first.
     auto& carried = GunModel::LoadoutWeapons();
+    const float slotWidth = (ImGui::GetContentRegionAvail().x -
+                             ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     for (int slot = 0; slot < 2; ++slot) {
         const bool active = g_armoryShopSlot == slot;
         if (active) {
@@ -323,7 +332,7 @@ static void RenderArmoryShopPanel(HWND hwnd) {
         char tabText[96];
         std::snprintf(tabText, sizeof(tabText), "SLOT %d: %s", slot + 1,
                       GunModel::WeaponName(carried[static_cast<size_t>(slot)]));
-        if (ImGui::Button(tabText, ImVec2(258.0f, 0.0f)))
+        if (ImGui::Button(tabText, ImVec2(slotWidth, 0.0f)))
             g_armoryShopSlot = slot;
         if (active) ImGui::PopStyleColor(2);
         if (slot == 0) ImGui::SameLine();
@@ -331,8 +340,11 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     const size_t slotIndex = static_cast<size_t>(g_armoryShopSlot);
     const size_t otherIndex = slotIndex == 0 ? 1 : 0;
 
-    ImGui::BeginChild("##armory_stock", ImVec2(0.0f, 480.0f));
-    ImGui::TextColored(UITheme::kTextDim, "SMALL ARMS");
+    // Reserve room for the manifest line and the leave-counter action below;
+    // the stock list scrolls once the catalogue exceeds this viewport.
+    ImGui::BeginChild("##armory_stock", ImVec2(0.0f,
+        (std::max)(80.0f, ImGui::GetContentRegionAvail().y - 100.0f)));
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "01  SMALL ARMS");
     for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
         // Same gate the deploy screen uses: hidden and debug weapons are not
         // stock unless the debug toggle put them there.
@@ -427,6 +439,7 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     if (ImGui::Button("LEAVE COUNTER  [E]", ImVec2(-1.0f, 32.0f)))
         CloseArmoryShop(hwnd);
     ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 // ---- Island travel --------------------------------------------------------
@@ -448,12 +461,17 @@ struct TravelDestination {
     const char* imagePath;
 };
 
-static const std::array<TravelDestination, 3> kTravelDestinations = { {
+static const std::array<TravelDestination, 4> kTravelDestinations = { {
     { "ISLAND 1", "Campaign - hostile territory",
       { "Content/Levels/Islandv10.json",
         "levels/Islandv10.json",
         "build/Content/Levels/Islandv10.json" },
       "Content/Textures/Islands/island1.png" },
+    { "MILITARY AIRFIELD", "Strike - aircraft on the ground",
+      { "Content/Levels/BigIslandv33.json",
+        "levels/BigIslandv33.json",
+        "build/Content/Levels/BigIslandv33.json" },
+      "Content/Textures/Islands/airfield.png" },
     { "TRAINING RANGE", "Live fire - no hostiles",
       { "Content/Levels/TrainingRange.json",
         "levels/TrainingRange.json",
@@ -697,8 +715,12 @@ static void RenderTravelPanel(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
     ImGui::BeginChild("##destinations", ImVec2(0.0f, -44.0f), false);
-    // Three across at the panel's width. Cards keep a 16:9 image so a real
-    // screenshot drops in without the layout shifting around it.
+    // Three across at the panel's width, then wrap. Cards keep a 16:9 image so
+    // a real screenshot drops in without the layout shifting around it. The row
+    // break is what lets the list grow: a fourth destination laid out on one
+    // line would need 910 px inside a 704 px child and would simply be clipped
+    // off the right edge with nothing to say it was there.
+    constexpr size_t kCardsPerRow = 3;
     constexpr float kCardWidth = 214.0f;
     constexpr float kImageHeight = kCardWidth * 9.0f / 16.0f;
     const TravelDestination* chosen = nullptr;
@@ -743,7 +765,11 @@ static void RenderTravelPanel(HWND hwnd) {
         ImGui::EndGroup();
         ImGui::PopID();
         if (clicked) chosen = &destination;
-        if (index + 1 < kTravelDestinations.size()) ImGui::SameLine(0.0f, 18.0f);
+        if (index + 1 < kTravelDestinations.size() &&
+            (index + 1) % kCardsPerRow != 0)
+            ImGui::SameLine(0.0f, 18.0f);
+        else if (index + 1 < kTravelDestinations.size())
+            ImGui::Dummy(ImVec2(0.0f, 14.0f));
     }
     ImGui::EndChild();
 

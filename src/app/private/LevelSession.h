@@ -640,6 +640,12 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.ResetLevelRuntimeState();
     // A tower rigged last run must not start the next one already demolishable.
     g_commTowersRiggedForDemolition.clear();
+    // Walking into the base ends the last kit's hire: the player arrives with
+    // empty hands and buys the next loadout at the counter out of the balance
+    // the last run earned. Done here rather than at the counter because the hub
+    // is reached from the menu and from an extraction alike, and both have to
+    // land the player in the same state.
+    if (g_baseMode) IssueBaseKit();
     scene.selectedGrenade = g_game.mission.Loadout().grenade;
     if (g_emptyLevelMode)
         GunModel::DisableLoadoutRestriction();
