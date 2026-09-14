@@ -236,6 +236,11 @@ static void ProcessInput(HWND) {
         const bool reviveHeld =
             nearDowned && (FocusedKeyState('E') & 0x8000) != 0;
         playerInput.Set(PlayerInput::Revive, reviveHeld);
+        // adsActive rather than holdAimDownSights: that one is only the debug
+        // hold, while this is the resolved state the viewmodel itself uses, so
+        // the body other players see raises its weapon exactly when this
+        // player's own does.
+        playerInput.Set(PlayerInput::Aim, scene.adsActive);
         if (MultiplayerActive()) {
             g_netSession.ReportReviveIntent(
                 reviveHeld ? reviveTarget : net::kInvalidPlayerId, reviveHeld);

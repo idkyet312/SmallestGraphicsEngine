@@ -57,6 +57,7 @@ struct RemotePlayer {
     bool moving = false;
     bool crouching = false;
     bool sprinting = false;
+    bool aiming = false;
     bool active = false;
     float health = kMaxPlayerHealth;
     bool downed = false;
@@ -402,6 +403,8 @@ public:
                 local.input.Held(PlayerInput::Crouch) ? 1 : 0;
             slot.current.sprinting =
                 local.input.Held(PlayerInput::Sprint) ? 1 : 0;
+            slot.current.aiming =
+                local.input.Held(PlayerInput::Aim) ? 1 : 0;
             // Health and downed are NOT written from local state: the host owns
             // them for every player including itself, so they flow the other
             // way -- out through the snapshot, and back via LocalStatus.
@@ -485,6 +488,10 @@ public:
             remote.moving = slot.current.moving != 0;
             remote.crouching = slot.current.crouching != 0;
             remote.sprinting = slot.current.sprinting != 0;
+            // Taken from the newest snapshot rather than interpolated: raising
+            // a weapon is a state, not a position, and blending it would leave
+            // a body half-sighted between packets.
+            remote.aiming = slot.current.aiming != 0;
             remote.active = true;
             // Not interpolated: these are states, not positions, and a
             // half-downed player is not a thing.
@@ -1692,6 +1699,8 @@ private:
             message.input.Held(PlayerInput::Crouch) ? 1 : 0;
         slot.current.sprinting =
             message.input.Held(PlayerInput::Sprint) ? 1 : 0;
+        slot.current.aiming =
+            message.input.Held(PlayerInput::Aim) ? 1 : 0;
     }
 
     void HandleSnapshot(Event& event) {

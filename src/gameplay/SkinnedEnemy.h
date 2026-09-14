@@ -159,6 +159,10 @@ public:
     // already hold it and should not reach back into the session.
     bool              netDowned = false;
     float             netHealth = 100.0f;
+    // Replicated aim state. Written by UpdateNetworkedPose and read by the gun
+    // layer to pick the raised hold; meaningless on an AI actor, which decides
+    // that from its own awareness.
+    bool              netAiming = false;
     // Stable network identity for an AI actor, assigned at spawn and never
     // reused within a session. Deliberately not the index in g_bandits: that
     // vector is compacted when bodies are removed, which would renumber every
@@ -332,7 +336,9 @@ public:
     // of from the AI. The ordinary Update path is skipped for those, and that
     // is what normally drives the clip and the skinning pose -- without this a
     // remote player would slide around frozen in its bind pose.
-    void UpdateNetworkedPose(float dt, bool moving, bool sprinting) {
+    void UpdateNetworkedPose(float dt, bool moving, bool sprinting,
+                             bool aiming = false) {
+        netAiming = aiming;
         if (netDowned) {
             // Hold whatever pose they were in and let the roll below lay the
             // body out. Advancing the clip would have a downed player jogging
@@ -2196,7 +2202,12 @@ private:
         // low against the body instead of raised, but keep solving the arm
         // IK toward that lowered grip so the hands -- and the separately
         // rendered gun mesh, which reads gunYaw_/gunPitch_ -- stay together.
-        if (awareness_ != AwarenessState::Combat) {
+        // A networked player body never reaches Combat: the AI that raises
+        // awareness is skipped for it entirely, so without the replicated aim
+        // below it carried its weapon lowered no matter what its owner was
+        // doing. The player's own sighted state stands in for the perception
+        // this body does not run.
+        if (awareness_ != AwarenessState::Combat && !netAiming) {
             const int spine = model.skeleton.Find("spine_01");
             if (spine >= 0) {
                 const float maxStep = XMConvertToRadians(spineTwistSpeedDegrees) * dt;

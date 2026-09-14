@@ -1271,7 +1271,8 @@ static void UpdateMultiplayerBodies(float frameDelta) {
         // nobody else can see.
         body->netDowned = remote.downed;
         body->netHealth = remote.health;
-        body->UpdateNetworkedPose(frameDelta, remote.moving, remote.sprinting);
+        body->UpdateNetworkedPose(frameDelta, remote.moving, remote.sprinting,
+                                  remote.aiming);
     }
 
     // Drop bodies for players that are no longer in the session. Erases in one

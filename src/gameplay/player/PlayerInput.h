@@ -47,6 +47,11 @@ struct PlayerInput {
         // sampled from the key's current state alongside the movement keys
         // rather than from the edge-triggered WM_KEYDOWN chain.
         Revive   = 1u << 5,
+        // Aiming down sights. A held state like Crouch and Sprint rather than a
+        // tap, and replicated for the same reason they are: it decides which
+        // way a body holds its weapon, and a receiver cannot infer it from
+        // position or angles.
+        Aim      = 1u << 6,
     };
     uint16_t buttons = 0;
 

@@ -34,6 +34,9 @@ namespace net {
 //    a resolved sculpt stamp, so an explosion leaves the same hole on every
 //    machine instead of each one cutting its own from its own tunables.
 // 10: each player publishes their insertion helicopter for remote rendering.
+// 14: players publish whether they are aiming, so a remote body raises its
+//     weapon into a sighted hold instead of carrying it lowered whatever its
+//     owner is doing.
 // 13: players announce the rounds they fire, so another player's gunfire is
 //     visible and audible where it happens instead of being a silent,
 //     invisible event you only learn about when something near you dies.
@@ -44,7 +47,7 @@ namespace net {
 //     objectives a charge is the only thing allowed to destroy -- the comm
 //     tower, the objective aircraft -- replicate instead of collapsing on the
 //     machine that set the charge and standing on every other one.
-inline constexpr uint32_t kProtocolVersion = 13;
+inline constexpr uint32_t kProtocolVersion = 14;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -176,7 +179,12 @@ struct PlayerSnapshot {
     // Who is currently reviving this player, or kInvalidPlayerId. Replicated so
     // every client can draw the progress, not just the two players involved.
     PlayerId reviver = kInvalidPlayerId;
-    uint8_t padding[2] = {};
+    // Whether this player is sighted. Drives which weapon hold their body uses
+    // on every other machine -- lowered at rest, raised when aiming. Claimed
+    // from the padding, so the struct keeps its size and `reviveProgress` stays
+    // on the 4-byte boundary the comment below relies on.
+    uint8_t aiming = 0;
+    uint8_t padding[1] = {};
     // Seconds of hold the host has credited, NOT normalised -- receivers divide
     // by kReviveSeconds themselves (PlayerStatus, LocalStatus, GetRemotePlayers
     // all already do), so normalising here would divide twice.
