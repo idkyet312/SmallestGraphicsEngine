@@ -445,7 +445,16 @@ static void UpdateNetworkCharges() {
         // same reason the local detonator does it: the blast is not resolved
         // until the projectile pass later this frame, by which point the charge
         // that authorised the demolition is gone.
-        if (authoritative) MarkCommTowersRiggedForDemolition();
+        //
+        // Every machine marks, not just the authoritative one. The mark is a
+        // permission, not damage: CommTowerDamageAllowed refuses all tower
+        // damage unless the tower is in this machine's own rigged set, and the
+        // committed demolition arrives later as an ordinary world break that
+        // has to pass that same gate here. Marking only on the host left a
+        // client rejecting the host's own answer -- charges went off at the
+        // foot of the tower and it stayed standing, on the screen of the player
+        // who had just blown it.
+        MarkCommTowersRiggedForDemolition();
         scene.DetonateRemoteChargesFor(static_cast<uint8_t>(fired.owner),
                                        authoritative);
     }
