@@ -25,6 +25,99 @@ static std::vector<net::WorldBreakEvent> g_netWorldBreakScratch;
 
 static bool MultiplayerActive() { return g_netSession.Active(); }
 
+// On-screen notices for players arriving and leaving. Driven off the session's
+// own slots rather than off spawned bodies: a player who joins while this
+// machine is still loading, or on a level whose marine model never came up, has
+// no body to notice, and the arrival is exactly when it is worth saying so.
+struct NetPlayerNotice {
+    std::string text;
+    float remaining = 0.0f;
+    bool joined = true;
+};
+static std::vector<NetPlayerNotice> g_netPlayerNotices;
+static bool g_netPlayerSeen[net::kMaxPlayers] = {};
+static constexpr float kNetNoticeSeconds = 4.5f;
+
+static void ResetNetPlayerNotices() {
+    g_netPlayerNotices.clear();
+    for (bool& seen : g_netPlayerSeen) seen = false;
+}
+
+// Diffs the session roster against the last frame and queues one notice per
+// change. The local player is skipped -- "you connected" tells nobody anything,
+// and the menu already names which player this machine is.
+static void UpdateNetPlayerNotices(float deltaTime) {
+    for (NetPlayerNotice& notice : g_netPlayerNotices)
+        notice.remaining -= deltaTime;
+    g_netPlayerNotices.erase(
+        std::remove_if(g_netPlayerNotices.begin(), g_netPlayerNotices.end(),
+                       [](const NetPlayerNotice& notice) {
+                           return notice.remaining <= 0.0f;
+                       }),
+        g_netPlayerNotices.end());
+
+    if (!MultiplayerActive()) {
+        ResetNetPlayerNotices();
+        return;
+    }
+    for (net::PlayerId id = 0; id < net::kMaxPlayers; ++id) {
+        const bool active = g_netSession.PlayerActive(id);
+        if (active == g_netPlayerSeen[id]) continue;
+        g_netPlayerSeen[id] = active;
+        if (id == g_netSession.LocalId()) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), "PLAYER-%d %s",
+                      static_cast<int>(id) + 1,
+                      active ? "CONNECTED" : "LEFT");
+        g_netPlayerNotices.push_back({ text, kNetNoticeSeconds, active });
+    }
+}
+
+// Drawn under the top edge, stacked downwards, newest last. Uses the foreground
+// list so it survives whatever the HUD is doing beneath it.
+static void DrawNetPlayerNotices() {
+    if (g_netPlayerNotices.empty()) return;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    float y = display.y * 0.11f;
+    for (const NetPlayerNotice& notice : g_netPlayerNotices) {
+        // Fade the last second so a notice leaves rather than vanishing.
+        const float alpha = (std::min)(1.0f, notice.remaining);
+        const ImVec2 size = ImGui::CalcTextSize(notice.text.c_str());
+        const float x = (display.x - size.x) * 0.5f;
+        draw->AddRectFilled(
+            ImVec2(x - 12.0f, y - 5.0f),
+            ImVec2(x + size.x + 12.0f, y + size.y + 5.0f),
+            IM_COL32(10, 14, 12, static_cast<int>(180 * alpha)), 4.0f);
+        const ImU32 colour = notice.joined
+            ? IM_COL32(150, 235, 170, static_cast<int>(250 * alpha))
+            : IM_COL32(235, 175, 130, static_cast<int>(250 * alpha));
+        draw->AddText(ImVec2(x, y), colour, notice.text.c_str());
+        y += size.y + 14.0f;
+    }
+}
+
+static DeferredReleaseQueue<std::unique_ptr<SkinnedEnemy>> g_retiredNetworkActors;
+
+template <typename Predicate>
+static void RetireNetworkActors(Predicate remove) {
+    for (auto& actor : g_bandits) {
+        if (!actor || !remove(*actor)) continue;
+        if (g_heldBandit == actor.get()) g_heldBandit = nullptr;
+        g_retiredNetworkActors.RetireAfterSubmission(std::move(actor));
+    }
+    g_bandits.erase(std::remove(g_bandits.begin(), g_bandits.end(), nullptr),
+                   g_bandits.end());
+}
+
+// At the next frame boundary, update and ImGui removals both have a submitted
+// direct fence covering their last draw. Never wait here.
+static void CollectRetiredNetworkActors() {
+    if (!g_dx12.fence) return;
+    g_retiredNetworkActors.SealSubmission(g_dx12.lastDirectFenceValue);
+    g_retiredNetworkActors.Collect(g_dx12.fence->GetCompletedValue());
+}
+
 // Levels used to be each player's own choice, which reads as a working session
 // right up until two people shoot at terrain only one of them has. The host's
 // map is now the session's map: it publishes what it is on, and a client loads
@@ -103,12 +196,49 @@ static void FollowHostLevel(HWND hwnd) {
 static void DamageBulletPrefabEntity(uint64_t entityId, float damage,
                                       const XMFLOAT3& hit, bool remoteCharge,
                                       bool playerOwned) {
-    if (MultiplayerActive() && !remoteCharge)
+    // Charges used to be excluded here and applied locally instead. That was
+    // not a policy, it was a missing field: the wire had nowhere to say "this
+    // was a charge", so a replicated demolition arrived looking like rifle fire
+    // and CommTowerDamageAllowed threw it away. The tower then came down for
+    // whoever planted the C4 and stayed standing for everyone else. The flag
+    // travels now, so this takes the same route every other impact takes.
+    if (MultiplayerActive())
         g_netSession.ReportWorldImpact(entityId, damage, hit.x, hit.y, hit.z,
                                        /*kind=*/1, 0.0f, 0.0f, 0, 0.0f, 0.0f,
-                                       0.0f, playerOwned);
+                                       0.0f, playerOwned, remoteCharge);
     else
         DamagePrefabEntity(entityId, damage, hit, remoteCharge, playerOwned);
+}
+
+// A round from this machine struck an enemy gunship. In a session the host owns
+// the airframe's health, so the hit is reported and the outcome comes back in
+// the vehicle state; offline it is applied where it happened.
+static void DamageNetworkedHelicopter(uint8_t airframe, float damage,
+                                      const XMFLOAT3& hit) {
+    if (MultiplayerActive()) {
+        g_netSession.ReportWorldImpact(airframe, damage, hit.x, hit.y, hit.z,
+                                       /*kind=*/3);
+        return;
+    }
+    if (airframe == 0) DamageHelicopter(damage, hit);
+    else DamageSecondaryHelicopter(damage, hit);
+}
+
+// Blast damage aimed at one objective by entity id -- the rigged comm tower and
+// the objective aircraft, both of which are found by volume rather than by the
+// radius sweep and so are damaged through a direct call. Same rule as the
+// bullet path: in a session the host owns the outcome, so report it and let the
+// committed edge come back, rather than collapsing the mast locally.
+static void DamageObjectivePrefabEntity(uint64_t entityId, float damage,
+                                        const XMFLOAT3& center,
+                                        bool remoteCharge, bool playerOwned) {
+    if (MultiplayerActive())
+        g_netSession.ReportWorldImpact(entityId, damage, center.x, center.y,
+                                       center.z, /*kind=*/1, 0.0f, 0.0f, 0,
+                                       0.0f, 0.0f, 0.0f, playerOwned,
+                                       remoteCharge);
+    else
+        DamagePrefabEntity(entityId, damage, center, remoteCharge, playerOwned);
 }
 
 // Applies a single authoritative world impact. The host and every client use
@@ -123,12 +253,13 @@ static void ApplyNetworkWorldImpact(uint8_t kind, uint64_t entityId,
                                     float damage, float radius, float impulse,
                                     float dirX, float dirY, float dirZ,
                                     const XMFLOAT3& hit,
-                                    bool spawnImpactFx, bool playerOwned) {
+                                    bool spawnImpactFx, bool playerOwned,
+                                    bool remoteCharge) {
     const XMFLOAT3 normal{ -dirX, -dirY, -dirZ };
     if (kind == 1) {
         // spawnImpactFx doubles as "this was not my round": the shot's own
         // machine already marked and sparked at the trigger pull.
-        DamagePrefabEntity(entityId, damage, hit, false, playerOwned,
+        DamagePrefabEntity(entityId, damage, hit, remoteCharge, playerOwned,
                            /*localShot=*/!spawnImpactFx);
         if (spawnImpactFx) {
             scene.SpawnBulletImpact(hit, normal);
@@ -155,6 +286,20 @@ static void ApplyNetworkWorldImpact(uint8_t kind, uint64_t entityId,
             if (metalSheetHit) PlayMetalHitAudio(hit, 0.9f);
             scene.SpawnBulletImpact(hit, normal);
             scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
+        }
+        return;
+    }
+    if (kind == 3) {
+        // Only the host acts on this. A client is told the result through the
+        // vehicle state instead: applying the damage here as well would take
+        // the same health off twice on the machine that fired.
+        if (g_netSession.CurrentRole() == net::Role::Host) {
+            if (entityId == 0) DamageHelicopter(damage, hit);
+            else DamageSecondaryHelicopter(damage, hit);
+        }
+        if (spawnImpactFx) {
+            PlayMetalHitAudio(hit, 0.85f);
+            scene.SpawnBulletImpact(hit, normal);
         }
         return;
     }
@@ -192,13 +337,13 @@ static void UpdateNetworkWorldImpacts() {
                                     impact.impulse, impact.dirX,
                                     impact.dirY, impact.dirZ, hit,
                                     impact.shooter != g_netSession.LocalId(),
-                                    impact.playerOwned);
+                                    impact.playerOwned, impact.remoteCharge);
             g_netSession.PublishWorldBreak(
                 impact.kind, impact.entityId,
                 impact.damage, impact.radius, impact.impulse,
                 impact.hitX, impact.hitY, impact.hitZ,
                 impact.dirX, impact.dirY, impact.dirZ, impact.shooter,
-                impact.playerOwned);
+                impact.playerOwned, impact.remoteCharge);
         }
     } else {
         g_netSession.DrainWorldBreaks(g_netWorldBreakScratch);
@@ -209,9 +354,134 @@ static void UpdateNetworkWorldImpacts() {
                                     impact.impulse, impact.dirX,
                                     impact.dirY, impact.dirZ, hit,
                                     impact.shooter != g_netSession.LocalId(),
-                                    impact.playerOwned);
+                                    impact.playerOwned, impact.remoteCharge);
         }
     }
+}
+
+static std::vector<net::RemoteShot> g_netRemoteShots;
+// Last shot count this machine has already put on the wire. Compared rather
+// than hooked, so Scene stays unaware that a session exists.
+static uint32_t g_netLastReportedShot = 0;
+
+// Announce whatever the local player has fired since the previous frame. The
+// counter can move by more than one on a frame that dropped below the fire
+// rate, and only the latest origin is kept, so a burst is reported as a single
+// shot from where the last round left rather than as a stack of stale muzzles.
+static void ReportLocalShots() {
+    if (!MultiplayerActive()) {
+        g_netLastReportedShot = scene.localShotCounter;
+        return;
+    }
+    if (scene.localShotCounter == g_netLastReportedShot) return;
+    g_netLastReportedShot = scene.localShotCounter;
+    g_netSession.ReportShotFired(
+        scene.localShotOrigin.x, scene.localShotOrigin.y,
+        scene.localShotOrigin.z, scene.localShotDirection.x,
+        scene.localShotDirection.y, scene.localShotDirection.z);
+}
+
+// Present the rounds other players fired. Purely presentation: the muzzle
+// flash, the smoke and the report, at the place the shot actually came from.
+// Nothing here damages anything -- what a round hits is settled by the
+// hit-report path, and spawning a live projectile would apply it twice.
+//
+// The flash is a small world explosion rather than TriggerMuzzleFlash, which
+// drives the local viewmodel and has no world position: the same reason the AA
+// turret presents its own fire this way.
+static void PresentRemoteShots(float deltaTime) {
+    // Ahead of the early-out and ahead of the drain: tracers already in flight
+    // have to keep flying while this machine sits on a menu or loads a level,
+    // and one spawned below should start its life at the muzzle rather than a
+    // frame downrange.
+    scene.UpdateRemoteTracers(deltaTime);
+    if (!MultiplayerActive()) return;
+    g_netSession.DrainRemoteShots(g_netRemoteShots);
+    for (const net::RemoteShot& shot : g_netRemoteShots) {
+        const XMFLOAT3 muzzle{ shot.x, shot.y, shot.z };
+        const XMFLOAT3 direction{ shot.dirX, shot.dirY, shot.dirZ };
+        // The tracer is what says "someone is shooting, and that way". A rifle
+        // firing is not an explosion: SpawnExplosionFX was standing in for a
+        // muzzle flash here and brought its whole payload with it -- 54 sparks
+        // and dust per round, and an ApplyExplosionImpulse that shook the
+        // camera of anyone watching. One puff of smoke is the whole effect,
+        // matching how the helicopter door gunner presents its own fire.
+        scene.SpawnRemoteTracer(muzzle, direction);
+        scene.SpawnWeaponSmoke(muzzle, direction, 0.55f);
+        g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.8f,
+                          0.98f + ((float)std::rand() / RAND_MAX) * 0.05f);
+    }
+}
+
+// The two enemy gunships are the host's aircraft. Each machine used to fly its
+// own copy from its own AI, which held together only while nothing touched
+// them: the moment a client shot one down it crashed on that client alone and
+// went on flying, firing and dropping troops for everyone else.
+//
+// Sent as plain state rather than as damage events. The craft is in continuous
+// motion and its health only ever falls, so the last word from the host is
+// always the right answer and a dropped unreliable packet costs one tick of
+// staleness instead of a permanent disagreement.
+static void PublishHostVehicles() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Host) return;
+    const VehicleSystem& vehicles = g_game.vehicles;
+    net::EnemyHelicopterState state[net::kEnemyHelicopterCount];
+
+    net::EnemyHelicopterState& primary = state[0];
+    primary.present = g_helicopterModel != nullptr && scene.showHelicopter &&
+                      !g_emptyLevelMode;
+    primary.dead = vehicles.helicopterDead;
+    primary.crashed = vehicles.helicopterCrashed;
+    primary.x = vehicles.helicopterPosition.x;
+    primary.y = vehicles.helicopterPosition.y;
+    primary.z = vehicles.helicopterPosition.z;
+    primary.yaw = vehicles.helicopterYaw;
+    primary.health = vehicles.helicopterHealth;
+
+    net::EnemyHelicopterState& secondary = state[1];
+    secondary.present = SecondaryHelicopterPresent() && !g_emptyLevelMode;
+    secondary.dead = vehicles.secondaryHelicopterDead;
+    secondary.crashed = vehicles.secondaryHelicopterCrashed;
+    secondary.x = vehicles.secondaryHelicopterPosition.x;
+    secondary.y = vehicles.secondaryHelicopterPosition.y;
+    secondary.z = vehicles.secondaryHelicopterPosition.z;
+    secondary.yaw = vehicles.secondaryHelicopterYaw;
+    secondary.pitch = vehicles.secondaryHelicopterPitch;
+    secondary.roll = vehicles.secondaryHelicopterRoll;
+    secondary.health = vehicles.secondaryHelicopterHealth;
+
+    g_netSession.PublishVehicles(state);
+}
+
+// Client-side. Runs after the local vehicle update rather than instead of it:
+// the rotor spin, the damage smoke and the audio are all presentation driven
+// off these same fields, so letting them run and then overwriting what the host
+// owns keeps the craft animated without letting the client decide where it is,
+// how hurt it is, or whether it is still flying.
+static void ApplyNetworkEnemyHelicopters() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Client) return;
+    const net::EnemyHelicopterState* state = g_netSession.RemoteVehicles();
+    if (!state) return;   // nothing received yet; leave the local craft alone
+    VehicleSystem& vehicles = g_game.vehicles;
+
+    const net::EnemyHelicopterState& primary = state[0];
+    vehicles.helicopterPosition = { primary.x, primary.y, primary.z };
+    vehicles.helicopterYaw = primary.yaw;
+    vehicles.helicopterHealth = primary.health;
+    vehicles.helicopterDead = primary.dead;
+    vehicles.helicopterCrashed = primary.crashed;
+
+    const net::EnemyHelicopterState& secondary = state[1];
+    vehicles.secondaryHelicopterPosition = {
+        secondary.x, secondary.y, secondary.z };
+    vehicles.secondaryHelicopterYaw = secondary.yaw;
+    vehicles.secondaryHelicopterPitch = secondary.pitch;
+    vehicles.secondaryHelicopterRoll = secondary.roll;
+    vehicles.secondaryHelicopterHealth = secondary.health;
+    vehicles.secondaryHelicopterDead = secondary.dead;
+    vehicles.secondaryHelicopterCrashed = secondary.crashed;
 }
 
 // Remote bodies live in g_bandits alongside the AI actors, so they are drawn,
@@ -467,17 +737,15 @@ static void UpdateClientEnemies(float frameDelta) {
     // Drop bodies the host has stopped sending. An enemy that fell out of the
     // nearest-N window is gone from this client's view until it comes back,
     // which is what keeps a distant firefight off the wire.
-    g_bandits.erase(
-        std::remove_if(g_bandits.begin(), g_bandits.end(),
-                       [&enemies](const std::unique_ptr<SkinnedEnemy>& actor) {
-                           if (!actor || actor->networkControlled) return false;
-                           if (actor->netEnemyId == net::kInvalidEnemyId)
+    RetireNetworkActors(
+                       [&enemies](const SkinnedEnemy& actor) {
+                           if (actor.networkControlled) return false;
+                           if (actor.netEnemyId == net::kInvalidEnemyId)
                                return false;
                            for (const net::RemoteEnemy& remote : enemies)
-                               if (remote.id == actor->netEnemyId) return false;
+                               if (remote.id == actor.netEnemyId) return false;
                            return true;
-                       }),
-        g_bandits.end());
+                       });
 }
 
 // Grenades are simulated by the host. A client may keep its locally thrown
@@ -605,6 +873,12 @@ static void UpdateNetworkGrenades() {
         p.hostile = spawn.hostile;
         p.active = true;
         p.fuse = (std::max)(0.0f, spawn.fuse);
+        // An AI throw starts inside its own thrower, and a hostile grenade
+        // collides with the player body the moment its grace runs out. Without
+        // the same grace the local throw used, a replicated bandit frag
+        // detonates on the arm that threw it.
+        if (spawn.owner == net::kInvalidPlayerId)
+            p.grenadeCollisionGrace = 0.18f;
         p.netGrenadeId = spawn.grenadeId;
         p.netClientToken = spawn.clientToken;
         p.netAuthoritative = g_netSession.CurrentRole() == net::Role::Host;
@@ -689,12 +963,9 @@ static void UpdateNetworkGrenades() {
 }
 
 static void ShutdownMultiplayer() {
-    g_bandits.erase(
-        std::remove_if(g_bandits.begin(), g_bandits.end(),
-                       [](const std::unique_ptr<SkinnedEnemy>& actor) {
-                           return actor && actor->networkControlled;
-                       }),
-        g_bandits.end());
+    RetireNetworkActors([](const SkinnedEnemy& actor) {
+        return actor.networkControlled;
+    });
     g_netSession.Shutdown();
 }
 
@@ -885,6 +1156,30 @@ static void UpdateMultiplayerSession(float frameDelta,
     // and sending the eye would sink every other player waist-deep in terrain.
     local.y = scene.camera.Position.y - scene.camera.PlayerHeight;
     local.z = scene.camera.Position.z;
+    if (IsGameplayScreen() && !g_game.loading.Active() &&
+        !g_insertionChoicePending && !g_baseMode && BlackHawkVisible()) {
+        auto& helicopter = local.helicopter;
+        helicopter.visible = 1;
+        helicopter.airframe = static_cast<uint8_t>(g_insertionAirframe);
+        helicopter.x = g_blackHawkPosition.x;
+        helicopter.y = g_blackHawkPosition.y;
+        helicopter.z = g_blackHawkPosition.z;
+        helicopter.yaw = XMConvertToDegrees(g_blackHawkYaw);
+        helicopter.pitch = XMConvertToDegrees(g_game.vehicles.blackHawkPitch);
+        helicopter.roll = XMConvertToDegrees(g_game.vehicles.blackHawkRoll);
+        helicopter.centerX = g_blackHawkModelCenter.x;
+        helicopter.minY = g_blackHawkModelMinY;
+        helicopter.centerZ = g_blackHawkModelCenter.z;
+        helicopter.scale = g_blackHawkModelScale;
+    }
+    if (g_insertionChoicePending) {
+        local.x = g_deploymentNetworkPosition.x;
+        local.y = g_deploymentNetworkPosition.y;
+        local.z = g_deploymentNetworkPosition.z;
+        local.input = {};
+        local.input.sequence = localInput.sequence;
+        local.input.deltaTime = localInput.deltaTime;
+    }
     g_netSession.Update(frameDelta, local);
 
     // The host owns our health in a session, so pull it back rather than
@@ -982,16 +1277,14 @@ static void UpdateMultiplayerBodies(float frameDelta) {
     // Drop bodies for players that are no longer in the session. Erases in one
     // pass rather than erasing one id at a time, so the vector is never
     // mutated while something else holds an iterator into it.
-    g_bandits.erase(
-        std::remove_if(g_bandits.begin(), g_bandits.end(),
-                       [](const std::unique_ptr<SkinnedEnemy>& actor) {
-                           if (!actor || !actor->networkControlled) return false;
+    RetireNetworkActors(
+                       [](const SkinnedEnemy& actor) {
+                           if (!actor.networkControlled) return false;
                            for (const net::RemotePlayer& remote :
                                     g_netRemoteScratch)
-                               if (remote.id == actor->netPlayerId) return false;
+                               if (remote.id == actor.netPlayerId) return false;
                            return true;
-                       }),
-        g_bandits.end());
+                       });
 
     if (g_netSession.CurrentRole() == net::Role::Host) {
         // Apply what clients reported hitting, then publish the result. Both
@@ -999,6 +1292,9 @@ static void UpdateMultiplayerBodies(float frameDelta) {
         // the positions the snapshot is about to carry.
         ApplyReportedEnemyHits();
         PublishHostEnemies();
+        // After the hits: a gunship brought down by a client's report this
+        // frame goes out already dead rather than flying for one more tick.
+        PublishHostVehicles();
     } else {
         UpdateClientEnemies(frameDelta);
     }

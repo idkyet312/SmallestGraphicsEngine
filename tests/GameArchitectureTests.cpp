@@ -748,6 +748,34 @@ int main() {
     releases.Collect(8);
     CHECK(releases.PendingCount() == 0);
 
+    // A disconnect from the UI can retire a move-only actor before its draw
+    // is submitted. An already-completed older fence must not destroy it.
+    DeferredReleaseQueue<std::unique_ptr<int>> actors;
+    auto actor = std::make_unique<int>(42);
+    int* actorAddress = actor.get();
+    actors.RetireAfterSubmission(std::move(actor));
+    actors.Collect(100);
+    CHECK(actors.PendingCount() == 1);
+    CHECK(*actorAddress == 42);
+    actors.SealSubmission(101);
+    actors.Collect(100);
+    CHECK(actors.PendingCount() == 1);
+    CHECK(*actorAddress == 42);
+    actors.Collect(101);
+    CHECK(actors.PendingCount() == 0);
+
+    // A later removal remains protected even when an earlier batch completes.
+    actors.RetireAfterSubmission(std::make_unique<int>(1));
+    actors.SealSubmission(102);
+    actors.RetireAfterSubmission(std::make_unique<int>(2));
+    actors.Collect(102);
+    CHECK(actors.PendingCount() == 1);
+    actors.SealSubmission(104);
+    actors.Collect(103);
+    CHECK(actors.PendingCount() == 1);
+    actors.Collect(104);
+    CHECK(actors.PendingCount() == 0);
+
     RuntimeWorld combatWorld;
     LevelEntity destructible;
     destructible.id = 500;

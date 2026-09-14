@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -177,4 +178,118 @@ int main() {
     client.Update(0.0f, local);
     Check(!client.TakePendingLevel(kind, file),
           "an unknown level kind must be ignored");
+
+    // Each player's insertion travels through the host, independently of
+    // their feet position or the other player's airframe choice.
+    local.helicopter.visible = 1;
+    local.helicopter.airframe = 1;
+    local.helicopter.x = 120.0f;
+    local.helicopter.y = 35.0f;
+    local.helicopter.yaw = 350.0f;
+    local.helicopter.scale = 2.0f;
+    ClientInputMessage insertion;
+    insertion.input.sequence = 1;
+    insertion.helicopter.visible = 1;
+    insertion.helicopter.airframe = 0;
+    insertion.helicopter.x = -80.0f;
+    insertion.helicopter.y = 42.0f;
+    insertion.helicopter.roll = 12.0f;
+    Receive(9, insertion);
+    wire.clear();
+    host.Update(1.0f / 30.0f, local);
+    std::vector<RemotePlayer> remotes;
+    host.GetRemotePlayers(remotes);
+    Check(remotes.size() == 1 && remotes[0].helicopter.visible &&
+          remotes[0].helicopter.airframe == 0 &&
+          remotes[0].helicopter.x == -80.0f &&
+          remotes[0].helicopter.roll == 12.0f,
+          "host must see the client's helicopter pose and chosen model");
+
+    const auto lastPlayerSnapshot = []() {
+        ServerSnapshotMessage result;
+        bool found = false;
+        for (const auto& packet : wire) {
+            if (packet.bytes.size() != sizeof(result)) continue;
+            MessageHeader header;
+            std::memcpy(&header, packet.bytes.data(), sizeof(header));
+            if (header.type != MessageType::ServerSnapshot) continue;
+            std::memcpy(&result, packet.bytes.data(), sizeof(result));
+            found = true;
+        }
+        Check(found, "host must send a player snapshot");
+        return result;
+    };
+    const auto flight = lastPlayerSnapshot();
+    Check(flight.playerCount == 2 && flight.players[0].helicopter.visible &&
+          flight.players[1].helicopter.visible,
+          "both helicopters must coexist in the same snapshot");
+    Receive(3, flight);
+    client.Update(0.0f, {});
+    client.GetRemotePlayers(remotes);
+    Check(remotes.size() == 1 && remotes[0].helicopter.visible &&
+          remotes[0].helicopter.airframe == 1 &&
+          remotes[0].helicopter.x == 120.0f &&
+          remotes[0].helicopter.scale == 2.0f,
+          "client must see the host's helicopter without duplicating its own");
+
+    // Invalid poses must not reach rendering. A newer hidden state must also
+    // remove a departed helicopter even if a late flight packet follows it.
+    insertion.input.sequence = 2;
+    insertion.helicopter.x = std::numeric_limits<float>::quiet_NaN();
+    Receive(9, insertion);
+    local.helicopter = {};
+    wire.clear();
+    host.Update(1.0f / 30.0f, local);
+    host.GetRemotePlayers(remotes);
+    Check(!remotes[0].helicopter.visible, "non-finite helicopter pose must be hidden");
+    Receive(3, lastPlayerSnapshot());
+    client.Update(0.0f, {});
+    Receive(3, flight);
+    client.Update(0.0f, {});
+    client.GetRemotePlayers(remotes);
+    Check(!remotes[0].helicopter.visible,
+          "an old snapshot must not resurrect a departed helicopter");
+
+    // A 42 m/s flight sampled at 30 Hz must still move at 42 m/s on every
+    // 60 Hz render frame after the interpolation buffer fills. Keeping only
+    // two samples with a two-tick delay used to alternate holds and jumps.
+    NetSession watcher;
+    Check(watcher.StartClient("host", 27120, nullptr), "watcher failed");
+    Receive(3, welcome);
+    watcher.Update(0.0f, {});
+    constexpr float frameTime = 1.0f / 60.0f;
+    float lastFlightX = 0.0f;
+    ServerSnapshotMessage movingFlight;
+    movingFlight.playerCount = 1;
+    movingFlight.players[0].id = 0;
+    movingFlight.players[0].helicopter.visible = 1;
+    for (int frame = 0; frame < 120; ++frame) {
+        if (frame % 2 == 0) {
+            ++movingFlight.tick;
+            auto& pilot = movingFlight.players[0];
+            pilot.helicopter.x = 42.0f * frame * frameTime;
+            pilot.x = pilot.helicopter.x + 2.0f;
+            pilot.helicopter.yaw = std::fmod(350.0f + frame * 2.0f, 360.0f);
+            Receive(3, movingFlight);
+        }
+        watcher.Update(frameTime, {});
+        watcher.GetRemotePlayers(remotes);
+        Check(remotes.size() == 1, "watcher must retain the pilot");
+        const float flightX = remotes[0].helicopter.x;
+        if (frame >= 8) {
+            const float expected = 42.0f *
+                ((frame + 1) * frameTime - NetSession::kInterpolationDelay);
+            Check(std::abs(flightX - expected) < 0.001f,
+                  "remote helicopter must follow the delayed flight timeline");
+            Check(std::abs(flightX - lastFlightX - 42.0f * frameTime) < 0.001f,
+                  "remote helicopter must move between packet arrivals");
+            Check(std::abs(remotes[0].x - flightX - 2.0f) < 0.001f,
+                  "remote pilot must stay aligned with the helicopter");
+        }
+        lastFlightX = flightX;
+    }
+    watcher.Update(0.5f, {});
+    watcher.GetRemotePlayers(remotes);
+    Check(remotes[0].helicopter.x == movingFlight.players[0].helicopter.x,
+          "a stalled connection must not extrapolate the helicopter indefinitely");
 }

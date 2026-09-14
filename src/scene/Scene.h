@@ -130,6 +130,25 @@ struct HarpoonTetherFX {
     float maxLife = 0.32f;
 };
 
+// A round another player fired, in flight. Presentation only, and deliberately
+// not a Projectile: what the shot hits was settled on the shooter's machine and
+// reported from there, so a body here would either damage the world twice or
+// need the whole projectile update taught to skip itself. Like LaserBeamFX this
+// owns a lifetime and draws itself, and touches nothing else.
+//
+// The head is integrated from a distance rather than stored as a position so
+// the renderer can size the streak from the ground covered since the last
+// frame, which is how the bullet tracer measures its own.
+struct RemoteTracerFX {
+    XMFLOAT3 origin = {};
+    XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
+    float speed = 0.0f;
+    float distance = 0.0f;
+    float previousDistance = 0.0f;
+    float life = 0.0f;
+    float maxLife = 0.6f;
+};
+
 struct PinnedHarpoonFX {
     XMFLOAT3 position = {};
     XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
@@ -409,6 +428,9 @@ struct Scene {
     // so it is depth-clipped against the scene rather than paint on the HUD.
     IRLaserFX aimDebugRay;
     HarpoonTetherFX harpoonTether;
+    // Rounds other players have fired, kept apart from `projectiles` so nothing
+    // in the projectile update can act on them.
+    std::vector<RemoteTracerFX> remoteTracers;
     std::vector<PinnedHarpoonFX> pinnedHarpoons;
     std::vector<RemoteCharge> remoteCharges;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
@@ -1123,6 +1145,7 @@ struct Scene {
 
     void ResetLevelRuntimeState() {
         projectiles.clear();
+        remoteTracers.clear();
         laserBeam.life = 0.0f;
         harpoonTether.life = 0.0f;
         pinnedHarpoons.clear();
@@ -2132,6 +2155,21 @@ struct Scene {
         return result;
     }
 
+    // Every round the local player fires, recorded rather than announced.
+    // Scene has no idea a session exists and must not gain one, so the
+    // networking layer polls this counter and sends what it finds: a remote
+    // player's fire is otherwise completely invisible and inaudible, and two
+    // people in the same firefight cannot tell who is shooting at what.
+    uint32_t localShotCounter = 0;
+    XMFLOAT3 localShotOrigin{};
+    XMFLOAT3 localShotDirection{};
+
+    void RecordLocalShot(const XMFLOAT3& origin, const XMFLOAT3& direction) {
+        localShotOrigin = origin;
+        localShotDirection = direction;
+        ++localShotCounter;
+    }
+
     void ShootProjectile(const SGE::ResolvedWeaponStats& stats) {
         // Bullets leave inside the cone the reticle is showing, so sights
         // tighten grouping in two ways: the bloom itself collapses under ADS,
@@ -2153,6 +2191,7 @@ struct Scene {
                            stats.muzzleFlashSizeMultiplier);
         SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
                          stats.smokeMultiplier);
+        RecordLocalShot(GetMuzzleWorldPosition(), camera.Front);
 
         Projectile p;
         p.position  = GetMuzzleWorldPosition();
@@ -2432,6 +2471,7 @@ struct Scene {
                            stats.muzzleFlashSizeMultiplier);
         SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
                          stats.smokeMultiplier);
+        RecordLocalShot(GetMuzzleWorldPosition(), camera.Front);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
@@ -2786,6 +2826,41 @@ struct Scene {
         p.lifetime = projectileLifetime;
         p.active = true;
         projectiles.push_back(p);
+    }
+
+    // Deliberately NOT part of Update(). Update runs behind the gameplay gate
+    // -- in a level, not loading, and alive -- while the shots these come from
+    // arrive from the network whatever screen this machine is on. Advancing
+    // them there left a tracer spawned during a level load frozen at the muzzle
+    // for good: measured on a joining client, 24 rounds arrived and the list
+    // grew 1..24 without a single one moving or expiring, which is a leak as
+    // well as a stationary dot where a streak should be. Spawn and advance have
+    // to sit behind the same gate, so both live beside the network drain.
+    void UpdateRemoteTracers(float dt) {
+        for (RemoteTracerFX& tracer : remoteTracers) {
+            tracer.previousDistance = tracer.distance;
+            tracer.distance += tracer.speed * dt;
+            tracer.life += dt;
+        }
+        remoteTracers.erase(
+            std::remove_if(remoteTracers.begin(), remoteTracers.end(),
+                [](const RemoteTracerFX& tracer) {
+                    return tracer.life >= tracer.maxLife;
+                }),
+            remoteTracers.end());
+    }
+
+    // The visible half of another player's shot. Travels at the same speed a
+    // local round does, so a tracer crossing the field reads at the rate every
+    // other bullet in the game does.
+    void SpawnRemoteTracer(const XMFLOAT3& origin, const XMFLOAT3& direction) {
+        const XMVECTOR forward = XMLoadFloat3(&direction);
+        if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) return;
+        RemoteTracerFX tracer;
+        tracer.origin = origin;
+        XMStoreFloat3(&tracer.direction, XMVector3Normalize(forward));
+        tracer.speed = projectileSpeed;
+        remoteTracers.push_back(tracer);
     }
 
     void ShootShotgun() {

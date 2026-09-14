@@ -33,7 +33,18 @@ namespace net {
 // 9: the host owns the ground. Every runtime crater and gouge is replicated as
 //    a resolved sculpt stamp, so an explosion leaves the same hole on every
 //    machine instead of each one cutting its own from its own tunables.
-inline constexpr uint32_t kProtocolVersion = 9;
+// 10: each player publishes their insertion helicopter for remote rendering.
+// 13: players announce the rounds they fire, so another player's gunfire is
+//     visible and audible where it happens instead of being a silent,
+//     invisible event you only learn about when something near you dies.
+// 12: the two enemy gunships are the host's. Their flight, their health and
+//     whether they have been shot down all replicate, so a helicopter that a
+//     client destroys stops flying on every machine instead of only its own.
+// 11: world impacts carry whether they came from a remote charge, so the
+//     objectives a charge is the only thing allowed to destroy -- the comm
+//     tower, the objective aircraft -- replicate instead of collapsing on the
+//     machine that set the charge and standing on every other one.
+inline constexpr uint32_t kProtocolVersion = 13;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -76,6 +87,9 @@ enum class MessageType : uint8_t {
     ServerTerrainDeform,      // host -> clients, reliable
     ClientTerrainDeform,      // client -> host, reliable
     ClientGrenadeDetonation,  // client -> host, reliable
+    ServerVehicleState,       // host -> clients, unreliable, every net tick
+    ClientShotFired,          // client -> host, unreliable
+    ServerShotFired,          // host -> clients, unreliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -120,10 +134,22 @@ struct ServerReject {
     uint32_t serverVersion = kProtocolVersion;
 };
 
+struct InsertionHelicopterState {
+    uint8_t visible = 0;
+    uint8_t airframe = 0;
+    uint8_t padding[2] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    // Degrees, matching player-angle interpolation.
+    float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+    float centerX = 0.0f, minY = 0.0f, centerZ = 0.0f;
+    float scale = 1.0f;
+};
+
 struct ClientInputMessage {
     MessageHeader header{ MessageType::ClientInput, {} };
     PlayerInput input;
     float x = 0.0f, y = 0.0f, z = 0.0f;
+    InsertionHelicopterState helicopter;
 };
 
 // One player's replicated state. Weapons and ammo are still local-only; health
@@ -163,6 +189,7 @@ struct PlayerSnapshot {
     //
     // Lands on a 4-byte boundary: the padding above closes out `reviver`.
     float reviveProgress = 0.0f;
+    InsertionHelicopterState helicopter;
 };
 
 struct ServerSnapshotMessage {
@@ -268,6 +295,52 @@ struct ServerEnemySnapshotMessage {
     EnemySnapshot enemies[kMaxReplicatedEnemies];
 };
 
+// One enemy gunship, as the host flies it. Both airframes are sent every tick
+// in one message rather than on change: the craft is in continuous motion, so
+// there is no quiet state to diff against, and two of them fit in a packet the
+// snapshot already fits beside.
+struct EnemyHelicopterSnapshot {
+    // Present at all -- the second airframe exists only on levels that place
+    // it, and a client must not fly a ghost the host does not have.
+    uint8_t present = 0;
+    uint8_t dead = 0;
+    uint8_t crashed = 0;
+    uint8_t padding = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    // Radians, matching VehicleSystem. The patrol airframe banks, so pitch and
+    // roll are carried too rather than left for the client to invent.
+    float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+    float health = 0.0f;
+};
+
+// Index 0 is the primary helicopter, index 1 the secondary/patrol gunship.
+inline constexpr uint8_t kEnemyHelicopterCount = 2;
+
+struct ServerVehicleStateMessage {
+    MessageHeader header{ MessageType::ServerVehicleState, {} };
+    uint32_t tick = 0;
+    EnemyHelicopterSnapshot helicopters[kEnemyHelicopterCount];
+};
+
+// One round leaving a player's muzzle. Carried purely so everyone else can see
+// and hear it: the damage it does is settled by the hit-report path and nothing
+// here is allowed to hurt anybody. Unreliable because a lost tracer is a missed
+// frame of presentation, and a retransmitted one would draw a round that has
+// already gone past.
+struct ClientShotFiredMessage {
+    MessageHeader header{ MessageType::ClientShotFired, {} };
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+};
+
+struct ServerShotFiredMessage {
+    MessageHeader header{ MessageType::ServerShotFired, {} };
+    PlayerId shooter = kInvalidPlayerId;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+};
+
 // A client's round connected with an enemy. Same shooter-authoritative bargain
 // as ClientHitReport: the client ran the geometry test against the body it can
 // see, and the host owns what the damage does.
@@ -297,7 +370,12 @@ struct ClientWorldImpactMessage {
     // only from a player, so an enemy round replicated as player fire would let
     // the garrison shoot down the objective the players are sent to destroy.
     uint8_t playerOwned = 1;
-    uint8_t padding[2] = {};
+    // A demolition charge rather than a round. CommTowerDamageAllowed refuses
+    // everything else, so without this the receiver rebuilt the hit as ordinary
+    // fire and dropped it -- the tower came down only for whoever set the C4.
+    // Claimed from the padding, so the message keeps its size and its offsets.
+    uint8_t remoteCharge = 0;
+    uint8_t padding[1] = {};
     uint64_t entityId = 0;
     float damage = 0.0f;
     float radius = 0.0f;
@@ -321,7 +399,10 @@ struct ServerWorldBreakMessage {
     // `entityId` sits on, which the previous layout left to the compiler.
     PlayerId shooter = kInvalidPlayerId;
     uint8_t playerOwned = 1;
-    uint8_t padding[5] = {};
+    // Same flag on the way back out, for the same reason: a client applying the
+    // committed break has to know it was a charge or its own gate refuses it.
+    uint8_t remoteCharge = 0;
+    uint8_t padding[4] = {};
     uint64_t entityId = 0;
     float damage = 0.0f;
     float radius = 0.0f;

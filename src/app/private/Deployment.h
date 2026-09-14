@@ -118,6 +118,9 @@ static bool g_missileStrikeArmed = false;
 // at the far end and stops the near end from pushing the camera through the
 // terrain.
 static float g_deploymentZoom = 1.0f;
+// The overview camera is not a player moving around the island. Networking
+// holds the pre-overview feet position until the player actually deploys.
+static XMFLOAT3 g_deploymentNetworkPosition{};
 static constexpr float kDeploymentZoomMin = 0.45f;
 static constexpr float kDeploymentZoomMax = 2.2f;
 // Manual orbit: right-drag turns and tilts the map, and the automatic rotation
@@ -648,6 +651,8 @@ void ApplyLiveWeatherState(WeatherState state);
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 
 static void BeginDeploymentPlanning() {
+    g_deploymentNetworkPosition = scene.camera.Position;
+    g_deploymentNetworkPosition.y -= scene.camera.PlayerHeight;
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
     const float deploymentRadius = g_customLevelMode

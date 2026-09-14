@@ -764,6 +764,13 @@ bool EscapeBoatVisible();
 DirectX::XMMATRIX BlackHawkWorldMatrix();
 // False once the insertion helicopter has climbed out of sight.
 bool BlackHawkVisible();
+struct RemoteInsertionHelicopterDraw {
+    std::shared_ptr<SceneNode> model;
+    DirectX::XMFLOAT4X4 world;
+    uint8_t airframe = 0;
+};
+const std::vector<RemoteInsertionHelicopterDraw>& RemoteInsertionHelicopters();
+D3D12_GPU_VIRTUAL_ADDRESS UploadRemoteInsertionPalette(uint8_t airframe);
 // World position the riding player is pinned to, from the model's PlayerRide
 // empty. Exposed as a function because g_game has internal linkage in main.cpp.
 DirectX::XMFLOAT3 BlackHawkRideWorldPosition();
@@ -2859,6 +2866,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.Use(scene.wireframeMode);
     }
 
+    for (const auto& helicopter : RemoteInsertionHelicopters()) {
+        DrawSceneNode(helicopter.model, shader, XMLoadFloat4x4(&helicopter.world),
+            view, proj, lightSpace, visibilityExtensionsOnly,
+            UploadRemoteInsertionPalette(helicopter.airframe));
+        shader.SetSkinningEnabled(false);
+    }
+
     // Flies its insertion every frame, so it never joins the static batch. The
     // bone palette spins its rotor.
     if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
@@ -3545,6 +3559,70 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const XMFLOAT3 core = p.hostile ? XMFLOAT3(9.0f, 0.8f, 0.18f)
                                         : XMFLOAT3(9.0f, 3.2f, 0.45f);
         shader.SetEmissiveMaterial(core, 0.92f);
+        DrawCube(geo);
+        shader.NextDrawCall();
+        shader.Use(scene.wireframeMode);
+    }
+
+    // Rounds other players fired. Same two-box additive streak as the bullet
+    // tracer above, and deliberately the same friendly orange: another player
+    // is on your side, so their fire must not read as incoming.
+    //
+    // These carry no Projectile, so the loop above never sees them and nothing
+    // in the projectile update can damage the world on their behalf.
+    for (const auto& tracer : scene.remoteTracers) {
+        XMVECTOR fwd = XMLoadFloat3(&tracer.direction);
+        if (XMVectorGetX(XMVector3LengthSq(fwd)) < 1e-6f) continue;
+        fwd = XMVector3Normalize(fwd);
+        XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f ? XMVectorSet(1, 0, 0, 0)
+                                                        : XMVectorSet(0, 1, 0, 0);
+        XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+        XMVECTOR up    = XMVector3Cross(fwd, right);
+
+        const XMVECTOR origin = XMLoadFloat3(&tracer.origin);
+        const XMVECTOR head = origin + fwd * tracer.distance;
+        // Ground covered this frame, clamped exactly as the bullet tracer
+        // clamps its own: visible at high refresh rates, and a frame hitch
+        // cannot stretch it into a beam across the map.
+        const float moved = tracer.distance - tracer.previousDistance;
+        const float len = (std::min)(5.0f, (std::max)(1.2f, moved));
+        const XMVECTOR center = head - fwd * (len * 0.5f);
+
+        XMMATRIX tracerBasis = XMMatrixIdentity();
+        tracerBasis.r[0] = XMVectorSetW(right, 0.0f);
+        tracerBasis.r[1] = XMVectorSetW(up, 0.0f);
+        tracerBasis.r[2] = XMVectorSetW(fwd, 0.0f);
+        tracerBasis.r[3] = XMVectorSetW(center, 1.0f);
+
+        // Thickness is held roughly constant in SCREEN space, which is the
+        // difference between this and your own tracer. Yours is born half a
+        // metre from the camera and is enormous before it shrinks; a remote
+        // player's is seen side-on from across the field for its whole life.
+        // At the bullet tracer's fixed 3.2 cm that works out to about one pixel
+        // at 30 m and a third of one at 100 m -- drawn every frame, and
+        // invisible in every frame. Widening it with distance keeps it a few
+        // pixels wherever the shot is, and leaves it at the old size up close
+        // where the fixed width was already right.
+        //
+        // 0.0043 rad is ~4 px tall at 1080p through the 60 degree vertical FOV.
+        const XMVECTOR toCamera = XMLoadFloat3(&scene.camera.Position) - center;
+        const float cameraDistance =
+            XMVectorGetX(XMVector3Length(toCamera));
+        const float haloR = (std::max)(
+            (std::max)(0.012f, scene.projectileScale * 0.16f),
+            cameraDistance * 0.0043f);
+        shader.UseAdditive();
+        model = XMMatrixScaling(haloR * 2.0f, haloR * 2.0f, len) * tracerBasis;
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetEmissiveMaterial(XMFLOAT3(4.0f, 0.55f, 0.025f), 0.24f);
+        DrawCube(geo);
+        shader.NextDrawCall();
+
+        const float coreR = haloR * 0.38f;
+        model = XMMatrixScaling(coreR * 2.0f, coreR * 2.0f, len * 0.92f) *
+                tracerBasis;
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetEmissiveMaterial(XMFLOAT3(9.0f, 3.2f, 0.45f), 0.92f);
         DrawCube(geo);
         shader.NextDrawCall();
         shader.Use(scene.wireframeMode);

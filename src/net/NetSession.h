@@ -50,6 +50,7 @@ inline constexpr float kRegenPerSecond = kMaxPlayerHealth / 2.0f;
 
 // Where a remote player is, already interpolated and ready to drive a body.
 struct RemotePlayer {
+    InsertionHelicopterState helicopter;
     PlayerId id = kInvalidPlayerId;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float yaw = 0.0f, pitch = 0.0f;
@@ -72,6 +73,27 @@ struct RemoteEnemy {
     float health = 0.0f;
     bool moving = false;
     bool dead = false;
+};
+
+// A round another player fired, for presentation only. Never carries damage:
+// what a shot hits is settled by the hit-report path, and a receiver that acted
+// on this would apply the same round twice.
+struct RemoteShot {
+    PlayerId shooter = kInvalidPlayerId;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+};
+
+// One enemy gunship as the gameplay layer sees it. Used in both directions: the
+// host fills it from its vehicle state, a client reads it back to overwrite its
+// own. Mirrors EnemyHelicopterSnapshot without the wire packing.
+struct EnemyHelicopterState {
+    bool present = false;
+    bool dead = false;
+    bool crashed = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+    float health = 0.0f;
 };
 
 // What the host publishes about one of its enemies each tick. The host fills a
@@ -124,6 +146,9 @@ struct WorldImpactRequest {
     uint8_t kind = 0;
     PlayerId shooter = kInvalidPlayerId;
     bool playerOwned = true;
+    // Set for a demolition charge. Carried end to end because the objectives
+    // only a charge may destroy check it before taking any damage at all.
+    bool remoteCharge = false;
     uint64_t entityId = 0;
     float damage = 0.0f;
     float radius = 0.0f;
@@ -139,6 +164,7 @@ struct WorldBreakEvent {
     // for its own shot, which it drew when it fired.
     PlayerId shooter = kInvalidPlayerId;
     bool playerOwned = true;
+    bool remoteCharge = false;
     uint64_t entityId = 0;
     float damage = 0.0f;
     float radius = 0.0f;
@@ -174,6 +200,7 @@ struct TerrainDeformEvent {
 
 // What the local player is doing this frame, handed to the session.
 struct LocalPlayerState {
+    InsertionHelicopterState helicopter;
     PlayerInput input;
     float x = 0.0f, y = 0.0f, z = 0.0f;
 };
@@ -269,6 +296,13 @@ public:
         stateChanges_.clear();
         hostEnemies_.clear();
         remoteEnemies_.clear();
+        remoteShots_.clear();
+        for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
+            hostHelicopters_[i] = EnemyHelicopterState{};
+            remoteHelicopters_[i] = EnemyHelicopterState{};
+        }
+        hasHostHelicopters_ = false;
+        hasRemoteHelicopters_ = false;
         enemyHits_.clear();
         worldImpacts_.clear();
         worldBreaks_.clear();
@@ -316,6 +350,23 @@ public:
     bool Active() const { return role_ != Role::Offline; }
     PlayerId LocalId() const { return localId_; }
 
+    // Everyone in the session, the local player included. The menu needs this
+    // before any body exists: a host sitting on the lobby screen has loaded no
+    // level, so counting spawned actors would report nobody had joined.
+    uint8_t PlayerCount() const {
+        uint8_t count = 0;
+        for (const PlayerSlot& slot : players_)
+            if (slot.active) ++count;
+        return count;
+    }
+
+    // True when `id` is a player the session is actually carrying. Lets the
+    // menu list occupied slots without reaching into the snapshot path, which
+    // interpolates and is meant for rendering bodies.
+    bool PlayerActive(PlayerId id) const {
+        return id < kMaxPlayers && players_[id].active;
+    }
+
     // Called once per frame. Drains the transport every frame so connection
     // events are handled promptly, but only sends on a net tick.
     void Update(float deltaTime, const LocalPlayerState& local) {
@@ -343,6 +394,7 @@ public:
             slot.current.x = local.x;
             slot.current.y = local.y;
             slot.current.z = local.z;
+            slot.current.helicopter = local.helicopter;
             slot.current.yaw = local.input.yaw;
             slot.current.pitch = local.input.pitch;
             slot.current.moving = local.input.Moving() ? 1 : 0;
@@ -370,6 +422,7 @@ public:
                 StepRevives(step);
                 SendSnapshot();
                 SendEnemySnapshots();
+                SendVehicleState();
             } else {
                 SendInput(local);
             }
@@ -385,18 +438,50 @@ public:
             const PlayerSlot& slot = players_[i];
             RemotePlayer remote;
             remote.id = slot.id;
-            // Interpolate between the last two snapshots. Falls back to the
-            // newest sample when there is only one, which is what happens on
-            // the first tick after a player joins.
-            const float span = slot.currentTime - slot.previousTime;
+            // The render delay spans two ticks, so the last two packets alone
+            // cannot bracket it. Sample retained history for both rider and
+            // aircraft; otherwise the aircraft freezes between packet arrivals.
+            const PlayerSnapshot* previous = &slot.previous;
+            const PlayerSnapshot* current = &slot.current;
+            float previousTime = slot.previousTime;
+            float currentTime = slot.currentTime;
+            for (size_t sample = 0; sample < slot.renderSampleCount; ++sample) {
+                const auto& next = slot.renderSamples[sample];
+                current = &next.state;
+                currentTime = next.time;
+                if (sample == 0) {
+                    previous = current;
+                    previousTime = currentTime;
+                }
+                if (currentTime >= RenderTime()) break;
+                previous = current;
+                previousTime = currentTime;
+            }
+            const float span = currentTime - previousTime;
             const float alpha = span > 1e-5f
-                ? Clamp01((RenderTime() - slot.previousTime) / span)
+                ? Clamp01((RenderTime() - previousTime) / span)
                 : 1.0f;
-            remote.x = Lerp(slot.previous.x, slot.current.x, alpha);
-            remote.y = Lerp(slot.previous.y, slot.current.y, alpha);
-            remote.z = Lerp(slot.previous.z, slot.current.z, alpha);
-            remote.yaw = LerpAngle(slot.previous.yaw, slot.current.yaw, alpha);
-            remote.pitch = Lerp(slot.previous.pitch, slot.current.pitch, alpha);
+            remote.x = Lerp(previous->x, current->x, alpha);
+            remote.y = Lerp(previous->y, current->y, alpha);
+            remote.z = Lerp(previous->z, current->z, alpha);
+            remote.yaw = LerpAngle(previous->yaw, current->yaw, alpha);
+            remote.pitch = Lerp(previous->pitch, current->pitch, alpha);
+            remote.helicopter = slot.current.helicopter;
+            const auto& previousHelicopter = previous->helicopter;
+            const auto& currentHelicopter = current->helicopter;
+            if (remote.helicopter.visible && previousHelicopter.visible &&
+                currentHelicopter.visible &&
+                remote.helicopter.airframe == previousHelicopter.airframe &&
+                remote.helicopter.airframe == currentHelicopter.airframe) {
+                remote.helicopter = currentHelicopter;
+                auto& helicopter = remote.helicopter;
+                helicopter.x = Lerp(previousHelicopter.x, helicopter.x, alpha);
+                helicopter.y = Lerp(previousHelicopter.y, helicopter.y, alpha);
+                helicopter.z = Lerp(previousHelicopter.z, helicopter.z, alpha);
+                helicopter.yaw = LerpAngle(previousHelicopter.yaw, helicopter.yaw, alpha);
+                helicopter.pitch = LerpAngle(previousHelicopter.pitch, helicopter.pitch, alpha);
+                helicopter.roll = LerpAngle(previousHelicopter.roll, helicopter.roll, alpha);
+            }
             remote.moving = slot.current.moving != 0;
             remote.crouching = slot.current.crouching != 0;
             remote.sprinting = slot.current.sprinting != 0;
@@ -481,7 +566,8 @@ public:
                            uint8_t kind = 1, float radius = 0.0f,
                            float impulse = 0.0f, uint32_t impactId = 0,
                            float dirX = 0.0f, float dirY = 0.0f,
-                           float dirZ = 0.0f, bool playerOwned = true) {
+                           float dirZ = 0.0f, bool playerOwned = true,
+                           bool remoteCharge = false) {
         const uint32_t assignedImpactId = impactId ? impactId : AllocateImpactId();
         if (!Active() || !ValidWorldTarget(entityId, kind, assignedImpactId) ||
             !(damage > 0.0f) ||
@@ -492,7 +578,8 @@ public:
             radius < 0.0f) return;
         if (role_ == Role::Host) {
             worldImpacts_.push_back({ assignedImpactId,
-                                       kind, localId_, playerOwned, entityId,
+                                       kind, localId_, playerOwned,
+                                       remoteCharge, entityId,
                                        damage,
                                        radius, impulse, dirX, dirY, dirZ,
                                        hitX, hitY, hitZ });
@@ -503,6 +590,7 @@ public:
         message.impactId = assignedImpactId;
         message.kind = kind;
         message.playerOwned = playerOwned ? 1 : 0;
+        message.remoteCharge = remoteCharge ? 1 : 0;
         message.entityId = entityId;
         message.damage = damage;
         message.radius = radius;
@@ -539,7 +627,8 @@ public:
                            float hitZ, float dirX = 0.0f,
                            float dirY = 0.0f, float dirZ = 0.0f,
                            PlayerId shooter = kInvalidPlayerId,
-                           bool playerOwned = true) {
+                           bool playerOwned = true,
+                           bool remoteCharge = false) {
         const uint32_t canonicalImpactId = AllocateImpactId();
         if (role_ != Role::Host ||
             !ValidWorldTarget(entityId, kind, canonicalImpactId) ||
@@ -549,6 +638,7 @@ public:
         message.kind = kind;
         message.shooter = shooter;
         message.playerOwned = playerOwned ? 1 : 0;
+        message.remoteCharge = remoteCharge ? 1 : 0;
         message.entityId = entityId;
         message.damage = damage;
         message.radius = radius;
@@ -635,9 +725,44 @@ public:
     }
 
     void QueueAuthoritativeGrenadeSpawn(const GrenadeSpawnEvent& event) {
-        if (role_ != Role::Host || event.owner >= kMaxPlayers ||
+        if (role_ != Role::Host ||
+            (event.owner >= kMaxPlayers && event.owner != kInvalidPlayerId) ||
             event.grenadeId == 0 || !ValidGrenade(event.kind)) return;
         grenadeSpawns_.push_back(event);
+    }
+
+    // An AI thrower's grenade. It has no player behind it, so it carries
+    // kInvalidPlayerId as its owner and is spawned on the host by the same
+    // queue every machine reads, rather than by its caller: the enemy AI runs
+    // on every machine, so a bandit that threw locally on each one produced a
+    // different grenade per screen, landing in different places and wounding
+    // different people. The host throws for everybody now.
+    //
+    // Returns the id, or 0 when there is no session to carry it.
+    uint32_t SpawnAIGrenade(GrenadeKind kind, bool hostile,
+                            float x, float y, float z,
+                            float velocityX, float velocityY, float velocityZ,
+                            float fuse) {
+        if (role_ != Role::Host || !transport_ || !ValidGrenade(kind) ||
+            !Finite3(x, y, z) ||
+            !Finite3(velocityX, velocityY, velocityZ) ||
+            !std::isfinite(fuse) || fuse < 0.0f) return 0;
+        const uint32_t id = AllocateGrenadeId();
+        GrenadeSpawnEvent event{ id, 0, kInvalidPlayerId, kind, hostile,
+                                 x, y, z, velocityX, velocityY, velocityZ,
+                                 fuse };
+        grenadeSpawns_.push_back(event);
+        ServerGrenadeSpawnMessage message;
+        message.grenadeId = id;
+        message.clientToken = 0;
+        message.owner = kInvalidPlayerId;
+        message.kind = kind;
+        message.hostile = hostile ? 1 : 0;
+        message.x = x; message.y = y; message.z = z;
+        message.velocityX = velocityX; message.velocityY = velocityY;
+        message.velocityZ = velocityZ; message.fuse = fuse;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+        return id;
     }
 
     void DrainGrenadeSpawns(std::vector<GrenadeSpawnEvent>& out) {
@@ -895,6 +1020,53 @@ public:
         return remoteEnemies_;
     }
 
+    // Host-side: the gunships as they stand this tick. Stored and sent with the
+    // next snapshot rather than sent here, so the send stays on the net tick.
+    void PublishVehicles(const EnemyHelicopterState* helicopters) {
+        if (role_ != Role::Host || !helicopters) return;
+        for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i)
+            hostHelicopters_[i] = helicopters[i];
+        hasHostHelicopters_ = true;
+    }
+
+    // A round left this machine's muzzle. A client tells the host, the host
+    // broadcasts; either way it reaches every other player and nobody else
+    // re-derives it. The shooter never gets its own shot back -- it drew the
+    // flash and played the sound when it pulled the trigger.
+    void ReportShotFired(float x, float y, float z,
+                         float dirX, float dirY, float dirZ) {
+        if (!Active() || !transport_ || localId_ == kInvalidPlayerId ||
+            !Finite3(x, y, z) || !Finite3(dirX, dirY, dirZ)) return;
+        if (role_ == Role::Host) {
+            ServerShotFiredMessage message;
+            message.shooter = localId_;
+            message.x = x; message.y = y; message.z = z;
+            message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+            transport_->Broadcast(&message, sizeof(message),
+                                  Channel::Unreliable);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientShotFiredMessage message;
+        message.x = x; message.y = y; message.z = z;
+        message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Unreliable);
+    }
+
+    // The shots to present this frame, moved out so each is drawn once.
+    void DrainRemoteShots(std::vector<RemoteShot>& out) {
+        out.clear();
+        out.swap(remoteShots_);
+    }
+
+    // Client-side: the gunship state the host last sent, or nullptr before the
+    // first one arrives -- which is the signal to leave the local craft alone
+    // rather than snapping it to an all-zero pose at the origin.
+    const EnemyHelicopterState* RemoteVehicles() const {
+        return hasRemoteHelicopters_ ? remoteHelicopters_ : nullptr;
+    }
+
     // A round from this machine hit an enemy. On a client this reports to the
     // host; on the host it queues into the same list the reports land in, so
     // both take one identical path into the damage code.
@@ -944,6 +1116,12 @@ public:
     }
 
 private:
+    static bool ValidInsertionHelicopter(const InsertionHelicopterState& h) {
+        return h.visible <= 1 && h.airframe < 2 &&
+            Finite3(h.x, h.y, h.z) && Finite3(h.yaw, h.pitch, h.roll) &&
+            Finite3(h.centerX, h.minY, h.centerZ) &&
+            std::isfinite(h.scale) && h.scale > 0.0f && h.scale <= 1000.0f;
+    }
     static bool Finite3(float x, float y, float z) {
         return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
     }
@@ -968,16 +1146,28 @@ private:
                deform.radius <= kMaxDeformRadius &&
                std::fabs(deform.value) <= kMaxDeformDepth;
     }
-    static bool ValidWorldKind(uint8_t kind) { return kind <= 2; }
+    // 3 is an enemy gunship, with the airframe index in entityId. It rides the
+    // world-impact channel rather than a message of its own: a round on a hull
+    // is the same shooter-authoritative bargain as a round on a wall, and the
+    // dedupe and validation here are exactly what it needs.
+    static bool ValidWorldKind(uint8_t kind) { return kind <= 3; }
     static bool ValidWorldTarget(uint64_t entityId, uint8_t kind,
                                  uint32_t impactId) {
-        // Destruction surfaces and trees have no prefab entity id. Their
-        // per-impact id is the stable key used for reliable dedupe.
+        // Destruction surfaces, trees and gunships have no prefab entity id.
+        // Their per-impact id is the stable key used for reliable dedupe.
+        // A gunship's entityId is an airframe index, so it must name one.
+        if (kind == 3 && entityId >= kEnemyHelicopterCount) return false;
         return ValidWorldKind(kind) &&
                (entityId != 0 || (kind != 1 && impactId != 0));
     }
 
     struct PlayerSlot {
+        struct RenderSample {
+            PlayerSnapshot state;
+            float time = 0.0f;
+        };
+        std::array<RenderSample, 8> renderSamples{};
+        size_t renderSampleCount = 0;
         PlayerId id = kInvalidPlayerId;
         bool active = false;
         PeerId peer = kInvalidPeer;
@@ -1243,6 +1433,15 @@ private:
         case MessageType::ServerEnemySnapshot:
             if (role_ == Role::Client) HandleEnemySnapshot(event);
             break;
+        case MessageType::ServerVehicleState:
+            if (role_ == Role::Client) HandleVehicleState(event);
+            break;
+        case MessageType::ClientShotFired:
+            if (role_ == Role::Host) HandleClientShotFired(event);
+            break;
+        case MessageType::ServerShotFired:
+            if (role_ == Role::Client) HandleServerShotFired(event);
+            break;
         case MessageType::ClientEnemyHitReport:
             if (role_ == Role::Host) HandleEnemyHitReport(event);
             break;
@@ -1483,6 +1682,8 @@ private:
             slot.current.z = message.z;
         }
         slot.lastInput = message.input;
+        slot.current.helicopter = ValidInsertionHelicopter(message.helicopter)
+            ? message.helicopter : InsertionHelicopterState{};
         slot.hasInput = true;
         slot.current.yaw = message.input.yaw;
         slot.current.pitch = message.input.pitch;
@@ -1518,7 +1719,25 @@ private:
             slot.previous = slot.current;
             slot.previousTime = slot.currentTime;
             slot.current = incoming;
+            if (!ValidInsertionHelicopter(slot.current.helicopter))
+                slot.current.helicopter = {};
             slot.currentTime = interpolationTime_;
+            // Visibility/airframe changes mark a new insertion, not a path
+            // through the old flight. Equal-time packets replace the newest
+            // sample rather than evicting useful history when UDP batches.
+            if (slot.previous.helicopter.visible != slot.current.helicopter.visible ||
+                slot.previous.helicopter.airframe != slot.current.helicopter.airframe)
+                slot.renderSampleCount = 0;
+            if (slot.renderSampleCount > 0 &&
+                slot.renderSamples[slot.renderSampleCount - 1].time == interpolationTime_)
+                --slot.renderSampleCount;
+            if (slot.renderSampleCount == slot.renderSamples.size()) {
+                for (size_t sample = 1; sample < slot.renderSampleCount; ++sample)
+                    slot.renderSamples[sample - 1] = slot.renderSamples[sample];
+                --slot.renderSampleCount;
+            }
+            slot.renderSamples[slot.renderSampleCount++] =
+                { slot.current, interpolationTime_ };
             slot.active = true;
             slot.id = incoming.id;
             // The snapshot is the authority on life state. Mirrored onto the
@@ -1562,6 +1781,93 @@ private:
 
     // Per-connection rather than broadcast: "nearest" is a different set for
     // every player, so each client gets its own message.
+    // Broadcast rather than per-connection: unlike the enemy snapshot there is
+    // no "nearest" to compute -- there are two airframes and everyone sees the
+    // same two.
+    void SendVehicleState() {
+        if (!hasHostHelicopters_ || !transport_) return;
+        ServerVehicleStateMessage message;
+        message.tick = tick_;
+        for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
+            const EnemyHelicopterState& source = hostHelicopters_[i];
+            EnemyHelicopterSnapshot& out = message.helicopters[i];
+            out.present = source.present ? 1 : 0;
+            out.dead = source.dead ? 1 : 0;
+            out.crashed = source.crashed ? 1 : 0;
+            out.x = source.x; out.y = source.y; out.z = source.z;
+            out.yaw = source.yaw;
+            out.pitch = source.pitch;
+            out.roll = source.roll;
+            out.health = source.health;
+        }
+        transport_->Broadcast(&message, sizeof(message), Channel::Unreliable);
+    }
+
+    void HandleClientShotFired(Event& event) {
+        if (event.payload.size() < sizeof(ClientShotFiredMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        ClientShotFiredMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (!Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.dirX, message.dirY, message.dirZ)) return;
+        // The host presents it too, then passes it on to everyone else. Sent
+        // rather than re-broadcast to all so the shooter is not told about its
+        // own round.
+        remoteShots_.push_back({ it->second, message.x, message.y, message.z,
+                                 message.dirX, message.dirY, message.dirZ });
+        ServerShotFiredMessage out;
+        out.shooter = it->second;
+        out.x = message.x; out.y = message.y; out.z = message.z;
+        out.dirX = message.dirX; out.dirY = message.dirY;
+        out.dirZ = message.dirZ;
+        for (const PlayerSlot& slot : players_) {
+            if (!slot.active || slot.peer == kInvalidPeer ||
+                slot.id == it->second) continue;
+            transport_->Send(slot.peer, &out, sizeof(out), Channel::Unreliable);
+        }
+    }
+
+    void HandleServerShotFired(Event& event) {
+        if (event.payload.size() < sizeof(ServerShotFiredMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerShotFiredMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.shooter == localId_ ||
+            !Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.dirX, message.dirY, message.dirZ)) return;
+        remoteShots_.push_back({ message.shooter, message.x, message.y,
+                                 message.z, message.dirX, message.dirY,
+                                 message.dirZ });
+    }
+
+    void HandleVehicleState(Event& event) {
+        if (event.payload.size() < sizeof(ServerVehicleStateMessage)) return;
+        ServerVehicleStateMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
+            const EnemyHelicopterSnapshot& in = message.helicopters[i];
+            // Unreliable, so a corrupt or partial packet must not be allowed to
+            // teleport a gunship to a NaN and take the flight code with it.
+            if (!Finite3(in.x, in.y, in.z) ||
+                !Finite3(in.yaw, in.pitch, in.roll) ||
+                !std::isfinite(in.health)) return;
+        }
+        for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
+            const EnemyHelicopterSnapshot& in = message.helicopters[i];
+            EnemyHelicopterState& out = remoteHelicopters_[i];
+            out.present = in.present != 0;
+            out.dead = in.dead != 0;
+            out.crashed = in.crashed != 0;
+            out.x = in.x; out.y = in.y; out.z = in.z;
+            out.yaw = in.yaw;
+            out.pitch = in.pitch;
+            out.roll = in.roll;
+            out.health = in.health;
+        }
+        hasRemoteHelicopters_ = true;
+    }
+
     void SendEnemySnapshots() {
         if (hostEnemies_.empty()) return;
         for (const auto& entry : peerToPlayer_) {
@@ -1695,6 +2001,7 @@ private:
         }
         worldImpacts_.push_back({ impactId, message.kind, it->second,
                                   message.playerOwned != 0,
+                                  message.remoteCharge != 0,
                                   message.entityId,
                                   message.damage, message.radius,
                                   message.impulse, message.dirX,
@@ -1720,6 +2027,7 @@ private:
         if (!receivedWorldBreaks_.insert(dedupe).second) return;
         worldBreaks_.push_back({ message.impactId, message.kind,
                                  message.shooter, message.playerOwned != 0,
+                                 message.remoteCharge != 0,
                                  message.entityId, message.damage,
                                  message.radius, message.impulse,
                                  message.dirX, message.dirY, message.dirZ,
@@ -1768,7 +2076,9 @@ private:
         if (event.peer != serverPeer_) return;
         ServerGrenadeSpawnMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
-        if (message.grenadeId == 0 || message.owner >= kMaxPlayers ||
+        if (message.grenadeId == 0 ||
+            (message.owner >= kMaxPlayers &&
+             message.owner != kInvalidPlayerId) ||
             !ValidGrenade(message.kind) || !Finite3(message.x, message.y,
                                                      message.z) ||
             !Finite3(message.velocityX, message.velocityY,
@@ -1861,6 +2171,7 @@ private:
         message.x = local.x;
         message.y = local.y;
         message.z = local.z;
+        message.helicopter = local.helicopter;
         message.input.sequence = ++inputSequence_;
         transport_->Send(serverPeer_, &message, sizeof(message),
                          Channel::Unreliable);
@@ -1914,6 +2225,11 @@ private:
     // on a given machine.
     std::vector<HostEnemyState> hostEnemies_;
     std::vector<RemoteEnemy> remoteEnemies_;
+    std::vector<RemoteShot> remoteShots_;
+    EnemyHelicopterState hostHelicopters_[kEnemyHelicopterCount]{};
+    EnemyHelicopterState remoteHelicopters_[kEnemyHelicopterCount]{};
+    bool hasHostHelicopters_ = false;
+    bool hasRemoteHelicopters_ = false;
     std::vector<EnemyHitRequest> enemyHits_;
     std::vector<WorldImpactRequest> worldImpacts_;
     std::vector<WorldBreakEvent> worldBreaks_;

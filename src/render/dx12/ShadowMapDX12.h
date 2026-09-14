@@ -950,6 +950,13 @@ public:
                 BlackHawkWorldMatrix(), lightSpace, UploadBlackHawkPalette());
         }
 
+        if (drawDynamic) {
+            for (const auto& helicopter : RemoteInsertionHelicopters())
+                DrawSceneNodeShadow(helicopter.model, drawShader,
+                    XMLoadFloat4x4(&helicopter.world), lightSpace,
+                    UploadRemoteInsertionPalette(helicopter.airframe));
+        }
+
         // Enemy gunships. Previously absent from this pass entirely, so an
         // aircraft cast nothing -- most obviously under its own searchlight,
         // which lit the ground straight through the fuselage carrying it.

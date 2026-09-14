@@ -146,6 +146,7 @@ using namespace DirectX;
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
 #include "private/Multiplayer.h"
+#include "private/MultiplayerInsertion.h"
 // After Multiplayer.h: the status line it sends says whether this is a session.
 #include "private/SteamPresence.h"
 #include "private/WindowInput.h"
@@ -215,6 +216,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     ShowWindow(hwnd, nCmdShow);
     ToggleFullscreen(hwnd);
     UpdateWindow(hwnd);
+
+    // Take the render size off the window now that it is in its final
+    // fullscreen state, rather than trusting the display mode read above.
+    //
+    // Those two disagree on any display not running at 100% scaling. This
+    // process declares no DPI awareness -- there is no manifest and no
+    // SetProcessDpiAware* call -- so Windows hands it virtualised coordinates:
+    // GetClientRect reports 1706x960 on a 2560x1440 screen at 150%, while
+    // EnumDisplaySettings reports the physical 2560x1440 it is unaffected by.
+    // The swapchain was therefore built 1.5x larger than the window, and ImGui,
+    // which re-reads GetClientRect every frame, laid its UI out for the smaller
+    // one -- so the interface drew into a corner of an oversized buffer at the
+    // wrong scale.
+    //
+    // The WM_SIZE that ToggleFullscreen raises cannot correct it: that handler
+    // is gated on g_dx12.initialized, and DX12 is initialised below. That gate
+    // is why pressing F11 twice fixed it by hand -- the toggles raise the same
+    // resize once the guard has opened, which is the sync this does up front.
+    RECT clientRect = {};
+    if (GetClientRect(hwnd, &clientRect)) {
+        const unsigned clientWidth =
+            static_cast<unsigned>(clientRect.right - clientRect.left);
+        const unsigned clientHeight =
+            static_cast<unsigned>(clientRect.bottom - clientRect.top);
+        if (clientWidth > 0 && clientHeight > 0 &&
+            (clientWidth != SCR_WIDTH || clientHeight != SCR_HEIGHT)) {
+            std::cout << "Display scaling: rendering at " << clientWidth << "x"
+                      << clientHeight << " to match the window, not the "
+                      << SCR_WIDTH << "x" << SCR_HEIGHT
+                      << " display mode\n";
+            SCR_WIDTH = clientWidth;
+            SCR_HEIGHT = clientHeight;
+        }
+    }
 
     // DX12
     try {
@@ -909,6 +944,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // and it does nothing at all when Steam was not found at startup.
         UpdateSteam();
 
+        CollectRetiredNetworkActors();
+
         if (g_dx12.fence)
             g_retiredPrefabResources.Collect(
                 g_dx12.fence->GetCompletedValue());
@@ -1017,6 +1054,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // complete, and joining from the menu was impossible. The remote bodies
         // are still moved inside the gate, where a level actually exists.
         UpdateMultiplayerSession(deltaTime, g_localPlayerInput);
+        // Alongside the poll above rather than inside the gameplay gate: the
+        // roster changes while a player sits in the menu, and the notices have
+        // to clear themselves when the session ends from any screen.
+        UpdateNetPlayerNotices(deltaTime);
+        // Both beside the session poll: a shot fired on the frame a level ends
+        // still belongs on the wire, and the presentation of someone else's
+        // fire must not wait on the gameplay gate either.
+        ReportLocalShots();
+        PresentRemoteShots(deltaTime);
 
         // A downed player keeps simulating. Their health is zero, but they are
         // not out: remote bodies have to keep moving so they can watch a
@@ -1279,6 +1325,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // reinforcement wave owns it.
             UpdateReinforcementDropship(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
+            // After the local flight step and before the smoke reads the
+            // result: on a client the host's word replaces where the gunships
+            // are and how hurt they are, so the smoke and rotors that follow
+            // are driven off the same state every machine agrees on.
+            ApplyNetworkEnemyHelicopters();
             UpdateEnemyHelicopterDamageSmoke(deltaTime);
             UpdateBoat(deltaTime);
             // Aim the insertion once the level is actually up. Waits for the
@@ -2689,8 +2740,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (c4Blast) {
                             const uint64_t riggedTower = CommTowerEntityAt(center);
                             if (riggedTower != 0)
-                                DamagePrefabEntity(riggedTower, blastDamage,
-                                                   center, true);
+                                DamageObjectivePrefabEntity(
+                                    riggedTower, blastDamage, center,
+                                    /*remoteCharge=*/true,
+                                    !projectile.hostile);
                         }
                         // The aircraft needs the same volume treatment, and for
                         // the same reason: the radius pass measures to the
@@ -2713,8 +2766,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 const float planeDamage = c4Blast
                                     ? 1000000.0f
                                     : ObjectivePlaneRocketDamage(hitPlane);
-                                DamagePrefabEntity(hitPlane, planeDamage, center,
-                                                   c4Blast, !projectile.hostile);
+                                DamageObjectivePrefabEntity(
+                                    hitPlane, planeDamage, center, c4Blast,
+                                    !projectile.hostile);
                             }
                         }
                         projectile.active = false;
@@ -3123,7 +3177,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     // Player rounds on the gunship's hull -- same sheet metal.
                     PlayMetalHitAudio(helicopterHit, 0.85f);
-                    DamageHelicopter(34.0f * projectile.damageMultiplier, helicopterHit);
+                    DamageNetworkedHelicopter(
+                        0, 34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
                     stopProjectileAt(helicopterHit);
@@ -3139,8 +3194,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     PlayMetalHitAudio(helicopterHit, 0.85f);
-                    DamageSecondaryHelicopter(
-                        34.0f * projectile.damageMultiplier, helicopterHit);
+                    DamageNetworkedHelicopter(
+                        1, 34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
                     stopProjectileAt(helicopterHit);
@@ -3326,10 +3381,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (protectedOwner != 0 && projectile.remoteCharge &&
                             (!projectile.harpoon ||
                              projectile.harpoonPiercedCount == 0)) {
-                            DamagePrefabEntity(
+                            DamageObjectivePrefabEntity(
                                 protectedOwner,
                                 34.0f * projectile.damageMultiplier, hit,
-                                /*fromRemoteCharge=*/true);
+                                /*remoteCharge=*/true,
+                                !projectile.hostile);
                         }
                         // A round that is not a charge still rings off the steel.
                         if (!projectile.remoteCharge)
@@ -3670,6 +3726,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         presentPrepProfile.reset();
 
         // ?? begin frame ??
+        UpdateRemoteInsertionVisuals(deltaTime);
+
         // Timed on its own: BeginFrame blocks on the frame fence, so folding it
         // into the setup scope below would report a GPU stall as CPU work. Read
         // this row next to the Wait line, not next to the scopes around it.
@@ -4543,6 +4601,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                              "only the BlackHawk will be offered\n";
 
             ApplyInsertionAirframe(g_insertionAirframe);
+            InitializeRemoteInsertionVisuals();
             if (g_blackHawkModel) {
                 // No merged depth proxy: merging bakes the bind pose into flat
                 // geometry, which would leave the shadow's blades frozen while
@@ -5956,6 +6015,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawEnemyVisionCones(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
+            // Outside the insertion-choice gate: someone joining while you are
+            // still picking a landing spot is exactly when you want to know.
+            DrawNetPlayerNotices();
             if (g_ddgiCornellTestMode) {
                 const DXRDDGIRenderer::Status& status = g_dxrDDGI.GetStatus();
                 ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_Always);
@@ -6679,6 +6741,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
     WaitForGPU();
     g_assetWatcher.Stop();
+    CollectRetiredNetworkActors();
     waterRenderer.Shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();

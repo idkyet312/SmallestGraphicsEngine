@@ -281,6 +281,27 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit,
     const float verticalSpeed = speed * std::sin(angle);
     const float inverseHorizontal = 1.0f / horizontal;
 
+    const XMFLOAT3 velocity{ dx * inverseHorizontal * horizontalSpeed,
+                             verticalSpeed,
+                             dz * inverseHorizontal * horizontalSpeed };
+
+    // The AI runs on every machine, so every machine used to throw its own copy
+    // of this grenade. They were never the same grenade: the throw is rolled
+    // against a local random, so one machine's bandit threw while another's did
+    // not, and the two that did threw at their own idea of where the player was
+    // standing. The host throws for the session now and the spawn is carried to
+    // everyone, exactly as a player's grenade is.
+    // Asked of the session directly: this header is included ahead of
+    // Multiplayer.h, so MultiplayerActive() does not exist yet here.
+    if (g_netSession.Active()) {
+        if (g_netSession.CurrentRole() != net::Role::Host) return;
+        g_netSession.SpawnAIGrenade(net::GrenadeKind::Frag, hostile,
+                                    origin.x, origin.y, origin.z,
+                                    velocity.x, velocity.y, velocity.z,
+                                    scene.grenadeFuse);
+        return;
+    }
+
     Projectile grenade = {};
     grenade.position = grenade.previousPosition = origin;
     grenade.direction = { dx * inverseHorizontal, 0.0f, dz * inverseHorizontal };
@@ -289,9 +310,7 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit,
     grenade.active = true;
     grenade.fuse = scene.grenadeFuse;
     grenade.grenadeCollisionGrace = 0.18f;
-    grenade.velocity = { dx * inverseHorizontal * horizontalSpeed,
-                         verticalSpeed,
-                         dz * inverseHorizontal * horizontalSpeed };
+    grenade.velocity = velocity;
     scene.projectiles.push_back(grenade);
 }
 

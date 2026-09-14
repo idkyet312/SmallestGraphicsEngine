@@ -554,6 +554,23 @@ bool IsCookExcluded(const fs::path& path) {
         return true;
     if (generic.find("models/mainplayer/rifle idle") != std::string::npos)
         return true;
+    // The M4's iron sights are split out of the mesh at load by node name
+    // ("Aiming Module"), so they can be hidden when an optic is fitted. The
+    // cook merges primitives per material and drops those names: the cooked
+    // M4 loads as 1 primitive with 0 iron sights split, which bakes the rear
+    // leaf in permanently and pokes it through a mounted red dot. Measured on
+    // the shotgun smoke: 16 primitives / 2 split uncooked, 1 / 0 cooked.
+    // Cooking it is worth 192 MB of VRAM, so this is worth revisiting if the
+    // cook ever preserves node identity; until then it imports like the AK47.
+    if (generic.find("models/mainplayer/guns/m4/") != std::string::npos)
+        return true;
+    // The R700 for the same reason, one level down: the scope's aperture is
+    // found by the "Scope Glass" material name and the cook merges 11 materials
+    // into one called Metal, so GetR700LensCenter never resolves and the
+    // picture-in-picture scope loses its lens. Nothing is given up by skipping
+    // it -- the model carries no embedded textures, so its cook saves 0 MB.
+    if (generic.find("models/mainplayer/guns/r700/") != std::string::npos)
+        return true;
     return false;
 }
 

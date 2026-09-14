@@ -365,6 +365,32 @@ static void RenderMultiplayerMenu() {
             ImGui::TextColored(UITheme::kAccent, "Connected as player %d",
                                static_cast<int>(g_netSession.LocalId()) + 1);
         }
+
+        // Who is actually in. A host used to see only "Hosting on port 27015"
+        // and had no way to tell a friend had arrived short of starting a level
+        // and looking for them, so the wait was indistinguishable from a
+        // handshake that never completed.
+        //
+        // Skipped mid-handshake: a client with no id yet holds no slots, and
+        // reporting "1 player" there would name the wrong session.
+        if (g_netSession.LocalId() != net::kInvalidPlayerId) {
+            const int count = static_cast<int>(g_netSession.PlayerCount());
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            ImGui::TextColored(count > 1 ? UITheme::kAccent : UITheme::kTextDim,
+                               "%d player%s connected", count,
+                               count == 1 ? "" : "s");
+            for (net::PlayerId id = 0; id < net::kMaxPlayers; ++id) {
+                if (!g_netSession.PlayerActive(id)) continue;
+                const bool self = id == g_netSession.LocalId();
+                ImGui::TextColored(self ? UITheme::kTextDim : UITheme::kAccent,
+                                   "   PLAYER-%d%s",
+                                   static_cast<int>(id) + 1,
+                                   self ? "  (you)" : "");
+            }
+            if (count == 1)
+                ImGui::TextColored(UITheme::kTextDim,
+                                   "   waiting for someone to join...");
+        }
     } else if (!g_multiplayerStatusError.empty()) {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
