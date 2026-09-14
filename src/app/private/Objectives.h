@@ -911,15 +911,14 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
         if (downedPlane) OnObjectivePlaneResolved();
         if (isCommTower) CollapseCommTower(towerBase);
         else if (!downedPlane) scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
-        // Same targeted removal as the radius path: a felled comm tower still
-        // needs the full rebuild, since its geometry is handed to the
-        // destruction model, but an ordinary prop only has to stop drawing.
+        // The tower's falling chunks already belong to the destruction system.
+        // Remove only its prefab components; rebuilding the entire level here
+        // stalls the frame before the released chunks can visibly fall.
         if (!downedPlane) {
-            if (isCommTower || !RemovePrefabEntityFromRuntime(entityId)) {
+            const bool removed = RemovePrefabEntityFromRuntime(entityId);
+            if (!removed && !isCommTower) {
                 g_prefabRebuildRequested = true;
-                g_prefabRebuildReason = isCommTower
-                    ? "comm tower felled (direct)"
-                    : "prefab destroyed (direct, removal missed)";
+                g_prefabRebuildReason = "prefab destroyed (direct, removal missed)";
             }
         }
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
@@ -956,8 +955,7 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             g_commTowerMusicSwell = true;
             g_exfilHereDelay = kExfilHereDelay;
             CollapseCommTower(towerBase);
-            g_prefabRebuildRequested = true;
-            g_prefabRebuildReason = "comm tower felled (radius)";
+            RemovePrefabEntityFromRuntime(result.entityId);
             continue;
         }
         if (g_game.session.TimerRunning()) {

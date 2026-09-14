@@ -2721,6 +2721,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 center, enemyRadius,
                                 c4Blast ? 175.0f : scene.grenadeEnemyImpulse);
                         }
+                        // The radius pass can disable a tower at the base. Keep
+                        // its id before that happens so the direct demolition
+                        // still reaches clients through the world-break event.
+                        const uint64_t riggedTower = c4Blast
+                            ? CommTowerEntityAt(center) : 0;
                         // Only a remote charge can fell the comm tower; frag
                         // grenades and rockets leave it standing.
                         {
@@ -2739,7 +2744,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // the first place -- if the charge rigged the tower, that
                         // same charge brings it down.
                         if (c4Blast) {
-                            const uint64_t riggedTower = CommTowerEntityAt(center);
                             if (riggedTower != 0)
                                 DamageObjectivePrefabEntity(
                                     riggedTower, blastDamage, center,
