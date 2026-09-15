@@ -951,6 +951,10 @@ bool                        g_terrainDeformedThisFrame = false;
 // style). Persists across frames; clamped to a sane range.
 static float                g_editorCameraSpeed = 1.0f;
 static bool                 g_pendingEnvironmentRebuild = false;
+// Deployment state is prepared before a level load so the chosen loadout and
+// insertion route survive the transition, but the planning screen must not
+// present until the scene rebuilds have settled.
+static bool                 g_deploymentPlanningVisible = false;
 static bool                 g_editorVisualRefreshRequested = false;
 static bool                 g_editorFullReconcileRequested = false;
 static bool                 g_editorFullReconcileInFlight = false;

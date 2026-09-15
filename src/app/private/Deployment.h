@@ -224,6 +224,7 @@ static bool g_deploymentDebugHideAO = false;
 
 static void CancelDeploymentPlanning() {
     g_insertionChoicePending = false;
+    g_deploymentPlanningVisible = false;
     g_insertionChoiceCursorReleased = false;
     g_deploymentZones.clear();
     g_selectedDeploymentZone = -1;
@@ -247,6 +248,9 @@ static void CancelDeploymentPlanning() {
 }
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
+bool DeploymentPlanningVisible() {
+    return g_insertionChoicePending && g_deploymentPlanningVisible;
+}
 int DeploymentWaterDebugMode() {
     return g_insertionChoicePending && g_deploymentDebugWaterDepth ? 1 : 0;
 }
@@ -688,6 +692,9 @@ void ApplyLiveWeatherState(WeatherState state);
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 
 static void BeginDeploymentPlanning() {
+    // Keep the planning state prepared while the level finishes loading, but
+    // let the main loop publish it only after the scene rebuilds are complete.
+    g_deploymentPlanningVisible = false;
     g_deploymentNetworkPosition = scene.camera.Position;
     g_deploymentNetworkPosition.y -= scene.camera.PlayerHeight;
     auto params = CurrentTerrainParams();
@@ -805,7 +812,7 @@ static void UpdateMenuMusic() {
 }
 
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
-    if (!g_insertionChoicePending) {
+    if (!DeploymentPlanningVisible()) {
         scene.cameraFarOverride = 0.0f;
         return;
     }

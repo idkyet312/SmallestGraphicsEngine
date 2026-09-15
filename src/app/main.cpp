@@ -3672,6 +3672,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // -- parking a boat off the hub that ends a run nobody started.
         if (g_game.session.Screen() == GameScreen::Level1 && !g_baseMode &&
             !g_emptyLevelMode && g_game.session.TimerRunning() &&
+            !g_insertionChoicePending &&
             scene.player.health > 0.0f) {
             const bool objectiveMet =
                 g_game.mission.Stats().commTowersTotal == 0 ||
@@ -3855,6 +3856,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // houses, barrels and vehicles as well as loading missing prefabs.
             SynchronizeEditorRuntimeVisual(true);
         }
+        // Deployment is prepared when the level starts so its state survives
+        // the load, but it is only a visible screen after all existing scene
+        // rebuild work has finished. This also covers warm loads, which do not
+        // enter the level loading state at all.
+        if (g_insertionChoicePending && !g_game.loading.Active() &&
+            !g_pendingEnvironmentRebuild && !g_prefabRebuildRequested)
+            g_deploymentPlanningVisible = true;
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.
@@ -5993,7 +6001,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         g_thumbnailUploadedThisFrame = false;
-        if (g_game.loading.Active()) {
+        if (g_game.loading.Active() ||
+            (g_insertionChoicePending && !g_deploymentPlanningVisible)) {
             RenderLoadingScreen();
         } else if (g_game.session.Screen() == GameScreen::MainMenu) {
             RenderMainMenu(hwnd);
@@ -6077,7 +6086,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
         } else {
-            if (!g_insertionChoicePending) {
+            if (!DeploymentPlanningVisible()) {
                 RenderPlayerHUD(scene);
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
@@ -6131,7 +6140,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (showUI) RenderUI(scene, visBuffer);
             } else if (!scene.player.godMode && scene.player.health <= 0.0f) {
                 RenderDeathScreen(hwnd);
-            } else if (g_insertionChoicePending) {
+            } else if (DeploymentPlanningVisible()) {
                 // Takes over the frame the same way the death screen does: the
                 // insertion runs are held until this is answered.
                 RenderInsertionChoiceScreen(hwnd);
