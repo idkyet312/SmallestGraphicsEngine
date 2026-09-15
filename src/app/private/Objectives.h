@@ -842,11 +842,9 @@ static void UpdateObjectivePlanes(float dt) {
             g_game.mission.RecordObjectivePlaneEscaped();
             SGE_LOG("LogGameplay", EngineLog::Level::Warning,
                 "Objective aircraft escaped");
-            // An escape resolves the aircraft too. The mission is failed on
-            // that count and the report says so, but the boat still has to come
-            // -- it is the only way to end a run, and letting the plane go must
-            // not leave the player stranded with nothing to do.
-            OnObjectivePlaneResolved();
+            // An escape resolves the aircraft too. Big Island withholds its
+            // exfil on this failed outcome; destroying the plane calls it in.
+            OnObjectivePlaneResolved(false);
         }
     }
 }
@@ -945,7 +943,7 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
         }
         // Outside the loop: the response to the aircraft going down is called
         // once, not once per matching plane.
-        if (downedPlane) OnObjectivePlaneResolved();
+        if (downedPlane) OnObjectivePlaneResolved(true);
         if (isCommTower) CollapseCommTower(towerBase);
         else if (!downedPlane) scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         // The tower's falling chunks already belong to the destruction system.
@@ -1025,7 +1023,7 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
                 "Objective aircraft destroyed");
         }
         if (downedPlane) {
-            OnObjectivePlaneResolved();
+            OnObjectivePlaneResolved(true);
             continue;
         }
         scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);

@@ -736,14 +736,21 @@ static void CallInReinforcementWave() {
 // of coast the boat is waiting off -- the garrison stands between the player and
 // the way out rather than somewhere unrelated.
 //
-// Called for an escaped aircraft as well as a downed one. A failed intercept is
-// a worse run, not an unfinishable one, and the boat is the only way to end a
-// mission -- without this an escape would strand the player on the island with
-// nothing left to shoot and no exit. Idempotent through
-// PlaceEscapeBoatOnBearing, so a second aircraft resolving later leaves the
-// first one's boat where it is.
-static void OnObjectivePlaneResolved() {
+// Big Island's airfield exfil is earned by destroying the aircraft. Older
+// authored levels keep the forgiving escape resolution below, so this scope is
+// deliberately keyed to the level family rather than changing every mission.
+static bool IsBigIslandLevel() {
+    return g_activeLevelFile.rfind("BigIsland", 0) == 0 ||
+           g_activeLevelFile.rfind("bigisland", 0) == 0;
+}
+
+// Called for an escaped aircraft as well as a downed one. Big Island only
+// places the boat for the downed case; other levels retain their existing
+// escape resolution. Idempotent through PlaceEscapeBoatOnBearing, so a second
+// aircraft resolving later leaves the first one's boat where it is.
+static void OnObjectivePlaneResolved(bool destroyed) {
     if (g_netSession.CurrentRole() == net::Role::Client) return;
+    if (!destroyed && IsBigIslandLevel()) return;
     VehicleSystem& vehicles = g_game.vehicles;
     // Nothing to do once the exfil is out there: the boat would not move
     // anyway, and re-running this would call in a wave per aircraft.
