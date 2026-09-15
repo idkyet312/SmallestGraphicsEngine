@@ -209,7 +209,7 @@ public:
 
     static const char* LabelFor(XpEvent event) {
         switch (event) {
-        case XpEvent::EnemyKilled:             return "KILL";
+        case XpEvent::EnemyKilled:             return "ENEMY KILLED";
         case XpEvent::PropDestroyed:           return "DEMOLITION";
         case XpEvent::CommTowerDestroyed:      return "COMM TOWER";
         case XpEvent::ObjectivePlaneDestroyed: return "AIRCRAFT DOWN";

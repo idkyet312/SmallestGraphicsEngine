@@ -127,7 +127,7 @@ int main() {
         const std::vector<XpAward> drained = rank.DrainAwards();
         CHECK(drained.size() == 1);
         CHECK(drained.front().amount == RankSystem::kEnemyKillXp * 3);
-        CHECK(std::strcmp(drained.front().label, "KILL") == 0);
+        CHECK(std::strcmp(drained.front().label, "ENEMY KILLED") == 0);
         // Drained means gone: an award left in the queue would be drawn again
         // on the next frame.
         CHECK(rank.DrainAwards().empty());
