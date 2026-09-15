@@ -630,10 +630,18 @@ static bool TryPenetrate(Projectile& projectile, float cost, float falloff) {
 static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      float radius, XMFLOAT3& hit,
                                      uint64_t* hitEntityId,
-                                     XMFLOAT3* hitNormal) {
+                                     XMFLOAT3* hitNormal,
+                                     bool fencePanelsTransparent) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
     for (const PrefabCollider& collider : g_prefabColliders) {
+        // A fence panel's coarse box is what the player sweep and the AI walk
+        // into, so it stays in the list. What it must not do is stop a trace
+        // that chain-link would not: a projectile has to reach the destructible
+        // panel behind it to damage it and carry on like thin sheeting, and
+        // sight and cover have to pass through the mesh the eye sees through.
+        if (fencePanelsTransparent && IsFencePrefab(collider.prefabId))
+            continue;
         // Skip the bounds box of anything that also has a triangle mesh. The box
         // always encloses the geometry, so its hit is at or before the real
         // surface and nearest-wins would let it shadow every mesh hit -- shots
@@ -874,11 +882,17 @@ static bool CoverRayBlockedNear(const XMFLOAT3& start, const XMFLOAT3& end,
         blocked = true;
     };
 
+    // Exactly the occlusion the shooter's own sight test uses, fences included.
+    // Cover must never claim something the enemy can see straight through: a
+    // point scored as hidden behind chain-link is a point the actor walks to
+    // and is shot at, in the open, believing itself covered.
     XMFLOAT3 hit;
     if (scene.useDestruction && g_destruction.IsInitialized() &&
-        g_destruction.HitTestSegment(start, end, 0.08f, hit))
+        g_destruction.HitTestSegmentForVision(start, end, 0.08f, hit))
         accept(hit);
-    if (HitPrefabColliderSegment(start, end, 0.08f, hit)) accept(hit);
+    if (HitPrefabColliderSegment(start, end, 0.08f, hit, nullptr, nullptr,
+                                 /*fencePanelsTransparent=*/true))
+        accept(hit);
     if (HitTerrainSegment(start, end, 0.08f, hit)) accept(hit);
     if (g_trees.BlocksSegment(start, end, 0.08f)) {
         blocked = true;

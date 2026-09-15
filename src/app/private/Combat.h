@@ -187,14 +187,20 @@ static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     return false;
 }
 
-// hitNormal is last and defaulted so the call sites that do not want a surface
-// normal compile unchanged. It is written only for triangle-mesh hits; a bounds
-// box has no meaningful normal, so callers keep their own fallback.
+// hitNormal is defaulted so the call sites that do not want a surface normal
+// compile unchanged. It is written only for triangle-mesh hits; a bounds box
+// has no meaningful normal, so callers keep their own fallback.
+//
+// Every default argument for this function lives here, on the declaration the
+// rest of the app sees. Repeating one on the definition in WorldCollision.h is
+// an error, and adding a parameter there without adding it here makes the two
+// a pair of overloads that no call can choose between.
 static bool HitPrefabColliderSegment(const XMFLOAT3& start,
                                      const XMFLOAT3& end, float radius,
                                      XMFLOAT3& hit,
                                      uint64_t* hitEntityId = nullptr,
-                                     XMFLOAT3* hitNormal = nullptr);
+                                     XMFLOAT3* hitNormal = nullptr,
+                                     bool fencePanelsTransparent = false);
 
 static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
                                  const XMFLOAT3& target) {
@@ -202,9 +208,14 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
     constexpr float rayRadius = 0.04f;
     XMFLOAT3 hit;
     if (scene.useDestruction && g_destruction.IsInitialized() &&
-        g_destruction.HitTestSegment(origin, target, rayRadius, hit))
+        g_destruction.HitTestSegmentForVision(origin, target, rayRadius, hit))
         return false;
-    if (HitPrefabColliderSegment(origin, target, rayRadius, hit)) return false;
+    // Chain-link is see-through, and the destruction test above already let the
+    // eye past the panel's chunks. The prefab box has to agree or the coarse
+    // collider puts the fence straight back in the way.
+    if (HitPrefabColliderSegment(origin, target, rayRadius, hit, nullptr,
+                                 nullptr, /*fencePanelsTransparent=*/true))
+        return false;
     if (HitTerrainSegment(origin, target, rayRadius, hit)) return false;
     if (g_trees.BlocksSegment(origin, target, rayRadius)) return false;
     for (const auto& bandit : g_bandits) {

@@ -3400,7 +3400,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 uint64_t prefabEntityId = 0;
                 if (HitPrefabColliderSegment(projectile.previousPosition,
                         projectile.position, bulletRadius, hit,
-                        &prefabEntityId, &normal)) {
+                        &prefabEntityId, &normal,
+                        /*fencePanelsTransparent=*/true)) {
                     projectile.position = hit;
                     scene.SpawnBulletImpact(hit, normal);
                     if (projectile.laser) scene.StopLaserBeamAt(hit);
@@ -3439,6 +3440,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // Sampled here, before any damage below can tear the sheet
                     // off and leave the cached hit chunk pointing elsewhere.
                     const bool metalSheetHit = g_destruction.IsMetalSheetAt(hit);
+                    const bool fencePieceHit = g_destruction.IsFencePieceAt(hit);
                     // Objective geometry does not chip, and only a remote charge
                     // damages it at all. Rounds ring off the lattice and stop
                     // there -- the mast comes apart in one piece when the charge
@@ -3552,7 +3554,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     //
                     // The damage above has already landed, so a penetrating
                     // round both chips the sheet and reaches what is behind it.
-                    if (metalSheetHit && !protectedHit &&
+                    if ((metalSheetHit || fencePieceHit) && !protectedHit &&
                         TryPenetrate(projectile, kPenetrationCostSheet,
                                      kPenetrationFalloffSheet)) {
                         // Step just past the surface before flying on. Without

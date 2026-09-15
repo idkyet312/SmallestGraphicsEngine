@@ -214,6 +214,13 @@ public:
                         const DirectX::XMFLOAT3& worldEnd, float radius,
                         DirectX::XMFLOAT3& hitPosition,
                         uint32_t ignoredHarpoonId = 0) const;
+    // AI vision treats chain-link fence chunks as transparent. The query still
+    // tests every other chunk, so an opaque structure behind a fence remains a
+    // valid blocker. Physics and projectile callers use HitTestSegment above.
+    bool HitTestSegmentForVision(const DirectX::XMFLOAT3& worldStart,
+                                 const DirectX::XMFLOAT3& worldEnd,
+                                 float radius,
+                                 DirectX::XMFLOAT3& hitPosition) const;
     // Chunks whose node name contains this marker are objective geometry: blasts
     // and radial damage from anything other than a deliberate call pass straight
     // through them. Lets the comm tower stand in the enemy helicopter's patrol
@@ -223,6 +230,9 @@ public:
     // sheet, so a caller can pick the right impact sound for the surface it
     // just hit. Cheap nearest-cell lookup; no physics query.
     bool IsMetalSheetAt(const DirectX::XMFLOAT3& worldPosition) const;
+    // True when the chunk selected by the most recent segment test is an
+    // authored fence panel, which bullets can penetrate after damaging.
+    bool IsFencePieceAt(const DirectX::XMFLOAT3& worldPosition) const;
     // True when the chunk the last hit test resolved is objective geometry
     // (ProtectedChunkMarker). Such a hit must not chip the chunk directly: the
     // caller routes the damage to the owning prefab's health instead, so the
@@ -423,6 +433,12 @@ public:
     void receive(const Nv::Blast::TkEvent* events, uint32_t eventCount) override;
 
 private:
+    bool HitTestSegmentFiltered(const DirectX::XMFLOAT3& worldStart,
+                                const DirectX::XMFLOAT3& worldEnd,
+                                float radius,
+                                DirectX::XMFLOAT3& hitPosition,
+                                uint32_t ignoredHarpoonId,
+                                bool skipFencePieces) const;
     struct Impl;
     std::unique_ptr<Impl> m;
 };

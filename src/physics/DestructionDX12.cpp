@@ -4685,6 +4685,21 @@ bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLO
 bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3& worldEnd,
                                      float radius, XMFLOAT3& hitPosition,
                                      uint32_t ignoredHarpoonId) const {
+    return HitTestSegmentFiltered(worldStart, worldEnd, radius, hitPosition,
+                                  ignoredHarpoonId, false);
+}
+
+bool DestructionDX12::HitTestSegmentForVision(
+    const XMFLOAT3& worldStart, const XMFLOAT3& worldEnd, float radius,
+    XMFLOAT3& hitPosition) const {
+    return HitTestSegmentFiltered(worldStart, worldEnd, radius, hitPosition,
+                                  0, true);
+}
+
+bool DestructionDX12::HitTestSegmentFiltered(
+    const XMFLOAT3& worldStart, const XMFLOAT3& worldEnd, float radius,
+    XMFLOAT3& hitPosition, uint32_t ignoredHarpoonId,
+    bool skipFencePieces) const {
     if (!m->initialized) return false;
     m->lastRagdollHit = -1;
     m->lastHitChunk = InvalidIndex;
@@ -4708,6 +4723,9 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
                          runtime->collisionMinimum, runtime->collisionMaximum,
                          actorT) || actorT >= closest) continue;
         for (uint32_t index : runtime->chunks) {
+            if (skipFencePieces && index < m->chunks.size() &&
+                m->chunks[index].fencePiece)
+                continue;
             float t = 0.0f;
             if (SegmentAabb(modelStart, modelEnd, radius,
                             m->chunks[index].minimum, m->chunks[index].maximum, t) && t < closest) {
@@ -4773,6 +4791,21 @@ bool DestructionDX12::IsMetalSheetAt(const XMFLOAT3& worldPosition) const {
                                      true, true, /*includeProtected=*/true))
         return false;
     return hitChunk < m->chunks.size() && m->chunks[hitChunk].sheet;
+}
+
+bool DestructionDX12::IsFencePieceAt(const XMFLOAT3& worldPosition) const {
+    if (!m->initialized) return false;
+    if (m->lastRagdollHit >= 0) return false;
+    if (m->lastHitChunk != InvalidIndex &&
+        m->lastHitChunk < m->chunks.size())
+        return m->chunks[m->lastHitChunk].fencePiece;
+
+    Impl::ActorRuntime* hitActor = nullptr;
+    uint32_t hitChunk = InvalidIndex;
+    if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk,
+                                     true, true, /*includeProtected=*/true))
+        return false;
+    return hitChunk < m->chunks.size() && m->chunks[hitChunk].fencePiece;
 }
 
 bool DestructionDX12::IsProtectedChunkAt(const XMFLOAT3& worldPosition) const {
