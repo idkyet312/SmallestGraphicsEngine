@@ -2636,6 +2636,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawMeshAt(slice, shader, xf, view, proj, lightSpace, false,
                     visibilityExtensionsOnly, nullptr, item.palmWindRoot);
             } else {
+                // The cube is the no-model fallback: if the palm FBX never
+                // loaded, a tree is a stack of boxes rather than nothing. With
+                // the model loaded a null slice means that band simply holds no
+                // geometry -- SliceBand returns nullptr for an empty band, and
+                // the trunk is sliced up to crownBaseY (6.00) while the bark
+                // itself stops at 5.38, so the last band is always empty. Drawing
+                // the fallback for it put an untextured cube, sized by the tree's
+                // model scale and centred on the tree base, around the foot of
+                // every standing palm -- shadow included.
+                if (PalmModel::Loaded()) continue;
                 if (visibilityExtensionsOnly) continue;
                 shader.Use(scene.wireframeMode);
                 shader.SetMatrices(xf, view, proj, lightSpace);

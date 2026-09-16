@@ -993,6 +993,11 @@ public:
 
                 const XMMATRIX model = XMLoadFloat4x4(&item.transform);
                 if (!slice) {
+                    // Cube only when the palm FBX never loaded; with it loaded a
+                    // null slice is an empty band. This one cast the shadow that
+                    // sat on the ground under every palm -- see the same guard in
+                    // ForwardRenderer's palm pass.
+                    if (PalmModel::Loaded()) continue;
                     drawShader.Use();
                     drawShader.SetMatrices(model, lightSpace);
                     DrawCube(geo);

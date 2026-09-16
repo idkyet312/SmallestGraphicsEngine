@@ -333,8 +333,12 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
             }
             if (slice) AppendOpaqueMeshDrawItems(slice,
                 XMLoadFloat4x4(&tree.transform), items, tree.palmWindRoot);
-            else items.push_back({ XMLoadFloat4x4(&tree.transform), tree.color,
-                true, MAT_CUBE, false });
+            // Cube only when the palm FBX never loaded. With it loaded a null
+            // slice is an empty band, not missing geometry -- see the same
+            // guard in ForwardRenderer's palm pass.
+            else if (!PalmModel::Loaded())
+                items.push_back({ XMLoadFloat4x4(&tree.transform), tree.color,
+                    true, MAT_CUBE, false });
         }
     }
 
