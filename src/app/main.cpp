@@ -1529,24 +1529,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_exfilHereDelay = -1.0f;
             }
         }
-        // Training range: the callout is the first order of the exercise, so it
-        // lands the moment the player is on his feet -- the touchdown of the
-        // insertion he flew in on, or the first frame of a map he spawns
-        // standing on. Keyed to IsGrounded rather than to level start so it
-        // never plays over the flight in. g_plantC4Played is cleared by the
-        // level start, which is what re-arms it for a restart of the range.
-        // Riding is excluded because the cabin hands IsGrounded the DECK's
-        // state (Deployment.h), so a bird still sitting on the pad before
-        // takeoff reads as grounded and would fire the order before the
-        // player has gone anywhere.
-        const bool ridingInsertion =
-            g_game.vehicles.blackHawkCarryingPlayer ||
-            g_game.vehicles.insertionBoatCarryingPlayer;
-        if (g_trainingRangeMode && !g_plantC4Played && !ridingInsertion &&
-            scene.camera.IsGrounded) {
-            g_plantC4TowerDelay = kPlantC4TowerDelay;
-            g_plantC4Played = true;
-        }
         // Fires once, then parks at -1 so it cannot retrigger.
         if (g_plantC4TowerDelay >= 0.0f) {
             g_plantC4TowerDelay -= deltaTime;

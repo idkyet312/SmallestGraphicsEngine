@@ -279,15 +279,20 @@ static void RenderMainMenu(HWND hwnd) {
     // through the hub rather than from a menu button beside it. Custom Game
     // stays, because a hand-authored level has no travel card at the base.
     //
-    // Island 1 and the Training Range are still reachable -- the travel board
-    // flies to the island, the editor loads any level, and --level=<path>
-    // starts one directly -- they are just no longer this menu's job.
+    // Island 1 is still reachable without a row of its own -- the travel board
+    // flies there, the editor loads any level, and --level=<path> starts one
+    // directly. The Training Range is back on the menu because it is practice
+    // rather than a destination: walking out to the hub's helicopter to reach
+    // a firing range is a detour through fiction nobody wants on the way to
+    // trying a weapon out.
     // One unbroken column, in the order the player uses it. The section rules
     // are gone with the buttons: a divider every two entries was structure the
     // list is short enough not to need, and it fought the wordmark rule above.
     ImGui::SetWindowFontScale(1.7f);
     if (UIMenuRow("ENTER BASE"))
         StartBase(hwnd);
+    if (UIMenuRow("TRAINING RANGE"))
+        StartTrainingRange(hwnd);
     if (UIMenuRow("CUSTOM GAME"))
         BrowseAndStartCustomLevel(hwnd);
     if (UIMenuRow("LEVEL EDITOR"))

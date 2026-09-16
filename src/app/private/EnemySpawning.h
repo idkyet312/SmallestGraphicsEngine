@@ -100,6 +100,14 @@ static void PlayBanditDeathEvents() {
         g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,
                                   bandit->position.z, 0.9f, pitch,
                                   kBanditVoiceRange);
+        // Training range: dropping the guard is the exercise, so his death is
+        // the cue for the next order. Guarded by g_plantC4Played -- which the
+        // level start clears -- so a range that later gains more enemies does
+        // not stack the callout once per kill.
+        if (g_trainingRangeMode && !g_plantC4Played) {
+            g_plantC4TowerDelay = kPlantC4TowerDelay;
+            g_plantC4Played = true;
+        }
     }
 }
 

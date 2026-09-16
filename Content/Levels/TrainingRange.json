@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "name": "Training Range",
   "insertionMode": "player_choice",
+  "patrolBoatEnabled": false,
   "terrain": {
     "heightScale": 0.0,
     "tilesX": 4,
