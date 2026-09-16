@@ -2895,6 +2895,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 const auto stopProjectileAt = [&](const XMFLOAT3& impact,
                                                    bool destructibleHit = false) {
+                    // Every world impact funnels through here, so this is the
+                    // one place the AI has to be told where a round landed.
+                    // Flame and laser are excluded: they stop against a surface
+                    // every frame they are alive and would queue hundreds of
+                    // events a second. Everything else lands once.
+                    if (projectile.playerOwned && !projectile.flame &&
+                        !projectile.laser)
+                        EmitBulletImpactNoise(impact);
                     if (projectile.harpoon) {
                         projectile.position = impact;
                         g_destruction.PinHarpoonRagdolls(

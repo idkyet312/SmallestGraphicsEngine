@@ -255,6 +255,7 @@ public:
     static constexpr float BaseVisionRange() { return kVisionRange; }
     static float AlertBroadcastRadius() { return kAlertBroadcastRadius; }
     static constexpr float GunshotHearingRadius() { return kGunshotHearingRadius; }
+    static constexpr float ImpactNoiseRadius() { return kImpactNoiseRadius; }
     float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
 
     // Optional authored patrol path. Leave unset and an enemy wanders in a
@@ -1997,6 +1998,12 @@ private:
     static constexpr float kVisionHalfFovCos = 0.173648f; // cos(80 deg): 160 deg cone
     static constexpr float kAlertBroadcastRadius = 19.0f;
     static constexpr float kGunshotHearingRadius = 40.0f;
+    // How far a landing round is heard from where it struck. Short on purpose:
+    // the muzzle report (kGunshotHearingRadius) is what wakes a whole compound,
+    // this only wakes the man standing by the wall the player just hit. It is
+    // deliberately not scaled by a suppressor -- muffling the muzzle does
+    // nothing to the crack at the far end of the shot.
+    static constexpr float kImpactNoiseRadius = 10.0f;
 
     // Applies damageTakenScale to an incoming hit.
     //

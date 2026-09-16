@@ -242,6 +242,27 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
 EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
 std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 std::vector<EnemyAlertEvent> g_enemyAlertEvents;
+
+// A player round landing on the world is heard where it struck, not just where
+// it was fired from -- otherwise shooting a wall next to a patrol from beyond
+// the muzzle's hearing radius is completely silent to them. Marked playerOwned
+// so a bandit that hears it routes to the player rather than to the nearest
+// marine, same as the muzzle report.
+//
+// Deduped against what is already queued: a shotgun blast is eight pellets into
+// one wall and a full-auto burst lands one of these every other frame, and each
+// duplicate costs every bandit another sphere test for no behavioural change.
+inline void EmitBulletImpactNoise(const DirectX::XMFLOAT3& impact) {
+    for (const EnemyNoiseEvent& queued : g_enemyNoiseEvents) {
+        if (!queued.playerOwned) continue;
+        const float dx = queued.position.x - impact.x;
+        const float dy = queued.position.y - impact.y;
+        const float dz = queued.position.z - impact.z;
+        if (dx * dx + dy * dy + dz * dz <= 9.0f) return; // already heard, 3m
+    }
+    g_enemyNoiseEvents.push_back(
+        { impact, SkinnedEnemy::ImpactNoiseRadius(), true });
+}
 // Clear daylight until a time of day says otherwise. ApplyTimeOfDay overwrites
 // this, and every level start runs through there, so the default only stands
 // for the frames before the first preset lands.
