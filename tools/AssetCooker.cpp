@@ -802,12 +802,43 @@ void FinalizePrimitive(PrimitiveData& result,
         static_cast<uint32_t>(result.meshlets.triangles.size());
 }
 
+// Which UV set actually carries the unwrap.
+//
+// An exporter that merges several models into one mesh levels every primitive
+// up to the same UV set count, and the filler set does not always land last.
+// WeaponRacks is the case that found this: the rack's channel 0 is a constant
+// (0, 1) for all 1320 vertices and its real unwrap sits in channel 1, so the
+// whole rack sampled one texel and rendered as flat dark grey while the rifles
+// beside it -- unwrap in channel 0, filler in channel 1 -- looked right.
+//
+// Channel 0 is tried first, so a well-formed mesh is picked exactly as before
+// and only a degenerate first set sends us looking further.
+uint32_t PickUVChannel(const aiMesh& mesh) {
+    if (mesh.mNumVertices == 0) return 0;
+    for (uint32_t channel = 0; channel < AI_MAX_NUMBER_OF_TEXTURECOORDS;
+         ++channel) {
+        if (!mesh.HasTextureCoords(channel)) continue;
+        const aiVector3D* uvs = mesh.mTextureCoords[channel];
+        float minU = uvs[0].x, maxU = uvs[0].x;
+        float minV = uvs[0].y, maxV = uvs[0].y;
+        for (uint32_t i = 1; i < mesh.mNumVertices; ++i) {
+            minU = (std::min)(minU, uvs[i].x);
+            maxU = (std::max)(maxU, uvs[i].x);
+            minV = (std::min)(minV, uvs[i].y);
+            maxV = (std::max)(maxV, uvs[i].y);
+        }
+        if (maxU - minU > 1e-6f || maxV - minV > 1e-6f) return channel;
+    }
+    return 0;
+}
+
 PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
                                const std::vector<Cooked::Material>& materials) {
     PrimitiveData result;
     result.record.name = strings.Add(mesh.mName.C_Str());
     result.record.material = mesh.mMaterialIndex;
     result.vertices.resize(mesh.mNumVertices);
+    const uint32_t uvChannel = PickUVChannel(mesh);
     for (uint32_t i = 0; i < mesh.mNumVertices; ++i) {
         Cooked::Vertex& vertex = result.vertices[i];
         vertex.position[0] = mesh.mVertices[i].x;
@@ -818,8 +849,8 @@ PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
         vertex.normal[0] = normal.x;
         vertex.normal[1] = normal.y;
         vertex.normal[2] = normal.z;
-        const aiVector3D uv = mesh.HasTextureCoords(0)
-            ? mesh.mTextureCoords[0][i] : aiVector3D();
+        const aiVector3D uv = mesh.HasTextureCoords(uvChannel)
+            ? mesh.mTextureCoords[uvChannel][i] : aiVector3D();
         vertex.uv[0] = uv.x;
         vertex.uv[1] = uv.y;
         const aiVector3D tangent = mesh.HasTangentsAndBitangents()
