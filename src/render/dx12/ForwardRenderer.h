@@ -784,6 +784,8 @@ const std::vector<RopeItem>& BlackHawkRopeItems();
 // still descending. Empty whenever no wave is unloading.
 const std::vector<RopeItem>& DropshipRopeItems();
 bool DeploymentPlanningActive();
+// True only while the planning screen is up AND its grass debug is ticked.
+bool DeploymentGrassDebugActive();
 const std::vector<DirectX::XMFLOAT3>& DeploymentZonePositions();
 int SelectedDeploymentZoneIndex();
 // Same, plus the aircraft-local offset packed as (side, up, forward), for the
@@ -2210,13 +2212,23 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
         g_dxrDDGICellCount, g_dxrDDGIIndexCount,
         g_spotShadowAtlasResource);
-
-    // The deployment overview does not draw grass at all. It orbits the whole
-    // island from far outside it, so covering that view means a draw distance
-    // of a few hundred metres -- every cell in the field submitted, for blades
-    // a couple of pixels tall that only muddy the terrain the planner is there
-    // to read. The map is clearer, and much cheaper, without them.
-    if (g_grass.IsInitialized() && !DeploymentPlanningActive()) {
+    // The deployment overview does not draw grass by default. It orbits the
+    // whole island from far outside it, so covering that view means a draw
+    // distance of a few hundred metres -- every cell in the field submitted,
+    // for blades a couple of pixels tall that only muddy the terrain the
+    // planner is there to read. The map is clearer, and much cheaper, without
+    // them. The planning debug asks for exactly that cost on purpose: it is the
+    // only view that shows the field's whole footprint at once.
+    const bool planningGrass = DeploymentGrassDebugActive();
+    const float savedGrassDrawDistance = g_grass.DrawDistance();
+    // Raised for the draw and put straight back: the value is persistent state
+    // the gameplay camera reads too, and a planning number left in it would
+    // follow the player into the level as a field that never thins out.
+    if (planningGrass)
+        g_grass.DrawDistance() =
+            g_grass.DrawDistanceCovering(scene.camera.Position);
+    if (g_grass.IsInitialized() &&
+        (!DeploymentPlanningActive() || planningGrass)) {
         g_grass.SetViewer(scene.camera.Position);
         static std::vector<GrassField::DrawRange> grassRanges;
         g_grass.GetVisible(grassRanges);
@@ -2253,6 +2265,7 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
             shader.NextDrawCall();
         }
     }
+    if (planningGrass) g_grass.DrawDistance() = savedGrassDrawDistance;
 
     // Palm crowns are alpha-cut foliage too. Draw them into this same 4x HDR
     // layer with the regular material shader so frond texture edges get true
@@ -2725,6 +2738,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     //
     // Blades are built in world space, hence the identity model matrix. Opaque, so
     // this lands before the transparent water below or it would sort wrong.
+    // Same planning-debug lift as the visibility path's blade pass: this block
+    // runs instead of that one when the renderer is forced to forward, and the
+    // debug has to mean the same thing from either.
+    const bool planningGrassForward = DeploymentGrassDebugActive();
+    const float savedForwardGrassDistance = g_grass.DrawDistance();
+    if (planningGrassForward)
+        g_grass.DrawDistance() =
+            g_grass.DrawDistanceCovering(scene.camera.Position);
     if (includeGrass && !g_emptyLevelMode && g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
         // Distinct from the separate "Grass 4x MSAA" pass in the frame list --
         // this is the in-pass instanced blade submission.
@@ -2786,6 +2807,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.Use(scene.wireframeMode);
         }
     }
+    if (planningGrassForward)
+        g_grass.DrawDistance() = savedForwardGrassDistance;
 
     // Pool floaters are opaque. Water surfaces render later through the dedicated
     // depth-aware pass after all ordinary opaque geometry is complete.

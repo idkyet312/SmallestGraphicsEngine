@@ -414,7 +414,8 @@ struct Scene {
     // budget corner-major over levels, so 5 buys the viewer's own page at all
     // three levels plus two pages of the next corner; raise it toward Capacity
     // (16) for the full 2x2 block per level and the level-0 3x3 ring.
-    int   virtualShadowPageBudget = 5;
+    static constexpr int kDefaultVirtualShadowPageBudget = 5;
+    int   virtualShadowPageBudget = kDefaultVirtualShadowPageBudget;
     bool  showVirtualShadowPages = false;
     bool  cacheFarShadowCascades = false;
     bool  cacheSpotShadows = false;

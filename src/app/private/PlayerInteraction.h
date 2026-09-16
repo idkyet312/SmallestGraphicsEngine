@@ -461,7 +461,12 @@ struct TravelDestination {
     const char* imagePath;
 };
 
-static const std::array<TravelDestination, 4> kTravelDestinations = { {
+// The two combat maps. The Training Range and Home Base were cards here too;
+// both are still reachable from the main menu, which is where a player goes to
+// practise or to re-kit. The helicopter is a ride out to a job, so the board it
+// carries lists jobs -- landing back at the base you just took off from was
+// never one.
+static const std::array<TravelDestination, 2> kTravelDestinations = { {
     { "ISLAND 1", "Campaign - hostile territory",
       { "Content/Levels/Islandv10.json",
         "levels/Islandv10.json",
@@ -472,16 +477,6 @@ static const std::array<TravelDestination, 4> kTravelDestinations = { {
         "levels/BigIslandv33.json",
         "build/Content/Levels/BigIslandv33.json" },
       "Content/Textures/Islands/airfield.png" },
-    { "TRAINING RANGE", "Live fire - no hostiles",
-      { "Content/Levels/TrainingRange.json",
-        "levels/TrainingRange.json",
-        "build/Content/Levels/TrainingRange.json" },
-      "Content/Textures/Islands/training_range.png" },
-    { "HOME BASE", "Armory and staging",
-      { "Content/Levels/Base.json",
-        "levels/Base.json",
-        "build/Content/Levels/Base.json" },
-      "Content/Textures/Islands/base.png" },
 } };
 
 
@@ -697,9 +692,20 @@ static void RenderTravelPanel(HWND hwnd) {
     }
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
+    // Sized off the screen rather than pinned at 720x560. The cards carry real
+    // top-down captures of each map, and at the old fixed width the island read
+    // as a green smudge 214 px across -- the tower, the huts and the drop
+    // markers were all in the picture and none of them were legible. Clamped at
+    // both ends: never wider than the screen less a margin, never so small on a
+    // tiny window that the three-across row stops fitting.
+    const float kPanelMargin = 48.0f;
+    const float panelWidth = (std::max)(720.0f,
+        (std::min)(display.x * 0.82f, display.x - kPanelMargin * 2.0f));
+    const float panelHeight = (std::max)(560.0f,
+        (std::min)(display.y * 0.86f, display.y - kPanelMargin * 2.0f));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(panelWidth, panelHeight), ImGuiCond_Always);
     ImGui::Begin("##island_travel", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -714,15 +720,46 @@ static void RenderTravelPanel(HWND hwnd) {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
-    ImGui::BeginChild("##destinations", ImVec2(0.0f, -44.0f), false);
-    // Three across at the panel's width, then wrap. Cards keep a 16:9 image so
-    // a real screenshot drops in without the layout shifting around it. The row
-    // break is what lets the list grow: a fourth destination laid out on one
-    // line would need 910 px inside a 704 px child and would simply be clipped
-    // off the right edge with nothing to say it was there.
+    const float kFooterHeight = 52.0f;
+    ImGui::BeginChild("##destinations", ImVec2(0.0f, -kFooterHeight), false);
+    // Three across, then wrap. The card width is whatever the panel leaves
+    // rather than a constant, so widening the window widens the pictures
+    // instead of parking them left with dead space on the right. Images stay
+    // 16:9 so a straight screenshot drops in with no letterboxing.
     constexpr size_t kCardsPerRow = 3;
-    constexpr float kCardWidth = 214.0f;
-    constexpr float kImageHeight = kCardWidth * 9.0f / 16.0f;
+    constexpr float kCardGap = 20.0f;
+    // Width comes from the panel, not from GetContentRegionAvail(). The live
+    // region shrinks by the scrollbar when one appears, and the card size is
+    // what decides whether the content is tall enough to need that scrollbar --
+    // reading it back would let the two chase each other frame to frame on a
+    // short window. Reserving the scrollbar unconditionally costs a few pixels
+    // and settles it.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float innerWidth = panelWidth - style.WindowPadding.x * 2.0f -
+                             style.ScrollbarSize;
+    const float cardWidth = std::floor(
+        ((std::max)(1.0f, innerWidth) - kCardGap * (kCardsPerRow - 1)) /
+        kCardsPerRow);
+    const float imageHeight = std::floor(cardWidth * 9.0f / 16.0f);
+
+    // Caption block, measured rather than assumed at 46 px. The subtitles are
+    // sentences, not labels: at the old fixed width "Strike - aircraft on the
+    // ground" ran straight across its neighbour's caption, because the text was
+    // drawn unclipped from the card origin. Wrapping them to the card width
+    // fixes the bleed but makes the block one or two lines deep depending on
+    // the string, so every card takes the tallest of them and the row below
+    // starts level.
+    const float kNameGap = 8.0f;
+    const float kSubtitleGap = 4.0f;
+    const float lineHeight = ImGui::GetTextLineHeight();
+    float captionHeight = 0.0f;
+    for (const TravelDestination& destination : kTravelDestinations) {
+        const float subtitleHeight = ImGui::CalcTextSize(
+            destination.subtitle, nullptr, false, cardWidth).y;
+        captionHeight = (std::max)(captionHeight,
+            kNameGap + lineHeight + kSubtitleGap + subtitleHeight);
+    }
+
     const TravelDestination* chosen = nullptr;
     for (size_t index = 0; index < kTravelDestinations.size(); ++index) {
         const TravelDestination& destination = kTravelDestinations[index];
@@ -733,12 +770,12 @@ static void RenderTravelPanel(HWND hwnd) {
         // One invisible button spans image and caption, so the whole card is
         // the click target rather than just the words.
         const bool clicked = ImGui::InvisibleButton("##card",
-            ImVec2(kCardWidth, kImageHeight + 46.0f));
+            ImVec2(cardWidth, imageHeight + captionHeight));
         const bool hovered = ImGui::IsItemHovered();
 
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 imageMin = origin;
-        const ImVec2 imageMax(origin.x + kCardWidth, origin.y + kImageHeight);
+        const ImVec2 imageMax(origin.x + cardWidth, origin.y + imageHeight);
         const uint64_t image = UITextureFromFile(destination.imagePath);
         if (image) {
             draw->AddImage((ImTextureID)(intptr_t)image, imageMin, imageMax);
@@ -748,28 +785,32 @@ static void RenderTravelPanel(HWND hwnd) {
             draw->AddRectFilled(imageMin, imageMax, IM_COL32(28, 38, 32, 255));
             const ImVec2 textSize = ImGui::CalcTextSize(destination.name);
             draw->AddText(ImVec2(
-                imageMin.x + (kCardWidth - textSize.x) * 0.5f,
-                imageMin.y + (kImageHeight - textSize.y) * 0.5f),
+                imageMin.x + (cardWidth - textSize.x) * 0.5f,
+                imageMin.y + (imageHeight - textSize.y) * 0.5f),
                 IM_COL32(120, 140, 125, 255), destination.name);
         }
         draw->AddRect(imageMin, imageMax,
             hovered ? IM_COL32(38, 178, 82, 255) : IM_COL32(70, 78, 72, 255),
             0.0f, 0, hovered ? 2.0f : 1.0f);
 
-        draw->AddText(ImVec2(origin.x, imageMax.y + 6.0f),
+        draw->AddText(ImVec2(origin.x, imageMax.y + kNameGap),
             hovered ? IM_COL32(120, 220, 150, 255)
                     : IM_COL32(230, 235, 230, 255), destination.name);
-        draw->AddText(ImVec2(origin.x, imageMax.y + 24.0f),
-            IM_COL32(131, 146, 135, 255), destination.subtitle);
+        // Wrapped at the card width: the overload taking a wrap width is the
+        // one that keeps a long subtitle inside its own card.
+        draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(origin.x, imageMax.y + kNameGap + lineHeight + kSubtitleGap),
+            IM_COL32(131, 146, 135, 255), destination.subtitle, nullptr,
+            cardWidth);
 
         ImGui::EndGroup();
         ImGui::PopID();
         if (clicked) chosen = &destination;
         if (index + 1 < kTravelDestinations.size() &&
             (index + 1) % kCardsPerRow != 0)
-            ImGui::SameLine(0.0f, 18.0f);
+            ImGui::SameLine(0.0f, kCardGap);
         else if (index + 1 < kTravelDestinations.size())
-            ImGui::Dummy(ImVec2(0.0f, 14.0f));
+            ImGui::Dummy(ImVec2(0.0f, 16.0f));
     }
     ImGui::EndChild();
 
@@ -777,7 +818,7 @@ static void RenderTravelPanel(HWND hwnd) {
         ImGui::TextColored(UITheme::kWarning, "%s", g_travelStatus.c_str());
 
     ImGui::Separator();
-    if (ImGui::Button("STAY HERE  [E]", ImVec2(-1.0f, 32.0f)))
+    if (ImGui::Button("STAY HERE  [E]", ImVec2(-1.0f, 36.0f)))
         CloseTravelScreen(hwnd);
     ImGui::End();
 

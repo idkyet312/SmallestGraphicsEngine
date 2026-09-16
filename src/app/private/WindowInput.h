@@ -665,6 +665,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 (g_mouseWalkTestMode ? "ON (RMB walks forward, ADS off)"
                                      : "OFF"));
         }
+        else if (wParam == VK_F9 && !(lParam & 0x40000000)) {
+            // The only way out of the clean-shot mode: the checkbox that sets
+            // it is itself hidden the moment it takes effect.
+            g_deploymentDebugHideUI = !g_deploymentDebugHideUI;
+            SGE_LOG("LogRender", EngineLog::Level::Display,
+                std::string("UI hidden for screenshot: ") +
+                (g_deploymentDebugHideUI ? "ON (F9 to restore)" : "OFF"));
+        }
         else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
         return 0;
 

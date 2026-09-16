@@ -6152,6 +6152,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // Takes over the frame the same way the death screen does: the
                 // insertion runs are held until this is answered.
                 RenderInsertionChoiceScreen(hwnd);
+                // The planning panel carries the page-budget slider, so the
+                // world overlay has to run on this branch too -- otherwise the
+                // toggle beside it does nothing until the level starts.
+                DrawVirtualShadowPageDebug(scene);
             } else {
                 if (showUI) RenderUI(scene, visBuffer);
                 DrawDestructionDebug(scene);
@@ -6161,9 +6165,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         ImGui::Render();
 
-        ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
-        g_dx12.commandList->SetDescriptorHeaps(1, heaps);
-        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_dx12.commandList.Get());
+        // Everything ImGui produced this frame is dropped on the floor when the
+        // clean-shot toggle is on. ImGui::Render() above still runs: it ends the
+        // frame, and skipping it would leave the next NewFrame asserting.
+        if (!g_deploymentDebugHideUI) {
+            ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
+            g_dx12.commandList->SetDescriptorHeaps(1, heaps);
+            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(),
+                                          g_dx12.commandList.Get());
+        }
         }
 
         // ?? end frame ??
@@ -6622,33 +6632,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (!allResolved) PostQuitMessage(7);
                 else g_travelSmokeStage = 3;
             } else if (g_travelSmokeStage == 3) {
-                // Stage 4: fly. Training Range remains the default because it
-                // is the cheapest destination to load; the optional airfield
-                // route reproduces the larger map travel path.
+                // Stage 4: fly. Island 1 is the default now that the Training
+                // Range has left the board -- index 2 no longer exists, and an
+                // out-of-range read here would have been the test corrupting
+                // itself rather than failing.
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     "Travel smoke stage 4: departing");
                 TravelToDestination(hwnd, kTravelDestinations[
-                    travelSmokeAirfield ? 1 : 2]);
+                    travelSmokeAirfield ? 1 : 0]);
                 g_travelSmokeStage = 4;
                 g_travelSmokeFrames = 0;
             } else if (g_travelSmokeStage == 4 && g_travelSmokeFrames > 30) {
-                // Stage 5: the swap landed. The board must be closed and the new
-                // level's own prefabs compiled. The Training Range has no
-                // boarding point, while the airfield is identified by its
-                // loaded level file.
+                // Stage 5: the swap landed. Both routes are now checked by the
+                // level file the load recorded. The default route used to infer
+                // it from g_prefabTravelPoints going empty, which only ever
+                // meant "a map with no boarding helicopter in it" -- true of
+                // every destination, since Base.json is the only level that
+                // places one. Naming the file asserts the right map arrived.
                 //
-                // The cursor is deliberately not asserted free here. The
-                // Training Range is a player_choice map, so StartLevelOne hands
-                // it to the deployment screen on arrival; whether mouse-look is
-                // live on landing belongs to the destination level's insertion
-                // mode, not to this feature. What travel owes is that the board
+                // The cursor is deliberately not asserted free here. Both maps
+                // are player_choice, so StartLevelOne hands them to the
+                // deployment screen on arrival; whether mouse-look is live on
+                // landing belongs to the destination level's insertion mode,
+                // not to this feature. What travel owes is that the board
                 // itself released its own hold, which is g_travelCursorReleased
                 // going back down.
                 const bool closed = !g_travelScreenOpen;
                 const bool boardReleased = !g_travelCursorReleased;
-                const bool swapped = travelSmokeAirfield
-                    ? g_activeLevelFile == "BigIslandv33.json"
-                    : g_prefabTravelPoints.empty();
+                const bool swapped = g_activeLevelFile ==
+                    (travelSmokeAirfield ? "BigIslandv33.json"
+                                         : "Islandv10.json");
                 const bool passed = closed && boardReleased && swapped;
                 SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display
                                               : EngineLog::Level::Error,

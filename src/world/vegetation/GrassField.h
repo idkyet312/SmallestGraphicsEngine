@@ -256,6 +256,30 @@ public:
         }
     }
 
+    // The draw distance that puts every cell of the field on screen from `eye`,
+    // fade included. Measured off the cells that actually exist rather than
+    // guessed from a map size: the field's extent follows the terrain's grass
+    // material, so a number that covers one level would be wrong for the next.
+    //
+    // The shader's fade is 3D (length(toEye)), so the camera's height counts as
+    // much as its ground distance. Cell centres carry no Y, so the vertical leg
+    // is bounded by the eye's own altitude -- the ground is somewhere between
+    // sea level and the camera. That makes this an upper bound, which is what
+    // is wanted: one fade band of slack on top and every blade lands at full
+    // height instead of shrinking away at the far rim.
+    float DrawDistanceCovering(const XMFLOAT3& eye) const {
+        float farthestSq = 0.0f;
+        for (const Cell& c : m_cells) {
+            const float dx = c.cx - eye.x;
+            const float dz = c.cz - eye.z;
+            farthestSq = (std::max)(farthestSq, dx * dx + dz * dz);
+        }
+        const float horizontal = std::sqrt(farthestSq) + kCellSize * 0.7072f;
+        const float vertical = std::fabs(eye.y);
+        return std::sqrt(horizontal * horizontal + vertical * vertical) +
+               m_fadeBand;
+    }
+
     void AddRuntimeExclusion(float x, float z, float radius) {
         if (radius <= 0.0f) return;
         m_runtimeExclusions.push_back({ x, z, radius });

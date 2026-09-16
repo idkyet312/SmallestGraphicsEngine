@@ -221,6 +221,21 @@ static bool g_deploymentDebugCoverageGuides = false;
 // the lee of every prop, which is exactly where a drop-off marker sits on a
 // map read from above -- turning it off makes the terrain shape itself legible.
 static bool g_deploymentDebugHideAO = false;
+// Hides every ImGui element -- panels, HUD, editor, debug overlays -- for a
+// clean screenshot. Gated at the draw-data submission rather than at each
+// window: the planning screen mixes its map orbit, marker picking and audio
+// cues in with its drawing, so skipping the call would also take the camera
+// controls needed to frame the shot. Building the frame and dropping it costs
+// one wasted ImGui pass and keeps every control live under the blank screen.
+// Toggled with F9, which is the only way back once the checkbox is invisible.
+static bool g_deploymentDebugHideUI = false;
+// Draws the grass field on the planning overview, which normally skips it
+// entirely. Not free and not a default: covering that view means a draw
+// distance of a few hundred metres, i.e. every cell in the field submitted at
+// once, for blades a couple of pixels tall. It is here to check the field's
+// coverage and its terrain-material boundary from above, which is the one view
+// that shows the whole thing at once.
+static bool g_deploymentDebugShowGrass = false;
 
 static void CancelDeploymentPlanning() {
     g_insertionChoicePending = false;
@@ -248,6 +263,12 @@ static void CancelDeploymentPlanning() {
 }
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
+// Renderer-side gate for the planning grass debug. Folded with the planning
+// state here rather than read raw, so the flag can only ever mean anything on
+// the screen that owns it -- leaving it set has no effect in a mission.
+bool DeploymentGrassDebugActive() {
+    return g_insertionChoicePending && g_deploymentDebugShowGrass;
+}
 bool DeploymentPlanningVisible() {
     return g_insertionChoicePending && g_deploymentPlanningVisible;
 }

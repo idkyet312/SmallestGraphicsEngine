@@ -1338,6 +1338,68 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 "Skips GTAO and contact shadows while planning.\n"
                 "Flattens the shading so terrain shape and zone markers\n"
                 "read clearly from above. Gameplay AO is untouched.");
+        ImGui::Checkbox("Draw grass on the overview",
+                        &g_deploymentDebugShowGrass);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "The planning camera normally skips the grass field.\n"
+                "On, the draw distance is raised to cover the whole\n"
+                "field from up here -- every cell submitted at once --\n"
+                "so the blades' footprint and their terrain-material\n"
+                "boundary can be read from above. Costs frames.");
+
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        // Unlike the toggles above, this one is not planning-only: it writes the
+        // scene setting the renderer reads everywhere, so it stays off into the
+        // mission until it is turned back on. Off falls back to the cascades.
+        if (scene.enableShadows) {
+            ImGui::Checkbox("Virtual shadow maps", &scene.virtualShadowMaps);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Off: cascade shadow maps take the sun back.\n"
+                    "This is a scene setting, not a planning-only one --\n"
+                    "it carries into the mission.");
+        } else {
+            ImGui::TextDisabled("Shadows disabled in scene settings");
+        }
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        // Page budget. Not a quality slider: a page that is not resident is not
+        // a softer shadow, it is no shadow at all, so this is here to answer
+        // "is that missing shadow a coverage hole?" on the planning camera,
+        // which sits far enough out to run the atlas dry. Capacity is the
+        // physical atlas (16 slots), so it cannot ask for pages that do not exist.
+        if (scene.enableShadows && scene.virtualShadowMaps) {
+            ImGui::SliderInt("Virtual shadow pages",
+                             &scene.virtualShadowPageBudget,
+                             1, static_cast<int>(VirtualShadows::Capacity));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "How many of the 16 atlas pages the sun may hold.\n"
+                    "Spent corner-major over the three levels: 5 buys the\n"
+                    "viewer's own page at every level, 16 buys the full\n"
+                    "2x2 block per level plus the level-0 ring.\n"
+                    "Below coverage, unmapped ground reads as unshadowed.");
+            if (g_vsmUnavailable)
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+                                   "VSM unavailable: cascades in use");
+            else
+                ImGui::Text("Pages: %u resident, %u refreshed, %u reused",
+                            g_vsmResident, g_vsmRefreshed, g_vsmReused);
+            ImGui::Checkbox("Show virtual shadow pages in world",
+                            &scene.showVirtualShadowPages);
+        } else {
+            ImGui::TextDisabled("Virtual shadow pages: VSM off");
+        }
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::Checkbox("Hide all UI (clean screenshot)",
+                        &g_deploymentDebugHideUI);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Drops every ImGui element -- this panel included.\n"
+                "The windows are still there invisibly and still take\n"
+                "clicks where they sat, so turn the map from the middle\n"
+                "of the screen, clear of the two side columns.\n"
+                "F9 brings the UI back (it is the only way back).");
         if (ImGui::Button("Reset diagnostics")) {
             g_deploymentDebugHideWater = false;
             g_deploymentDebugHideAtmosphere = false;
@@ -1345,6 +1407,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             g_deploymentDebugWaterDepth = false;
             g_deploymentDebugCoverageGuides = false;
             g_deploymentDebugHideAO = false;
+            scene.virtualShadowPageBudget =
+                Scene::kDefaultVirtualShadowPageBudget;
+            scene.showVirtualShadowPages = false;
+            g_deploymentDebugHideUI = false;
+            g_deploymentDebugShowGrass = false;
         }
 
         const TerrainRendererDX12::Params diagnosticTerrain =
