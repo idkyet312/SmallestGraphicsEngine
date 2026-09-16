@@ -87,7 +87,7 @@
       "type": "prefab",
       "prefab": "props/airport",
       "name": "Military Airport",
-      "enabled": true,
+      "enabled": false,
       "transform": {
         "position": [
           0.0,
