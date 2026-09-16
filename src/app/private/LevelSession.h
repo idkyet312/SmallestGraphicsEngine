@@ -322,12 +322,17 @@ static void OpenWinScreen() {
     // The grade pays out. Recorded before StopTimer only because nothing here
     // is gated on the timer -- extraction is the one award that lands whatever
     // the run state, and it is what turns the score into money.
-    g_winScreenMissionBonus = g_game.money.AwardMissionBonus(report.totalScore);
+    // The range is practice and pays nothing, extraction included -- the same
+    // rule AwardCombatEvent applies to every kill on it. The score is still
+    // computed and still shown; it just does not turn into money or rank.
+    g_winScreenMissionBonus = g_trainingRangeMode
+        ? 0 : g_game.money.AwardMissionBonus(report.totalScore);
     g_winScreenPayout = static_cast<int64_t>(g_game.money.SessionEarned());
     // And the same grade in experience. The rank readout is snapshotted here
     // too: the run's promotions are drained off the queue by the HUD the frame
     // they happen, so the win screen cannot go looking for them afterwards.
-    g_winScreenXpBonus = g_game.rank.AwardMissionBonus(report.totalScore);
+    g_winScreenXpBonus = g_trainingRangeMode
+        ? 0 : g_game.rank.AwardMissionBonus(report.totalScore);
     g_winScreenXpEarned = g_game.rank.SessionXp();
     g_winScreenLevelAfter = g_game.rank.Level();
     g_winScreenTierAfter = g_game.rank.Tier();

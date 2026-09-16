@@ -91,7 +91,17 @@ static void ApplyRewardMultiplier() {
     g_game.rank.SetRewardMultiplier(multiplier);
 }
 
+// Defined with the other level-mode flags further down this header; the award
+// funnel sits above them and has to know whether this is the range.
+extern bool g_trainingRangeMode;
+
 static void AwardCombatEvent(MoneyEvent event, int count = 1) {
+    // The range pays nothing at all. It exists to try a weapon out against a
+    // target that shoots back, and a wallet that grows while you do it turns
+    // practice into the cheapest way to farm -- no travel, no threat, no timer
+    // pressure. Everything else about the range still works: the guard dies,
+    // the mission grade still moves, the callout still fires.
+    if (g_trainingRangeMode) return;
     // Wrecking the map pays nothing. RecordDestruction at every call site is
     // untouched, so demolition still moves the mission grade and the bonus it
     // buys -- it just no longer prints cash and experience per fracture, which
