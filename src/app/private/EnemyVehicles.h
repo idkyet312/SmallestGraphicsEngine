@@ -156,12 +156,25 @@ static void DamageAATurret(size_t turretIndex, float damage,
     SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
 }
 
-static bool HitOccupiedInsertionBlackHawkSegment(
+// The insertion BlackHawk's hull, for as long as there is an airframe to hit.
+//
+// Occupancy is deliberately NOT part of this. The aircraft used to stop taking
+// rounds the moment the player stepped off it, which made the most exposed part
+// of its flight -- climbing out of a hot LZ, empty, slow and low -- the one part
+// it could not be shot down in. Whether anyone is aboard decides who is allowed
+// to shoot (see the call site) and how loud the hit is, not whether the metal
+// is there.
+//
+// Crashing and Down are excluded so a wreck does not go on swallowing rounds
+// aimed past it; Gone clears blackHawkVisible. That matches the phases
+// DamageInsertionBlackHawkFromEnemyFire already refuses, so the hull and the
+// damage agree on when the aircraft is still a target.
+static bool HitInsertionBlackHawkSegment(
         const XMFLOAT3& start, const XMFLOAT3& end,
         float radius, XMFLOAT3& hit) {
     const VehicleSystem& vehicles = g_game.vehicles;
     if (!g_blackHawkModel || !vehicles.blackHawkVisible ||
-        !vehicles.blackHawkCarryingPlayer)
+        vehicles.BlackHawkIsCrashing() || vehicles.BlackHawkIsDown())
         return false;
     XMFLOAT3 center = vehicles.blackHawkPosition;
     center.y += 2.2f;

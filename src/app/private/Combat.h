@@ -377,11 +377,17 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit,
 // an end and a duration, the required velocity is exact, so the round lands on
 // the clicked point regardless of how far the camera happens to be orbiting.
 // Solving for an angle instead would miss whenever the target was out of range.
+//
+// flightSeconds is a parameter rather than a constant because the two callers
+// want different things from the same round. From the planning map it is a
+// shot the player watches go out: 1.6 s is long enough to read and short
+// enough not to stall the screen. The ongoing bombardment fires it at a player
+// standing under the impact, where the flight time IS the warning, so it asks
+// for considerably longer (see UpdateOngoingBombardment).
 static void LaunchMissileStrike(const XMFLOAT3& origin,
-                                const XMFLOAT3& target) {
-    // Long enough to watch it travel, short enough not to leave the player
-    // waiting on the planning screen.
-    constexpr float kFlightSeconds = 1.6f;
+                                const XMFLOAT3& target,
+                                float flightSeconds) {
+    const float kFlightSeconds = (std::max)(0.2f, flightSeconds);
     const float gravity = 9.81f * scene.grenadeGravityScale;
 
     Projectile missile = {};

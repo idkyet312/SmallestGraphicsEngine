@@ -49,6 +49,85 @@ static void DrawEscapeBoatMarker(CXMMATRIX view, CXMMATRIX projection) {
                   green, label);
 }
 
+// Impact marker for an inbound bombardment round. This is the counterplay, not
+// a flourish: the round is aimed at a random point with no regard for where the
+// player is standing, so without something on the ground saying where it lands
+// the bombardment is an unsignalled death every few seconds.
+//
+// Drawn at the impact point itself rather than clamped to a screen edge. A ring
+// the player cannot see is one they are not standing in -- clamping it would
+// put a warning on screen for every round on the island and teach them to
+// ignore all of them.
+static void DrawIncomingStrikeMarker(CXMMATRIX view, CXMMATRIX projection) {
+    if (!BombardmentInbound()) return;
+    if (g_game.session.Screen() != GameScreen::Level1) return;
+
+    const XMFLOAT3 impact = BombardmentImpact();
+    const XMFLOAT3 anchor{ impact.x, impact.y + 0.35f, impact.z };
+    const XMVECTOR clip = XMVector3Transform(
+        XMLoadFloat3(&anchor), view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    const float dx = scene.camera.Position.x - impact.x;
+    const float dz = scene.camera.Position.z - impact.z;
+    const float distance = std::sqrt(dx * dx + dz * dz);
+    // The radius that actually kills, so the ring the player is reading is the
+    // ring they have to be outside of. Same product the deploy board quotes.
+    const float lethalRadius =
+        scene.grenadeEnemyRadius * scene.missileBlastScale;
+    const bool inside = distance < lethalRadius;
+
+    // Closing ring: it starts wide and shrinks onto the impact as the round
+    // falls, so time-to-impact is read from the size without a number.
+    const float remaining = (std::max)(0.0f, BombardmentInboundRemaining());
+    const float progress = 1.0f -
+        (std::min)(1.0f, remaining / kBombardmentFlightSeconds);
+    // Perspective-correct: project a point one lethal radius to the side and
+    // take the screen distance, so the ring covers the ground the blast covers
+    // instead of being a fixed pixel size that lies at every other range.
+    const XMFLOAT3 edgeWorld{ impact.x + lethalRadius, anchor.y, impact.z };
+    const XMVECTOR edgeClip = XMVector3Transform(
+        XMLoadFloat3(&edgeWorld), view * projection);
+    const float edgeW = XMVectorGetW(edgeClip);
+    float groundRadius = 14.0f;
+    if (edgeW > 0.01f) {
+        const float edgeX =
+            (XMVectorGetX(edgeClip) / edgeW * 0.5f + 0.5f) * display.x;
+        const float edgeY =
+            (1.0f - (XMVectorGetY(edgeClip) / edgeW * 0.5f + 0.5f)) * display.y;
+        const float ex = edgeX - screen.x;
+        const float ey = edgeY - screen.y;
+        groundRadius = (std::max)(6.0f, std::sqrt(ex * ex + ey * ey));
+    }
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    // Red either way. "This one is mine" still has to read at a glance, so the
+    // distinction moves off hue and onto weight: a deep, half-lit red for a
+    // round landing elsewhere, full brightness plus the thicker ring below once
+    // the player is inside the lethal radius.
+    const ImU32 colour = inside ? IM_COL32(255, 48, 38, 250)
+                                : IM_COL32(196, 34, 30, 215);
+    draw->AddCircle(screen, groundRadius, colour, 48, inside ? 3.0f : 2.0f);
+    draw->AddCircle(screen, groundRadius * (1.0f - progress * 0.82f),
+                    colour, 40, 2.0f);
+    draw->AddCircleFilled(screen, 3.5f, colour);
+
+    const char* label = inside ? "INCOMING  MOVE" : "INCOMING";
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    const float labelY = screen.y - groundRadius - 6.0f - size.y;
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 4.0f, labelY - 2.0f),
+        ImVec2(screen.x + size.x * 0.5f + 4.0f, labelY + size.y + 2.0f),
+        IM_COL32(28, 4, 4, 185), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, labelY), colour, label);
+}
+
 // Friendly marker. Marines wear the same fatigues as the bandits they are
 // fighting, so at a glance in tall grass there is nothing to tell them apart.
 // A small dot over the head is enough: it reads instantly without covering the

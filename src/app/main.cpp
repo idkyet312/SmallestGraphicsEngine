@@ -2217,6 +2217,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 UpdateHumveeTurretAim(deltaTime);
                 UpdateWeaponPickups(deltaTime);
                 UpdateFootsteps(deltaTime);
+                // Ongoing bombardment, armed on the deploy board. Gated on a
+                // run actually being under way: the mission clock is what
+                // separates a player on the ground from one still on the
+                // planning map or watching a load, and a round called during
+                // either would land with nobody able to move out of it.
+                UpdateOngoingBombardment(
+                    deltaTime,
+                    g_game.session.Screen() == GameScreen::Level1 &&
+                        g_game.session.TimerRunning() &&
+                        !DeploymentPlanningVisible() &&
+                        !g_game.loading.Active());
             }
             if (!g_emptyLevelMode && g_banditLoaded) {
                 const std::vector<DestructionDebrisHazard> debris =
@@ -3203,17 +3214,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     continue;
                 }
                 XMFLOAT3 insertionVehicleHit;
-                if (projectile.hostile &&
-                    HitOccupiedInsertionBlackHawkSegment(
+                // Enemy fire always counts, aboard or not -- a helicopter that
+                // stopped being shootable the moment its passenger jumped out
+                // could never be brought down on the way out of a hot LZ.
+                // The player's own rounds only count once they are off it: a
+                // rifle fired from inside the cabin should not be chewing
+                // through the fuselage the shooter is sitting in.
+                const bool aboardBlackHawk =
+                    g_game.vehicles.blackHawkCarryingPlayer;
+                if ((projectile.hostile || !aboardBlackHawk) &&
+                    HitInsertionBlackHawkSegment(
                         projectile.previousPosition, projectile.position,
                         bulletRadius, insertionVehicleHit)) {
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(insertionVehicleHit, normal);
-                    // Rounds on the airframe: the player is inside it, so this
-                    // is the loudest metal hit in the game.
-                    PlayMetalHitAudio(insertionVehicleHit, 1.0f);
+                    // Loudest metal hit in the game while the player is inside
+                    // the airframe. Once they are out it is a hit on something
+                    // across the LZ, and PlayMetalHitAudio's distance falloff
+                    // does the rest.
+                    PlayMetalHitAudio(insertionVehicleHit,
+                                      aboardBlackHawk ? 1.0f : 0.8f);
                     g_game.vehicles.DamageInsertionBlackHawkFromEnemyFire(
                         2.4f * projectile.damageMultiplier);
                     stopProjectileAt(insertionVehicleHit);
@@ -6099,6 +6121,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawMarineFriendlyMarkers(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawIncomingStrikeMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawImpactDecalDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());

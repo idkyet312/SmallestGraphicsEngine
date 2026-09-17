@@ -146,6 +146,225 @@ static bool ArmoryPurchase(int price) {
 // map picks the impact point instead of a landing zone, so the two picking
 // modes never compete for the same click.
 static bool g_missileStrikeArmed = false;
+
+// "RANDOM WARTORN": a four-round barrage scattered across the island, as
+// opposed to the single round LAUNCH MISSILE has the player place by hand. It
+// is the same projectile and the same blast scale -- only the targeting is
+// different, so the two buttons share LaunchMissileStrike rather than each
+// owning a flight path.
+//
+// LaunchMissileStrike lives in Combat.h, which is included after this file.
+// Declared here the way DeploymentPlanningActive above is.
+static void LaunchMissileStrike(const XMFLOAT3& origin,
+                                const XMFLOAT3& target,
+                                float flightSeconds = 1.6f);
+
+static constexpr int kWartornSalvoRounds = 4;
+// Spacing between rounds. Flight time is a fixed 1.6 s, so at this interval the
+// first round is still in the air when the last one launches: the salvo reads
+// as a barrage walking across the island rather than four separate calls.
+static constexpr float kWartornSalvoInterval = 0.45f;
+// Every impact point is solved up front rather than one per round -- see
+// QueueWartornBarrage.
+static XMFLOAT3 g_wartornSalvoImpacts[kWartornSalvoRounds]{};
+static int g_wartornSalvoCount = 0;
+static int g_wartornSalvoFired = 0;
+static float g_wartornSalvoDelay = 0.0f;
+
+// Random dry-land point on the island for one round of the barrage.
+//
+// Rejection sampling against the real height field: the island is not a disc
+// and its coast is not a circle, so an angle-and-radius pick lands offshore
+// often enough that it has to be tested. The ocean surface is y = 0, so this
+// takes the same 0.55 m land floor the enemy scatter uses (see EnemySpawning) --
+// a round dropped in open water is a wasted quarter of the salvo.
+static bool PickRandomIslandImpact(const XMFLOAT3* taken, int takenCount,
+                                   XMFLOAT3& impact) {
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    const float islandRadius = 43.0f * (std::max)(
+        params.islandScaleX, params.islandScaleZ);
+    constexpr float kMinLandHeight = 0.55f;
+    // Two rounds in the same crater read as one hit. A quarter of the island
+    // radius is far enough apart to stay separate at the overview's framing.
+    const float separation = islandRadius * 0.25f;
+    constexpr int kMaxAttempts = 64;
+    // Attempts left before separation is abandoned. A small island, or a
+    // barrage whose first rounds happened to box the rest out, would otherwise
+    // drop rounds entirely -- landing four close together beats firing two.
+    constexpr int kRelaxAfter = 48;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const float angle =
+            ((float)std::rand() / (float)RAND_MAX) * XM_2PI;
+        // sqrt spreads the picks evenly over the area. Without it they bunch
+        // toward the centre, which is exactly where every barrage would land.
+        const float radius = std::sqrt(
+            (float)std::rand() / (float)RAND_MAX) * islandRadius;
+        const float x = std::cos(angle) * radius;
+        const float z = std::sin(angle) * radius;
+        const float y = TerrainRendererDX12::HeightAt(params, x, z);
+        if (y < kMinLandHeight) continue;
+        if (attempt < kRelaxAfter) {
+            bool crowded = false;
+            for (int index = 0; index < takenCount; ++index) {
+                const float dx = taken[index].x - x;
+                const float dz = taken[index].z - z;
+                if (dx * dx + dz * dz < separation * separation) {
+                    crowded = true;
+                    break;
+                }
+            }
+            if (crowded) continue;
+        }
+        impact = { x, y, z };
+        return true;
+    }
+    return false;
+}
+
+// Arms the barrage. Every impact point is chosen now, not one per round: the
+// spread is a property of the whole salvo, and picking each point as it fires
+// could not keep the fourth round away from the first.
+//
+// A pick can fail on terrain with no qualifying land, so the salvo is however
+// many points were found rather than a fixed four.
+static void QueueWartornBarrage() {
+    g_wartornSalvoCount = 0;
+    g_wartornSalvoFired = 0;
+    for (int round = 0; round < kWartornSalvoRounds; ++round) {
+        XMFLOAT3 impact{};
+        if (!PickRandomIslandImpact(g_wartornSalvoImpacts,
+                                    g_wartornSalvoCount, impact))
+            break;
+        g_wartornSalvoImpacts[g_wartornSalvoCount++] = impact;
+    }
+    // First round leaves on the next tick; the interval only spaces the rest.
+    g_wartornSalvoDelay = 0.0f;
+}
+
+static void ClearWartornBarrage() {
+    g_wartornSalvoCount = 0;
+    g_wartornSalvoFired = 0;
+    g_wartornSalvoDelay = 0.0f;
+}
+
+static bool WartornBarrageActive() {
+    return g_wartornSalvoFired < g_wartornSalvoCount;
+}
+
+// Releases one round per interval. Fired from the orbit camera, the same origin
+// a hand-placed strike uses, so the salvo comes off the screen the player is
+// looking through instead of materialising overhead.
+static void UpdateWartornBarrage(float deltaTime) {
+    if (!WartornBarrageActive()) return;
+    g_wartornSalvoDelay -= (std::max)(0.0f, deltaTime);
+    if (g_wartornSalvoDelay > 0.0f) return;
+    LaunchMissileStrike(scene.camera.Position,
+                        g_wartornSalvoImpacts[g_wartornSalvoFired]);
+    ++g_wartornSalvoFired;
+    g_wartornSalvoDelay = kWartornSalvoInterval;
+}
+
+// Ongoing bombardment. Armed on the deploy board and, unlike the one-shot
+// barrage above, it keeps running once the player is on the ground: a round
+// lands somewhere on the island every interval for the whole mission.
+//
+// Its counterpart is not LAUNCH MISSILE but the sniper's laser -- this is
+// hostile fire the player has to read and move away from, so the same rule
+// applies: it has to be dodgeable. Three things make it so, and none of them
+// are decoration:
+//   * the round comes in on a long flight, so there is time to move;
+//   * the impact point is marked on the ground for that whole flight
+//     (DrawIncomingStrikeMarker);
+//   * a whistle plays at the impact point, so it can be located without
+//     looking at it.
+// Shortening the flight or dropping the marker turns it into a random death.
+static bool  g_bombardmentEnabled = false;
+static float g_bombardmentInterval = 10.0f;
+static float g_bombardmentTimer = 0.0f;
+// Inbound round. One at a time: the interval is longer than the flight, so a
+// second round cannot be in the air while the first is still falling, and the
+// marker never has to describe two impacts at once.
+static bool  g_bombardmentInbound = false;
+static XMFLOAT3 g_bombardmentImpact{};
+static float g_bombardmentInboundRemaining = 0.0f;
+// Flight time, which is also the warning. A lethal radius of
+// grenadeEnemyRadius * missileBlastScale is 14 m at the defaults; a sprint
+// clears that comfortably in four seconds, which is the margin being bought
+// here.
+static constexpr float kBombardmentFlightSeconds = 4.0f;
+// Metres the round is offset horizontally from its impact before launch. A
+// round spawned directly overhead falls straight down out of nothing; coming
+// in at a slant reads as artillery fired from off the island.
+static constexpr float kBombardmentStandoff = 70.0f;
+// Launch altitude above the impact point, on top of the terrain height there.
+static constexpr float kBombardmentAltitude = 190.0f;
+
+static bool BombardmentInbound() { return g_bombardmentInbound; }
+static const XMFLOAT3& BombardmentImpact() { return g_bombardmentImpact; }
+static float BombardmentInboundRemaining() {
+    return g_bombardmentInboundRemaining;
+}
+
+// Puts the next round back a full interval and forgets any inbound one. Called
+// when a run starts, so a mission never opens with a round already falling
+// from the timer the last one left behind.
+static void ResetOngoingBombardment() {
+    g_bombardmentTimer = 0.0f;
+    g_bombardmentInbound = false;
+    g_bombardmentInboundRemaining = 0.0f;
+}
+
+// Ticked every gameplay frame. `active` is the caller's gate: on the ground,
+// mission running, not planning and not loading. Passing it in rather than
+// testing here keeps the level/screen predicates at the one site in main that
+// already owns them.
+static void UpdateOngoingBombardment(float deltaTime, bool active) {
+    if (!g_bombardmentEnabled || !active) {
+        // Not a pause. A round already in the air belongs to a situation the
+        // player has left, so it goes with the bombardment rather than being
+        // resumed into a screen where its marker means nothing.
+        if (g_bombardmentInbound) ResetOngoingBombardment();
+        return;
+    }
+    const float step = (std::max)(0.0f, deltaTime);
+    if (g_bombardmentInbound) {
+        g_bombardmentInboundRemaining -= step;
+        // The projectile detonates on its own contact; this only stops the
+        // marker being drawn for a round that has already landed. Cleared a
+        // little past zero so the marker survives to the moment of impact
+        // rather than blinking out just before it.
+        if (g_bombardmentInboundRemaining <= -0.15f)
+            g_bombardmentInbound = false;
+    }
+    g_bombardmentTimer -= step;
+    if (g_bombardmentTimer > 0.0f) return;
+    g_bombardmentTimer = (std::max)(1.0f, g_bombardmentInterval);
+
+    XMFLOAT3 impact{};
+    // No taken points to keep clear of: each round stands alone, and the
+    // interval already separates them in time.
+    if (!PickRandomIslandImpact(nullptr, 0, impact)) return;
+
+    // Slant the approach. The bearing is random per round so the fire does not
+    // appear to come from one fixed battery.
+    const float bearing = ((float)std::rand() / (float)RAND_MAX) * XM_2PI;
+    const XMFLOAT3 origin{
+        impact.x + std::cos(bearing) * kBombardmentStandoff,
+        impact.y + kBombardmentAltitude,
+        impact.z + std::sin(bearing) * kBombardmentStandoff };
+    LaunchMissileStrike(origin, impact, kBombardmentFlightSeconds);
+
+    g_bombardmentInbound = true;
+    g_bombardmentImpact = impact;
+    g_bombardmentInboundRemaining = kBombardmentFlightSeconds;
+
+    // Whistle placed at the impact, not at the launch: the useful information
+    // is where it is going to land. The rolloff is stretched well past the
+    // default so a round landing across the island is still audible as a
+    // distant one rather than dropping to nothing.
+    g_rpgFireAudio.PlayAt(impact.x, impact.y, impact.z, 0.9f, 0.62f, 220.0f);
+}
 // Mouse-wheel zoom on the deployment overview, as a multiplier on the orbit
 // rig BuildCameraFrame composes. Applied to radius and height together so the
 // framing scales instead of skewing: pulling in low over the island would
@@ -249,6 +468,7 @@ static void CancelDeploymentPlanning() {
     // A cancelled plan never puts a transport in the air, so a drop banked from
     // a previous attempt must not survive into the next one.
     g_marineDropPending = false;
+    ClearWartornBarrage();
     g_deploymentZoom = 1.0f;
     g_deploymentOrbitDragging = false;
     g_deploymentOrbitOffset = 0.0f;
@@ -743,6 +963,10 @@ static void BeginDeploymentPlanning() {
     // for one deployment, so this screen opens with nothing paid for and the
     // storefront quotes a price on every row again.
     ClearMissionRentals();
+    // A new run starts with a clean bombardment clock. The toggle itself is
+    // deliberately not cleared here -- it is a mode the player chose, not kit
+    // they rented for one mission.
+    ResetOngoingBombardment();
     // The squad is hired the same way and cannot be inherited either, or a
     // restart would deploy marines the player was never charged for.
     g_deploymentMarineCount = 0;
@@ -835,12 +1059,21 @@ static void UpdateMenuMusic() {
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
     if (!DeploymentPlanningVisible()) {
         scene.cameraFarOverride = 0.0f;
+        // Leaving the overview -- deployed, cancelled or dropped into the
+        // editor -- takes the rest of the salvo with it. The barrage is fired
+        // from the orbit camera, so rounds still pending once that camera is
+        // gone would launch from wherever the player now stands.
+        ClearWartornBarrage();
         return;
     }
     if (g_game.loading.Active()) {
         scene.cameraFarOverride = 0.0f;
         return;
     }
+    // Ahead of the camera update on purpose: a round leaves from the camera as
+    // it was framed when the player watched it go, not from where this frame's
+    // orbit is about to put it.
+    UpdateWartornBarrage(deltaTime);
     // The automatic orbit only advances when the player is not steering it, the
     // flick has coasted to a stop, and the pause after that has run out.
     // Holding the clock still (rather than letting it run and snapping back) is

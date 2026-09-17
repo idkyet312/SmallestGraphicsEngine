@@ -980,14 +980,18 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             // Bandits only. Marines are friendly and a red dot would read as a
             // threat the player then plans around for no reason.
             if (bandit->faction != Faction::Bandit) continue;
-            // An authored Humvee's gunner is already represented by the vehicle
-            // dot below, drawn a metre away from where he stands -- two dots for
-            // one emplacement just read as two enemies. Only gunners on authored
-            // Humvees (mountedVehicleIndex >= 0) are skipped: the boat gunner
-            // (kBoatGunnerMount) and the stress-test gunner
-            // (kStressHumveeGunnerMount) use negative sentinels and have no
-            // vehicle dot standing in for them, so they keep their own.
+            // A gunner already covered by a vehicle dot below does not get a
+            // second one -- two dots a metre apart read as two enemies rather
+            // than one emplacement. That is every authored Humvee gunner
+            // (mountedVehicleIndex >= 0), and now the boat gunner too, since the
+            // patrol boat draws its own dot further down. The stress-test gunner
+            // (kStressHumveeGunnerMount) still has nothing standing in for it,
+            // so it keeps its own.
             if (bandit->turretGunner && bandit->mountedVehicleIndex >= 0)
+                continue;
+            if (bandit->turretGunner &&
+                bandit->mountedVehicleIndex == kBoatGunnerMount &&
+                g_levelPatrolBoatEnabled && g_boatModel)
                 continue;
 
             XMFLOAT3 spot = bandit->position;
@@ -1060,6 +1064,57 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                                         IM_COL32(232, 48, 48, 235));
             foreground->AddCircle(turretScreen, 8.5f,
                                   IM_COL32(232, 48, 48, 190), 12, 1.6f);
+        }
+
+        // Patrol boat. The one hostile on the map that is not where it will be
+        // by the time the player lands: it circles the island continuously, and
+        // it keeps circling while this screen is open, so the dot moves as the
+        // map turns. That is the point of showing it -- an approach that is
+        // clear now may have a gunboat sitting on it in thirty seconds.
+        //
+        // Position rather than spawn: g_boatPosition only leaves the island
+        // centre once UpdateBoat has run, so a dot taken from g_boatCenter
+        // would sit inland until the first tick.
+        if (g_levelPatrolBoatEnabled && g_boatModel &&
+            !g_game.vehicles.boatDead && !g_game.vehicles.boatSunk) {
+            XMFLOAT3 spot = g_boatPosition;
+            spot.y += 2.6f;
+            const XMVECTOR boatClip = XMVector3Transform(
+                XMLoadFloat3(&spot), viewProjection);
+            const float boatW = XMVectorGetW(boatClip);
+            if (boatW > 0.01f) {
+                const ImVec2 boatScreen{
+                    (XMVectorGetX(boatClip) / boatW * 0.5f + 0.5f) * display.x,
+                    (1.0f - (XMVectorGetY(boatClip) / boatW * 0.5f + 0.5f)) *
+                        display.y };
+                foreground->AddCircleFilled(boatScreen, 6.0f,
+                                            IM_COL32(20, 4, 6, 200));
+                foreground->AddCircleFilled(boatScreen, 4.0f,
+                                            IM_COL32(232, 48, 48, 235));
+                foreground->AddCircle(boatScreen, 8.5f,
+                                      IM_COL32(232, 48, 48, 190), 12, 1.6f);
+                // Heading tick. The other vehicle dots mark fixed emplacements,
+                // where a direction would mean nothing; this one is under way,
+                // and which way it is going is what decides whether a landing
+                // site is about to be overlooked.
+                const float tickX = std::sin(g_boatYaw);
+                const float tickZ = std::cos(g_boatYaw);
+                XMFLOAT3 ahead{ g_boatPosition.x + tickX * 14.0f,
+                                spot.y,
+                                g_boatPosition.z + tickZ * 14.0f };
+                const XMVECTOR aheadClip = XMVector3Transform(
+                    XMLoadFloat3(&ahead), viewProjection);
+                const float aheadW = XMVectorGetW(aheadClip);
+                if (aheadW > 0.01f) {
+                    const ImVec2 aheadScreen{
+                        (XMVectorGetX(aheadClip) / aheadW * 0.5f + 0.5f) *
+                            display.x,
+                        (1.0f - (XMVectorGetY(aheadClip) / aheadW * 0.5f + 0.5f))
+                            * display.y };
+                    foreground->AddLine(boatScreen, aheadScreen,
+                                        IM_COL32(232, 48, 48, 200), 1.8f);
+                }
+            }
         }
     }
 
@@ -2108,6 +2163,62 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ImGui::SetTooltip(
                 "Call in an impact-fused round. Arms targeting; the next\n"
                 "click on the map is the impact point, not a zone pick.");
+    }
+
+    // Unaimed counterpart to LAUNCH MISSILE: four rounds walked across random
+    // dry land. Left enabled while a strike is armed -- the two do not share
+    // the map click, so arming one does not block the other.
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    ImGui::SetCursorPosX(45.0f);
+    {
+        // Re-arming mid-salvo would throw away the rounds still queued, so the
+        // button holds until the last one is away. That is a fraction of a
+        // second at the authored interval, not a cooldown.
+        const bool firing = WartornBarrageActive();
+        ImGui::BeginDisabled(firing);
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(95, 60, 25, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(130, 82, 34, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(155, 98, 40, 255));
+        if (ImGui::Button("RANDOM WARTORN", ImVec2(340.0f, 32.0f)))
+            QueueWartornBarrage();
+        ImGui::PopStyleColor(3);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Walk a four-round barrage across the island at random.\n"
+                "Same round and same blast scale as a called strike, but\n"
+                "the impact points are picked for you -- spread apart and\n"
+                "kept on dry land.");
+    }
+
+    // Ongoing bombardment. The two buttons above are single events the player
+    // fires from this screen; this is a mode that outlives it, so it is a
+    // checkbox rather than a button and it survives the deploy.
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::Checkbox("ONGOING BOMBARDMENT", &g_bombardmentEnabled);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Keeps shelling the island for the whole mission: one round\n"
+            "on a random point every interval, starting once you are on\n"
+            "the ground. Rounds are aimed without regard for where you\n"
+            "are -- each one is marked on the ground and whistles as it\n"
+            "falls, and you have about four seconds to leave the ring.");
+    if (g_bombardmentEnabled) {
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::SetNextItemWidth(340.0f);
+        // Floor of 4 s rather than 0: the round is in the air for 4 s, and an
+        // interval under that would put a second one up before the first has
+        // landed, which the single inbound marker cannot describe.
+        ImGui::SliderFloat("##BombardmentInterval", &g_bombardmentInterval,
+                           4.0f, 60.0f, "Every %.0f s");
+        ImGui::SetCursorPosX(45.0f);
+        // The interval alone does not say how dangerous this is; the lethal
+        // ring is the other half, and it moves with the blast slider below.
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
+            "Lethal ring %.0f m -- rounds do not avoid you",
+            scene.grenadeEnemyRadius * scene.missileBlastScale);
     }
 
     // Blast size. Applies to the called-in strike only, so widening it does not
