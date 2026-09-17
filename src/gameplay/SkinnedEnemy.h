@@ -377,7 +377,12 @@ public:
             return;
         }
         EaseDownedRoll(dt, false);
-        PlayClip(moving ? (sprinting ? "Run" : "Walk") : "Idle");
+        // `moving` is the sender's input axes, not their travel: a player
+        // holding W against a wall, a crate or another body reports moving
+        // forever while the snapshots put them in the same spot. Stand them up
+        // once the position says they have stopped.
+        const bool netStill = MeasureStillness(dt, position);
+        PlayClip(moving && !netStill ? (sprinting ? "Run" : "Walk") : "Idle");
 
         // Play the cycle at the rate the body is actually travelling instead of
         // the clip's authored speed. A networked body is moved by snapshots, so
@@ -1898,12 +1903,28 @@ private:
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
     AnimationInstance upperBodyAnim_;
     LocomotionBlendSpace locomotion_;
+    // Where the body was when locomotion was last evaluated, and how long it
+    // has covered no ground since. Shared by the AI and networked paths: both
+    // ask for a gait from intent, and only the position says whether the body
+    // is really going anywhere.
+    DirectX::XMFLOAT3 locomotionPreviousSample_{};
+    bool  hasLocomotionHistory_ = false;
+    float stillTime_ = 0.0f;
 
     void UpdateLocomotion(float dt, const DirectX::XMFLOAT3& start,
                           float requestedSpeed, float fallbackPlaybackRate = 1.0f) {
         const float inverseDt = dt > 1e-5f ? 1.0f / dt : 0.0f;
-        const float vx = (position.x - start.x) * inverseDt;
-        const float vz = (position.z - start.z) * inverseDt;
+        float vx = (position.x - start.x) * inverseDt;
+        float vz = (position.z - start.z) * inverseDt;
+        // What the steering asked for is not what the body did. Three things
+        // run after Update and can cancel the move outright -- the ledge
+        // revert, the prefab pushout and the vehicle pushout -- so an actor
+        // pressed into a wall or stopped at the edge of a watchtower deck kept
+        // a full walk cycle while its feet covered no ground. Frame-over-frame
+        // displacement is measured from the position this Update started at
+        // versus the one before, which is after all of those corrections.
+        const bool still = MeasureStillness(dt, start);
+        if (still) { vx = 0.0f; vz = 0.0f; }
         const float c = std::cos(yaw), s = std::sin(yaw);
         const AnimationClip* pose = directionalLocomotionIK
             ? locomotion_.Update(dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)
@@ -1911,10 +1932,38 @@ private:
         if (pose) {
             if (anim.clip != pose) anim.Play(pose);
         } else {
-            PlayClip(requestedSpeed > moveSpeed * 1.2f ? "Run" :
-                     requestedSpeed > 0.01f ? "Walk" : "Idle");
-            anim.Advance(dt * fallbackPlaybackRate);
+            const float gaitSpeed = still ? 0.0f : requestedSpeed;
+            PlayClip(gaitSpeed > moveSpeed * 1.2f ? "Run" :
+                     gaitSpeed > 0.01f ? "Walk" : "Idle");
+            anim.Advance(dt * (still ? 1.0f : fallbackPlaybackRate));
         }
+    }
+
+    // Speed under which a body counts as standing, and how long it has to stay
+    // there before the legs stop. The hold keeps a walk from flickering off
+    // during the frame a direction is reversed or a pushout briefly eats the
+    // step, and keeps the gait starting on the frame the actor sets off rather
+    // than one frame later.
+    static constexpr float kStillSpeed = 0.2f;
+    static constexpr float kStillHold = 0.12f;
+    // Anything faster than this is a teleport, a rappel drop or a respawn, not
+    // travel: the history restarts instead of reading as a sprint.
+    static constexpr float kTeleportSpeed = 30.0f;
+
+    // True once the body has actually been standing for kStillHold, whatever
+    // the AI or the network says it is doing.
+    bool MeasureStillness(float dt, const DirectX::XMFLOAT3& sample) {
+        const float dx = sample.x - locomotionPreviousSample_.x;
+        const float dz = sample.z - locomotionPreviousSample_.z;
+        const bool hadHistory = hasLocomotionHistory_;
+        locomotionPreviousSample_ = sample;
+        hasLocomotionHistory_ = true;
+        if (!hadHistory || dt <= 1e-5f) { stillTime_ = 0.0f; return false; }
+        const float speed = std::sqrt(dx * dx + dz * dz) / dt;
+        if (speed > kTeleportSpeed) { stillTime_ = 0.0f; return false; }
+        if (speed > kStillSpeed) { stillTime_ = 0.0f; return false; }
+        stillTime_ += dt;
+        return stillTime_ >= kStillHold;
     }
     std::vector<float> upperBodyMask_;
     std::vector<DirectX::XMFLOAT4> gunPoseOffsets_;
