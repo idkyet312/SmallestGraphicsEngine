@@ -681,7 +681,10 @@ public:
     // above the waterline. World metres against the normalized hull.
     float insertionBoatRideSide = 0.0f;
     float insertionBoatRideForward = -1.2f;
-    float insertionBoatRideHeight = 0.9f;
+    // Overwritten by ConfigureInsertionBoatBounds, which derives it from how
+    // deep the hull floats. Kept in step here so the default is not the one
+    // figure still describing a boat that rode higher.
+    float insertionBoatRideHeight = 0.7f;
 
     // Where the passenger's centre sits for the current pose. Rotated by roll
     // and yaw both, so they lean with the hull as it founders instead of

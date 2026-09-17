@@ -559,9 +559,9 @@ static void ConfigureBoatBounds() {
         (minimum.z + maximum.z) * 0.5f };
     g_boatModelMinY = minimum.y;
     // Waterline sits a little above the hull bottom so it reads as floating,
-    // not resting on the surface.
+    // not resting on the surface. Applied in model space, hence the divide.
     g_boatModelScale = 9.0f / horizontalLength;
-    g_boatModelMinY += 0.35f / g_boatModelScale;
+    g_boatModelMinY += kBoatFloatDepth / g_boatModelScale;
 }
 
 XMMATRIX InsertionBoatWorldMatrix() {
@@ -634,12 +634,15 @@ static void ConfigureInsertionBoatBounds() {
     vehicles.insertionBoatModelMinY = minimum.y;
     vehicles.insertionBoatModelScale = 9.0f / horizontalLength;
     // Waterline a little above the hull bottom, so it floats rather than rests.
-    vehicles.insertionBoatModelMinY += 0.35f / vehicles.insertionBoatModelScale;
+    vehicles.insertionBoatModelMinY +=
+        kBoatFloatDepth / vehicles.insertionBoatModelScale;
     // Stand the passenger on the deck of the normalized hull, a little aft of
-    // centre so they are not perched on the bow.
+    // centre so they are not perched on the bow. The height tracks
+    // kBoatFloatDepth: the deck goes down with the hull, and a rider left at
+    // the old figure hovers above the planking by however far the hull moved.
     vehicles.insertionBoatRideForward =
         -(maximum.z - minimum.z) * vehicles.insertionBoatModelScale * 0.18f;
-    vehicles.insertionBoatRideHeight = 0.9f;
+    vehicles.insertionBoatRideHeight = 1.25f - kBoatFloatDepth;
 }
 
 // The humvee ships its base colour map embedded in the source FBX. Where that

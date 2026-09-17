@@ -527,7 +527,15 @@ constexpr float              kBoatPatrolRadius = 60.0f;
 constexpr float              kBoatDeckHalfBeam = 1.5f;
 constexpr float              kBoatDeckHalfLength = 4.5f;
 constexpr float              kBoatHullHeight = 1.1f;
-constexpr float              kBoatDeckOffset = 0.10f;
+// How far a hull sits below the water plane. Both boats normalise their mesh
+// against this, so it is the one number that says how deep they ride; the deck
+// and rider offsets below are measured to match it and have to move with it,
+// or the surfaces people stand on come away from the planking they belong to.
+constexpr float              kBoatFloatDepth = 0.55f;
+// Deck plane, relative to the water rather than to the hull -- the patrol
+// boat's own y IS the waterline. Negative because the deck now sits just under
+// it: the hull rides 0.55 m deep and the freeboard is ~0.45 m of that.
+constexpr float              kBoatDeckOffset = -0.10f;
 // Crew stand this much above the deck the player walks on. The bandit rig's
 // origin sits slightly inside the boots, so an actor placed exactly on the deck
 // plane reads as sunk into it. Lifting the actors alone leaves the walkable
