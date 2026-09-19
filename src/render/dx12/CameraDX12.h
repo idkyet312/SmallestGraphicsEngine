@@ -20,56 +20,25 @@ public:
     float MouseSensitivity;
     bool BodycamAiming = false;
     bool BodycamActive = false;
-    float BodycamFollowSpeed = 6.0f;
+    // Lower than the 6.0 this shipped at: same curve, longer settle, which is
+    // the whole of what makes it read as smoother. The dev panel's slider is
+    // the knob if it wants to be quicker again.
+    float BodycamFollowSpeed = 4.0f;
     float AimYawOffset = 0.0f;
     float AimPitchOffset = 0.0f;
-    // Follow velocity, in degrees/second, for the spring below. Carried across
-    // frames because a second-order follow needs its own momentum -- this is
-    // what a plain exponential does not have.
-    float AimYawVelocity = 0.0f;
-    float AimPitchVelocity = 0.0f;
     XMFLOAT3 AimFront{};
 
     const XMFLOAT3& GetAimFront() const {
         return BodycamActive ? AimFront : Front;
     }
 
-    // Critically damped follow of one offset toward zero. Returns how far the
-    // offset moved, which is what the body turns by.
-    //
-    // A first-order exponential -- offset *= exp(-w dt) -- is fastest at the
-    // instant the mouse stops and decays from there, so the camera lurches and
-    // then crawls. This is the exact solution to the critically damped spring
-    //     x'' = -2w x' - w^2 x
-    // which starts at the velocity the turn actually had, accelerates, and
-    // eases into the target with no overshoot. Closed form, so it is stable at
-    // any timestep and still frame-rate independent.
-    static float SpringToZero(float& x, float& v, float w, float dt) {
-        const float before = x;
-        const float decay = std::exp(-w * dt);
-        // Grouped once: it appears in both the position and velocity terms.
-        const float impulse = v + w * x;
-        x = (x + impulse * dt) * decay;
-        v = (v - w * impulse * dt) * decay;
-        return before - x;
-    }
-
     // How far the gun may lead the camera before the body has to catch up.
     static constexpr float kAimYawLeash = 18.0f;
     static constexpr float kAimPitchLeash = 12.0f;
 
-    // Stiffness climbs as the lead approaches its leash, so the body speeds up
-    // to keep station instead of running into a wall and being yanked along.
-    // Cubic: unnoticeable around centre, decisive at the edge.
-    static float LeashedRate(float w, float offset, float leash) {
-        const float t = (std::min)(1.0f, std::fabs(offset) / leash);
-        return w * (1.0f + 9.0f * t * t * t);
-    }
-
-    // Backstop for a flick faster than the body can possibly follow. Returns
-    // the body turn that brings an over-extended lead back inside its leash.
-    // With the progressive stiffness above this is rare, which is the point --
-    // it is the only part of the turn that moves the camera without smoothing.
+    // Returns the body turn that brings an over-extended lead back inside its
+    // leash. Applied where the input lands rather than at the next frame, so
+    // the gun never visibly reaches past its limit and gets pulled back.
     static float ClampToLeash(float& offset, float leash) {
         const float clamped = std::clamp(offset, -leash, leash);
         const float excess = offset - clamped;
@@ -81,23 +50,22 @@ public:
         BodycamActive = BodycamAiming && allowed && FPSMode;
         if (!BodycamActive) {
             AimYawOffset = AimPitchOffset = 0.0f;
-            AimYawVelocity = AimPitchVelocity = 0.0f;
             return;
         }
-        const float step = (std::max)(dt, 0.0f);
-        // Undamped frequency. Halved against the old exponential rate so the
-        // slider's numbers keep meaning roughly the same settling time: a
-        // critically damped spring takes about twice as long to settle as a
-        // first-order decay at the same w.
-        const float w = (std::max)(0.01f, BodycamFollowSpeed * 0.5f);
-        Yaw += SpringToZero(AimYawOffset, AimYawVelocity,
-                            LeashedRate(w, AimYawOffset, kAimYawLeash), step);
-        Pitch += SpringToZero(AimPitchOffset, AimPitchVelocity,
-                              LeashedRate(w, AimPitchOffset, kAimPitchLeash),
-                              step);
-        // No clamp needed here. The lead is already inside its leash when the
-        // input lands, and a critically damped spring pulling toward zero has
-        // no overshoot, so it can only ever shorten the lead from there.
+        // Exponential follow, frame-rate independent: one constant rate at any
+        // lead distance. A critically damped spring was tried here and it reads
+        // as a different control -- it carries momentum and its rate varies
+        // with how far the gun is leading, which changes the handling rather
+        // than just smoothing it. This is the original curve; the rate below is
+        // what softens it.
+        const float blend =
+            1.0f - std::exp(-BodycamFollowSpeed * (std::max)(dt, 0.0f));
+        const float yawStep = AimYawOffset * blend;
+        const float pitchStep = AimPitchOffset * blend;
+        Yaw += yawStep;
+        Pitch += pitchStep;
+        AimYawOffset -= yawStep;
+        AimPitchOffset -= pitchStep;
         updateCameraVectors();
     }
     
@@ -340,9 +308,6 @@ public:
     // ProcessMouseMovement, which owns sensitivity and pitch clamping.
     void SetViewAngles(float yawDegrees, float pitchDegrees) {
         AimYawOffset = AimPitchOffset = 0.0f;
-        // Momentum belongs to the offset it was carrying; a snap to absolute
-        // angles would otherwise spring away from the orientation just set.
-        AimYawVelocity = AimPitchVelocity = 0.0f;
         Yaw = yawDegrees;
         Pitch = std::clamp(pitchDegrees, -89.0f, 89.0f);
         updateCameraVectors();
