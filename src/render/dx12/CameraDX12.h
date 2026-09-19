@@ -95,8 +95,9 @@ public:
         Pitch += SpringToZero(AimPitchOffset, AimPitchVelocity,
                               LeashedRate(w, AimPitchOffset, kAimPitchLeash),
                               step);
-        Yaw += ClampToLeash(AimYawOffset, kAimYawLeash);
-        Pitch += ClampToLeash(AimPitchOffset, kAimPitchLeash);
+        // No clamp needed here. The lead is already inside its leash when the
+        // input lands, and a critically damped spring pulling toward zero has
+        // no overshoot, so it can only ever shorten the lead from there.
         updateCameraVectors();
     }
     
@@ -370,6 +371,20 @@ public:
             const float aimPitch =
                 std::clamp(Pitch + AimPitchOffset + yoffset, -89.0f, 89.0f);
             AimPitchOffset = aimPitch - Pitch;
+            // Enforce the leash here, at the moment the input lands, not at the
+            // next frame's spring step. updateCameraVectors runs on every mouse
+            // message, so a lead left over-extended until the frame ends is a
+            // lead the player actually sees the gun reach before it is pulled
+            // back. Turning the body by the excess keeps the point of aim
+            // exactly 1:1 with the mouse while the lead stays inside its limit.
+            //
+            // This is the same instant path that used to make low frame rates
+            // stutter, but it is no longer the one carrying the turn: the
+            // progressive stiffness in UpdateBodycamAim has the body already
+            // moving before the leash is reached, so only the part of a flick
+            // faster than the body can follow arrives this way.
+            Yaw += ClampToLeash(AimYawOffset, kAimYawLeash);
+            Pitch += ClampToLeash(AimPitchOffset, kAimPitchLeash);
             updateCameraVectors();
             return;
         }
