@@ -367,6 +367,37 @@ static void RenderMainMenu(HWND hwnd) {
     {
         static bool resetArmed = false;
         const float footerHeight = ImGui::GetFrameHeightWithSpacing();
+
+        // Funds grant, on the footer row above the reset. It belongs down here
+        // with the other career-wide action rather than in the destination
+        // list, for the same reason the reset does: the list is for places to
+        // go, and a row between TEST LEVEL and QUIT is a row hit by accident.
+        constexpr int64_t kMenuFundsGrant = 500000;
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() -
+                             footerHeight * 2.0f - 10.0f);
+        ImGui::SetCursorPosX(14.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                              ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+        ImGui::PushStyleColor(ImGuiCol_Text, UITheme::kAccent);
+        if (ImGui::Button("+$500,000")) {
+            // SetBalance rather than a payout event: this is money that was
+            // never earned, so it must not land in career earnings and inflate
+            // the totals the extraction report and the rank screen read from.
+            g_game.money.SetBalance(
+                g_game.money.Balance() + kMenuFundsGrant,
+                g_game.money.TotalEarned());
+            // Written straight through, same as the reset beside it: a balance
+            // the player can see has to survive killing the process.
+            SaveCareer();
+        }
+        ImGui::PopStyleColor(4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Adds %lld to funds. Career earnings unchanged.",
+                              static_cast<long long>(kMenuFundsGrant));
+
         ImGui::SetCursorPosY(ImGui::GetWindowHeight() - footerHeight - 10.0f);
         ImGui::SetCursorPosX(14.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
