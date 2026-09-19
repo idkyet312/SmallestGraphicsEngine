@@ -30,6 +30,9 @@ cbuffer MeshDrawBuffer : register(b6) {
     float modelMaxScale;
     uint instanceCount;
     uint instancingEnabled;
+    // Unused here. The two MeshDrawBuffer declarations are kept as exact
+    // mirrors so the shared b6 root-constant layout stays obvious.
+    float frustumRadiusScale;
 };
 
 ByteAddressBuffer vertexData : register(t6);

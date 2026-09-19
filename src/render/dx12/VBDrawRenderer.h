@@ -402,8 +402,10 @@ inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMA
         XMFLOAT3 center(item.worldBounds.x, item.worldBounds.y,
                         item.worldBounds.z);
 
-        // Backface culling (object-level) where safe
-        if (item.backfaceCullable) {
+        // Backface culling (object-level) where safe. This is the VB path's
+        // nearest analogue to mesh_as.hlsl's meshlet cone test, so the cone
+        // toggle suppresses it too.
+        if (item.backfaceCullable && !scene.debugDisableMeshletConeCull) {
             XMFLOAT3 worldNormal = TransformDir(item.model, XMFLOAT3(0, 1, 0));
             XMFLOAT3 toCamera(scene.camera.Position.x - center.x,
                               scene.camera.Position.y - center.y,
@@ -464,8 +466,18 @@ struct alignas(256) GPUVisibilityCullConstants {
     UINT hzbMipCount;
     UINT useOcclusion;
     float lodPixelThreshold;
-    XMFLOAT2 padding;
+    // Mirrors mesh_as.hlsl's isolation mask; only bit 2 (frustum) is read here.
+    // Takes the first half of the old XMFLOAT2 padding, so the struct size and
+    // every field offset before it are unchanged.
+    UINT debugCullMask;
+    // Widens FrustumVisible() only. This path's planes are already normalized
+    // by ExtractFrustumPlanes, so it needs the multiplier but not the maths fix
+    // mesh_as.hlsl needed. Takes the old trailing padding float, so the struct
+    // size and every preceding offset are unchanged.
+    float frustumRadiusScale;
 };
+static_assert(sizeof(GPUVisibilityCullConstants) == 256,
+    "GPU cull constants must match visibility_cull_cs.hlsl.");
 
 struct GPUDrivenVisibilityContext {
     bool initialized = false;
@@ -994,8 +1006,19 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         cull.projectionScaleY = fabsf(projection._22);
         cull.screenSize = XMUINT2(g_dx12.screenWidth, g_dx12.screenHeight);
         cull.hzbMipCount = hzb ? hzb->GetMipCount() : 0;
-        cull.useOcclusion = useHZBOcclusion ? 1u : 0u;
-        cull.lodPixelThreshold = 2.0f;
+        cull.useOcclusion =
+            (useHZBOcclusion && !scene.debugDisableMeshletOcclusionCull)
+                ? 1u : 0u;
+        cull.debugCullMask = scene.DebugMeshletCullMask();
+        // The projected-size reject is this path's own killer. Leaving it armed
+        // while a test is suppressed would hide the very geometry the A/B is
+        // trying to account for.
+        cull.lodPixelThreshold =
+            scene.DebugCullIsolationActive() ? 0.0f : 2.0f;
+        // cull is zero-initialized above, so this assignment is mandatory --
+        // a 0 here would shrink the test instead of widening it.
+        cull.frustumRadiusScale =
+            std::clamp(scene.meshletFrustumRadiusScale, 0.1f, 3.0f);
         if (culledCount > 0) {
             cull.commandCount = culledCount;
             gpuCulled.Cull(g_dx12.commandList.Get(), cull, hzb);

@@ -7,7 +7,7 @@
       "path": "Content/Models/HomeBase/NATO_Shelter_V1_PackedTextures.glb",
       "defaultScale": [1.0, 1.0, 1.0],
       "targetSize": 0.0,
-      "automaticLod": true,
+      "automaticLod": false,
       "castShadow": true,
       "useMaterials": true,
       "materialAmbientScale": 1.0,

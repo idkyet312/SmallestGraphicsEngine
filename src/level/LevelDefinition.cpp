@@ -561,6 +561,7 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         // Older maps all shipped with the patrol boat, so absence preserves
         // their existing behavior.
         level.patrolBoatEnabled = root.value("patrolBoatEnabled", true);
+        level.virtualShadowMaps = root.value("virtualShadowMaps", true);
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
         {
             const json& terrainRoot = root.at("terrain");
@@ -807,6 +808,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"deploymentRadius", level.deploymentRadius},
             {"patrolBoatEnabled", level.patrolBoatEnabled},
+            {"virtualShadowMaps", level.virtualShadowMaps},
             {"terrain", {{"heightScale", level.terrainHeightScale},
                          {"flat", level.terrainFlat},
                          {"tilesX", level.terrainTilesX},

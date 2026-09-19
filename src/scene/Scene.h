@@ -1128,6 +1128,40 @@ struct Scene {
     // Z key: wireframe for the mesh-shader pipelines (meshlets + terrain)
     bool meshletWireframe = false;
 
+    // F6 cull isolation. Each flag suppresses one rejection test so a chunk of
+    // geometry that vanishes can be pinned on a single one. The CPU bounds flag
+    // is the fourth because with all three GPU tests off the whole-model test in
+    // ForwardRenderer still rejects prefabs, which would make "everything off
+    // and it still pops" ambiguous.
+    bool debugDisableMeshletFrustumCull   = false;
+    bool debugDisableMeshletConeCull      = false;
+    bool debugDisableMeshletOcclusionCull = false;
+    bool debugDisablePrefabBoundsCull     = false;
+
+    // Scales the bounding-sphere radius used by the meshlet and object frustum
+    // tests. 1.0 is the exact sphere-vs-plane result and the shipping value;
+    // above that trades culling efficiency for certainty, below it under-sizes
+    // the sphere on purpose and culls more aggressively. Clamped to [0.1, 3.0].
+    //
+    // Ships at 1.0, the exact sphere-vs-plane answer. Dropping below it trades a
+    // thin band of edge geometry for cull throughput; the old code was 43% inside
+    // on X, which is what made chunks vanish, so treat sub-1.0 as a debug aid.
+    // Deliberately NOT part of
+    // DebugCullIsolationActive(), so raising it does not also zero the
+    // visibility path's lodPixelThreshold -- this knob ships, the F6 flags do not.
+    static constexpr float kDefaultMeshletFrustumRadiusScale = 1.0f;
+    float meshletFrustumRadiusScale = kDefaultMeshletFrustumRadiusScale;
+
+    // Bits 2/3/4 for mesh_as.hlsl's cullingFlags; 0 when nothing is suppressed.
+    uint32_t DebugMeshletCullMask() const {
+        return (debugDisableMeshletFrustumCull   ? 4u  : 0u) |
+               (debugDisableMeshletConeCull      ? 8u  : 0u) |
+               (debugDisableMeshletOcclusionCull ? 16u : 0u);
+    }
+    bool DebugCullIsolationActive() const {
+        return DebugMeshletCullMask() != 0u || debugDisablePrefabBoundsCull;
+    }
+
     Scene() {
         cube1.position = { 0.0f, 1.0f, 0.0f };
         cube1.scale    = { 2.0f, 2.0f, 2.0f };
@@ -1638,7 +1672,7 @@ struct Scene {
                     // Battlefield 2-style wire guidance: rocket bends toward the
                     // player's current crosshair, with finite steering authority.
                     const XMVECTOR aim = XMLoadFloat3(&camera.Position) +
-                                         XMLoadFloat3(&camera.Front) * 500.0f;
+                                         XMLoadFloat3(&camera.GetAimFront()) * 500.0f;
                     const XMVECTOR position = XMLoadFloat3(&p.position);
                     const XMVECTOR current = XMVector3Normalize(XMLoadFloat3(&p.direction));
                     const XMVECTOR desired = XMVector3Normalize(aim - position);
@@ -2215,16 +2249,16 @@ struct Scene {
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
         TriggerMuzzleFlash(stats.muzzleFlashDurationMultiplier,
                            stats.muzzleFlashSizeMultiplier);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(),
                          stats.smokeMultiplier);
-        RecordLocalShot(GetMuzzleWorldPosition(), camera.Front);
+        RecordLocalShot(GetMuzzleWorldPosition(), camera.GetAimFront());
 
         Projectile p;
         p.position  = GetMuzzleWorldPosition();
         p.previousPosition = p.position;
         const float spreadMultiplier = stats.hipSpreadMultiplier +
             (stats.adsSpreadMultiplier - stats.hipSpreadMultiplier) * adsBlend;
-        p.direction = ApplyShotSpread(camera.Front, spreadMultiplier);
+        p.direction = ApplyShotSpread(camera.GetAimFront(), spreadMultiplier);
         // projectileSpeed remains live-tunable in the engine UI; the immutable
         // definition records the authored baseline without stealing that knob.
         p.speed     = projectileSpeed;
@@ -2241,7 +2275,7 @@ struct Scene {
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
-        p.direction = camera.Front;
+        p.direction = camera.GetAimFront();
         p.speed = 1800.0f;
         p.lifetime = 0.075f;
         p.active = true;
@@ -2275,11 +2309,11 @@ struct Scene {
         gunRecoilBack = (std::min)(0.14f, gunRecoilBack + 0.11f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 3.2f);
         TriggerMuzzleFlash(0.9f, 0.72f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 0.55f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(), 0.55f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
-        p.direction = camera.Front;
+        p.direction = camera.GetAimFront();
         p.speed = 92.0f;
         p.lifetime = 0.85f;
         p.active = true;
@@ -2307,11 +2341,11 @@ struct Scene {
     void ThrowRemoteCharge() {
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
-        p.direction = camera.Front;
+        p.direction = camera.GetAimFront();
         p.velocity = {
-            camera.Front.x * 18.0f,
-            camera.Front.y * 18.0f + 2.2f,
-            camera.Front.z * 18.0f };
+            camera.GetAimFront().x * 18.0f,
+            camera.GetAimFront().y * 18.0f + 2.2f,
+            camera.GetAimFront().z * 18.0f };
         p.lifetime = 4.0f;
         p.active = true;
         p.remoteCharge = true;
@@ -2367,7 +2401,7 @@ struct Scene {
 
     void ShootFlameBurst() {
         const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
-        const XMVECTOR forward = XMLoadFloat3(&camera.Front);
+        const XMVECTOR forward = XMLoadFloat3(&camera.GetAimFront());
         const XMVECTOR up = XMLoadFloat3(&camera.Up);
         const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, forward));
         for (int flameIndex = 0; flameIndex < 2; ++flameIndex) {
@@ -2395,7 +2429,7 @@ struct Scene {
         Projectile p;
         p.position  = camera.Position;
         p.previousPosition = p.position;
-        p.direction = camera.Front;
+        p.direction = camera.GetAimFront();
         p.grenade   = true;
         p.playerOwned = true;
         p.molotov   = selectedGrenade == GrenadeType::Molotov;
@@ -2404,9 +2438,9 @@ struct Scene {
         p.fuse      = p.molotov ? 4.0f : grenadeFuse;
         p.grenadeCollisionGrace = 0.18f;
         // Launch along the aim direction plus a slight upward lob.
-        p.velocity  = { camera.Front.x * grenadeThrowSpeed,
-                        camera.Front.y * grenadeThrowSpeed + grenadeLob,
-                        camera.Front.z * grenadeThrowSpeed };
+        p.velocity  = { camera.GetAimFront().x * grenadeThrowSpeed,
+                        camera.GetAimFront().y * grenadeThrowSpeed + grenadeLob,
+                        camera.GetAimFront().z * grenadeThrowSpeed };
         projectiles.push_back(p);
     }
 
@@ -2503,7 +2537,7 @@ struct Scene {
         // wanders is not one, and the 5x damage multiplier only means something
         // if the shot is trusted. The reticle may bloom while moving; this
         // weapon deliberately does not honour it.
-        const XMFLOAT3 aimDirection = camera.Front;
+        const XMFLOAT3 aimDirection = camera.GetAimFront();
         camera.ApplyRecoil(
             recoilPitch * (stats.recoilPitchDegrees / 0.55f), 0.0f);
         // Marksman rifle. A shade less than the shotgun despite the bigger aim
@@ -2517,9 +2551,9 @@ struct Scene {
         // night the faint flash is a fair tell for an enemy who is looking.
         TriggerMuzzleFlash(stats.muzzleFlashDurationMultiplier,
                            stats.muzzleFlashSizeMultiplier);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(),
                          stats.smokeMultiplier);
-        RecordLocalShot(GetMuzzleWorldPosition(), camera.Front);
+        RecordLocalShot(GetMuzzleWorldPosition(), camera.GetAimFront());
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
@@ -2542,11 +2576,11 @@ struct Scene {
         gunRecoilBack = (std::min)(0.20f, gunRecoilBack + 0.16f);
         gunRecoilKick = (std::min)(14.0f, gunRecoilKick + 9.0f);
         TriggerMuzzleFlash(1.8f, 1.75f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 2.4f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(), 2.4f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
-        p.direction = camera.Front;
+        p.direction = camera.GetAimFront();
         p.speed = 42.0f;
         p.lifetime = 6.0f;
         p.active = true;
@@ -2739,7 +2773,7 @@ struct Scene {
         return ejected ? ejectAnchorPosition : camera.Position;
     }
     const XMFLOAT3& ViewmodelAnchorFront() const {
-        return ejected ? ejectAnchorFront : camera.Front;
+        return ejected ? ejectAnchorFront : camera.GetAimFront();
     }
 
     void ToggleEjectedCamera() {
@@ -2747,7 +2781,8 @@ struct Scene {
             // Freeze the viewpoint the weapon hangs off, and remember where to
             // put the player back.
             ejectAnchorPosition = ejectReturnPosition = camera.Position;
-            ejectAnchorFront = ejectReturnFront = camera.Front;
+            ejectAnchorFront = camera.GetAimFront();
+            ejectReturnFront = camera.Front;
             ejectReturnYaw      = camera.Yaw;
             ejectReturnPitch    = camera.Pitch;
             // Free flight: gravity and the XZ-plane walk constraint would fight
@@ -2919,10 +2954,10 @@ struct Scene {
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.13f);
         gunRecoilKick = (std::min)(11.0f, gunRecoilKick + 7.5f);
         TriggerMuzzleFlash(1.35f, 1.45f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.8f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(), 1.8f);
 
         const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
-        const XMVECTOR cameraFront = XMLoadFloat3(&camera.Front);
+        const XMVECTOR cameraFront = XMLoadFloat3(&camera.GetAimFront());
         const XMVECTOR cameraUp = XMLoadFloat3(&camera.Up);
         const XMVECTOR cameraRight = XMVector3Normalize(
             XMVector3Cross(cameraUp, cameraFront));

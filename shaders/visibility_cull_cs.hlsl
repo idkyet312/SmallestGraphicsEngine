@@ -8,8 +8,15 @@ cbuffer CullConstants : register(b0) {
     uint hzbMipCount;
     uint useOcclusion;
     float lodPixelThreshold;
-    float2 cullPadding;
+    // Bit 2 suppresses the frustum test, mirroring mesh_as.hlsl's isolation
+    // mask so an A/B covers the terrain and floor this path owns as well.
+    uint debugCullMask;
+    // Widens FrustumVisible() only; 1.0 is the exact test. These planes are
+    // already normalized on the CPU, so this path needs no maths fix.
+    float frustumRadiusScale;
 };
+
+static const uint kDebugNoFrustum = 4u;
 
 struct CullInput {
     uint2 vertexBufferAddress;
@@ -103,7 +110,11 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     CullInput command = inputCommands[index];
     float3 center = command.worldBounds.xyz;
     float radius = command.worldBounds.w;
-    if (!FrustumVisible(center, radius)) return;
+    // Scale only this argument: `radius` is reused below for the projected-size
+    // LOD reject and by Occluded(), and widening those would change LOD popping
+    // and occlusion behaviour along with the frustum.
+    if ((debugCullMask & kDebugNoFrustum) == 0u &&
+        !FrustumVisible(center, radius * max(frustumRadiusScale, 0.1))) return;
 
     // Moving destruction chunks and closed house shells cannot safely use the
     // previous frame as an occlusion oracle. Their CPU material policy already

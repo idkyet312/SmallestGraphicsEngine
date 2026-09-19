@@ -334,8 +334,10 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT firstMeshlet;
     UINT meshletCount;
     // Bit 0 enables HZB occlusion; bit 1 disables meshlet-cone backface
-    // rejection for a double-sided draw. Packing both here preserves the
-    // 13-root-constant contract shared with the grass mesh path.
+    // rejection for a double-sided draw. Bits 2-4 are MeshShaderDX12's
+    // debugCullMask, which suppresses the frustum, cone and occlusion tests
+    // one at a time. Packing all of them here preserves the 13-root-constant
+    // contract shared with the grass mesh path.
     UINT cullingFlags;
     UINT screenWidth;
     UINT screenHeight;
@@ -347,6 +349,11 @@ struct alignas(256) MeshDrawBufferDX12 {
     float modelMaxScale;
     UINT instanceCount;
     UINT instancingEnabled;
+    // Conservative widening of the meshlet frustum test; 1.0 is exact. Appended
+    // at the end so no existing field's root-constant offset moves. Both upload
+    // sites init this struct positionally -- a missing initializer here would
+    // send 0.0 and cull almost everything, which the shader's max() absorbs.
+    float frustumRadiusScale;
 };
 
 struct alignas(256) ShadowCascadeBufferDX12 {

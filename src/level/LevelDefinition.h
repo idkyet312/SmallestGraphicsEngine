@@ -218,6 +218,11 @@ struct LevelDefinition {
     // The autonomous armed patrol boat is level scenery/gameplay, separate from
     // the insertion and extraction boats selected by mission flow.
     bool patrolBoatEnabled = true;
+    // Virtual shadow maps for this level. Defaults true, matching the engine
+    // default, so every existing level keeps its current shadow path; a level
+    // that sets it false falls back to the cascade path on load and any other
+    // level restores it, rather than the choice leaking across a level change.
+    bool virtualShadowMaps = true;
     float terrainHeightScale = 3.057f;
     // Flat authoring mode: suppress every procedural landform -- the fbm relief,
     // the pool basin carved near the origin, and the beach/seabed coast falloff

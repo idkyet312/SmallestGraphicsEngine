@@ -274,6 +274,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         scene.virtualShadowMaps = false;
     else if (GetEnvironmentVariableA("SGE_VSM", nullptr, 0) > 0)
         scene.virtualShadowMaps = true;
+    // Captured after the env vars so a level load can lower it but never raise
+    // it back past an explicit SGE_VSM_OFF.
+    g_vsmRunDefault = scene.virtualShadowMaps;
     scene.cacheFarShadowCascades =
         GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
@@ -4217,6 +4220,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         mainShader.BeginFrame();
         mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
         g_meshShader.BeginFrame();
+        // Set here rather than in RenderForward: the scope pass and the
+        // viewmodel draws run before it, and a toggle that misses half the
+        // frame would make the A/B it exists to serve unreadable.
+        g_meshShader.debugCullMask = scene.DebugMeshletCullMask();
+        g_debugDisablePrefabBoundsCull = scene.debugDisablePrefabBoundsCull;
+        g_meshShader.frustumRadiusScale =
+            std::clamp(scene.meshletFrustumRadiusScale, 0.1f, 3.0f);
         mainShader.SetPreviousViewProjection(previousHZBViewProjection);
         RenderSniperScopeTexture(now, editorHideFog || deploymentHideAtmosphere);
 

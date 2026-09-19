@@ -460,7 +460,15 @@ inline void RenderPlayerHUD(const Scene& scene) {
     }
 
     if (scene.player.health > 0.0f) {
-        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        if (scene.camera.BodycamActive) {
+            const XMVECTOR aimPoint = XMLoadFloat3(&scene.camera.Position) +
+                XMLoadFloat3(&scene.camera.GetAimFront()) * 500.0f;
+            const XMVECTOR projected = XMVector3TransformCoord(aimPoint,
+                scene.GetViewMatrix() * scene.GetProjectionMatrix());
+            center.x *= 1.0f + XMVectorGetX(projected);
+            center.y *= 1.0f - XMVectorGetY(projected);
+        }
         // Four independent arms around a fixed centre. The resting gap is the
         // floor; scene.crosshairSpread pushes all four outward together as
         // movement, firing and recoil degrade the shot (see the bloom target in
@@ -1766,6 +1774,23 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     };
     static RTDebugSettings rtDebug;
 
+    struct AllShadowDebugSettings {
+        bool active = false;
+        bool enableShadows = true;
+        float contactShadowStrength = 0.0f;
+        bool enableAmbientOcclusion = true;
+        bool enhancedRTShadows = false;
+        bool screenSpaceRTEnabled = false;
+        bool screenSpaceRTAO = false;
+        bool useDDGI = false;
+        bool useRaytracing = false;
+        bool rtEnabled = false;
+        UINT spotShadowActiveCount = 0;
+        bool enableVolumetricFog = true;
+        Scene::LightShaftMode lightShaftMode = Scene::LightShaftMode::Off;
+    };
+    static AllShadowDebugSettings allShadowDebug;
+
     struct RTXSelfTestState {
         bool running = false;
         bool passed = false;
@@ -1862,6 +1887,51 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         vb.debugViewMode = rtDebug.debugViewMode;
     };
 
+    auto saveAllShadowDebugSettings = [&]() {
+        allShadowDebug.enableShadows = scene.enableShadows;
+        allShadowDebug.contactShadowStrength = scene.contactShadowStrength;
+        allShadowDebug.enableAmbientOcclusion = scene.enableAmbientOcclusion;
+        allShadowDebug.enhancedRTShadows = scene.enhancedRTShadows;
+        allShadowDebug.screenSpaceRTEnabled = scene.screenSpaceRTEnabled;
+        allShadowDebug.screenSpaceRTAO = scene.screenSpaceRTAO;
+        allShadowDebug.useDDGI = scene.useDDGI;
+        allShadowDebug.useRaytracing = scene.useRaytracing;
+        allShadowDebug.rtEnabled = g_rt.enabled;
+        allShadowDebug.spotShadowActiveCount = g_spotShadowActiveCount;
+        allShadowDebug.enableVolumetricFog = scene.enableVolumetricFog;
+        allShadowDebug.lightShaftMode = scene.lightShaftMode;
+    };
+
+    auto applyAllShadowDebugSettings = [&]() {
+        scene.enableShadows = false;
+        scene.contactShadowStrength = 0.0f;
+        scene.enableAmbientOcclusion = false;
+        scene.enhancedRTShadows = false;
+        scene.screenSpaceRTEnabled = false;
+        scene.screenSpaceRTAO = false;
+        scene.useDDGI = false;
+        scene.useRaytracing = false;
+        g_rt.enabled = false;
+        g_spotShadowActiveCount = 0;
+        scene.enableVolumetricFog = false;
+        scene.lightShaftMode = Scene::LightShaftMode::Off;
+    };
+
+    auto restoreAllShadowDebugSettings = [&]() {
+        scene.enableShadows = allShadowDebug.enableShadows;
+        scene.contactShadowStrength = allShadowDebug.contactShadowStrength;
+        scene.enableAmbientOcclusion = allShadowDebug.enableAmbientOcclusion;
+        scene.enhancedRTShadows = allShadowDebug.enhancedRTShadows;
+        scene.screenSpaceRTEnabled = allShadowDebug.screenSpaceRTEnabled;
+        scene.screenSpaceRTAO = allShadowDebug.screenSpaceRTAO;
+        scene.useDDGI = allShadowDebug.useDDGI;
+        scene.useRaytracing = allShadowDebug.useRaytracing;
+        g_rt.enabled = allShadowDebug.rtEnabled;
+        g_spotShadowActiveCount = allShadowDebug.spotShadowActiveCount;
+        scene.enableVolumetricFog = allShadowDebug.enableVolumetricFog;
+        scene.lightShaftMode = allShadowDebug.lightShaftMode;
+    };
+
     bool enhancedHeapsReady = true;
     bool atrousHeapsReady = true;
     for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
@@ -1933,6 +2003,28 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             "while toggling the settings that change it.");
     ImGui::Separator();
 
+    if (ImGui::Button(allShadowDebug.active
+            ? "Restore Shadows"
+            : "Disable All Shadows (Debug)")) {
+        if (allShadowDebug.active) {
+            restoreAllShadowDebugSettings();
+            allShadowDebug.active = false;
+        } else {
+            saveAllShadowDebugSettings();
+            allShadowDebug.active = true;
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Temporarily disables direct shadows, contact shadows, AO, "
+            "screen-space RT/AO, DDGI, ray tracing, volumetric fog, and "
+            "light shafts for a lighting A/B comparison. Baked texture "
+            "shading remains enabled; click again to restore the captured "
+            "settings.");
+    if (allShadowDebug.active)
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
+                           "SHADOW DEBUG: all shadow-like effects disabled");
+
     // Frame cost, front and centre: the CPU-side systems here (water waves, grass
     // wind) are easy to scale past what the frame can pay for, and without a
     // number on screen that only shows up as a vague feeling of sluggishness.
@@ -1946,6 +2038,30 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Mesh dispatches: %u  Batches: %u  Instances: %u  Meshlets: %u",
                 g_meshShader.dispatchesThisFrame, g_meshShader.batchesThisFrame,
                 g_meshShader.instancesThisFrame, g_meshShader.meshletsThisFrame);
+    // Flags a value moved off the shipping default, so a recording carries its
+    // own state. Red below the exact test, where visible geometry gets dropped.
+    if (std::fabs(scene.meshletFrustumRadiusScale -
+                  Scene::kDefaultMeshletFrustumRadiusScale) > 0.001f) {
+        ImGui::TextColored(
+            scene.meshletFrustumRadiusScale < 1.0f
+                ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f)
+                : ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+            "Frustum cull radius x%.2f (default %.2f)",
+            scene.meshletFrustumRadiusScale,
+            Scene::kDefaultMeshletFrustumRadiusScale);
+    }
+    // Only while something is suppressed, so a screen recording of the A/B
+    // carries its own state instead of relying on memory of which key was hit.
+    if (scene.DebugCullIsolationActive()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+            "CULL DEBUG: frustum=%s cone=%s occlusion=%s cpuBounds=%s"
+            "  prefabs %u/%u",
+            scene.debugDisableMeshletFrustumCull   ? "OFF" : "on",
+            scene.debugDisableMeshletConeCull      ? "OFF" : "on",
+            scene.debugDisableMeshletOcclusionCull ? "OFF" : "on",
+            scene.debugDisablePrefabBoundsCull     ? "OFF" : "on",
+            g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
+    }
     ImGui::Text("Shadow instance batches: %u  Instances: %u",
                 g_shadowBatches, g_shadowBatchInstances);
     ImGui::Text("Far shadow cache: %u reused  %u refreshed",
@@ -2077,6 +2193,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::BulletText("Humvee LMB: Fire turret");
     ImGui::BulletText("V: Toggle FPS Walking Mode");
     ImGui::BulletText("Z: Meshlet Wireframe");
+    ImGui::BulletText("F6: Meshlet cull isolation (cycle)");
     ImGui::BulletText("Left Click: Lock camera / Shoot");
     ImGui::BulletText("R: Reload (ammo is unlimited in God Mode)");
     ImGui::Separator();
@@ -2237,6 +2354,61 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Checkbox("Automatic prefab LOD", &scene.automaticPrefabLod);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Use generated distance LODs for opted-in static prefabs (NATO shelter). Collision stays full detail.");
+
+        ImGui::SliderFloat("Frustum cull radius x",
+                           &scene.meshletFrustumRadiusScale, 0.1f, 3.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Scales the bounding-sphere radius used by the meshlet and "
+                "object frustum tests.\n"
+                "1.0 is the exact sphere-vs-plane result and the shipping "
+                "default.\n"
+                "Above 1.0 widens: use it to confirm a vanishing chunk is a "
+                "bounds problem rather than a plane problem.\n"
+                "Below 1.0 deliberately under-sizes the sphere so the cull "
+                "bites early and its\nboundary becomes visible. That WILL drop "
+                "geometry you can see -- debug only.");
+
+        ImGui::SeparatorText("Meshlet cull isolation (debug)");
+        ImGui::TextDisabled("F6 cycles these. Pair with Z (meshlet wireframe):");
+        ImGui::TextDisabled("a culled meshlet reads as a clean hole.");
+        ImGui::Checkbox("Disable frustum cull",
+                        &scene.debugDisableMeshletFrustumCull);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Suppresses IntersectsFrustum() in mesh_as.hlsl, and the "
+                "frustum reject in visibility_cull_cs.hlsl.");
+        ImGui::Checkbox("Disable cone backface cull",
+                        &scene.debugDisableMeshletConeCull);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Suppresses IsBackfacing() in mesh_as.hlsl, and the "
+                "object-level backface reject on the visibility path.");
+        ImGui::Checkbox("Disable HZB occlusion cull",
+                        &scene.debugDisableMeshletOcclusionCull);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Suppresses IsOccluded() in mesh_as.hlsl, which tests this "
+                "frame's geometry against last frame's depth pyramid.");
+        ImGui::Checkbox("Disable CPU prefab bounds cull",
+                        &scene.debugDisablePrefabBoundsCull);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Suppresses the whole-model ModelBoundsVisible() reject that "
+                "runs before the GPU ever sees the prefab.");
+        if (ImGui::Button("Disable all")) {
+            scene.debugDisableMeshletFrustumCull = true;
+            scene.debugDisableMeshletConeCull = true;
+            scene.debugDisableMeshletOcclusionCull = true;
+            scene.debugDisablePrefabBoundsCull = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) {
+            scene.debugDisableMeshletFrustumCull = false;
+            scene.debugDisableMeshletConeCull = false;
+            scene.debugDisableMeshletOcclusionCull = false;
+            scene.debugDisablePrefabBoundsCull = false;
+        }
         ImGui::Checkbox("Mesh Shader Terrain", &scene.useMeshTerrain);
         if (scene.useMeshTerrain) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
@@ -3442,7 +3614,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     if (UISearchHeader("Viewmodel (Gun)", 0,
                        "weapon rifle offset scale rotation fit attachments "
                        "optic sight red dot scope suppressor grip "
-                       "ads aim down sights fov blend recoil sway "
+                       "ads aim down sights bodycam classic camera follow fov blend recoil sway "
                        "see-through see through transparent transparency "
                        "opacity alpha binocular fade "
                        "arms hands mirror head auto fire interval muzzle")) {
@@ -3752,6 +3924,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // Aim debug ray. Not gated on any weapon or attachment: the whole point
         // is to compare the shot line against whatever sight is in use, so it
         // has to be available with every one of them.
+        ImGui::SeparatorText("Aiming Mode");
+        if (ImGui::Button(scene.camera.BodycamAiming
+                ? "Aiming: Bodycam" : "Aiming: Classic")) {
+            scene.camera.BodycamAiming = !scene.camera.BodycamAiming;
+            scene.camera.UpdateBodycamAim(0.0f, !scene.ejected);
+        }
+        ImGui::SetItemTooltip("Switch aiming mode. Bodycam lets the gun lead while the camera follows.");
+        if (scene.camera.BodycamAiming)
+            ImGui::SliderFloat("Camera follow speed", &scene.camera.BodycamFollowSpeed,
+                               2.0f, 16.0f, "%.1f");
+
         ImGui::SeparatorText("Aim Debug");
         ImGui::Checkbox("Hold ADS", &scene.holdAimDownSights);
         ImGui::SetItemTooltip(
@@ -3761,7 +3944,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Checkbox("Show Aim Ray", &scene.showAimDebugRay);
         ImGui::SetItemTooltip(
             "Draws a green beam down the exact line bullets travel: camera "
-            "position along camera forward, with no sway and no muzzle offset. "
+            "position along the weapon aim, with no sway and no muzzle offset. "
             "Where this lands is where the round goes, so any gap between it "
             "and a sight picture is that sight's alignment error.");
         ImGui::BeginDisabled(!scene.showAimDebugRay);
@@ -4092,6 +4275,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // selector to move from Lit to the temporal and a-trous inspection views.
     if (rtDebug.active)
         applyRTDebugSettings();
+    if (allShadowDebug.active)
+        applyAllShadowDebugSettings();
     if (scene.useRaytracing) renderer = "DXR Raytracing";
     else if (scene.useVisibilityBuffer) renderer = "id Tech VB+Deferred";
     ImGui::Text("Renderer: DirectX 12 (%s)", renderer);

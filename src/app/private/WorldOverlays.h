@@ -395,7 +395,7 @@ static void UpdateIRLaser() {
     // looking up or down. The sway is capped at +/-0.9 degrees, so the dot stays
     // within a whisker of the crosshair at any usable range.
     const XMVECTOR camFront = XMVector3Normalize(
-        XMLoadFloat3(&scene.camera.Front));
+        XMLoadFloat3(&scene.camera.GetAimFront()));
     const XMVECTOR camUp = XMVector3Normalize(XMLoadFloat3(&scene.camera.Up));
     XMVECTOR camRight = XMVector3Cross(camUp, camFront);
     if (XMVectorGetX(XMVector3LengthSq(camRight)) < 1e-6f)
@@ -465,7 +465,7 @@ static void UpdateAimDebugRay() {
 
     const XMFLOAT3 origin = scene.camera.Position;
     const XMVECTOR camFront = XMVector3Normalize(
-        XMLoadFloat3(&scene.camera.Front));
+        XMLoadFloat3(&scene.camera.GetAimFront()));
     XMFLOAT3 direction;
     XMStoreFloat3(&direction, camFront);
 

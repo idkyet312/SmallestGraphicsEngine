@@ -18,6 +18,33 @@ public:
     float Pitch;
     float MovementSpeed;
     float MouseSensitivity;
+    bool BodycamAiming = false;
+    bool BodycamActive = false;
+    float BodycamFollowSpeed = 6.0f;
+    float AimYawOffset = 0.0f;
+    float AimPitchOffset = 0.0f;
+    XMFLOAT3 AimFront{};
+
+    const XMFLOAT3& GetAimFront() const {
+        return BodycamActive ? AimFront : Front;
+    }
+
+    void UpdateBodycamAim(float dt, bool allowed) {
+        BodycamActive = BodycamAiming && allowed && FPSMode;
+        if (!BodycamActive) {
+            AimYawOffset = AimPitchOffset = 0.0f;
+            return;
+        }
+        // Exponential follow keeps settling time independent of frame rate.
+        const float blend = 1.0f - std::exp(-BodycamFollowSpeed * (std::max)(dt, 0.0f));
+        const float yawStep = AimYawOffset * blend;
+        const float pitchStep = AimPitchOffset * blend;
+        Yaw += yawStep;
+        Pitch += pitchStep;
+        AimYawOffset -= yawStep;
+        AimPitchOffset -= pitchStep;
+        updateCameraVectors();
+    }
     
     // FPS mode settings
     bool FPSMode;
@@ -257,6 +284,7 @@ public:
     // angles arrive over the wire. Local look still goes through
     // ProcessMouseMovement, which owns sensitivity and pitch clamping.
     void SetViewAngles(float yawDegrees, float pitchDegrees) {
+        AimYawOffset = AimPitchOffset = 0.0f;
         Yaw = yawDegrees;
         Pitch = std::clamp(pitchDegrees, -89.0f, 89.0f);
         updateCameraVectors();
@@ -265,6 +293,17 @@ public:
     void ProcessMouseMovement(float xoffset, float yoffset) {
         xoffset *= MouseSensitivity;
         yoffset *= MouseSensitivity;
+        if (BodycamActive) {
+            // Excess turn moves the body so fast input cannot lose the gun offscreen.
+            const float yaw = AimYawOffset - xoffset;
+            AimYawOffset = std::clamp(yaw, -18.0f, 18.0f);
+            Yaw += yaw - AimYawOffset;
+            const float pitch = std::clamp(Pitch + AimPitchOffset + yoffset, -89.0f, 89.0f);
+            AimPitchOffset = std::clamp(pitch - Pitch, -12.0f, 12.0f);
+            Pitch = pitch - AimPitchOffset;
+            updateCameraVectors();
+            return;
+        }
         Yaw -= xoffset;
         Pitch += yoffset;
         if (Pitch > 89.0f) Pitch = 89.0f;
@@ -319,6 +358,8 @@ public:
     // already expressed in degrees, so sensitivity must not scale it.
     void ApplyRecoil(float pitchDegrees, float yawDegrees) {
         Pitch = (std::max)(-89.0f, (std::min)(89.0f, Pitch + pitchDegrees));
+        if (BodycamActive)
+            AimPitchOffset = std::clamp(Pitch + AimPitchOffset, -89.0f, 89.0f) - Pitch;
         Yaw += yawDegrees;
         updateCameraVectors();
     }
@@ -388,6 +429,10 @@ private:
         
         XMVECTOR frontVec = XMVector3Normalize(XMLoadFloat3(&front));
         XMStoreFloat3(&Front, frontVec);
+        const float aimYaw = XMConvertToRadians(Yaw + AimYawOffset);
+        const float aimPitch = XMConvertToRadians(std::clamp(Pitch + AimPitchOffset, -89.0f, 89.0f));
+        AimFront = { cosf(aimYaw) * cosf(aimPitch), sinf(aimPitch),
+                     sinf(aimYaw) * cosf(aimPitch) };
     }
 };
 

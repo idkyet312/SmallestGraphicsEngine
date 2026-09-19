@@ -959,6 +959,10 @@ NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
 bool                        g_customLevelMode = false;
+// Run-wide virtual shadow map baseline, fixed once at startup from SGE_VSM_OFF.
+// Levels can only turn VSM off from here, never on, so the env opt-out survives
+// a level change and a level's own choice cannot leak into the next one.
+bool                        g_vsmRunDefault = true;
 bool                        g_terrainInVisibilityBuffer = false;
 bool                        g_destructionInVisibilityBuffer = false;
 // Set when a runtime crater or gouge changes the terrain height field. The

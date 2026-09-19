@@ -24,6 +24,9 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint meshletCount;
     // Bit 0 enables HZB occlusion. Bit 1 disables cone backface rejection so
     // a runtime material override cannot be undone before rasterization.
+    // Bits 2-4 are the debug isolation mask (F6): each one suppresses a single
+    // test so a flickering chunk can be attributed to one of the three rather
+    // than guessed at. All clear is the shipping path.
     uint cullingFlags;
     uint screenWidth;
     uint screenHeight;
@@ -41,12 +44,22 @@ cbuffer MeshDrawBuffer : register(b6) {
     float modelMaxScale;
     uint instanceCount;
     uint instancingEnabled;
+    // Conservative widening of the frustum test. 1.0 is the exact
+    // sphere-vs-plane answer; above that trades culling for certainty.
+    float frustumRadiusScale;
 };
 
 cbuffer CameraBuffer : register(b2) {
     float3 viewPos;
     float cameraPadding;
 };
+
+// Debug isolation bits in cullingFlags. Each suppresses exactly one test, so
+// cycling them over the same camera path attributes a vanishing chunk to a
+// single culprit instead of a hypothesis.
+static const uint kDebugNoFrustum   = 4u;
+static const uint kDebugNoCone      = 8u;
+static const uint kDebugNoOcclusion = 16u;
 
 struct MeshletBounds {
     float3 boundsMin;
@@ -72,22 +85,59 @@ struct MeshPayload { uint2 workItems[32]; };
 groupshared MeshPayload payloadData;
 groupshared uint visibleCount;
 
-bool IntersectsFrustum(MeshletBounds bounds, float4x4 drawMVP, float drawScale) {
-    float4 clipCenter = mul(float4(bounds.sphereCenter, 1), drawMVP);
-    float radius = bounds.sphereRadius * drawScale;
-    float radiusX = radius * abs(projection[0][0]);
-    float radiusY = radius * abs(projection[1][1]);
-    // Inflate depth radius because perspective changes both clip z and w.
-    float radiusZ = radius * (abs(projection[2][2]) + abs(projection[2][3]));
-    return clipCenter.x + radiusX >= -clipCenter.w &&
-           clipCenter.x - radiusX <=  clipCenter.w &&
-           clipCenter.y + radiusY >= -clipCenter.w &&
-           clipCenter.y - radiusY <=  clipCenter.w &&
-           clipCenter.z + radiusZ >= 0.0 &&
-           clipCenter.z - radiusZ <= clipCenter.w + radiusZ;
+// Reject only when the sphere lies wholly outside the half-space, i.e.
+// d < -radius * length(n). Squaring avoids the sqrt; the d < 0 guard is what
+// keeps the squaring from flipping the sign, so the two forms are identical.
+bool SphereOutsidePlane(float d, float3 n, float radiusSq) {
+    return d < 0.0 && d * d > radiusSq * dot(n, n);
+}
+
+// Exact conservative sphere-vs-frustum, evaluated in the draw's LOCAL space.
+//
+// mul(v, M) computes clip[j] = sum_i v[i] * M[i][j], so clip.x is built from
+// column 0 of drawMVP and clip.w from column 3. That holds whatever
+// transposition the CPU applied, because it is the same mul the test itself
+// performs. Each clip-space half-space pulls back to a local-space plane built
+// from those columns, and the plane normal's LENGTH already carries both the
+// projection and the full model transform.
+//
+// That length is the whole bug. The old test used radius * |projection[0][0]|
+// as the margin, which is short by 1/cos(half-FOV): at this engine's 60 degree
+// vertical FOV and 16:9 that is 43% on X and 15% on Y. Meshlets near the left
+// and right screen edges were rejected while still plainly visible, which is
+// what made chunks of the shelter and the fence vanish.
+//
+// drawScale must NOT be reapplied here. The normal length already contains it,
+// per plane, so anisotropic scale and shear come out exact rather than being
+// inflated to the largest axis the way modelMaxScale did. It is still needed by
+// IsBackfacing and IsOccluded, which work in world and view space.
+bool IntersectsFrustum(MeshletBounds bounds, float4x4 drawMVP) {
+    if ((cullingFlags & kDebugNoFrustum) != 0u) return true;
+
+    float4 clip = mul(float4(bounds.sphereCenter, 1), drawMVP);
+    float3 cx = drawMVP._m00_m10_m20;   // column 0
+    float3 cy = drawMVP._m01_m11_m21;   // column 1
+    float3 cz = drawMVP._m02_m12_m22;   // column 2
+    float3 cw = drawMVP._m03_m13_m23;   // column 3
+
+    // 1.0 is the exact test. Below it the sphere is deliberately under-sized so
+    // the cull bites early and the boundary becomes visible -- a debug aid, not
+    // a correct setting. The floor keeps a draw site that forgets the root
+    // constant at a very aggressive cull rather than a zero-radius blackout.
+    float radius = bounds.sphereRadius * max(frustumRadiusScale, 0.1);
+    float radiusSq = radius * radius;
+
+    if (SphereOutsidePlane(clip.x + clip.w, cx + cw, radiusSq)) return false;
+    if (SphereOutsidePlane(clip.w - clip.x, cw - cx, radiusSq)) return false;
+    if (SphereOutsidePlane(clip.y + clip.w, cy + cw, radiusSq)) return false;
+    if (SphereOutsidePlane(clip.w - clip.y, cw - cy, radiusSq)) return false;
+    if (SphereOutsidePlane(clip.z,          cz,      radiusSq)) return false;
+    if (SphereOutsidePlane(clip.w - clip.z, cw - cz, radiusSq)) return false;
+    return true;
 }
 
 bool IsBackfacing(MeshletBounds bounds, float4x4 drawModel, float drawScale) {
+    if ((cullingFlags & kDebugNoCone) != 0u) return false;
     if (bounds.coneCutoff < 0.0) return false;
     float3 worldCenter = mul(float4(bounds.sphereCenter, 1), drawModel).xyz;
     float3 axis = normalize(mul(bounds.coneAxis, (float3x3)drawModel));
@@ -98,7 +148,8 @@ bool IsBackfacing(MeshletBounds bounds, float4x4 drawModel, float drawScale) {
 
 bool IsOccluded(MeshletBounds bounds, float4x4 drawModel,
                 float4x4 drawModelView, float drawScale) {
-    if ((cullingFlags & 1u) == 0u) return false;
+    if ((cullingFlags & 1u) == 0u ||
+        (cullingFlags & kDebugNoOcclusion) != 0u) return false;
     float4 localCenter = float4(bounds.sphereCenter, 1);
     float4 viewCenter = mul(localCenter, drawModelView);
     float4 worldCenter = mul(localCenter, drawModel);
@@ -170,7 +221,7 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
         // culling entirely; static geometry keeps the full test.
         bool visible = skinningEnabled
             ? true
-            : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
+            : (IntersectsFrustum(bounds, drawMVP) &&
                ((cullingFlags & 2u) != 0u ||
                 !IsBackfacing(bounds, drawModel, drawScale)) &&
                !IsOccluded(bounds, drawModel, drawModelView, drawScale));

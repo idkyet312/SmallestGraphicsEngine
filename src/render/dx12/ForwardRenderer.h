@@ -420,7 +420,7 @@ inline bool AddPlayerFlashlight(Scene& scene) {
     // into cluster lists and then silently skipped while shading.
     if (scene.clusteredRenderer.lights.size() >= 64) return false;
     const XMVECTOR forward = XMVector3Normalize(
-        XMLoadFloat3(&scene.camera.Front));
+        XMLoadFloat3(&scene.camera.GetAimFront()));
     const XMFLOAT3 muzzle = scene.GetMuzzleWorldPosition();
     // Dropped below the barrel and pushed forward: mounted on top, the lamp sat
     // in the bullet's path and the tracer geometry cut the beam every shot.
@@ -1320,7 +1320,7 @@ inline XMMATRIX PlayerWeaponTransform(const Scene& scene, FXMMATRIX view,
     if (alignSight && GunModel::R700Selected() && scene.adsBlend > 0.0f &&
         GunModel::GetR700LensCenter(lens)) {
         const XMFLOAT2 aim = SniperScopeOptics::ProjectTangent(
-            XMVector3TransformNormal(XMLoadFloat3(&scene.camera.Front), view));
+            XMVector3TransformNormal(XMLoadFloat3(&scene.camera.GetAimFront()), view));
         weapon = SniperScopeOptics::AlignWeapon(weapon, view, lens, aim, scene.adsBlend);
     }
     return weapon;
@@ -1339,7 +1339,7 @@ inline bool PrepareR700ScopeFrame(Scene& scene) {
     if (XMVectorGetZ(lensView) <= scene.cameraNear) return false;
     g_r700ScopeFrame.lensTangent = SniperScopeOptics::ProjectTangent(lensView);
     g_r700ScopeFrame.aimTangent = SniperScopeOptics::ProjectTangent(
-        XMVector3TransformNormal(XMLoadFloat3(&scene.camera.Front), view));
+        XMVector3TransformNormal(XMLoadFloat3(&scene.camera.GetAimFront()), view));
     float radius = 0.0f;
     for (const auto& primitive : aperture->primitives) {
         for (size_t i = 0; i + 11 < primitive.vertices.size(); i += 12) {
@@ -1361,7 +1361,7 @@ inline bool PrepareR700ScopeFrame(Scene& scene) {
     // firing direction. The crosshair is therefore an aiming reference even
     // during recoil, rather than a decorative mark on a shaken camera axis.
     const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
-    const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+    const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&scene.camera.GetAimFront()));
     const XMVECTOR eye = inverseView.r[3] + forward * scene.sniperScopeCameraForwardMetres;
     const XMVECTOR up = XMVector3TransformNormal(inverseView.r[1],
         XMMatrixRotationAxis(forward, XMConvertToRadians(scene.sniperScopeCameraRollDegrees)));
@@ -1622,6 +1622,11 @@ struct PrefabDrawStats {
 };
 inline PrefabDrawStats g_prefabDrawStats;
 
+// Mirrors scene.debugDisablePrefabBoundsCull. DrawSceneNode is a free function
+// with no Scene parameter, so the F6 isolation state reaches it here rather
+// than by widening a signature every call site would have to carry.
+inline bool g_debugDisablePrefabBoundsCull = false;
+
 struct ForwardExtensionListCacheEntry {
     std::weak_ptr<SceneNode> root;
     std::vector<SceneNode*> nodes;
@@ -1733,6 +1738,7 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                 g_meshShader.CanDraw(prim.meshletCount, meshletDescAddress,
                     boundsAddress, vertexIndexAddress, triangleAddress);
             if (!meshShaderDraw && !transparent && !prim.skinBuffer &&
+                !g_debugDisablePrefabBoundsCull &&
                 !RasterPrimitiveIntersectsFrustum(prim, model * view * proj))
                 continue;
             if (transparent && g_transparencyQueueActive &&
@@ -2977,7 +2983,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const XMMATRIX viewProj = view * proj;
         for (const XMMATRIX& transform : batch.transforms) {
             ++g_prefabDrawStats.considered;
-            if (!ModelBoundsVisible(bounds, transform * viewProj)) continue;
+            if (!g_debugDisablePrefabBoundsCull &&
+                !ModelBoundsVisible(bounds, transform * viewProj)) continue;
             ++g_prefabDrawStats.drawn;
             DrawSceneNode(batch.model, shader, transform,
                           view, proj, lightSpace, visibilityExtensionsOnly);

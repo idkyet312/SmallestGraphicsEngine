@@ -191,6 +191,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     const RuntimeLevelPlan plan =
         LevelRuntimeBuilder::Build(g_game.world.Level());
     g_levelPatrolBoatEnabled = plan.patrolBoatEnabled;
+    scene.virtualShadowMaps = g_vsmRunDefault && plan.virtualShadowMaps;
     scene.terrainHeightScale = plan.terrainHeightScale;
     scene.terrainFlat = plan.terrainFlat;
     scene.terrainTilesX = plan.terrainTilesX;
@@ -574,6 +575,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     }
     g_game.session.SetScreen(GameScreen::Level1);
     g_customLevelMode = !stressTest && !emptyLevel;
+    // Reset before the branch: ApplyRuntimeLevelBasics refines this from the
+    // level plan, but it early-returns for the stress and empty test levels,
+    // which would otherwise inherit whatever the previous level chose.
+    scene.virtualShadowMaps = g_vsmRunDefault;
     // The network identity of this level. Every start funnels through here, so
     // this is the one place that cannot be forgotten; StartCustomLevel fills in
     // the file name afterwards, since only the caller with the path knows it.

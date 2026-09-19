@@ -41,6 +41,9 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
+    scene.camera.UpdateBodycamAim(deltaTime,
+        IsGameplayScreen() && !g_insertionChoicePending && !g_drivingHumvee &&
+        !scene.ejected && scene.player.health > 0.0f);
     scene.weaponAdsFOV = scene.player.ResolveWeaponStats(
         GunModel::SelectedWeapon()).adsFovDegrees;
     if (g_insertionChoicePending) {
@@ -206,8 +209,8 @@ static void ProcessInput(HWND) {
     PlayerInput playerInput;
     playerInput.forward = forwardInput;
     playerInput.strafe = strafeInput;
-    playerInput.yaw = scene.camera.Yaw;
-    playerInput.pitch = scene.camera.Pitch;
+    playerInput.yaw = scene.camera.Yaw + scene.camera.AimYawOffset;
+    playerInput.pitch = scene.camera.Pitch + scene.camera.AimPitchOffset;
     playerInput.deltaTime = deltaTime;
     playerInput.Set(PlayerInput::Crouch, crouching);
     playerInput.Set(PlayerInput::Sprint, sprinting);
@@ -646,6 +649,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Bit 30 = key was already down (autorepeat); toggle once per press.
         else if (wParam == 'Z' && !(lParam & 0x40000000)) {
             scene.meshletWireframe = !scene.meshletWireframe;
+        }
+        else if (wParam == VK_F6 && !(lParam & 0x40000000)) {
+            // Cull isolation. Flying the camera is what reproduces the vanishing
+            // chunks, and reaching an ImGui checkbox means letting go of mouse
+            // look -- so the cycle lives on a key. One test off at a time, then
+            // everything off, so a chunk that keeps flickering in mode 4 is not
+            // a culling bug at all.
+            static int mode = 0;
+            mode = (mode + 1) % 5;
+            scene.debugDisableMeshletOcclusionCull = (mode == 1 || mode == 4);
+            scene.debugDisableMeshletConeCull      = (mode == 2 || mode == 4);
+            scene.debugDisableMeshletFrustumCull   = (mode == 3 || mode == 4);
+            scene.debugDisablePrefabBoundsCull     = (mode == 4);
+            static const char* kNames[5] = {
+                "0 baseline (all tests on)",
+                "1 HZB occlusion OFF",
+                "2 cone backface OFF",
+                "3 frustum OFF",
+                "4 all OFF (incl. CPU prefab bounds)"
+            };
+            SGE_LOG("LogRender", EngineLog::Level::Display,
+                std::string("Meshlet cull isolation: ") + kNames[mode]);
         }
         else if (wParam == VK_F8 && !(lParam & 0x40000000)) {
             // Unreal-style eject: detach the camera from the player so the view

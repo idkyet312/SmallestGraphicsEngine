@@ -14,6 +14,9 @@
 #include <fstream>
 #include <sstream>
 #include <cstring>
+#include <array>
+#include <climits>
+#include <set>
 #include "VirtualShadowMapDX12.h"
 
 // 4096 rather than 2048: at 2048 a cascade-1/2 texel covered enough wall that
@@ -33,6 +36,44 @@ static constexpr D3D12_RESOURCE_STATES SHADOW_SHADER_READ_STATE =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
+// TEMPORARY diagnostic for the alpha-shadow texture binding. Gated on
+// SGE_SHADOW_ALPHA_LOG so it costs one already-resolved bool in a normal run.
+// Remove once the descriptor-ring fix has been confirmed from a log diff.
+inline bool ShadowAlphaLogEnabled() {
+    static const bool enabled =
+        GetEnvironmentVariableA("SGE_SHADOW_ALPHA_LOG", nullptr, 0) > 0;
+    return enabled;
+}
+
+inline bool ShadowAlphaSolidDebug() {
+    static const bool enabled =
+        GetEnvironmentVariableA("SGE_SHADOW_ALPHA_SOLID", nullptr, 0) > 0;
+    return enabled;
+}
+
+inline bool ShadowAlphaLogBudget() {
+    static int remaining = 4000;
+    if (remaining <= 0) return false;
+    --remaining;
+    return true;
+}
+
+// One line per distinct key, so a material drawn on every instance does not
+// bury the one draw being investigated.
+inline bool ShadowAlphaLogOnce(const std::string& key) {
+    static std::set<std::string> seen;
+    return seen.insert(key).second;
+}
+
+// Distinct alpha-cutout textures one frame's shadow passes can hold at once.
+// The Base map needs six; 64 leaves room for a scene with far more cutout
+// props before the path degrades back to aliasing.
+static const UINT SHADOW_ALPHA_TEXTURE_SLOTS = 64;
+// Per frame slice: the generic ring, then one trailing slot reserved for the
+// palm path so palm draws keep the last-writer-wins behaviour they have today
+// and their shadows do not change.
+static const UINT SHADOW_ALPHA_HEAP_STRIDE = SHADOW_ALPHA_TEXTURE_SLOTS + 1;
+
 class DepthOnlyShaderDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
@@ -50,7 +91,14 @@ public:
     UINT instancesThisFrame = 0;
     bool loaded = false;
     PalmWindFrameDX12 palmWindFrame{};
+    // Palm region only. Everything else goes through the ring below.
     ID3D12Resource* boundPalmTexture = nullptr;
+    UINT boundPalmFrame = UINT_MAX;
+    UINT descriptorStride = 0;
+    UINT alphaSlotCursor = 0;
+    UINT alphaSlotFrame = UINT_MAX;
+    bool alphaSlotOverflowReported = false;
+    std::array<ID3D12Resource*, SHADOW_ALPHA_TEXTURE_SLOTS> alphaSlotTextures{};
 
     bool Load(const char* vertexPath) {
         std::ifstream vsFile(vertexPath);
@@ -278,12 +326,22 @@ public:
             &psoDesc, IID_PPV_ARGS(&palmAlphaPipelineState));
         if (FAILED(hr)) return false;
 
+        // One descriptor per frame slice per distinct alpha texture, not one
+        // descriptor total. CreateShaderResourceView writes on the CPU
+        // timeline, but the draws that read it are only recorded here and
+        // execute later, so a single slot means every alpha-cutout shadow draw
+        // in the frame samples whichever texture was written last. Measured on
+        // the Base map: six distinct textures overwriting one slot, with the
+        // chain-link fence's atlas among the losers, which is why its panel
+        // clipped away entirely and cast no shadow.
         D3D12_DESCRIPTOR_HEAP_DESC palmHeapDesc = {};
-        palmHeapDesc.NumDescriptors = 1;
+        palmHeapDesc.NumDescriptors = FRAME_COUNT * SHADOW_ALPHA_HEAP_STRIDE;
         palmHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         palmHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &palmHeapDesc, IID_PPV_ARGS(&palmTextureHeap)))) return false;
+        descriptorStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
         if (!matrixBuffer.Create(FRAME_COUNT * SHADOW_MAX_DRAWS)) return false;
         if (!instanceBuffer.Create(FRAME_COUNT * SHADOW_MAX_INSTANCES)) return false;
@@ -319,6 +377,21 @@ public:
         const float opacity = (std::max)(0.0f,
             (std::min)(1.0f, material->baseColorFactor.w));
         ID3D12Resource* texture = material->baseColorTexture.Get();
+        if (ShadowAlphaLogEnabled() && ShadowAlphaLogBudget() &&
+            ShadowAlphaLogOnce("mat:" + material->name)) {
+            std::cout << "[alphaShadow] material=" << material->name
+                      << " cutout=" << cutout << " blended=" << blended
+                      << " cutoff=" << material->alphaCutoff
+                      << " opacity=" << opacity
+                      << " tex=" << static_cast<const void*>(texture);
+            if (texture) {
+                const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+                std::cout << " " << desc.Width << "x" << desc.Height
+                          << " mips=" << desc.MipLevels
+                          << " fmt=" << static_cast<int>(desc.Format);
+            }
+            std::cout << " draw=" << currentDrawCall << std::endl;
+        }
         if (!texture && cutout && opacity < material->alphaCutoff) return false;
         if (!texture && blended && opacity <= 0.0f) return false;
         if (!texture && blended && opacity >= 0.999f) {
@@ -337,10 +410,15 @@ public:
             material->alphaFromLuminance ? 3u : (cutout ? 1u : 2u),
             texture ? 1u : 0u
         };
+        // TEMPORARY. SGE_SHADOW_ALPHA_SOLID=1 makes every cutout caster opaque
+        // in the shadow pass, which separates "the clip is discarding the whole
+        // panel" from "the panel never rasterises or its depth is biased out of
+        // the map". Without it the two look identical on screen: no shadow.
+        if (cutout && ShadowAlphaSolidDebug()) constants.alphaMode = 4u;
         g_dx12.commandList->SetPipelineState(alphaPipelineState.Get());
         g_dx12.commandList->SetGraphicsRoot32BitConstants(
             9, 4, &constants, 0);
-        if (texture) SetPalmTexture(texture);
+        if (texture) SetAlphaMaterialTexture(texture);
         return true;
     }
 
@@ -418,23 +496,104 @@ public:
             alphaCutout ? palmAlphaPipelineState.Get() : palmPipelineState.Get());
     }
 
-    void SetPalmTexture(ID3D12Resource* texture) {
-        if (!texture || !palmTextureHeap) return;
-        if (boundPalmTexture != texture) {
-            const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srv.Format = desc.Format;
-            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = desc.MipLevels;
-            g_dx12.device->CreateShaderResourceView(
-                texture, &srv, palmTextureHeap->GetCPUDescriptorHandleForHeapStart());
-            boundPalmTexture = texture;
-        }
+    D3D12_CPU_DESCRIPTOR_HANDLE AlphaSlotCPU(UINT slot) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            palmTextureHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(slot) * descriptorStride;
+        return handle;
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE AlphaSlotGPU(UINT slot) const {
+        D3D12_GPU_DESCRIPTOR_HANDLE handle =
+            palmTextureHeap->GetGPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<UINT64>(slot) * descriptorStride;
+        return handle;
+    }
+
+    void WriteAlphaSlot(UINT slot, ID3D12Resource* texture) {
+        const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = desc.MipLevels;
+        g_dx12.device->CreateShaderResourceView(
+            texture, &srv, AlphaSlotCPU(slot));
+    }
+
+    void BindAlphaSlot(UINT slot) {
         ID3D12DescriptorHeap* heaps[] = { palmTextureHeap.Get() };
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);
-        g_dx12.commandList->SetGraphicsRootDescriptorTable(
-            8, palmTextureHeap->GetGPUDescriptorHandleForHeapStart());
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(8, AlphaSlotGPU(slot));
+    }
+
+    // Generic alpha-cutout and blended materials. Each distinct texture gets
+    // its own descriptor for the whole frame, so a draw recorded early still
+    // samples its own texture once the command list executes.
+    //
+    // The cursor resets on frame-index change rather than in BeginFrame,
+    // because BeginFrame runs more than once per frame on depthShader (the spot
+    // pass and the cascade pass each call it) -- resetting there would hand two
+    // passes the same slots while the first pass's draws are still unexecuted.
+    void SetAlphaMaterialTexture(ID3D12Resource* texture) {
+        if (!texture || !palmTextureHeap) return;
+        if (alphaSlotFrame != g_dx12.frameIndex) {
+            alphaSlotFrame = g_dx12.frameIndex;
+            alphaSlotCursor = 0;
+            alphaSlotTextures.fill(nullptr);
+        }
+        const UINT base = g_dx12.frameIndex * SHADOW_ALPHA_HEAP_STRIDE;
+
+        UINT slot = SHADOW_ALPHA_TEXTURE_SLOTS;
+        for (UINT i = 0; i < alphaSlotCursor; ++i) {
+            if (alphaSlotTextures[i] == texture) { slot = i; break; }
+        }
+        if (slot == SHADOW_ALPHA_TEXTURE_SLOTS) {
+            if (alphaSlotCursor < SHADOW_ALPHA_TEXTURE_SLOTS) {
+                slot = alphaSlotCursor++;
+            } else {
+                // Degrade to the old aliasing rather than writing outside the
+                // ring: the last slot is shared and the newest texture wins.
+                slot = SHADOW_ALPHA_TEXTURE_SLOTS - 1;
+                if (!alphaSlotOverflowReported) {
+                    alphaSlotOverflowReported = true;
+                    std::cerr << "Shadow alpha texture slots exhausted ("
+                              << SHADOW_ALPHA_TEXTURE_SLOTS
+                              << "); cutout shadows may sample the wrong texture"
+                              << std::endl;
+                }
+            }
+            alphaSlotTextures[slot] = texture;
+            WriteAlphaSlot(base + slot, texture);
+        }
+        if (ShadowAlphaLogEnabled() && ShadowAlphaLogBudget() &&
+            ShadowAlphaLogOnce("slot:" + std::to_string(g_dx12.frameIndex) + ":" +
+                               std::to_string(slot))) {
+            std::cout << "[alphaShadow] generic slot=" << slot
+                      << " tex=" << static_cast<const void*>(texture)
+                      << " frame=" << g_dx12.frameIndex
+                      << " draw=" << currentDrawCall << std::endl;
+        }
+        BindAlphaSlot(base + slot);
+    }
+
+    // Palm cards only. Deliberately left on one descriptor per frame slice:
+    // palms are the last alpha draws recorded, so last-writer-wins is already
+    // what they resolve to today and keeping it means their shadows are
+    // unchanged by the ring above.
+    void SetPalmTexture(ID3D12Resource* texture) {
+        if (!texture || !palmTextureHeap) return;
+        const UINT slot = g_dx12.frameIndex * SHADOW_ALPHA_HEAP_STRIDE +
+                          SHADOW_ALPHA_TEXTURE_SLOTS;
+        // The frame check matters as much as the texture check: the two frame
+        // slices are different descriptors, so a cached pointer from the other
+        // slice would leave this one never written.
+        if (boundPalmTexture != texture || boundPalmFrame != g_dx12.frameIndex) {
+            WriteAlphaSlot(slot, texture);
+            boundPalmTexture = texture;
+            boundPalmFrame = g_dx12.frameIndex;
+        }
+        BindAlphaSlot(slot);
     }
 
     void SetGrass(const GrassField::Params& params,

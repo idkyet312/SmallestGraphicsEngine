@@ -60,6 +60,15 @@ public:
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw meshlets as wireframe
+    // F6 cull isolation: bits 2/3/4 suppress the frustum, cone and occlusion
+    // tests in mesh_as.hlsl. Zero is the shipping path. OR'd into cullingFlags
+    // rather than threaded through Draw()'s signature, which every skinned and
+    // viewmodel call site would otherwise have to carry.
+    UINT debugCullMask = 0;
+    // Widens the AS frustum test. 1.0 is the exact sphere-vs-plane result and
+    // the shipping default; the slider raises it only to prove a vanishing
+    // chunk is a bounds problem rather than a plane problem.
+    float frustumRadiusScale = 1.0f;
     bool hdrTargetEnabled = false;
     bool extensionMotionEnabled = false;
     bool bindlessReady = false;
@@ -456,12 +465,12 @@ public:
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstMeshlet, totalMeshlets,
                 ((occlusionEnabled && allowOcclusion) ? 1u : 0u) |
-                    (doubleSided ? 2u : 0u),
+                    (doubleSided ? 2u : 0u) | debugCullMask,
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 skinning, occlusionMipCount, g_currentModelMaxScale,
-                1u, 0u
+                1u, 0u, frustumRadiusScale
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 13, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 14, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
             ++dispatchesThisFrame;
             meshletsThisFrame += meshletCount;
@@ -545,12 +554,12 @@ public:
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstWorkItem, totalMeshlets,
                 ((occlusionEnabled && allowOcclusion) ? 1u : 0u) |
-                    (doubleSided ? 2u : 0u),
+                    (doubleSided ? 2u : 0u) | debugCullMask,
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 0u, occlusionMipCount, 1.0f,
-                instanceCount, 1u
+                instanceCount, 1u, frustumRadiusScale
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 13, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 14, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
             ++dispatchesThisFrame;
             firstWorkItem += workCount;
