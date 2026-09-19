@@ -20,10 +20,7 @@ public:
     float MouseSensitivity;
     bool BodycamAiming = false;
     bool BodycamActive = false;
-    // Lower than the 6.0 this shipped at: same curve, longer settle, which is
-    // the whole of what makes it read as smoother. The dev panel's slider is
-    // the knob if it wants to be quicker again.
-    float BodycamFollowSpeed = 4.0f;
+    float BodycamFollowSpeed = 6.0f;
     float AimYawOffset = 0.0f;
     float AimPitchOffset = 0.0f;
     XMFLOAT3 AimFront{};
