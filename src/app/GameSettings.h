@@ -53,6 +53,22 @@ struct GameSettings {
     // numbers are useless if turning them on means a recompile.
     bool debugLoadingScreen = false;
 
+    // Aiming model. Classic is the shipping one: the camera and the muzzle are
+    // the same ray, so where you look is where you shoot. Realistic decouples
+    // them -- the gun leads and the camera follows on a spring, so a fast flick
+    // swings the body rather than teleporting the muzzle. It changes how the
+    // weapon handles, not just how it looks, so it belongs to the player and
+    // survives a restart rather than living on a dev key.
+    bool realisticAiming = false;
+
+    // Hip-fire crosshair. On is the shipping presentation. Off is for players
+    // who want the weapon's own sights to be the only aiming reference; the
+    // optic dot and scope reticles are unaffected, since those are the sight
+    // picture rather than a HUD overlay.
+    bool showCrosshair = true;
+
+    static constexpr bool  kDefaultRealisticAiming = false;
+    static constexpr bool  kDefaultShowCrosshair = true;
     static constexpr bool  kDefaultDebugLoadingScreen = false;
     static constexpr bool  kDefaultSeeThroughWeapon = false;
     static constexpr float kDefaultSeeThroughStrength = 1.0f;
@@ -71,6 +87,8 @@ struct GameSettings {
         mouseSensitivity = kDefaultSensitivity;
         seeThroughWeaponWhenAiming = kDefaultSeeThroughWeapon;
         seeThroughWeaponStrength = kDefaultSeeThroughStrength;
+        realisticAiming = kDefaultRealisticAiming;
+        showCrosshair = kDefaultShowCrosshair;
         debugLoadingScreen = kDefaultDebugLoadingScreen;
     }
 };
@@ -122,6 +140,18 @@ inline bool LoadGameSettings(GameSettings& out) {
         else if (key == "SeeThroughWeaponStrength") {
             out.seeThroughWeaponStrength = std::strtof(value.c_str(), nullptr);
         }
+        else if (key == "RealisticAiming") {
+            out.realisticAiming =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "ShowCrosshair") {
+            // Unlike the others this one defaults on, so the test is for the
+            // off spellings. A missing key never reaches here and keeps the
+            // default; anything unrecognised reads as on, which is the
+            // presentation a player who never touched the setting expects.
+            out.showCrosshair =
+                !(value == "0" || value == "false" || value == "no");
+        }
         else if (key == "DebugLoadingScreen") {
             out.debugLoadingScreen =
                 value == "1" || value == "true" || value == "yes";
@@ -145,6 +175,11 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << (settings.seeThroughWeaponWhenAiming ? 1 : 0) << "\n"
          << "SeeThroughWeaponStrength="
          << settings.seeThroughWeaponStrength << "\n"
+         << "RealisticAiming="
+         << (settings.realisticAiming ? 1 : 0) << "\n"
+         << "[HUD]\n"
+         << "ShowCrosshair="
+         << (settings.showCrosshair ? 1 : 0) << "\n"
          << "[Debug]\n"
          << "DebugLoadingScreen="
          << (settings.debugLoadingScreen ? 1 : 0) << "\n";

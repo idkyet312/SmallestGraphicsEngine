@@ -23,26 +23,52 @@ public:
     float BodycamFollowSpeed = 6.0f;
     float AimYawOffset = 0.0f;
     float AimPitchOffset = 0.0f;
+    // Follow velocity, in degrees/second, for the spring below. Carried across
+    // frames because a second-order follow needs its own momentum -- this is
+    // what a plain exponential does not have.
+    float AimYawVelocity = 0.0f;
+    float AimPitchVelocity = 0.0f;
     XMFLOAT3 AimFront{};
 
     const XMFLOAT3& GetAimFront() const {
         return BodycamActive ? AimFront : Front;
     }
 
+    // Critically damped follow of one offset toward zero. Returns how far the
+    // offset moved, which is what the body turns by.
+    //
+    // A first-order exponential -- offset *= exp(-w dt) -- is fastest at the
+    // instant the mouse stops and decays from there, so the camera lurches and
+    // then crawls. This is the exact solution to the critically damped spring
+    //     x'' = -2w x' - w^2 x
+    // which starts at the velocity the turn actually had, accelerates, and
+    // eases into the target with no overshoot. Closed form, so it is stable at
+    // any timestep and still frame-rate independent.
+    static float SpringToZero(float& x, float& v, float w, float dt) {
+        const float before = x;
+        const float decay = std::exp(-w * dt);
+        // Grouped once: it appears in both the position and velocity terms.
+        const float impulse = v + w * x;
+        x = (x + impulse * dt) * decay;
+        v = (v - w * impulse * dt) * decay;
+        return before - x;
+    }
+
     void UpdateBodycamAim(float dt, bool allowed) {
         BodycamActive = BodycamAiming && allowed && FPSMode;
         if (!BodycamActive) {
             AimYawOffset = AimPitchOffset = 0.0f;
+            AimYawVelocity = AimPitchVelocity = 0.0f;
             return;
         }
-        // Exponential follow keeps settling time independent of frame rate.
-        const float blend = 1.0f - std::exp(-BodycamFollowSpeed * (std::max)(dt, 0.0f));
-        const float yawStep = AimYawOffset * blend;
-        const float pitchStep = AimPitchOffset * blend;
-        Yaw += yawStep;
-        Pitch += pitchStep;
-        AimYawOffset -= yawStep;
-        AimPitchOffset -= pitchStep;
+        const float step = (std::max)(dt, 0.0f);
+        // Undamped frequency. Halved against the old exponential rate so the
+        // slider's numbers keep meaning roughly the same settling time: a
+        // critically damped spring takes about twice as long to settle as a
+        // first-order decay at the same w.
+        const float w = (std::max)(0.01f, BodycamFollowSpeed * 0.5f);
+        Yaw += SpringToZero(AimYawOffset, AimYawVelocity, w, step);
+        Pitch += SpringToZero(AimPitchOffset, AimPitchVelocity, w, step);
         updateCameraVectors();
     }
     
@@ -285,6 +311,9 @@ public:
     // ProcessMouseMovement, which owns sensitivity and pitch clamping.
     void SetViewAngles(float yawDegrees, float pitchDegrees) {
         AimYawOffset = AimPitchOffset = 0.0f;
+        // Momentum belongs to the offset it was carrying; a snap to absolute
+        // angles would otherwise spring away from the orientation just set.
+        AimYawVelocity = AimPitchVelocity = 0.0f;
         Yaw = yawDegrees;
         Pitch = std::clamp(pitchDegrees, -89.0f, 89.0f);
         updateCameraVectors();

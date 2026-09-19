@@ -669,6 +669,12 @@ static void ApplyGameSettings() {
     // with the scene agreeing with the file.
     scene.seeThroughWeaponWhenAiming = g_settings.seeThroughWeaponWhenAiming;
     scene.seeThroughWeaponStrength = g_settings.seeThroughWeaponStrength;
+    scene.showCrosshair = g_settings.showCrosshair;
+    // The aiming model is global: every path that reloads settings -- boot,
+    // level start, editor entry -- lands here, so a camera rebuilt for a new
+    // level comes up in the mode the player chose rather than the default.
+    // UpdateBodycamAim is left to the frame loop; this only sets the intent.
+    scene.camera.BodycamAiming = g_settings.realisticAiming;
 }
 
 // Player velocity in full 3D, differenced from the camera position each frame.

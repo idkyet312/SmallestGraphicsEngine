@@ -258,6 +258,38 @@ static void RenderSettingsMenu() {
     ImGui::EndDisabled();
 
     ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    UISectionLabel("AIMING");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    // A button showing the mode that is active rather than a checkbox: the two
+    // models are named alternatives, and "Realistic aiming [x]" makes the other
+    // one nameless. Clicking swaps to the other.
+    if (UIMenuButton(g_settings.realisticAiming ? "REALISTIC AIMING"
+                                                : "CLASSIC AIMING", 38.0f)) {
+        g_settings.realisticAiming = !g_settings.realisticAiming;
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       g_settings.realisticAiming
+                           ? "The gun leads and the camera follows. A fast "
+                             "turn swings your body."
+                           : "Camera and muzzle are one line. Where you look "
+                             "is where you shoot.");
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    UISectionLabel("HUD");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    if (ImGui::Checkbox("Show crosshair", &g_settings.showCrosshair)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Off leaves the weapon's own sights as the only aiming "
+                       "reference. Optics are unaffected.");
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
     UISectionLabel("DEBUG");
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 

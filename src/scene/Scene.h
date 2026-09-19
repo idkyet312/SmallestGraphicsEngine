@@ -358,6 +358,11 @@ struct Scene {
     // settings object, which is file-static to main.cpp.
     bool   seeThroughWeaponWhenAiming = false;
     float  seeThroughWeaponStrength = 1.0f;
+    // Mirrors GameSettings::showCrosshair. The HUD cannot see g_settings, so
+    // the player's choice is pushed here by ApplyGameSettings like the two
+    // above it. Only the hip-fire cross is gated: the optic dot and scope
+    // reticles are the sight picture, not an overlay.
+    bool   showCrosshair = true;
     // Shape of the fade, live-tunable from the debug panel. Defaults are the
     // weapon's measured extent down the sight line: the gun origin sits at
     // adsOffsetZ from the eye and the muzzle ~0.75m beyond it.

@@ -484,6 +484,10 @@ inline void RenderPlayerHUD(const Scene& scene) {
         const int reticleAlpha = static_cast<int>(220.0f * reticleFade);
         const ImU32 outline = IM_COL32(0, 0, 0, outlineAlpha);
         const ImU32 reticle = IM_COL32(235, 235, 225, reticleAlpha);
+        // Skipping only the four arms, not the block: `center` is computed
+        // above and the optic dot below is drawn at that same point, so an
+        // early-out here would take the sight picture with it.
+        if (scene.showCrosshair) {
         const ImVec2 segments[4][2] = {
             { ImVec2(center.x - gap - arm, center.y), ImVec2(center.x - gap, center.y) },
             { ImVec2(center.x + gap, center.y), ImVec2(center.x + gap + arm, center.y) },
@@ -494,6 +498,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddLine(segment[0], segment[1], outline, 3.0f);
         for (const auto& segment : segments)
             draw->AddLine(segment[0], segment[1], reticle, 1.0f);
+        }
 
         // The optic dot replaces the fading hip reticle as the rifle reaches
         // the shoulder. It is projected at the point of aim so parallax from
@@ -3614,7 +3619,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     if (UISearchHeader("Viewmodel (Gun)", 0,
                        "weapon rifle offset scale rotation fit attachments "
                        "optic sight red dot scope suppressor grip "
-                       "ads aim down sights bodycam classic camera follow fov blend recoil sway "
+                       "ads aim down sights realistic classic camera follow fov blend recoil sway "
                        "see-through see through transparent transparency "
                        "opacity alpha binocular fade "
                        "arms hands mirror head auto fire interval muzzle")) {
@@ -3926,11 +3931,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // has to be available with every one of them.
         ImGui::SeparatorText("Aiming Mode");
         if (ImGui::Button(scene.camera.BodycamAiming
-                ? "Aiming: Bodycam" : "Aiming: Classic")) {
+                ? "Aiming: Realistic" : "Aiming: Classic")) {
             scene.camera.BodycamAiming = !scene.camera.BodycamAiming;
             scene.camera.UpdateBodycamAim(0.0f, !scene.ejected);
         }
-        ImGui::SetItemTooltip("Switch aiming mode. Bodycam lets the gun lead while the camera follows.");
+        // Live override only. The player-facing setting lives in the settings
+        // menu and is what persists; this flips the camera for the current
+        // session and is overwritten the next time ApplyGameSettings runs.
+        ImGui::SetItemTooltip("Switch aiming mode for this session. Realistic "
+                              "lets the gun lead while the camera follows. "
+                              "Settings > Aiming is the one that sticks.");
         if (scene.camera.BodycamAiming)
             ImGui::SliderFloat("Camera follow speed", &scene.camera.BodycamFollowSpeed,
                                2.0f, 16.0f, "%.1f");
