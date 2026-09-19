@@ -54,6 +54,29 @@ public:
         return before - x;
     }
 
+    // How far the gun may lead the camera before the body has to catch up.
+    static constexpr float kAimYawLeash = 18.0f;
+    static constexpr float kAimPitchLeash = 12.0f;
+
+    // Stiffness climbs as the lead approaches its leash, so the body speeds up
+    // to keep station instead of running into a wall and being yanked along.
+    // Cubic: unnoticeable around centre, decisive at the edge.
+    static float LeashedRate(float w, float offset, float leash) {
+        const float t = (std::min)(1.0f, std::fabs(offset) / leash);
+        return w * (1.0f + 9.0f * t * t * t);
+    }
+
+    // Backstop for a flick faster than the body can possibly follow. Returns
+    // the body turn that brings an over-extended lead back inside its leash.
+    // With the progressive stiffness above this is rare, which is the point --
+    // it is the only part of the turn that moves the camera without smoothing.
+    static float ClampToLeash(float& offset, float leash) {
+        const float clamped = std::clamp(offset, -leash, leash);
+        const float excess = offset - clamped;
+        offset = clamped;
+        return excess;
+    }
+
     void UpdateBodycamAim(float dt, bool allowed) {
         BodycamActive = BodycamAiming && allowed && FPSMode;
         if (!BodycamActive) {
@@ -67,8 +90,13 @@ public:
         // critically damped spring takes about twice as long to settle as a
         // first-order decay at the same w.
         const float w = (std::max)(0.01f, BodycamFollowSpeed * 0.5f);
-        Yaw += SpringToZero(AimYawOffset, AimYawVelocity, w, step);
-        Pitch += SpringToZero(AimPitchOffset, AimPitchVelocity, w, step);
+        Yaw += SpringToZero(AimYawOffset, AimYawVelocity,
+                            LeashedRate(w, AimYawOffset, kAimYawLeash), step);
+        Pitch += SpringToZero(AimPitchOffset, AimPitchVelocity,
+                              LeashedRate(w, AimPitchOffset, kAimPitchLeash),
+                              step);
+        Yaw += ClampToLeash(AimYawOffset, kAimYawLeash);
+        Pitch += ClampToLeash(AimPitchOffset, kAimPitchLeash);
         updateCameraVectors();
     }
     
@@ -323,13 +351,25 @@ public:
         xoffset *= MouseSensitivity;
         yoffset *= MouseSensitivity;
         if (BodycamActive) {
-            // Excess turn moves the body so fast input cannot lose the gun offscreen.
-            const float yaw = AimYawOffset - xoffset;
-            AimYawOffset = std::clamp(yaw, -18.0f, 18.0f);
-            Yaw += yaw - AimYawOffset;
-            const float pitch = std::clamp(Pitch + AimPitchOffset + yoffset, -89.0f, 89.0f);
-            AimPitchOffset = std::clamp(pitch - Pitch, -12.0f, 12.0f);
-            Pitch = pitch - AimPitchOffset;
+            // Accumulate into the lead only -- the body is turned by the spring
+            // in UpdateBodycamAim and nowhere else.
+            //
+            // This used to clamp here and add the excess straight to Yaw. That
+            // made the smoothing frame-rate dependent in the worst direction:
+            // mouse messages arrive at the device rate while the spring drains
+            // once per frame, so at 20 fps the lead had 50 ms to fill, spent
+            // most of it pinned at the leash, and dumped the overflow into the
+            // camera unsmoothed. Low frame rates therefore stuttered far worse
+            // than the frame rate alone accounted for.
+            //
+            // Aim is unaffected by the change: updateCameraVectors builds
+            // AimFront from Yaw + AimYawOffset, so the point of aim still
+            // tracks the mouse 1:1 and with no delay however far the camera
+            // trails behind it.
+            AimYawOffset -= xoffset;
+            const float aimPitch =
+                std::clamp(Pitch + AimPitchOffset + yoffset, -89.0f, 89.0f);
+            AimPitchOffset = aimPitch - Pitch;
             updateCameraVectors();
             return;
         }
