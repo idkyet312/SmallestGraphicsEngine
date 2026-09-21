@@ -76,6 +76,7 @@
 #include "SkinnedFBXImporter.h"
 #include "SkinnedEnemy.h"
 #include "T3DPhysicsAsset.h"
+#include "RagdollRigFit.h"
 #include "GunAudio.h"
 #include "WaterVolume.h"
 #include "WaterRendererDX12.h"
@@ -1646,6 +1647,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // actor picks up live slider edits, not just the ones that
                 // reach the general movement path.
                 bandit->leftArmReach = g_banditLeftArmReach;
+                // Pushed with the other tunables so the toggle reaches actors
+                // that are already on the ground, not just newly spawned ones.
+                bandit->upperBodyGunLayer = !g_freeArmsNoWeaponIK;
                 bandit->headTorsoYawOffsetDegrees = g_banditHeadYawOffsetDegrees;
                 bandit->gunScale = g_banditGunScale;
                 bandit->gunGripForward = g_banditGunGripForward;
@@ -4754,11 +4758,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
             AdvanceLevelLoading(LevelLoadStage::BanditModel,
                 "Bandit mesh, skeleton, clips and physics asset",
-                "Content/Models/MilitaryMercenaryBandit/SK_Bandit.FBX",
+                "Content/Models/MilitaryMercenaryBandit/Mixamo/SK_BanditMixamo.fbx",
                 g_helicopterModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::BanditModel) {
 
-            // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
+            // Skinned Bandit enemy: mesh + four directional runs. Texture uploads
             // ride the same command list flushed just below.
             //
             // The base spawns neither enemies nor allies, so both skinned
@@ -4772,55 +4776,56 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // to render whatever enemies the host's level holds.
             if (!g_baseMode) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
-                const std::string animDir = banditDir + "Animations/Demo/";
-                // The UE4-rigged bandit. A Mixamo-rigged variant of the same
-                // character sits in Mixamo/ carrying four authored run cycles
-                // on the rig they were made for -- built by
-                // scripts/mixamo-to-ue.py and checked by StrafeImportTests --
-                // but the enemy in play is still this one, which retargets the
-                // two strafe cycles onto its own skeleton.
+                const std::string mixamoDir = banditDir + "Mixamo/";
+                // The forward cycle is embedded in this mesh. All four clips
+                // share its rig; mixing the old UE gait keys into it changes
+                // bone lengths and local axes.
+                // The idle comes last so the four run cycles keep the slots
+                // the blend space names below, whatever the file stems are.
                 std::vector<std::string> clips = {
-                    animDir + "ThirdPersonIdle.FBX",
-                    animDir + "ThirdPersonWalk.FBX",
-                    animDir + "ThirdPersonRun.FBX",
-                    // Strafe cycles, converted to the UE4 rig before import, so
-                    // they resolve onto the bandit's own bones by name like any
-                    // other clip. The clip name is the file stem.
-                    banditDir + "Animations/Mixamo/RunRight.UE.fbx",
-                    banditDir + "Animations/Mixamo/RunLeft.UE.fbx",
+                    mixamoDir + "Animations/RunBackward.fbx",
+                    mixamoDir + "Animations/RunLeft.fbx",
+                    mixamoDir + "Animations/RunRight.fbx",
+                    mixamoDir + "Animations/RifleAimingIdle.fbx",
                 };
-                // The strafe clips were converted from another rig and still
-                // carry its bone lengths, so they contribute rotation only --
-                // the bandit's own proportions drive everything else.
                 SkinnedModel bm = SkinnedFBXImporter::Load(
-                    banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList,
-                    0.01f, true, { "RunRight.UE", "RunLeft.UE" });
-                bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
-                if (bm.valid) {
-                    // The strafe clips came in with the gait clips above. Both
-                    // gaits adopt them: the alternative for the walk slots is
-                    // the IK bake, which drags the feet to targets instead of
-                    // replaying real footwork.
-                    //
-                    // The slot is stated rather than measured. These are
-                    // running strafes whose trailing leg crosses over, so the
-                    // planted foot sweeps both ways inside a single cycle and
-                    // no footfall test separates left from right. Measured on
-                    // the source clips, the mean foot offset from the rest
-                    // stance is +1.74 for RunRight and -1.74 for RunLeft, so
-                    // each fills the slot its name implies.
-                    constexpr int kStrafeLeft = 2, kStrafeRight = 3;
+                    mixamoDir + "SK_BanditMixamo.fbx", clips,
+                    g_dx12.device, g_dx12.commandList, 0.01f, false);
+                if (bm.valid && bm.clips.size() == 5) {
+                    constexpr size_t kIdleClip = 4;
+                    bm.clips[0].name = "RunForwardSource";
+                    for (size_t i = 1; i < kIdleClip; ++i)
+                        bm.clips[i].name += "Source";
+                    // The authored rifle idle replaces the held rest pose the
+                    // rig shipped with, so stopping keeps the aim the gun IK
+                    // overlay is built on rather than freezing a run frame.
+                    bm.clips[kIdleClip].name = "Idle";
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         authoredNames = {
-                            { "RunRight.UE", true, true, kStrafeRight },
-                            { "RunLeft.UE", true, true, kStrafeLeft },
+                            { "RunForwardSource", true, true, 0 },
+                            { "RunBackwardSource", true, true, 1 },
+                            { "RunLeftSource", true, true, 2 },
+                            { "RunRightSource", true, true, 3 },
                         };
-                    if (!DirectionalLocomotion::Bake(
-                            bm.skeleton, bm.clips, authoredNames))
-                        std::cerr << "Bandit directional locomotion unavailable; using source clips\n";
-                    g_banditModel = std::move(bm);
+                    bm.authoredDirectional = DirectionalLocomotion::BakeAuthored(
+                        bm.skeleton, bm.clips, authoredNames);
+                    bm.rootPitch = 0.0f;
+                    // The forward cycle's skinned sole dips about 2 cm below
+                    // the export origin; keep that contact above the terrain.
+                    bm.groundOffset = 0.022f;
+                    const Skeleton reference = SkinnedFBXImporter::LoadSkeleton(
+                        banditDir + "SK_Bandit.FBX");
+                    bm.ragdoll = T3DPhysicsAsset::Load(
+                        banditDir + "Phy_Bandit_PhysicsAsset.T3D");
+                    // Physics frames are bone-local: matching names alone does
+                    // not make the old collider orientations valid on this rig.
+                    bm.ragdoll = RagdollRigFit::Fit(reference, bm.skeleton, bm.ragdoll,
+                        XMMatrixRotationX(-XM_PIDIV2));
+                    if (bm.authoredDirectional && !bm.ragdoll.bodies.empty())
+                        g_banditModel = std::move(bm);
+                    else std::cerr << "Bandit four-way animation setup failed\n";
                 } else {
-                    std::cerr << "Bandit squad failed to load\n";
+                    std::cerr << "Bandit mesh or one of its four run cycles failed to load\n";
                 }
             }
 

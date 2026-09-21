@@ -544,6 +544,14 @@ constexpr float              kBoatCrewRise = 0.20f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;
+// Opt-in: let every AI actor play its authored arm animation instead of having
+// both hands solved onto the rifle. Off by default, so the squad shoulders its
+// weapons the way it always has. On, the gun layer and its two arm IK solves
+// are skipped and the clip's own arms come through unmodified -- which is the
+// point: it is there to watch the animations whole.
+//
+// The player body is unaffected; this only reaches actors in g_bandits.
+bool                        g_freeArmsNoWeaponIK = false;
 float                       g_banditLeftArmReach = 0.85f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 // Rifle grip tuning, pushed to every bandit each frame so the sliders in

@@ -1207,10 +1207,10 @@ static void UpdateMolotovFireDamage() {
 
 // One-line Bandit status for the debug HUD (declared in EngineUI.h).
 void BanditDebugText() {
-    ImGui::Checkbox("Directional locomotion (strafe clips)",
+    ImGui::Checkbox("Legacy rig directional locomotion",
                     &SkinnedEnemy::directionalLocomotionIK);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Enable procedural sideways/backward leg animations. Off uses the original Idle/Walk/Run clips.");
+        ImGui::SetTooltip("Enable the generated blend space on legacy rigs. The new bandit always uses its authored four-way cycles.");
     if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
     int textured = 0, parts = 0;
     if (g_banditModel.node && g_banditModel.node->mesh) {
@@ -1244,6 +1244,13 @@ void BanditDebugText() {
                        -90.0f, 90.0f, "%.1f deg");
 
     if (ImGui::CollapsingHeader("Rifle grip")) {
+        ImGui::Checkbox("Free arms (no weapon IK)", &g_freeArmsNoWeaponIK);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Play each enemy's authored arm animation "
+                              "instead of solving both hands onto the rifle, "
+                              "so the clips can be watched whole. The rifle "
+                              "mesh is hidden while this is on, and the grip "
+                              "sliders below stop applying.");
         ImGui::TextDisabled("Trigger hand (from the shoulder)");
         ImGui::SliderFloat("Rear forward", &g_banditGunRearGripForward,
                            -0.20f, 0.50f, "%.3f m");

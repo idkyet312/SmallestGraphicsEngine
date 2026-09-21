@@ -391,6 +391,17 @@ constexpr unsigned kImportFlags = aiProcess_Triangulate | aiProcess_JoinIdentica
 
 } // namespace
 
+Skeleton SkinnedFBXImporter::LoadSkeleton(const std::string& path) {
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(path, 0);
+    Skeleton skeleton;
+    if (!scene || !scene->mRootNode) return skeleton;
+    BuildSkeleton(scene->mRootNode, -1, skeleton);
+    XMStoreFloat4x4(&skeleton.globalInverse,
+        XMMatrixInverse(nullptr, XMLoadFloat4x4(&skeleton.localBind[0])));
+    return skeleton;
+}
+
 SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     const std::vector<std::string>& animPaths,
     Microsoft::WRL::ComPtr<ID3D12Device> device,

@@ -177,9 +177,9 @@ int main(int argc, char** argv) {
         Check(adopted.size()==3,"Load the gait sources onto the Mixamo rig");
         const char* files[][2]={
             {"SK_BanditMixamo.fbx","SK_BanditMixamo"},
-            {"Animations/RunBackward.fbx","RunBackward"},
-            {"Animations/RunLeft.fbx","RunLeft"},
-            {"Animations/RunRight.fbx","RunRight"}};
+            {"Animations/RunBackward.fbx","RunBackwardSource"},
+            {"Animations/RunLeft.fbx","RunLeftSource"},
+            {"Animations/RunRight.fbx","RunRightSource"}};
         for (auto& f : files) {
             Assimp::Importer importer;
             const aiScene* sc=importer.ReadFile(mixamoDir+f[0],0);
@@ -189,8 +189,8 @@ int main(int argc, char** argv) {
         Check(adopted.size()==7,"Load the four authored cycles");
 
         const std::vector<DirectionalLocomotion::AuthoredCycle> cycles={
-            {"SK_BanditMixamo",true,true,0},{"RunBackward",true,true,1},
-            {"RunLeft",true,true,2},{"RunRight",true,true,3}};
+            {"SK_BanditMixamo",true,true,0},{"RunBackwardSource",true,true,1},
+            {"RunLeftSource",true,true,2},{"RunRightSource",true,true,3}};
         Check(DirectionalLocomotion::Bake(mixamo,adopted,cycles),
               "Bake the adopted cycles");
 
@@ -230,6 +230,45 @@ int main(int argc, char** argv) {
                 Check(std::abs(XMVectorGetX(XMVector4Length(XMLoadFloat4(&q)))-1)<1e-4f,
                       "Normalised rotations over the adopted blend");
             }
+        }
+
+        // Mixamo's authored-only arrangement has no generic Walk/Run clips.
+        // Use renamed copies so the test also proves BakeAuthored leaves its
+        // source inventory untouched while producing both gaits.
+        std::vector<AnimationClip> authoredOnly;
+        const char* sourceNames[4] = {
+            "SK_BanditMixamo", "RunBackwardSource", "RunLeftSource", "RunRightSource"};
+        std::vector<std::string> originalNames;
+        for (int direction=0; direction<4; ++direction) {
+            auto it=std::find_if(adopted.begin(),adopted.end(),[&](const AnimationClip& c) {
+                return c.name==sourceNames[direction];
+            });
+            Check(it!=adopted.end(),"Find authored-only source");
+            authoredOnly.push_back(*it);
+            authoredOnly.back().name="AuthoredSource"+std::to_string(direction);
+            originalNames.push_back(authoredOnly.back().name);
+        }
+        const std::vector<DirectionalLocomotion::AuthoredCycle> authored={
+            {"AuthoredSource0",true,false,0},{"AuthoredSource1",true,false,1},
+            {"AuthoredSource2",true,false,2},{"AuthoredSource3",true,false,3}};
+        Check(DirectionalLocomotion::BakeAuthored(mixamo,authoredOnly,authored),
+              "Bake authored-only Y-up cycles");
+        Check(authoredOnly.size()==12,"Retain four authored sources and add eight slots");
+        for (int direction=0; direction<4; ++direction) {
+            Check(authoredOnly[direction].name==originalNames[direction],
+                  "Preserve authored source names");
+            const auto walkIt=std::find_if(authoredOnly.begin(),authoredOnly.end(),[&](const AnimationClip& c) {
+                return c.name==DirectionalLocomotion::Names[direction];
+            });
+            const auto runIt=std::find_if(authoredOnly.begin(),authoredOnly.end(),[&](const AnimationClip& c) {
+                return c.name==DirectionalLocomotion::Names[4+direction];
+            });
+            Check(walkIt!=authoredOnly.end() && runIt!=authoredOnly.end(),
+                  "Find authored-only slots");
+            const auto& walk=*walkIt;
+            const auto& run=*runIt;
+            Check(std::abs(walk.duration/run.duration-1.5f)<1e-4f,
+                  "Retime authored run as walk");
         }
     }
     std::cout<<"Directional locomotion: weights, real-asset bake, adopted cycles,"

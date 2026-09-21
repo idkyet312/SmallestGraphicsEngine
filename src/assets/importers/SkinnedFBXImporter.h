@@ -26,6 +26,9 @@ struct SkinnedModel {
     // that blend directional clips have to suppress their torso; a model whose
     // clips were all authored on its own skeleton carries a real one.
     bool                        rebasedClips = false;
+    bool                        authoredDirectional = false;
+    float                       rootPitch = -DirectX::XM_PIDIV2;
+    float                       groundOffset = 0.16f;
 
     const AnimationClip* FindClip(const std::string& name) const {
         for (const auto& c : clips)
@@ -36,6 +39,8 @@ struct SkinnedModel {
 
 class SkinnedFBXImporter {
 public:
+    // Read a reference rig for CPU-side physics fitting without uploading its mesh.
+    static Skeleton LoadSkeleton(const std::string& path);
     // meshPath: the SK_*.FBX skinned mesh. animPaths: extra clip FBX files whose
     // AnimStacks are appended to the model's clip list. uniformScale bakes into
     // the mesh vertices AND the skeleton bind transforms so both stay consistent.

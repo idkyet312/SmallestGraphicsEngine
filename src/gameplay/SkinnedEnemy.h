@@ -78,9 +78,8 @@ public:
     // authored strafe cycles; off, it falls back to the forward-only Run/Walk
     // clips and slides when it strafes.
     //
-    // Off by default: the plain forward gait is the look we want for now. The
-    // blend space and the cycles it needs are still built at load, so the
-    // debug-HUD checkbox switches the whole thing on live.
+    // Legacy rigs keep the opt-in bake. Models with a complete authored set
+    // use it automatically.
     inline static bool directionalLocomotionIK = false;
     SkinnedModel      model;
     AnimationInstance anim;
@@ -337,6 +336,8 @@ public:
     bool Init(const SkinnedModel& m) {
         model = m;
         if (!model.valid) return false;
+        rootPitch = model.rootPitch;
+        footOffset = model.groundOffset;
         locomotion_.Initialize(model.skeleton, model.clips, model.rebasedClips);
         // One palette upload buffer per in-flight frame so we never overwrite a
         // palette the GPU is still reading.
@@ -420,7 +421,20 @@ public:
         const float playbackRate = speed > 0.01f && referenceSpeed > 0.01f
             ? (std::max)(0.75f, (std::min)(2.2f, speed / referenceSpeed))
             : 1.0f;
-        anim.Advance(dt * playbackRate);
+        if (model.authoredDirectional) {
+            const float c = std::cos(yaw), s = std::sin(yaw);
+            const bool travelling = moving && !netStill && speed > 0.01f &&
+                                    speed < kTeleportSpeed;
+            directionalMoving_ = travelling;
+            const float vx = travelling ? dx * inverseDt : 0.0f;
+            const float vz = travelling ? dz * inverseDt : 0.0f;
+            if (const AnimationClip* pose = locomotion_.Update(
+                    dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)) {
+                if (anim.clip != pose) anim.Play(pose);
+            }
+        } else {
+            anim.Advance(dt * playbackRate);
+        }
         ComputePose(dt);
     }
 
@@ -437,7 +451,7 @@ public:
         constexpr float kDownedRoll = DirectX::XM_PIDIV2;
         // Standing footOffset lifts the model so its feet meet the ground. On
         // its side that same lift floats the body, so it drops toward zero.
-        constexpr float kStandingFootOffset = 0.16f;
+        const float kStandingFootOffset = model.groundOffset;
         constexpr float kDownedFootOffset = 0.02f;
         // Roughly half a second either way: fast enough to read as falling
         // over rather than sinking, slow enough not to pop.
@@ -502,6 +516,7 @@ public:
     // would have to derive that a frame late, which shows up as the animation
     // starting after the body has already set off.
     bool NetworkMoving() const {
+        if (model.authoredDirectional) return directionalMoving_;
         if (!anim.clip) return false;
         const AnimationClip* idle = model.FindClip("Idle");
         return anim.clip != idle;
@@ -1911,6 +1926,7 @@ private:
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
     AnimationInstance upperBodyAnim_;
     LocomotionBlendSpace locomotion_;
+    bool directionalMoving_ = false;
     // Where the body was when locomotion was last evaluated, and how long it
     // has covered no ground since. Shared by the AI and networked paths: both
     // ask for a gait from intent, and only the position says whether the body
@@ -1933,8 +1949,9 @@ private:
         // versus the one before, which is after all of those corrections.
         const bool still = MeasureStillness(dt, start);
         if (still) { vx = 0.0f; vz = 0.0f; }
+        directionalMoving_ = vx * vx + vz * vz > 0.01f;
         const float c = std::cos(yaw), s = std::sin(yaw);
-        const AnimationClip* pose = directionalLocomotionIK
+        const AnimationClip* pose = (model.authoredDirectional || directionalLocomotionIK)
             ? locomotion_.Update(dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)
             : nullptr;
         if (pose) {
@@ -2133,8 +2150,10 @@ private:
         }
 
         // Rifle-ready additive pose. Only masked upper-body bones receive it.
-        SetPoseOffset("spine_02", -3.0f, 0.0f, 0.0f);
-        SetPoseOffset("spine_03", -4.0f, 0.0f, 0.0f);
+        if (!model.authoredDirectional) {
+            SetPoseOffset("spine_02", -3.0f, 0.0f, 0.0f);
+            SetPoseOffset("spine_03", -4.0f, 0.0f, 0.0f);
+        }
     }
 
     void ComputePose(float dt) {
@@ -2144,7 +2163,13 @@ private:
         if (model.valid) {
             DirectX::XMStoreFloat4x4(&previousMeshWorld_, MeshWorldMatrix());
         }
-        if (upperBodyGunLayer && upperBodyAnim_.clip) {
+        if (model.authoredDirectional) {
+            // These clips contain a complete rifle-running pose. Keep their
+            // torso motion instead of replacing it with the legacy idle layer.
+            anim.ComputePalette(model.skeleton, paletteCPU_);
+            anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            if (upperBodyGunLayer) ApplyGunIK(dt);
+        } else if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);
             ApplyGunIK(dt);

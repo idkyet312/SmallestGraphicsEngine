@@ -48,7 +48,11 @@ public:
             if (clip.name == "Run" || clip.name == "ThirdPersonRun") sources[1] = &clip;
             if (clip.name == Names[0]) return true;
         }
-        if (!sources[0] || !sources[1]) return false;
+        // A rig may ship only the four directional Mixamo cycles.  Keep this
+        // path separate from the IK fallback: it does not need a generic Walk
+        // or Run clip to establish a cadence.
+        if (!sources[0] || !sources[1])
+            return authored.empty() ? false : BakeAuthored(skel, clips, authored);
         std::vector<AnimationClip> baked;
         // Bandit FBX is Z-up: after RotationX(-pi/2), native -Y is
         // engine forward and native +X is engine right.
@@ -77,10 +81,11 @@ public:
             // The gait's own footfall, as a phase of the baked cycle. Authored
             // clips are shifted onto it so a strafe and a forward run planted
             // at the same phase stay planted together while they blend.
+            const int upAxis = UpAxis(skel);
             int plant = 0;
             for (int s = 1; s < Samples; ++s)
-                if (XMVectorGetZ(XMLoadFloat4x4(&frames[s][feet[0]]).r[3]) <
-                    XMVectorGetZ(XMLoadFloat4x4(&frames[plant][feet[0]]).r[3]))
+                if (XMVectorGetByIndex(XMLoadFloat4x4(&frames[s][feet[0]]).r[3], upAxis) <
+                    XMVectorGetByIndex(XMLoadFloat4x4(&frames[plant][feet[0]]).r[3], upAxis))
                     plant = s;
             const float plantPhase =
                 float((plant - phaseOrigin + Samples) % Samples) / Samples;
@@ -100,8 +105,10 @@ public:
                 AnimationClip fitted = Resample(skel, clips[index],
                     Names[gait * 4 + direction], plantPhase,
                     ownGait ? 0.0f : source.clip->duration);
-                if (ownGait) clips[index] = std::move(fitted);
-                else baked.push_back(std::move(fitted));
+                // Source clips are also used by upper-body animation and are
+                // part of the asset's public inventory. Never rename or
+                // replace them while filling a directional slot.
+                baked.push_back(std::move(fitted));
                 adopted[direction] = true;
             }
 
@@ -138,6 +145,47 @@ public:
                 }
                 baked.push_back(std::move(clip));
             }
+        }
+        for (auto& clip : baked) clips.push_back(std::move(clip));
+        return true;
+    }
+
+    // Bake a blend space from four authored cardinal cycles. This is the
+    // normal path for Mixamo exports, which commonly contain no generic Walk
+    // or Run clips. Each authored run is retained and sampled twice: its run
+    // duration is kept for the run slots and stretched by 1.5x for walking.
+    // Every source cycle is rolled so its lowest foot sample is at phase zero,
+    // making independently exported clips line up when blended.
+    static bool BakeAuthored(const Skeleton& skel,
+                             std::vector<AnimationClip>& clips,
+                             const std::vector<AuthoredCycle>& authored) {
+        if (skel.Find("foot_l") < 0 || skel.Find("foot_r") < 0 ||
+            skel.Find("thigh_l") < 0 || skel.Find("thigh_r") < 0)
+            return false;
+        std::array<const AnimationClip*, 4> source{};
+        for (const AuthoredCycle& cycle : authored) {
+            if (cycle.direction < 0 || cycle.direction >= 4) continue;
+            const int index = FindClip(clips, cycle.clip);
+            if (index >= 0 && !source[cycle.direction]) source[cycle.direction] = &clips[index];
+        }
+        for (const AnimationClip* clip : source)
+            if (!clip || clip->duration <= 0.0f) return false;
+        // Keeping source clips intact means their names cannot also identify
+        // generated slots: otherwise the blend space would select an
+        // unretimed source and the result would depend on vector order.
+        for (int direction = 0; direction < 4; ++direction)
+            if (FindClip(clips, Names[direction]) >= 0 ||
+                FindClip(clips, Names[4 + direction]) >= 0)
+                return false;
+
+        std::vector<AnimationClip> baked;
+        baked.reserve(8);
+        for (int direction = 0; direction < 4; ++direction) {
+            const AnimationClip& run = *source[direction];
+            baked.push_back(Resample(skel, run, Names[direction], 0.0f,
+                                     run.duration * 1.5f));
+            baked.push_back(Resample(skel, run, Names[4 + direction], 0.0f,
+                                     run.duration));
         }
         for (auto& clip : baked) clips.push_back(std::move(clip));
         return true;
@@ -223,6 +271,24 @@ public:
     }
 
 private:
+    // The imported scene may be Y-up (Mixamo) or Z-up (the UE4 bandit).
+    // Infer up from the bind-pose pelvis-to-foot separation instead of making
+    // the resampler depend on one exporter convention.
+    static int UpAxis(const Skeleton& skel) {
+        const int pelvis = skel.Find("pelvis");
+        const int foot = skel.Find("foot_l");
+        if (pelvis < 0 || foot < 0) return 2;
+        using namespace DirectX;
+        AnimationInstance rest;
+        std::vector<XMFLOAT4X4> bind;
+        rest.ComputeGlobalMatrices(skel, bind);
+        const XMVECTOR delta = XMVectorAbs(
+            XMLoadFloat4x4(&bind[pelvis]).r[3] -
+            XMLoadFloat4x4(&bind[foot]).r[3]);
+        XMFLOAT3 d; XMStoreFloat3(&d, delta);
+        return d.y >= d.x && d.y >= d.z ? 1 : (d.z >= d.x ? 2 : 0);
+    }
+
     // One sampled pose becomes one key per bone, converted back out of model
     // space into the parent-local transforms a clip stores.
     static void WriteFrame(const Skeleton& skel,
@@ -269,11 +335,13 @@ private:
         instance.Play(&source);
         const int foot = skel.Find("foot_l");
         std::vector<XMFLOAT4X4> globals;
+        const int upAxis = UpAxis(skel);
         float plantTime = 0.0f, lowest = 0.0f;
         for (int s = 0; s < Samples; ++s) {
             instance.time = source.duration * s / Samples;
             instance.ComputeGlobalMatrices(skel, globals);
-            const float height = XMVectorGetZ(XMLoadFloat4x4(&globals[foot]).r[3]);
+            const XMVECTOR position = XMLoadFloat4x4(&globals[foot]).r[3];
+            const float height = XMVectorGetByIndex(position, upAxis);
             if (s == 0 || height < lowest) { lowest = height; plantTime = instance.time; }
         }
         const float start = std::fmod(
