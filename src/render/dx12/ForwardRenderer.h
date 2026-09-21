@@ -2399,7 +2399,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         mainLight.lightPos = scene.lightPos;
         mainLight.lightType = scene.lightType;
         mainLight.lightColor = scene.lightColor;
-        mainLight.intensity = scene.directionalLightIntensity;
+        // Colour and intensity travel separately here, so this is the one main-
+        // light path that does not pick up the horizon fade from
+        // EffectiveLightColor. Without it the probes keep bouncing a set sun.
+        mainLight.intensity = scene.EffectiveDirectionalIntensity();
         mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         mainLight.shadowBias = scene.shadowBias;
         mainLight.enableShadows = scene.enableShadows && shadowMap ? 1 : 0;

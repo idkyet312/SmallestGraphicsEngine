@@ -1254,7 +1254,10 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         mainLight.lightPos = scene.lightPos;
         mainLight.lightType = scene.lightType;
         mainLight.lightColor = scene.lightColor;
-        mainLight.intensity = scene.directionalLightIntensity;
+        // As in ForwardRenderer's probe update: colour and intensity are two
+        // fields here, so the horizon fade has to be applied to the intensity
+        // rather than arriving folded into EffectiveLightColor.
+        mainLight.intensity = scene.EffectiveDirectionalIntensity();
         mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         mainLight.shadowBias = scene.shadowBias;
         mainLight.enableShadows = scene.enableShadows && shadowResource ? 1 : 0;

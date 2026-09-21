@@ -82,6 +82,27 @@ inline float TimeOfDaySunElevation(const TimeOfDaySettings& settings) {
     return length > 1e-6f ? l.y / length : 0.0f;
 }
 
+// How much of the directional light survives the horizon, for a sun elevation
+// as TimeOfDaySunElevation returns it.
+//
+// A sun below the horizon cannot light the scene, but nothing enforced that.
+// Night has to put the sun underneath (that is what makes the analytic sky
+// render unlit), and both shading paths feed that direction straight into
+// max(N.L, 0) while the volumetric fog feeds it into its in-scattering term.
+// The result was a night "sun" shining upward from below: the fog over the
+// NATO shelter's floor lit up in the preset's blue, and anything facing
+// downward did the same, while the same surfaces read black in daylight.
+//
+// The constants match PhysicalSky's sunUp fade in sky_ps.hlsl, so the sky, the
+// fog and the scene light cross the horizon together rather than at three
+// different elevations. Fading over the last few degrees instead of switching
+// at zero keeps Dusk (elevation +0.087) fully lit.
+inline float TimeOfDaySunHorizonFade(float sunElevation) {
+    const float t = (sunElevation + 0.10f) / 0.16f;
+    const float clamped = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    return clamped * clamped * (3.0f - 2.0f * clamped);
+}
+
 // True when the preset is dark enough that the player should expect to rely on
 // muzzle flashes and silhouettes rather than seeing across the island.
 inline bool TimeOfDayIsDark(TimeOfDay time) {

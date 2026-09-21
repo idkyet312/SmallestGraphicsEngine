@@ -3958,7 +3958,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     dxrDDGICommands.Get(), ++dxrDDGIFrame,
                     raySunDirection, scene.lightColor,
                     g_ddgiCornellTestMode
-                        ? 0.0f : scene.directionalLightIntensity,
+                        ? 0.0f : scene.EffectiveDirectionalIntensity(),
                     g_ddgiCornellTestMode ? 0.0f : 1.0f,
                     g_ddgiCornellTestMode
                         ? g_ddgiCornellLightPosition : XMFLOAT3{},

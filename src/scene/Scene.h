@@ -7,6 +7,7 @@
 #include "PlayerState.h"
 #include "MissionSystem.h"
 #include "Weather.h"
+#include "TimeOfDay.h"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -427,11 +428,35 @@ struct Scene {
     XMFLOAT3 shadowCenter    = { 0.0f, 3.0f, 0.0f };
     float shadowOrthoSize    = 30.0f;
 
+    // How much of the directional light survives the horizon. The curve itself
+    // lives in TimeOfDay.h next to TimeOfDaySunElevation, which is the header
+    // kept free of the renderer so this is unit-testable; Scene only supplies
+    // the live light direction, which the editor can move away from any preset.
+    float SunHorizonFade() const {
+        const float length = std::sqrt(lightPos.x * lightPos.x +
+                                       lightPos.y * lightPos.y +
+                                       lightPos.z * lightPos.z);
+        if (length <= 1e-6f) return 1.0f;
+        return TimeOfDaySunHorizonFade(lightPos.y / length);
+    }
+
+    // Intensity after the horizon fade. Separate from EffectiveLightColor
+    // because the DDGI probe update carries colour and intensity as two fields
+    // and would otherwise keep lighting probes with a sun that has set.
+    float EffectiveDirectionalIntensity() const {
+        // Point lights are positions, not directions -- the horizon has no
+        // meaning for them, and a lamp below a surface is meant to light it.
+        return lightType == 0
+            ? directionalLightIntensity * SunHorizonFade()
+            : directionalLightIntensity;
+    }
+
     XMFLOAT3 EffectiveLightColor() const {
+        const float scale = EffectiveDirectionalIntensity();
         return {
-            lightColor.x * directionalLightIntensity,
-            lightColor.y * directionalLightIntensity,
-            lightColor.z * directionalLightIntensity
+            lightColor.x * scale,
+            lightColor.y * scale,
+            lightColor.z * scale
         };
     }
     float shadowDistance     = 40.0f;

@@ -675,6 +675,12 @@ if(BUILD_TESTING)
     target_link_libraries(DirectionalLocomotionTests PRIVATE SGEProjectHeaders assimp::assimp)
     add_test(NAME DirectionalLocomotionTests COMMAND DirectionalLocomotionTests "${CMAKE_SOURCE_DIR}")
 
+    # TimeOfDay.h is deliberately renderer-free, so the sun-elevation fade that
+    # keeps a set sun from lighting the scene is checkable without a device.
+    add_executable(SunHorizonFadeTests tests/SunHorizonFadeTests.cpp)
+    target_link_libraries(SunHorizonFadeTests PRIVATE SGEProjectHeaders)
+    add_test(NAME SunHorizonFadeTests COMMAND SunHorizonFadeTests)
+
     # Pure struct/bitfield checks -- no device, no socket, no content root.
     add_executable(PlayerInputTests tests/PlayerInputTests.cpp)
     target_link_libraries(PlayerInputTests PRIVATE SGEProjectHeaders)

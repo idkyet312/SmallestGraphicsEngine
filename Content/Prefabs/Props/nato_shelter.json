@@ -10,8 +10,8 @@
       "automaticLod": false,
       "castShadow": true,
       "useMaterials": true,
-      "materialAmbientScale": 1.0,
-      "materialViewFillStrength": 0.0
+      "materialAmbientScale": 1.1,
+      "materialViewFillStrength": 0.12
     },
     "collision": {
       "shape": "mesh"
