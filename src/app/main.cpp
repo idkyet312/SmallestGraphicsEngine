@@ -1650,6 +1650,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // Pushed with the other tunables so the toggle reaches actors
                 // that are already on the ground, not just newly spawned ones.
                 bandit->upperBodyGunLayer = !g_freeArmsNoWeaponIK;
+                bandit->gunHandOffsetX = g_gunHandOffsetX;
+                bandit->gunHandOffsetY = g_gunHandOffsetY;
+                bandit->gunHandOffsetZ = g_gunHandOffsetZ;
+                bandit->gunHandPitchDegrees = g_gunHandPitchDegrees;
+                bandit->gunHandYawDegrees = g_gunHandYawDegrees;
+                bandit->gunHandRollDegrees = g_gunHandRollDegrees;
+                bandit->gunHandScale = g_gunHandScale;
                 bandit->headTorsoYawOffsetDegrees = g_banditHeadYawOffsetDegrees;
                 bandit->gunScale = g_banditGunScale;
                 bandit->gunGripForward = g_banditGunGripForward;

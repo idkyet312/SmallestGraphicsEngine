@@ -544,14 +544,30 @@ constexpr float              kBoatCrewRise = 0.20f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;
-// Opt-in: let every AI actor play its authored arm animation instead of having
-// both hands solved onto the rifle. Off by default, so the squad shoulders its
-// weapons the way it always has. On, the gun layer and its two arm IK solves
-// are skipped and the clip's own arms come through unmodified -- which is the
-// point: it is there to watch the animations whole.
+// Every AI actor plays its authored arm animation instead of having both hands
+// solved onto the rifle: the gun layer and its two arm IK solves are skipped
+// and the clip's own arms come through unmodified. The weapon stays loaded,
+// parented to the trigger hand by UpdateGunFromHandBone.
+//
+// On by default -- the authored cycles already hold a rifle, so solving the
+// wrists onto one a second time only fought the animation. Clearing this
+// returns to the IK hold, which is what the legacy rigs still want.
 //
 // The player body is unaffected; this only reaches actors in g_bandits.
-bool                        g_freeArmsNoWeaponIK = false;
+bool                        g_freeArmsNoWeaponIK = true;
+// Weapon placement while the arms are free. In the trigger hand's own bone
+// frame, so a value tuned here holds as the wrist moves through the clip.
+// Tuned against the Mixamo bandit's hand: the large Euler angles are the
+// authored wrist axes, not a correction on top of a near-identity pose.
+float                       g_gunHandOffsetX = 0.033f;
+float                       g_gunHandOffsetY = 0.022f;
+float                       g_gunHandOffsetZ = -0.037f;
+float                       g_gunHandPitchDegrees = -138.5f;
+float                       g_gunHandYawDegrees = 94.9f;
+float                       g_gunHandRollDegrees = 93.6f;
+// Separate from g_banditGunScale so tuning the hand mount does not resize the
+// weapon in the normal shouldered hold.
+float                       g_gunHandScale = 0.60f;
 float                       g_banditLeftArmReach = 0.85f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 // Rifle grip tuning, pushed to every bandit each frame so the sliders in

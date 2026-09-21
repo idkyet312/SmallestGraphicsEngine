@@ -1248,9 +1248,39 @@ void BanditDebugText() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Play each enemy's authored arm animation "
                               "instead of solving both hands onto the rifle, "
-                              "so the clips can be watched whole. The rifle "
-                              "mesh is hidden while this is on, and the grip "
-                              "sliders below stop applying.");
+                              "so the clips can be watched whole. The weapon "
+                              "stays loaded, parented to the trigger hand; "
+                              "place it with the sliders just below. The grip "
+                              "sliders further down stop applying.");
+
+        if (g_freeArmsNoWeaponIK) {
+            ImGui::TextDisabled("Weapon on the hand (in the hand's own frame)");
+            ImGui::SliderFloat("Hand offset X", &g_gunHandOffsetX,
+                               -0.50f, 0.50f, "%.3f m");
+            ImGui::SliderFloat("Hand offset Y", &g_gunHandOffsetY,
+                               -0.50f, 0.50f, "%.3f m");
+            ImGui::SliderFloat("Hand offset Z", &g_gunHandOffsetZ,
+                               -0.50f, 0.50f, "%.3f m");
+            ImGui::SliderFloat("Hand pitch", &g_gunHandPitchDegrees,
+                               -180.0f, 180.0f, "%.1f deg");
+            ImGui::SliderFloat("Hand yaw", &g_gunHandYawDegrees,
+                               -180.0f, 180.0f, "%.1f deg");
+            ImGui::SliderFloat("Hand roll", &g_gunHandRollDegrees,
+                               -180.0f, 180.0f, "%.1f deg");
+            ImGui::SliderFloat("Hand gun scale", &g_gunHandScale,
+                               0.20f, 1.50f, "%.2f x");
+            if (ImGui::Button("Reset weapon on hand")) {
+                g_gunHandOffsetX = 0.033f;
+                g_gunHandOffsetY = 0.022f;
+                g_gunHandOffsetZ = -0.037f;
+                g_gunHandPitchDegrees = -138.5f;
+                g_gunHandYawDegrees = 94.9f;
+                g_gunHandRollDegrees = 93.6f;
+                g_gunHandScale = 0.60f;
+            }
+            ImGui::Separator();
+        }
+
         ImGui::TextDisabled("Trigger hand (from the shoulder)");
         ImGui::SliderFloat("Rear forward", &g_banditGunRearGripForward,
                            -0.20f, 0.50f, "%.3f m");

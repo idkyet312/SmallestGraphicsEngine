@@ -113,7 +113,11 @@ public:
     float             meshPitch = 0.0f;
     float             meshRoll = 0.0f;
     float             meshYaw  = 0.0f;
-    bool              upperBodyGunLayer = true;
+    // Off by default: the authored cycles already hold a rifle, so the weapon
+    // rides the trigger hand (UpdateGunFromHandBone) and the arms play as
+    // animated. Set it to solve both wrists onto the gun instead, which is
+    // what a rig without an authored rifle pose needs.
+    bool              upperBodyGunLayer = false;
     float             leftArmReach = 0.85f;
     // Gun mesh seating relative to the trigger hand, applied along the barrel
     // and the gun's own up axis in UpdateGunFromHands.
@@ -131,6 +135,21 @@ public:
     // two shift it across and above the barrel in the gun's own frame.
     float             gunForeGripLateral = 0.253f;
     float             gunForeGripRise = -0.206f;
+    // Hand-attached weapon placement, used only when the arm IK is off (see
+    // UpdateGunFromHandBone). The gun rides the trigger hand's own bone frame,
+    // so these are expressed in that bone's space rather than in world axes:
+    // the offsets travel and rotate with the wrist, and the Euler angles line
+    // the receiver up with however the hand happens to be authored.
+    float             gunHandOffsetX = 0.033f;
+    float             gunHandOffsetY = 0.022f;
+    float             gunHandOffsetZ = -0.037f;
+    float             gunHandPitchDegrees = -138.5f;
+    float             gunHandYawDegrees = 94.9f;
+    float             gunHandRollDegrees = 93.6f;
+    // Its own scale rather than gunScale: that one is shared with the IK grip
+    // path, and the hand mount was tuned slightly smaller. Folding the two
+    // together would move the normal shouldered hold to match this.
+    float             gunHandScale = 0.60f;
     float             headTorsoYawOffsetDegrees = 20.4f;
     float             maxSpineTwistDegrees = 85.0f;
     float             spineTwistSpeedDegrees = 220.0f;
@@ -984,8 +1003,12 @@ public:
         return true;
     }
 
+    // With the arm IK off the weapon is parented to the trigger hand instead
+    // of solved onto both, so it still has a valid pose and still draws --
+    // gunWorld_ is written either way. The pose arrays being populated is the
+    // real requirement, and that holds in both paths.
     bool HasGunPose() const {
-        return upperBodyGunLayer && !dead_ && handBone_ >= 0 &&
+        return !dead_ && handBone_ >= 0 &&
                static_cast<size_t>(handBone_) < poseGlobals_.size();
     }
 
@@ -2169,6 +2192,7 @@ private:
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
             if (upperBodyGunLayer) ApplyGunIK(dt);
+            else UpdateGunFromHandBone(model.skeleton.Find("hand_l"));
         } else if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);
@@ -2176,6 +2200,9 @@ private:
         } else {
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            // No IK to hang the weapon off, so parent it to the hand instead
+            // of leaving the actor empty-handed.
+            UpdateGunFromHandBone(model.skeleton.Find("hand_l"));
         }
         DirectX::XMStoreFloat4x4(&poseWorld_, WorldMatrix());
     }
@@ -2349,6 +2376,61 @@ private:
                         XMMatrixRotationX(-gunPitch_) *
                         XMMatrixRotationY(gunYaw_) *
                         XMMatrixTranslationFromVector(origin));
+    }
+
+    // Parent the gun to the trigger hand's bone frame, for when the arm IK is
+    // off and the authored arms are playing untouched.
+    //
+    // UpdateGunFromHands takes only the origin from the hand and builds
+    // orientation from the aimed body angles, which is right when the IK has
+    // just placed both wrists on a rifle held along that aim. With the IK off
+    // there is no such guarantee -- the arms are wherever the clip puts them --
+    // so the aim angles would leave the weapon floating at the hand's position
+    // in an unrelated attitude. Here the whole transform, rotation included,
+    // comes off the bone, which is what makes the gun actually stick through
+    // reloads, sprints and gestures.
+    //
+    // Bone routing matches ApplyGunIK: after this asset's axis conversion the
+    // UE labels read mirrored, so hand_l is the trigger hand.
+    void UpdateGunFromHandBone(int triggerHand) {
+        using namespace DirectX;
+        if (triggerHand < 0) return;
+        if (static_cast<size_t>(triggerHand) >= poseGlobals_.size()) return;
+
+        // The bone frame carries the mesh's centimetre scale, which would
+        // multiply into the gun on top of gunScale. Take rotation and
+        // translation and drop the scale.
+        const XMMATRIX handWorld =
+            XMLoadFloat4x4(&poseGlobals_[triggerHand]) * MeshWorldMatrix();
+        XMVECTOR handScale, handRotation, handTranslation;
+        if (!XMMatrixDecompose(&handScale, &handRotation, &handTranslation,
+                               handWorld))
+            return;
+        const XMMATRIX handFrame =
+            XMMatrixRotationQuaternion(handRotation) *
+            XMMatrixTranslationFromVector(handTranslation);
+
+        // Offsets are in the hand's frame, so they stay put as the wrist turns.
+        const XMMATRIX local =
+            XMMatrixScaling(gunHandScale, gunHandScale, gunHandScale) *
+            XMMatrixRotationRollPitchYaw(
+                XMConvertToRadians(gunHandPitchDegrees),
+                XMConvertToRadians(gunHandYawDegrees),
+                XMConvertToRadians(gunHandRollDegrees)) *
+            XMMatrixTranslation(gunHandOffsetX, gunHandOffsetY, gunHandOffsetZ);
+
+        XMStoreFloat4x4(&gunWorld_, local * handFrame);
+
+        // Keep the muzzle angles the tracer and laser read in step with where
+        // the weapon actually points now, rather than leaving them on the last
+        // IK frame's aim.
+        const XMVECTOR barrel = XMVector3Normalize(
+            XMVector3TransformNormal(XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f),
+                                     XMLoadFloat4x4(&gunWorld_)));
+        XMFLOAT3 direction;
+        XMStoreFloat3(&direction, barrel);
+        gunYaw_ = std::atan2(direction.x, direction.z);
+        gunPitch_ = std::asin((std::max)(-1.0f, (std::min)(1.0f, direction.y)));
     }
 
     // Where the two hands should sit to hold a rifle aimed along yaw/pitch.
