@@ -13,7 +13,29 @@ public:
         "WalkForward", "WalkBackward", "WalkLeft", "WalkRight",
         "RunForward", "RunBackward", "RunLeft", "RunRight" };
 
-    static bool Bake(const Skeleton& skel, std::vector<AnimationClip>& clips) {
+    // An authored cycle to fit into the blend space instead of baking one, and
+    // the gait it belongs to. Which slot it fills is measured from the clip
+    // where that is possible, because a converted rig need not agree with the
+    // engine about which side of the body +X is; a caller that knows can say
+    // so instead.
+    struct AuthoredCycle {
+        std::string clip;
+        bool running = true;
+        // An authored cycle can stand in for the other gait as well. The IK
+        // bake is the only thing that fills a slot otherwise, and it drags the
+        // feet to targets rather than replaying real footwork, so a real clip
+        // retimed to the walk's cycle beats a synthesised one.
+        bool bothGaits = false;
+        // Which slot to fill: 0 = forward, 1 = backward, 2 = left, 3 = right,
+        // or -1 to measure it from the clip's own footfall. A running cycle
+        // crosses its trailing leg over, so the planted foot sweeps both ways
+        // within one cycle and the measurement cannot always separate the
+        // four -- state it instead when the answer is already known.
+        int direction = -1;
+    };
+
+    static bool Bake(const Skeleton& skel, std::vector<AnimationClip>& clips,
+                     const std::vector<AuthoredCycle>& authored = {}) {
         using namespace DirectX;
         const int thighs[2] = { skel.Find("thigh_l"), skel.Find("thigh_r") };
         const int calves[2] = { skel.Find("calf_l"), skel.Find("calf_r") };
@@ -52,7 +74,39 @@ public:
                 if (XMVectorGetX(XMVector3Dot(XMLoadFloat4x4(&frames[s][feet[0]]).r[3], forward)) >
                     XMVectorGetX(XMVector3Dot(XMLoadFloat4x4(&frames[phaseOrigin][feet[0]]).r[3], forward)))
                     phaseOrigin = s;
+            // The gait's own footfall, as a phase of the baked cycle. Authored
+            // clips are shifted onto it so a strafe and a forward run planted
+            // at the same phase stay planted together while they blend.
+            int plant = 0;
+            for (int s = 1; s < Samples; ++s)
+                if (XMVectorGetZ(XMLoadFloat4x4(&frames[s][feet[0]]).r[3]) <
+                    XMVectorGetZ(XMLoadFloat4x4(&frames[plant][feet[0]]).r[3]))
+                    plant = s;
+            const float plantPhase =
+                float((plant - phaseOrigin + Samples) % Samples) / Samples;
+
+            bool adopted[4] = {};
+            for (const AuthoredCycle& cycle : authored) {
+                const bool ownGait = cycle.running == (gait == 1);
+                if (!ownGait && !cycle.bothGaits) continue;
+                const int index = FindClip(clips, cycle.clip);
+                if (index < 0) continue;
+                const int direction = cycle.direction >= 0
+                    ? cycle.direction : MeasureDirection(skel, clips[index]);
+                if (direction < 0 || adopted[direction]) continue;
+                // The clip belongs to one gait; the other borrows it at that
+                // gait's cycle length, so a borrowed run strafe reads as a
+                // walk instead of running on the spot.
+                AnimationClip fitted = Resample(skel, clips[index],
+                    Names[gait * 4 + direction], plantPhase,
+                    ownGait ? 0.0f : source.clip->duration);
+                if (ownGait) clips[index] = std::move(fitted);
+                else baked.push_back(std::move(fitted));
+                adopted[direction] = true;
+            }
+
             for (int direction = 0; direction < 4; ++direction) {
+                if (adopted[direction]) continue;
                 AnimationClip clip;
                 clip.name = Names[gait * 4 + direction];
                 const bool strafe = direction >= 2;
@@ -80,23 +134,7 @@ public:
                         planted.r[3] = movedFoot.r[3];
                         TransformBranch(skel, globals, feet[side], XMMatrixInverse(nullptr, movedFoot) * planted);
                     }
-                    for (size_t b = 0; b < skel.BoneCount(); ++b) {
-                        const int parent = skel.parent[b];
-                        const XMMATRIX local = XMLoadFloat4x4(&globals[b]) *
-                            (parent < 0 ? XMMatrixInverse(nullptr, XMLoadFloat4x4(&skel.globalInverse))
-                                        : XMMatrixInverse(nullptr, XMLoadFloat4x4(&globals[parent])));
-                        XMVECTOR scale, rotation, translation;
-                        XMMatrixDecompose(&scale, &rotation, &translation, local);
-                        const float time = clip.duration * s / Samples;
-                        BoneTrack::VecKey p{time, {}}, sc{time, {}};
-                        BoneTrack::QuatKey r{time, {}};
-                        XMStoreFloat3(&p.value, translation);
-                        XMStoreFloat3(&sc.value, scale);
-                        XMStoreFloat4(&r.value, XMQuaternionNormalize(rotation));
-                        clip.tracks[b].positions.push_back(p);
-                        clip.tracks[b].scales.push_back(sc);
-                        clip.tracks[b].rotations.push_back(r);
-                    }
+                    WriteFrame(skel, globals, clip.duration * s / Samples, clip);
                 }
                 baked.push_back(std::move(clip));
             }
@@ -105,7 +143,158 @@ public:
         return true;
     }
 
+    // Which way an in-place cycle travels, as a blend-space direction index
+    // (0 = forward, 1 = backward, 2 = left, 3 = right, -1 when the clip does
+    // not travel at all). A planted foot does not move with the body, the body
+    // moves over it, so the ground sweep of whichever foot is lower points
+    // opposite to travel. Whichever axis the sweep favours decides the pair,
+    // and its sign decides which of the two.
+    static int MeasureDirection(const Skeleton& skel, const AnimationClip& clip) {
+        using namespace DirectX;
+        const int feet[2] = { skel.Find("foot_l"), skel.Find("foot_r") };
+        const int pelvis = skel.Find("pelvis");
+        if (feet[0] < 0 || feet[1] < 0 || pelvis < 0 || clip.duration <= 0.0f)
+            return -1;
+        // Which axis is which is a property of the rig, not of the engine: the
+        // UE4 bandit stands along native +Z while a Mixamo rig stands along
+        // +Y, and the two disagree about the remaining pair as well. Read the
+        // frame off the REST pose -- mid-stride the feet are split along the
+        // direction of travel, so a posed frame would answer for the clip
+        // rather than for the skeleton.
+        AnimationInstance rest;
+        std::vector<XMFLOAT4X4> bind;
+        rest.ComputeGlobalMatrices(skel, bind);
+
+        // The pelvis sits directly above the feet, so the axis they differ
+        // along most is up.
+        XMFLOAT3 stance;
+        XMStoreFloat3(&stance, XMVectorAbs(XMLoadFloat4x4(&bind[pelvis]).r[3] -
+                                           XMLoadFloat4x4(&bind[feet[0]]).r[3]));
+        const int up = stance.z >= stance.x && stance.z >= stance.y ? 2
+                     : stance.y >= stance.x ? 1 : 0;
+
+        // Left and right come from the axis the two feet straddle at rest, so
+        // a rig mirrored the other way cannot transpose the two slots. The
+        // remaining axis carries fore and aft.
+        XMFLOAT3 straddle;
+        XMStoreFloat3(&straddle, XMLoadFloat4x4(&bind[feet[0]]).r[3] -
+                                 XMLoadFloat4x4(&bind[feet[1]]).r[3]);
+        int lateral = up == 0 ? 1 : 0;
+        for (int axis = 0; axis < 3; ++axis)
+            if (axis != up && std::abs((&straddle.x)[axis]) >
+                              std::abs((&straddle.x)[lateral]))
+                lateral = axis;
+        const int travel = 3 - up - lateral;
+        // Which way along that axis the left foot lies, so the reading below
+        // means the same thing on a rig mirrored the other way.
+        const float handedness = (&straddle.x)[lateral] >= 0.0f ? 1.0f : -1.0f;
+
+        AnimationInstance instance;
+        instance.Play(&clip);
+        std::vector<XMFLOAT4X4> previous, current;
+        instance.ComputeGlobalMatrices(skel, previous);
+
+        XMFLOAT3 total{};
+        for (int s = 1; s <= Samples * 2; ++s) {
+            instance.time = clip.duration * s / (Samples * 2);
+            instance.ComputeGlobalMatrices(skel, current);
+            for (int side = 0; side < 2; ++side) {
+                XMFLOAT3 foot, other, was;
+                XMStoreFloat3(&foot, XMLoadFloat4x4(&current[feet[side]]).r[3]);
+                XMStoreFloat3(&other, XMLoadFloat4x4(&current[feet[1 - side]]).r[3]);
+                XMStoreFloat3(&was, XMLoadFloat4x4(&previous[feet[side]]).r[3]);
+                // Only the planted foot -- the lower of the two -- sweeps.
+                if ((&foot.x)[up] > (&other.x)[up]) continue;
+                for (int axis = 0; axis < 3; ++axis)
+                    (&total.x)[axis] += (&foot.x)[axis] - (&was.x)[axis];
+            }
+            previous.swap(current);
+        }
+        // Measured on both rigs: a cycle travelling forward sweeps its planted
+        // foot along native +Y on the Z-up bandit and native -Z on the Y-up
+        // Mixamo rig, and one travelling left sweeps away from the side the
+        // left foot rests on. Both readings are normalised to "positive means
+        // forward" and "positive means right" here.
+        const float sideways = (&total.x)[lateral] * handedness;
+        const float forward = (up == 2 ? 1.0f : -1.0f) * (&total.x)[travel];
+        if (std::abs(sideways) >= std::abs(forward))
+            return std::abs(sideways) < 1e-3f ? -1 : (sideways > 0.0f ? 3 : 2);
+        return std::abs(forward) < 1e-3f ? -1 : (forward > 0.0f ? 0 : 1);
+    }
+
 private:
+    // One sampled pose becomes one key per bone, converted back out of model
+    // space into the parent-local transforms a clip stores.
+    static void WriteFrame(const Skeleton& skel,
+                           const std::vector<DirectX::XMFLOAT4X4>& globals,
+                           float time, AnimationClip& clip) {
+        using namespace DirectX;
+        for (size_t b = 0; b < skel.BoneCount(); ++b) {
+            const int parent = skel.parent[b];
+            const XMMATRIX local = XMLoadFloat4x4(&globals[b]) *
+                (parent < 0 ? XMMatrixInverse(nullptr, XMLoadFloat4x4(&skel.globalInverse))
+                            : XMMatrixInverse(nullptr, XMLoadFloat4x4(&globals[parent])));
+            XMVECTOR scale, rotation, translation;
+            XMMatrixDecompose(&scale, &rotation, &translation, local);
+            BoneTrack::VecKey p{time, {}}, sc{time, {}};
+            BoneTrack::QuatKey r{time, {}};
+            XMStoreFloat3(&p.value, translation);
+            XMStoreFloat3(&sc.value, scale);
+            XMStoreFloat4(&r.value, XMQuaternionNormalize(rotation));
+            clip.tracks[b].positions.push_back(p);
+            clip.tracks[b].scales.push_back(sc);
+            clip.tracks[b].rotations.push_back(r);
+        }
+    }
+
+    static int FindClip(const std::vector<AnimationClip>& clips, const std::string& name) {
+        for (size_t i = 0; i < clips.size(); ++i)
+            if (clips[i].name == name) return static_cast<int>(i);
+        return -1;
+    }
+
+
+    // Refit an authored cycle into the layout the blend space indexes: a key
+    // per bone per phase sample, with the clip rolled so its own footfall lands
+    // on the gait's. The seam repeats the first sample rather than resampling
+    // the wrap, so a clip that does not quite close still loops cleanly.
+    // `duration` retimes the result: the poses are the source's, spread over
+    // whichever cycle length the gait being filled runs at. Zero keeps the
+    // source's own length.
+    static AnimationClip Resample(const Skeleton& skel, const AnimationClip& source,
+                                  const std::string& name, float plantPhase,
+                                  float duration = 0.0f) {
+        using namespace DirectX;
+        AnimationInstance instance;
+        instance.Play(&source);
+        const int foot = skel.Find("foot_l");
+        std::vector<XMFLOAT4X4> globals;
+        float plantTime = 0.0f, lowest = 0.0f;
+        for (int s = 0; s < Samples; ++s) {
+            instance.time = source.duration * s / Samples;
+            instance.ComputeGlobalMatrices(skel, globals);
+            const float height = XMVectorGetZ(XMLoadFloat4x4(&globals[foot]).r[3]);
+            if (s == 0 || height < lowest) { lowest = height; plantTime = instance.time; }
+        }
+        const float start = std::fmod(
+            source.duration * 2.0f + plantTime - plantPhase * source.duration,
+            source.duration);
+
+        AnimationClip clip;
+        clip.name = name;
+        clip.duration = duration > 0.0f ? duration : source.duration;
+        clip.tracks.resize(skel.BoneCount());
+        for (size_t b = 0; b < skel.BoneCount(); ++b)
+            clip.tracks[b].bone = static_cast<int>(b);
+        for (int s = 0; s <= Samples; ++s) {
+            instance.time = s == Samples
+                ? start : std::fmod(start + source.duration * s / Samples, source.duration);
+            instance.ComputeGlobalMatrices(skel, globals);
+            WriteFrame(skel, globals, clip.duration * s / Samples, clip);
+        }
+        return clip;
+    }
+
     static void TransformBranch(const Skeleton& skel,
         std::vector<DirectX::XMFLOAT4X4>& globals, int root, DirectX::FXMMATRIX delta) {
         using namespace DirectX;
@@ -164,7 +353,13 @@ private:
 // one-frame clip plugs into the existing upper-body layer and rifle IK.
 class LocomotionBlendSpace {
 public:
-    bool Initialize(const Skeleton& skel, const std::vector<AnimationClip>& clips) {
+    // legsOnlyClips: whether the directional clips can be trusted above the
+    // hips. A cycle retargeted onto a foreign skeleton only has its legs
+    // rebuilt and keeps bind pose everywhere else, so its torso has to be
+    // suppressed; a cycle authored on this rig carries a real torso and
+    // suppressing it would throw that away.
+    bool Initialize(const Skeleton& skel, const std::vector<AnimationClip>& clips,
+                    bool legsOnlyClips = true) {
         ready_ = false;
         clips_.fill(nullptr);
         right_ = forward_ = phase_ = 0.0f;
@@ -197,6 +392,9 @@ public:
             XMStoreFloat4(&track.rotations[0].value, r);
         }
         idle_ = output_;
+        if (legsOnlyClips) BuildLowerBodyMask(skel);
+        else lowerBody_.assign(skel.BoneCount(), true);
+        legsOnly_ = legsOnlyClips;
         ready_ = true;
         return true;
     }
@@ -232,18 +430,34 @@ public:
         const float sample = phase_ * DirectionalLocomotion::Samples;
         const int frame = static_cast<int>(sample);
         const float alpha = sample - frame;
+        // Above the hips a leg-only slot hands its weight to the gait it
+        // belongs to, so the torso plays a plain forward cycle at the same
+        // cadence while the legs go sideways. Retargeted arms and spine never
+        // reach the mesh, and the gun layer keeps a stable pose to sit on.
+        // Clips authored on this rig need none of that -- lowerBody_ is all
+        // true for them, so `upper` goes unread.
+        auto upper = weights;
+        if (legsOnly_) for (int gait = 0; gait < 2; ++gait) {
+            const int forwardSlot = 1 + gait * 4, backwardSlot = forwardSlot + 1;
+            for (int side = 2; side < 4; ++side) {
+                const int slot = forwardSlot + side;
+                upper[forward_ >= 0.0f ? forwardSlot : backwardSlot] += upper[slot];
+                upper[slot] = 0.0f;
+            }
+        }
         for (size_t b = 0; b < output_.tracks.size(); ++b) {
             XMVECTOR translation = XMVectorZero(), scale = XMVectorZero(), rotation = XMVectorZero();
             const XMVECTOR reference = XMLoadFloat4(&idle_.tracks[b].rotations[0].value);
+            const auto& active = (b < lowerBody_.size() && lowerBody_[b]) ? weights : upper;
             for (int i = 0; i < 9; ++i) {
-                if (weights[i] <= 0.0f) continue;
+                if (active[i] <= 0.0f) continue;
                 const auto& track = i == 0 ? idle_.tracks[b] : clips_[i]->tracks[b];
                 const int lo = i == 0 ? 0 : frame, hi = i == 0 ? 0 : frame + 1;
-                translation += XMVectorLerp(XMLoadFloat3(&track.positions[lo].value), XMLoadFloat3(&track.positions[hi].value), alpha) * weights[i];
-                scale += XMVectorLerp(XMLoadFloat3(&track.scales[lo].value), XMLoadFloat3(&track.scales[hi].value), alpha) * weights[i];
+                translation += XMVectorLerp(XMLoadFloat3(&track.positions[lo].value), XMLoadFloat3(&track.positions[hi].value), alpha) * active[i];
+                scale += XMVectorLerp(XMLoadFloat3(&track.scales[lo].value), XMLoadFloat3(&track.scales[hi].value), alpha) * active[i];
                 XMVECTOR q = XMQuaternionSlerp(XMLoadFloat4(&track.rotations[lo].value), XMLoadFloat4(&track.rotations[hi].value), alpha);
                 if (XMVectorGetX(XMVector4Dot(reference, q)) < 0.0f) q = -q;
-                rotation += q * weights[i];
+                rotation += q * active[i];
             }
             auto& track = output_.tracks[b];
             XMStoreFloat3(&track.positions[0].value, translation);
@@ -254,8 +468,31 @@ public:
     }
 
 private:
+    // Which bones the blend space is allowed to write. The strafe cycles are
+    // retargeted from another rig and only their legs are trustworthy, so the
+    // pelvis and everything above it keeps the forward gait's own pose and the
+    // upper-body gun layer still lands on an undisturbed spine.
+    void BuildLowerBodyMask(const Skeleton& skel) {
+        const int pelvis = skel.Find("pelvis");
+        lowerBody_.assign(skel.BoneCount(), false);
+        for (size_t b = 0; b < skel.BoneCount(); ++b) {
+            // A leg bone is one that reaches the pelvis without passing through
+            // the spine, so the arms and head are excluded by construction.
+            for (int p = static_cast<int>(b); p >= 0; p = skel.parent[p]) {
+                if (p == pelvis) { lowerBody_[b] = true; break; }
+                const std::string& name = skel.names[p];
+                if (name.rfind("spine", 0) == 0) break;
+            }
+        }
+        // The pelvis itself carries the whole body, so a strafe's hip swing
+        // would drag the torso sideways with it.
+        if (pelvis >= 0) lowerBody_[pelvis] = false;
+    }
+
     std::array<const AnimationClip*, 9> clips_{};
     AnimationClip output_, idle_;
+    std::vector<bool> lowerBody_;
+    bool legsOnly_ = true;
     float right_ = 0.0f, forward_ = 0.0f, phase_ = 0.0f;
     bool ready_ = false;
 };

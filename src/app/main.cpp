@@ -4773,16 +4773,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (!g_baseMode) {
                 const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
+                // The UE4-rigged bandit. A Mixamo-rigged variant of the same
+                // character sits in Mixamo/ carrying four authored run cycles
+                // on the rig they were made for -- built by
+                // scripts/mixamo-to-ue.py and checked by StrafeImportTests --
+                // but the enemy in play is still this one, which retargets the
+                // two strafe cycles onto its own skeleton.
                 std::vector<std::string> clips = {
                     animDir + "ThirdPersonIdle.FBX",
                     animDir + "ThirdPersonWalk.FBX",
                     animDir + "ThirdPersonRun.FBX",
+                    // Strafe cycles, converted to the UE4 rig before import, so
+                    // they resolve onto the bandit's own bones by name like any
+                    // other clip. The clip name is the file stem.
+                    banditDir + "Animations/Mixamo/RunRight.UE.fbx",
+                    banditDir + "Animations/Mixamo/RunLeft.UE.fbx",
                 };
+                // The strafe clips were converted from another rig and still
+                // carry its bone lengths, so they contribute rotation only --
+                // the bandit's own proportions drive everything else.
                 SkinnedModel bm = SkinnedFBXImporter::Load(
-                    banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
+                    banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList,
+                    0.01f, true, { "RunRight.UE", "RunLeft.UE" });
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid) {
-                    if (!DirectionalLocomotion::Bake(bm.skeleton, bm.clips))
+                    // The strafe clips came in with the gait clips above. Both
+                    // gaits adopt them: the alternative for the walk slots is
+                    // the IK bake, which drags the feet to targets instead of
+                    // replaying real footwork.
+                    //
+                    // The slot is stated rather than measured. These are
+                    // running strafes whose trailing leg crosses over, so the
+                    // planted foot sweeps both ways inside a single cycle and
+                    // no footfall test separates left from right. Measured on
+                    // the source clips, the mean foot offset from the rest
+                    // stance is +1.74 for RunRight and -1.74 for RunLeft, so
+                    // each fills the slot its name implies.
+                    constexpr int kStrafeLeft = 2, kStrafeRight = 3;
+                    const std::vector<DirectionalLocomotion::AuthoredCycle>
+                        authoredNames = {
+                            { "RunRight.UE", true, true, kStrafeRight },
+                            { "RunLeft.UE", true, true, kStrafeLeft },
+                        };
+                    if (!DirectionalLocomotion::Bake(
+                            bm.skeleton, bm.clips, authoredNames))
                         std::cerr << "Bandit directional locomotion unavailable; using source clips\n";
                     g_banditModel = std::move(bm);
                 } else {

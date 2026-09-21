@@ -675,6 +675,15 @@ if(BUILD_TESTING)
     target_link_libraries(DirectionalLocomotionTests PRIVATE SGEProjectHeaders assimp::assimp)
     add_test(NAME DirectionalLocomotionTests COMMAND DirectionalLocomotionTests "${CMAKE_SOURCE_DIR}")
 
+    # The Mixamo-rigged bandit's bones are renamed to UE4 names by
+    # scripts/mixamo-to-ue.py, a build step no compiler checks. This verifies
+    # the converted FBX files on disk: every bone the engine looks up by name
+    # resolves, the mesh keeps its skin, and each authored cycle travels the
+    # way the blend-space slot it fills expects.
+    add_executable(StrafeImportTests tests/StrafeImportTests.cpp)
+    target_link_libraries(StrafeImportTests PRIVATE SGEProjectHeaders assimp::assimp)
+    add_test(NAME StrafeImportTests COMMAND StrafeImportTests "${CMAKE_SOURCE_DIR}")
+
     # TimeOfDay.h is deliberately renderer-free, so the sun-elevation fade that
     # keeps a set sun from lighting the scene is checkable without a device.
     add_executable(SunHorizonFadeTests tests/SunHorizonFadeTests.cpp)

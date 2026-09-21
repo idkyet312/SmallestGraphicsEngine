@@ -5,8 +5,11 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+// AnimationInstance: a rebased clip is replayed here to find its floor.
+#include "AnimationRuntime.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -121,6 +124,227 @@ bool AppendRetargetedSplitRotationTrack(const aiScene* scene,
     return true;
 }
 
+// A clip converted from another rig can share this skeleton's bone names and
+// still be a foreign rig underneath: these Mixamo strafes run their bones down
+// +Y where the bandit's run down -X, carry their own bone lengths, and are not
+// mirrored left-to-right where the bandit is. Copying the keys across therefore
+// fails three ways at once -- the position keys resize the skeleton inside the
+// mesh, and no single rotation delta can serve a mirrored pair, so both legs
+// end up swinging the same way and the strafe collapses into a shuffle.
+//
+// A DIRECTION survives all of that, because it has no axis convention and no
+// handedness. So drive each leg segment by aiming it along the direction its
+// counterpart points in the clip, in model space, and let the skeleton keep its
+// own bone lengths, stance and mirroring:
+//
+//     have = normalize(childGlobal - boneGlobal)      on this skeleton
+//     want = normalize(childGlobal - boneGlobal)      in the clip
+//     rotate the bone about its own origin by the swing taking have to want
+//
+// The body is then dropped so its lowest foot rests on the bind floor, which is
+// what keeps a cycle authored for other legs from hovering or sinking.
+struct ClipRig {
+    std::vector<std::string> names;
+    std::vector<int> parent;
+    std::vector<aiMatrix4x4> bind;
+    std::vector<const aiNodeAnim*> channel;
+};
+
+void BuildClipRig(const aiNode* node, int parent, ClipRig& rig) {
+    const int id = static_cast<int>(rig.names.size());
+    rig.names.push_back(node->mName.C_Str());
+    rig.parent.push_back(parent);
+    rig.bind.push_back(node->mTransformation);
+    rig.channel.push_back(nullptr);
+    for (unsigned c = 0; c < node->mNumChildren; ++c)
+        BuildClipRig(node->mChildren[c], id, rig);
+}
+
+// The clip rig's parent-local matrix for one node at `time` ticks.
+XMMATRIX ClipLocal(const ClipRig& rig, int node, double time) {
+    const XMFLOAT4X4 store = ToXM(rig.bind[node]);
+    const XMMATRIX bind = XMLoadFloat4x4(&store);
+    const aiNodeAnim* channel = rig.channel[node];
+    if (!channel || channel->mNumRotationKeys == 0) return bind;
+    XMVECTOR scale, rotation, translation;
+    if (!XMMatrixDecompose(&scale, &rotation, &translation, bind)) {
+        scale = XMVectorSplatOne();
+        rotation = XMQuaternionIdentity();
+        translation = XMVectorZero();
+    }
+    unsigned key = 0;
+    while (key + 1 < channel->mNumRotationKeys &&
+           channel->mRotationKeys[key + 1].mTime <= time) ++key;
+    const unsigned next = (key + 1 < channel->mNumRotationKeys) ? key + 1 : key;
+    const double span =
+        channel->mRotationKeys[next].mTime - channel->mRotationKeys[key].mTime;
+    const float alpha = span > 1e-9
+        ? static_cast<float>((time - channel->mRotationKeys[key].mTime) / span) : 0.0f;
+    auto load = [&](unsigned k) {
+        const aiQuaternion& q = channel->mRotationKeys[k].mValue;
+        return XMQuaternionNormalize(XMVectorSet(q.x, q.y, q.z, q.w));
+    };
+    rotation = XMQuaternionSlerp(load(key), load(next), alpha);
+    if (channel->mNumPositionKeys) {
+        unsigned p = 0;
+        while (p + 1 < channel->mNumPositionKeys &&
+               channel->mPositionKeys[p + 1].mTime <= time) ++p;
+        const aiVector3D& value = channel->mPositionKeys[p].mValue;
+        translation = XMVectorSet(value.x, value.y, value.z, 0.0f);
+    }
+    return XMMatrixAffineTransformation(
+        scale, XMVectorZero(), rotation, translation);
+}
+
+// The shortest rotation taking one direction onto another.
+XMMATRIX SwingBetween(FXMVECTOR from, FXMVECTOR to) {
+    const XMVECTOR a = XMVector3Normalize(from), b = XMVector3Normalize(to);
+    const float dot = XMVectorGetX(XMVector3Dot(a, b));
+    if (dot > 0.9999f) return XMMatrixIdentity();
+    if (dot < -0.9999f) {
+        XMVECTOR axis = XMVector3Cross(a, XMVectorSet(1, 0, 0, 0));
+        if (XMVectorGetX(XMVector3LengthSq(axis)) < 1e-6f)
+            axis = XMVector3Cross(a, XMVectorSet(0, 1, 0, 0));
+        return XMMatrixRotationAxis(XMVector3Normalize(axis), 3.14159265f);
+    }
+    return XMMatrixRotationAxis(
+        XMVector3Normalize(XMVector3Cross(a, b)), std::acos(dot));
+}
+
+// The limb segments a strafe needs. Everything else keeps its bind pose, which
+// is what the upper-body gun layer expects to sit on.
+struct LimbSegment { const char* bone; const char* child; };
+const LimbSegment kLegSegments[] = {
+    { "thigh_l", "calf_l" }, { "calf_l", "foot_l" }, { "foot_l", "ball_l" },
+    { "thigh_r", "calf_r" }, { "calf_r", "foot_r" }, { "foot_r", "ball_r" },
+};
+
+// Append every AnimStack in `scene`, direction-matched onto `skel` as above.
+void AppendRebasedClips(const aiScene* scene, const Skeleton& skel,
+                        std::vector<AnimationClip>& clips) {
+    const size_t bones = skel.BoneCount();
+    ClipRig rig;
+    BuildClipRig(scene->mRootNode, -1, rig);
+    const int pelvis = skel.Find("pelvis");
+    const int feet[2] = { skel.Find("foot_l"), skel.Find("foot_r") };
+    if (pelvis < 0 || feet[0] < 0 || feet[1] < 0) return;
+
+    // This skeleton's own rest, and the floor its feet stand on. Measured the
+    // way the runtime will measure it -- ComputeGlobalMatrices divides the
+    // scene root back out, so a floor taken from the raw chain sits in a
+    // different space and the drop below would aim at the wrong height.
+    AnimationInstance rest;
+    std::vector<XMFLOAT4X4> bindGlobal;
+    rest.ComputeGlobalMatrices(skel, bindGlobal);
+    const float floor = (std::min)(bindGlobal[feet[0]]._43,
+                                   bindGlobal[feet[1]]._43);
+
+    for (unsigned a = 0; a < scene->mNumAnimations; ++a) {
+        const aiAnimation* anim = scene->mAnimations[a];
+        if (anim->mDuration <= 0.0) continue;
+        const double tps = anim->mTicksPerSecond != 0.0 ? anim->mTicksPerSecond : 30.0;
+        std::fill(rig.channel.begin(), rig.channel.end(), nullptr);
+        for (unsigned c = 0; c < anim->mNumChannels; ++c) {
+            const std::string name = anim->mChannels[c]->mNodeName.C_Str();
+            for (size_t node = 0; node < rig.names.size(); ++node)
+                if (rig.names[node] == name) {
+                    rig.channel[node] = anim->mChannels[c];
+                    break;
+                }
+        }
+
+        AnimationClip clip;
+        clip.name = anim->mName.length ? anim->mName.C_Str() : ("anim" + std::to_string(a));
+        clip.duration = static_cast<float>(anim->mDuration / tps);
+        clip.tracks.resize(bones);
+        for (size_t b = 0; b < bones; ++b) clip.tracks[b].bone = static_cast<int>(b);
+
+        const int frames = (std::max)(1, static_cast<int>(std::lround(anim->mDuration)));
+        std::vector<XMMATRIX> clipGlobal(rig.names.size());
+        std::vector<XMMATRIX> global(bones), local(bones);
+        for (int f = 0; f <= frames; ++f) {
+            const double ticks = anim->mDuration * f / frames;
+            for (size_t node = 0; node < rig.names.size(); ++node) {
+                const XMMATRIX m = ClipLocal(rig, static_cast<int>(node), ticks);
+                clipGlobal[node] = rig.parent[node] < 0
+                    ? m : m * clipGlobal[rig.parent[node]];
+            }
+            auto clipDirection = [&](const char* from, const char* to) {
+                XMVECTOR head = XMVectorZero(), tail = XMVectorZero();
+                for (size_t node = 0; node < rig.names.size(); ++node) {
+                    if (rig.names[node] == from) head = clipGlobal[node].r[3];
+                    if (rig.names[node] == to)   tail = clipGlobal[node].r[3];
+                }
+                return XMVector3Normalize(tail - head);
+            };
+
+            for (size_t b = 0; b < bones; ++b) {
+                local[b] = XMLoadFloat4x4(&skel.localBind[b]);
+                global[b] = skel.parent[b] < 0
+                    ? local[b] : local[b] * global[skel.parent[b]];
+            }
+            for (const LimbSegment& segment : kLegSegments) {
+                const int bone = skel.Find(segment.bone);
+                const int child = skel.Find(segment.child);
+                if (bone < 0 || child < 0) continue;
+                const XMVECTOR have =
+                    XMVector3Normalize(global[child].r[3] - global[bone].r[3]);
+                const XMMATRIX swing = SwingBetween(
+                    have, clipDirection(segment.bone, segment.child));
+                const XMVECTOR origin = global[bone].r[3];
+                XMMATRIX rotated = global[bone];
+                rotated.r[3] = XMVectorSet(0, 0, 0, 1);
+                rotated = rotated * swing;
+                rotated.r[3] = origin;
+                global[bone] = rotated;
+                // Carry the rest of the limb with the bone that just moved.
+                for (size_t k = 0; k < bones; ++k) {
+                    if (skel.parent[k] < 0 || static_cast<int>(k) == bone) continue;
+                    bool descends = false;
+                    for (int p = static_cast<int>(k); p >= 0; p = skel.parent[p])
+                        if (p == bone) { descends = true; break; }
+                    if (descends) global[k] = local[k] * global[skel.parent[k]];
+                }
+            }
+
+            const float time = static_cast<float>(ticks / tps);
+            for (size_t b = 0; b < bones; ++b) {
+                const int parent = skel.parent[b];
+                const XMMATRIX parentGlobal =
+                    parent < 0 ? XMMatrixIdentity() : global[parent];
+                XMVECTOR scale, rotation, translation;
+                XMMatrixDecompose(&scale, &rotation, &translation,
+                    global[b] * XMMatrixInverse(nullptr, parentGlobal));
+                XMFLOAT4 value;
+                XMStoreFloat4(&value, XMQuaternionNormalize(rotation));
+                clip.tracks[b].rotations.push_back({ time, value });
+            }
+        }
+
+        // Legs authored for another body land at another height. Drop the whole
+        // skeleton so its lowest foot over the cycle rests on the bind floor.
+        AnimationInstance probe;
+        probe.Play(&clip);
+        std::vector<XMFLOAT4X4> posed;
+        float lowest = FLT_MAX;
+        for (int s = 0; s <= frames * 2; ++s) {
+            probe.time = clip.duration * s / (frames * 2);
+            probe.ComputeGlobalMatrices(skel, posed);
+            for (int foot : feet)
+                lowest = (std::min)(lowest, posed[foot]._43);
+        }
+        const XMFLOAT4X4& pelvisBind = skel.localBind[pelvis];
+        const float drop = floor - lowest;
+        for (int f = 0; f <= frames; ++f)
+            clip.tracks[pelvis].positions.push_back(
+                { clip.duration * f / frames,
+                  { pelvisBind._41, pelvisBind._42, pelvisBind._43 + drop } });
+
+        clips.push_back(std::move(clip));
+    }
+}
+
+
 // Append every AnimStack in `scene` to `clips`, resolving channels to skeleton
 // bone ids by name. positionScale scales translation keys to match the baked
 // mesh scale.
@@ -172,7 +396,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     Microsoft::WRL::ComPtr<ID3D12Device> device,
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
     float uniformScale,
-    bool useCookedClips) {
+    bool useCookedClips,
+    const std::vector<std::string>& rotationOnlyAnims) {
 
     SkinnedModel out;
     Assimp::Importer importer;
@@ -190,8 +415,19 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     auto root = std::make_shared<SceneNode>("SkinnedRoot");
     root->mesh = std::make_shared<SceneMesh>();
     const fs::path base = fs::path(meshPath).parent_path();
-    const fs::path textureRoot =
-        base.filename() == "fbx" ? base.parent_path() : base;
+    // Textures are searched for under this root, so it has to be the directory
+    // that actually holds them. A variant of a character lives in a subfolder
+    // beside its own animations and shares the parent's texture set rather
+    // than duplicating it -- these maps run to hundreds of megabytes -- so a
+    // folder with no Textures/ of its own defers to its parent, the same way
+    // the "fbx" wrapper directory some exports come in does.
+    const auto hasTextures = [](const fs::path& dir) {
+        std::error_code ec;
+        return fs::exists(dir / "Textures", ec);
+    };
+    fs::path textureRoot = base.filename() == "fbx" ? base.parent_path() : base;
+    if (!hasTextures(textureRoot) && hasTextures(textureRoot.parent_path()))
+        textureRoot = textureRoot.parent_path();
 
     auto lowerStr = [](std::string s) {
         for (char& c : s) c = (char)tolower((unsigned char)c);
@@ -515,9 +751,16 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     }
     for (const std::string& ap : animPaths) {
         const size_t before = out.clips.size();
-        if (useCookedClips && CookedAssetLoader::LoadAnimationsForSource(
+        // Name the clip from its filename so callers can FindClip("Walk") etc.
+        const std::string stem = fs::path(ap).stem().string();
+        const bool rotationOnly =
+            std::find(rotationOnlyAnims.begin(), rotationOnlyAnims.end(), stem) !=
+            rotationOnlyAnims.end();
+        // A cooked blob stores the keys as they were parsed, foreign bone
+        // lengths included, so a rotation-only clip has to come from source.
+        if (useCookedClips && !rotationOnly &&
+            CookedAssetLoader::LoadAnimationsForSource(
                 ap, out.skeleton, out.clips)) {
-            const std::string stem = fs::path(ap).stem().string();
             for (size_t i = before; i < out.clips.size(); ++i)
                 out.clips[i].name = stem;
             std::cout << "Loaded cooked animation: " << stem << "\n";
@@ -529,9 +772,12 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             std::cerr << "Anim FBX load failed: " << ap << " : " << animImporter.GetErrorString() << "\n";
             continue;
         }
-        // Name the clip from its filename so callers can FindClip("Walk") etc.
-        const std::string stem = fs::path(ap).stem().string();
-        AppendClips(as, out.skeleton, 1.0f, out.clips);
+        if (rotationOnly) {
+            AppendRebasedClips(as, out.skeleton, out.clips);
+            out.rebasedClips = true;
+        } else {
+            AppendClips(as, out.skeleton, 1.0f, out.clips);
+        }
         for (size_t i = before; i < out.clips.size(); ++i) out.clips[i].name = stem;
     }
 

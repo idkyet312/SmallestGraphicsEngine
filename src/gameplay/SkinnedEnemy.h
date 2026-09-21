@@ -73,6 +73,14 @@ enum class Faction : uint8_t { Bandit, Marine };
 
 class SkinnedEnemy {
 public:
+    // Gates the directional blend space, not an IK solve -- the blend space is
+    // plain weighted clip blending. On, a body that moves sideways plays the
+    // authored strafe cycles; off, it falls back to the forward-only Run/Walk
+    // clips and slides when it strafes.
+    //
+    // Off by default: the plain forward gait is the look we want for now. The
+    // blend space and the cycles it needs are still built at load, so the
+    // debug-HUD checkbox switches the whole thing on live.
     inline static bool directionalLocomotionIK = false;
     SkinnedModel      model;
     AnimationInstance anim;
@@ -329,7 +337,7 @@ public:
     bool Init(const SkinnedModel& m) {
         model = m;
         if (!model.valid) return false;
-        locomotion_.Initialize(model.skeleton, model.clips);
+        locomotion_.Initialize(model.skeleton, model.clips, model.rebasedClips);
         // One palette upload buffer per in-flight frame so we never overwrite a
         // palette the GPU is still reading.
         const UINT bytes = (UINT)(model.skeleton.BoneCount() * sizeof(DirectX::XMFLOAT4X4));

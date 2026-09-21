@@ -21,6 +21,11 @@ struct SkinnedModel {
     std::vector<AnimationClip>  clips;      // includes the clip baked into the mesh FBX
     RagdollSpec                 ragdoll;
     bool                        valid = false;
+    // Whether any clip here was rebased off a foreign rig. Such a clip only
+    // has its legs rebuilt and keeps bind pose above the hips, so consumers
+    // that blend directional clips have to suppress their torso; a model whose
+    // clips were all authored on its own skeleton carries a real one.
+    bool                        rebasedClips = false;
 
     const AnimationClip* FindClip(const std::string& name) const {
         for (const auto& c : clips)
@@ -39,10 +44,20 @@ public:
     // cooked blobs. The cooker's compression drops bone tracks (the player's
     // rifle idle came back with 4 of 66), which leaves most of the skeleton in
     // bind pose and visibly misaligns the mesh. Player assets pass false.
+    //
+    // rotationOnlyAnims: file stems (as animPaths name their clips) whose clips
+    // are rebased onto this skeleton rather than copied onto it. A clip
+    // converted from another rig can share these bone names while keeping its
+    // own rest pose, bone axes and bone lengths, so its keys mean something
+    // else here: copied straight across they resize the skeleton inside the
+    // mesh and bend the limbs the wrong way. Rebasing carries the motion --
+    // each bone's rotation relative to its own rest -- and leaves translation
+    // and scale to this skeleton, so the proportions stay the mesh's.
     static SkinnedModel Load(const std::string& meshPath,
                              const std::vector<std::string>& animPaths,
                              Microsoft::WRL::ComPtr<ID3D12Device> device,
                              Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
                              float uniformScale = 0.01f,
-                             bool useCookedClips = true);
+                             bool useCookedClips = true,
+                             const std::vector<std::string>& rotationOnlyAnims = {});
 };

@@ -22,6 +22,36 @@ static void Bones(const aiNode* node, int parent, Skeleton& s) {
     for (unsigned i=0; i<node->mNumChildren; ++i) Bones(node->mChildren[i], id, s);
 }
 
+// One AnimStack resolved onto `skeleton` by bone name, the way the importer
+// builds a clip. Shared by both cases below so the adopted cycles are read
+// exactly as the baked ones are.
+static bool ReadClip(const aiScene* scene, const Skeleton& skeleton,
+                     const std::string& name, AnimationClip& clip) {
+    if (!scene || !scene->mNumAnimations) return false;
+    const aiAnimation& a=*scene->mAnimations[0];
+    const double rate=a.mTicksPerSecond ? a.mTicksPerSecond : 30;
+    clip.name=name; clip.duration=static_cast<float>(a.mDuration/rate);
+    for (unsigned c=0;c<a.mNumChannels;++c) {
+        const auto& channel=*a.mChannels[c];
+        const int bone=skeleton.Find(channel.mNodeName.C_Str()); if (bone<0) continue;
+        BoneTrack track; track.bone=bone;
+        for (unsigned k=0;k<channel.mNumPositionKeys;++k) {
+            const auto& key=channel.mPositionKeys[k];
+            track.positions.push_back({float(key.mTime/rate),{key.mValue.x,key.mValue.y,key.mValue.z}});
+        }
+        for (unsigned k=0;k<channel.mNumRotationKeys;++k) {
+            const auto& key=channel.mRotationKeys[k];
+            track.rotations.push_back({float(key.mTime/rate),{key.mValue.x,key.mValue.y,key.mValue.z,key.mValue.w}});
+        }
+        for (unsigned k=0;k<channel.mNumScalingKeys;++k) {
+            const auto& key=channel.mScalingKeys[k];
+            track.scales.push_back({float(key.mTime/rate),{key.mValue.x,key.mValue.y,key.mValue.z}});
+        }
+        clip.tracks.push_back(std::move(track));
+    }
+    return !clip.tracks.empty();
+}
+
 int main(int argc, char** argv) {
     for (int x=-20; x<=20; ++x) for (int y=-20; y<=20; ++y) {
         auto w = LocomotionBlendSpace::Weights(x*0.2f,y*0.2f,1.8f);
@@ -79,7 +109,12 @@ int main(int argc, char** argv) {
         std::vector<XMFLOAT4X4> globals;
         for (int sample=0;sample<=32;++sample) {
             anim.time=anim.clip->duration*sample/32; anim.ComputeGlobalMatrices(skeleton,globals);
-            if (i==5 || i==6 || i==9 || i==10)
+            // Only the IK-baked sideways slots. Named rather than indexed so
+            // the check follows the clip if the list is reordered, and scoped
+            // to this bake because an authored running strafe really does
+            // cross its trailing leg over -- see the adoption case below.
+            const std::string& baked=clips[i].name;
+            if (baked=="WalkLeft"||baked=="WalkRight"||baked=="RunLeft"||baked=="RunRight")
                 Check(globals[skeleton.Find("foot_l")]._41 > globals[skeleton.Find("foot_r")]._41,
                       "Strafe feet must not cross");
             AnimationInstance reference;
@@ -112,5 +147,91 @@ int main(int argc, char** argv) {
             Check(std::abs(XMVectorGetX(XMVector4Length(XMLoadFloat4(&q)))-1)<1e-4f,"Normalised blended rotations");
         }
     }
-    std::cout<<"Directional locomotion: weights, real-asset bake, loop seams and rotating blend passed\n";
+    // The shipped path: the Mixamo-rigged bandit adopts four authored cycles
+    // instead of baking its run slots. The bake above only covers the IK
+    // fallback, so without this the arrangement the game actually loads goes
+    // untested.
+    {
+        const std::string mixamoDir=std::string(argv[1])+
+            "/Content/Models/MilitaryMercenaryBandit/Mixamo/";
+        Assimp::Importer meshImporter;
+        const aiScene* meshScene=meshImporter.ReadFile(mixamoDir+"SK_BanditMixamo.fbx",0);
+        Check(meshScene && meshScene->mRootNode,"Load the Mixamo-rigged bandit");
+        Skeleton mixamo; Bones(meshScene->mRootNode,-1,mixamo);
+        XMStoreFloat4x4(&mixamo.globalInverse,
+            XMMatrixInverse(nullptr,XMLoadFloat4x4(&mixamo.localBind[0])));
+
+        // Idle and the two gaits still come from the UE4 demo clips, exactly
+        // as main.cpp loads them: they resolve onto this rig by bone name and
+        // give the bake the sources it needs for the slots left over.
+        std::vector<AnimationClip> adopted;
+        for (const char* name : {"Idle","Walk","Run"}) {
+            Assimp::Importer importer;
+            const aiScene* sc=importer.ReadFile(
+                std::string(argv[1])+"/Content/Models/MilitaryMercenaryBandit/"
+                "Animations/Demo/ThirdPerson"+name+".FBX",0);
+            AnimationClip clip;
+            if (ReadClip(sc,mixamo,std::string("ThirdPerson")+name,clip))
+                adopted.push_back(std::move(clip));
+        }
+        Check(adopted.size()==3,"Load the gait sources onto the Mixamo rig");
+        const char* files[][2]={
+            {"SK_BanditMixamo.fbx","SK_BanditMixamo"},
+            {"Animations/RunBackward.fbx","RunBackward"},
+            {"Animations/RunLeft.fbx","RunLeft"},
+            {"Animations/RunRight.fbx","RunRight"}};
+        for (auto& f : files) {
+            Assimp::Importer importer;
+            const aiScene* sc=importer.ReadFile(mixamoDir+f[0],0);
+            AnimationClip clip;
+            if (ReadClip(sc,mixamo,f[1],clip)) adopted.push_back(std::move(clip));
+        }
+        Check(adopted.size()==7,"Load the four authored cycles");
+
+        const std::vector<DirectionalLocomotion::AuthoredCycle> cycles={
+            {"SK_BanditMixamo",true,true,0},{"RunBackward",true,true,1},
+            {"RunLeft",true,true,2},{"RunRight",true,true,3}};
+        Check(DirectionalLocomotion::Bake(mixamo,adopted,cycles),
+              "Bake the adopted cycles");
+
+        // Adoption replaces a clip in place for its own gait but appends for
+        // the gait that borrows it, so a total count says little. What has to
+        // hold is that every slot the blend space indexes exists exactly once.
+        for (int slot=0;slot<8;++slot) {
+            int found=0;
+            for (const auto& clip:adopted)
+                if (clip.name==DirectionalLocomotion::Names[slot]) ++found;
+            if (found!=1) std::cerr<<DirectionalLocomotion::Names[slot]<<": "<<found<<std::endl;
+            Check(found==1,"Each directional slot is filled exactly once");
+        }
+
+        LocomotionBlendSpace adoptedBlend;
+        Check(adoptedBlend.Initialize(mixamo,adopted,false),
+              "Initialize the blend space over the adopted cycles");
+        for (const auto& clip:adopted) {
+            bool slot=false;
+            for (int i=0;i<8;++i) slot=slot||clip.name==DirectionalLocomotion::Names[i];
+            if (!slot) continue;
+            for (const auto& track:clip.tracks) {
+                if (track.rotations.empty()) continue;
+                const auto& a=track.rotations.front().value;
+                const auto& b=track.rotations.back().value;
+                Check(std::abs(std::abs(XMVectorGetX(XMVector4Dot(
+                          XMLoadFloat4(&a),XMLoadFloat4(&b))))-1)<1e-3f,
+                      "Adopted cycles loop seamlessly");
+            }
+        }
+        for (int frame=0;frame<600;++frame) {
+            const float angle=frame*.025f;
+            const auto* clip=adoptedBlend.Update(
+                1.0f/60,std::sin(angle)*2.97f,std::cos(angle)*2.97f,1.8f);
+            for (const auto& track:clip->tracks) {
+                const auto& q=track.rotations[0].value;
+                Check(std::abs(XMVectorGetX(XMVector4Length(XMLoadFloat4(&q)))-1)<1e-4f,
+                      "Normalised rotations over the adopted blend");
+            }
+        }
+    }
+    std::cout<<"Directional locomotion: weights, real-asset bake, adopted cycles,"
+               " loop seams and rotating blend passed"<<std::endl;
 }
