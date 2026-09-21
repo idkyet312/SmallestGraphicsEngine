@@ -97,9 +97,21 @@ inline uint32_t BuildRequests(float viewerX, float viewerY, uint32_t budget,
         if (std::find(requests.begin(), requests.end(), key) == requests.end())
             requests[count++] = key;
     };
-    // Reserve coverage at every scale before spending spare slots on detail.
-    // The nearest 2x2 block contains the viewer even across negative coordinates
-    // and gives the outer level at least half a page of coverage in every direction.
+    // Reserve the nearest 2x2 block at the outer level first. This keeps a
+    // coarse fallback around the viewer whenever the budget is at least four.
+    // The nearest 2x2 block contains the viewer across negative coordinates;
+    // the existing loop then spends remaining slots on finer detail.
+    {
+        const float x = viewerX / PageExtent(Levels - 1);
+        const float y = viewerY / PageExtent(Levels - 1);
+        const int cx = static_cast<int>(std::floor(x));
+        const int cy = static_cast<int>(std::floor(y));
+        const int dx = x - cx < 0.5f ? -1 : 1;
+        const int dy = y - cy < 0.5f ? -1 : 1;
+        for (uint32_t corner = 0; corner < 4; ++corner)
+            add(Levels - 1, cx + ((corner & 1) ? dx : 0),
+                             cy + ((corner & 2) ? dy : 0));
+    }
     for (uint32_t corner = 0; corner < 4; ++corner) {
         for (uint32_t level = 0; level < Levels; ++level) {
             const float x = viewerX / PageExtent(level);

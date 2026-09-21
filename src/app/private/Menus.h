@@ -1461,9 +1461,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
                     "How many of the 16 atlas pages the sun may hold.\n"
-                    "Spent corner-major over the three levels: 5 buys the\n"
-                    "viewer's own page at every level, 16 buys the full\n"
-                    "2x2 block per level plus the level-0 ring.\n"
+                    "The first 4 pages are coarse coverage around the viewer;\n"
+                    "page 5 adds fine coverage and page 6 adds middle coverage.\n"
+                    "Below 4 pages, coverage is not guaranteed.\n"
                     "Below coverage, unmapped ground reads as unshadowed.");
             if (g_vsmUnavailable)
                 ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
