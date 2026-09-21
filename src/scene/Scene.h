@@ -416,11 +416,18 @@ struct Scene {
     bool  virtualShadowMaps = true;
     // Virtual shadows have no cascade fallback, so an unmapped page is a hole
     // in the shadowing rather than a softer sample: spending fewer pages does
-    // not trade quality for cost, it removes shadows. BuildRequests spends the
-    // budget corner-major over levels, so 5 buys the viewer's own page at all
-    // three levels plus two pages of the next corner; raise it toward Capacity
-    // (16) for the full 2x2 block per level and the level-0 3x3 ring.
-    static constexpr int kDefaultVirtualShadowPageBudget = 5;
+    // not trade quality for cost, it removes shadows. BuildRequests reserves
+    // four outer-level pages first, so budgets below 4 have no coverage
+    // guarantee; budget 5 adds the viewer's finest page, and budget 6 adds the
+    // middle page too. Raise it toward Capacity (16) for fine coverage.
+    //
+    // Set to 2 deliberately. BuildRequests spends both on the outer level's
+    // nearest 2x2 block, so the sun holds two coarse 192 m pages and nothing
+    // finer: the cheapest atlas the system can run. This is below the 4-page
+    // coverage guarantee, so ground the viewer stands on can fall outside a
+    // resident page and read as unshadowed -- that is the accepted trade here,
+    // not a bug. The editor slider and the deployment panel raise it live.
+    static constexpr int kDefaultVirtualShadowPageBudget = 2;
     int   virtualShadowPageBudget = kDefaultVirtualShadowPageBudget;
     bool  showVirtualShadowPages = false;
     bool  cacheFarShadowCascades = false;
@@ -911,9 +918,12 @@ struct Scene {
     // a texel-addressing bug, not an inherent limitation: half-res pixel
     // centres land exactly on full-res texel boundaries, where a point sampler
     // picks between two neighbours by float rounding. The shader now re-centres
-    // source fetches (TraceUVToSourceUV) so each lands mid-texel. On by
-    // default: the trace is the pass bottleneck and half res cuts it ~52%.
-    bool  halfResolutionAO = true;
+    // source fetches (TraceUVToSourceUV) so each lands mid-texel.
+    //
+    // Off by default: the ~52% the half-res trace saves is paid for in AO
+    // detail, and the full-res trace is the quality baseline. The editor
+    // toggle and SGE_AO_HALF_RES still turn it on.
+    bool  halfResolutionAO = false;
     // The independently resolved 4x grass depth can drive GTAO/contact so grass
     // receives and casts the screen-space effect. On by default: grass that is
     // absent from the AO depth neither occludes nor is occluded, so blades sit
