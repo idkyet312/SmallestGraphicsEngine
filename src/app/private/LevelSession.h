@@ -122,6 +122,11 @@ static void OpenMainMenu() {
     // Always return to the menu's root rather than whatever sub-panel was open
     // when the player last left it.
     g_showSettingsMenu = false;
+    // Quitting from the pause screen leaves the level, so the pause goes with
+    // it. Left set, the next level would start paused behind a screen the
+    // player never opened.
+    g_gamePaused = false;
+    g_showPauseSettings = false;
     // The panel closes but the session behind it does not: returning to the
     // menu mid-run must not drop the other players, or every level change
     // would cost a reconnect.
@@ -134,6 +139,44 @@ static void OpenMainMenu() {
     cameraLocked = true;
     ReleaseCapture();
     SetCursorVisible(true);
+}
+
+// Opens and closes the in-game pause screen, and owns the cursor swap that goes
+// with it: paused needs a free pointer to click the rows, playing needs it
+// captured and re-centred for mouse-look.
+//
+// Re-centring on resume is not optional. The camera turns on the delta between
+// the cursor and the window centre, so handing control back with the pointer
+// wherever the player last left it feeds one enormous delta into the first
+// frame and snaps the view -- the same reason the TAB overlay and level start
+// both re-centre before capturing.
+static void TogglePauseMenu(HWND hwnd) {
+    g_gamePaused = !g_gamePaused;
+    if (g_gamePaused) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        return;
+    }
+    // Always back to the pause screen's root, so opening it again does not
+    // land on the settings panel the player was in last time.
+    g_showPauseSettings = false;
+    // A player who paused with the TAB overlay up keeps it, cursor and all;
+    // capturing here would take the pointer away from the UI they left open.
+    if (showUI) return;
+    cameraLocked = false;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    POINT center = { (rect.right - rect.left) / 2,
+                     (rect.bottom - rect.top) / 2 };
+    ClientToScreen(hwnd, &center);
+    ignoreNextMouseMove = true;
+    SetCursorPos(center.x, center.y);
+    lastX = (float)(rect.right - rect.left) * 0.5f;
+    lastY = (float)(rect.bottom - rect.top) * 0.5f;
+    firstMouse = true;
 }
 
 static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
@@ -709,6 +752,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         g_deploymentTargetValid = false;
     }
     g_game.commands.Set(GameCommand::ResetLevelRuntime, modeAssetsLoaded);
+    // A level always starts running. Travelling between levels from a paused
+    // state would otherwise carry the pause into the new one.
+    g_gamePaused = false;
+    g_showPauseSettings = false;
     deathCursorReleased = false;
     // The cursor is re-grabbed for mouse-look below, so the next prompt has to
     // release it again rather than assuming it is already free.

@@ -950,6 +950,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // lastTime resets after the reset/load blocks still help the frame
         // *after* a stall; this covers the stall frame itself.
         deltaTime = (std::min)(deltaTime, 0.1f);
+        // Real elapsed time, before pause can zero the gameplay delta below.
+        // Kept for the things that measure the frame rather than live in the
+        // world: a profiler told the frame took zero seconds would report a
+        // stall-free 0 ms frame for as long as the game sat paused.
+        const float unpausedDeltaTime = deltaTime;
 
         // Cheap and unconditional: it is how the overlay gets a chance to open,
         // and it does nothing at all when Steam was not found at startup.
@@ -1075,6 +1080,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ReportLocalShots();
         PresentRemoteShots(deltaTime);
         UpdateNetworkCharges();
+
+        // Pause stops the world by zeroing the gameplay delta rather than by
+        // skipping the block below. The systems inside are not one update
+        // call: they are dozens of separate steps reading `deltaTime`, several
+        // of which also latch state or service requests, and gating them all
+        // would mean auditing every one for what must still run. Advancing
+        // them by zero seconds freezes motion while leaving that structure
+        // alone.
+        //
+        // Never in multiplayer. The other machines keep simulating whatever
+        // this one does, so a paused client would sit still while the world
+        // moved on and then snap back into a firefight it could not see; the
+        // pause screen still opens, but the game keeps running behind it,
+        // which is the only honest option when time is shared.
+        //
+        // Everything above this line -- audio, the session poll, remote shot
+        // presentation -- keeps the real delta on purpose: none of it is world
+        // state, and freezing it would stall the menus and the network too.
+
+        // Dying or going down while paused clears it. The pause screen is not
+        // drawn in either state, so leaving the flag set would freeze the
+        // world behind a death screen with nothing on screen able to unfreeze
+        // it -- the player's only way out would be to quit.
+        if (g_gamePaused &&
+            (scene.player.downed ||
+             (!scene.player.godMode && scene.player.health <= 0.0f))) {
+            g_gamePaused = false;
+            g_showPauseSettings = false;
+        }
+        if (g_gamePaused && !MultiplayerActive()) deltaTime = 0.0f;
 
         // A downed player keeps simulating. Their health is zero, but they are
         // not out: remote bodies have to keep moving so they can watch a
@@ -2668,9 +2703,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             // runs the blast on its own machine and sends the
                             // cut it made. A client asking for a second one for
                             // the same explosion digs the hole twice.
+                            // Rockets share this branch and keep the full
+                            // depth; only the thrown frag digs shallower.
                             AddExplosionTerrainCrater(
                                 center, blastScale,
-                                /*hostAuthored=*/projectile.netGrenadeId != 0);
+                                /*hostAuthored=*/projectile.netGrenadeId != 0,
+                                /*depthScale=*/projectile.rocket
+                                    ? 1.0f : scene.grenadeCraterDepthScale);
                             AddExplosionBuildingHole(center, blastScale);
                         }
                         {
@@ -6317,7 +6356,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawDXRDDGIProbeDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
-            if (scene.player.downed) {
+            // Above the downed and death branches: those are states the player
+            // cannot pause out of, and a pause screen layered over a death
+            // screen would leave two panels fighting for the same clicks. A
+            // player who goes down while paused gets the downed overlay, which
+            // is the screen that actually matters then.
+            if (g_gamePaused && !scene.player.downed &&
+                (scene.player.godMode || scene.player.health > 0.0f)) {
+                RenderPauseMenu(hwnd);
+            } else if (scene.player.downed) {
                 // Not the death screen: the world behind this is still running
                 // and a teammate can still reach you, so it draws over the live
                 // scene instead of taking the frame. The HUD stays up for the
@@ -6400,7 +6447,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         msaaUsedLastFrame = msaaActive;
         endFrameProfile.reset();
         g_profiler.EndCpuFrame();
-        LogFrameSpike(deltaTime);
+        LogFrameSpike(unpausedDeltaTime);
         if (molotovSmokeInjected && ++molotovSmokeFrames >= 240) {
             std::ofstream smoke("molotov_smoke.log", std::ios::trunc);
             smoke << "peak_patches=" << molotovSmokePeakPatches << '\n'

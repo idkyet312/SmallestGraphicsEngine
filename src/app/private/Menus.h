@@ -2940,3 +2940,150 @@ static void RenderWinScreen(HWND hwnd) {
     }
     ImGui::End();
 }
+
+// In-game pause. ESC used to quit the run outright; this is what it opens
+// instead, and leaving is now a button that says so.
+//
+// Built from the main menu's own vocabulary rather than a new look: the same
+// wordmark treatment with hand-tracked letters, the same hairline rule under
+// it, the same UIMenuRow entries, and the same RenderSettingsMenu panel drawn
+// in place of the row list. The screen the player pauses into should read as
+// the screen they started from.
+//
+// What differs is the backdrop. The main menu owns the whole screen and can
+// fill it with art; a pause screen has a live frame behind it that the player
+// needs to still recognise, so this is a scrim over the game rather than a
+// replacement for it.
+static void RenderPauseMenu(HWND hwnd) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
+    // Dark enough to carry white text over a bright desert or a muzzle flash,
+    // sheer enough to leave the world readable underneath -- the player is
+    // pausing in a place, and blacking it out loses where they were.
+    backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
+        IM_COL32(8, 14, 16, 214), IM_COL32(20, 32, 32, 214),
+        IM_COL32(6, 12, 14, 226), IM_COL32(5, 9, 12, 226));
+    // The same top and bottom vignette the main menu and the win screen use,
+    // which is what makes a scrim read as a screen rather than a grey sheet.
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, 0), ImVec2(display.x, display.y * 0.16f),
+        IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, display.y * 0.82f), ImVec2(display.x, display.y),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+
+    // Centred rather than the main menu's left column. There is no art to sit
+    // beside here -- the backdrop is the player's own frame -- so a column
+    // hugging the left edge would read as a panel that had slid off centre.
+    const float width = (std::min)(460.0f, display.x - 48.0f);
+    const float height = (std::min)(620.0f, display.y - 48.0f);
+    ImGui::SetNextWindowPos(ImVec2((display.x - width) * 0.5f,
+                                   (display.y - height) * 0.5f),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 24));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
+    ImGui::Begin("Pause Menu", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    // Baked fonts draw at 1.0; only the built-in fallback is scaled. Same rule
+    // as the main menu, and for the same reason -- scaling a baked font is
+    // what softens the text.
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.3f);
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    const float contentWidth = ImGui::GetContentRegionAvail().x;
+
+    // Wordmark, tracked by hand exactly as the main menu draws MILBOX. One
+    // glyph at a time is the only way ImGui offers letter-spacing.
+    if (g_menuTitleFont) ImGui::PushFont(g_menuTitleFont);
+    else ImGui::SetWindowFontScale(4.4f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
+    {
+        const char* title = "PAUSED";
+        ImVec2 pen = ImGui::GetCursorScreenPos();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float tracking = ImGui::GetFontSize() * 0.14f;
+        float x = pen.x;
+        for (const char* c = title; *c; ++c) {
+            const char glyph[2] = { *c, '\0' };
+            draw->AddText(ImVec2(x, pen.y), IM_COL32(255, 255, 255, 255), glyph);
+            x += ImGui::CalcTextSize(glyph).x + tracking;
+        }
+        ImGui::Dummy(ImVec2(x - pen.x, ImGui::GetTextLineHeight()));
+    }
+    if (g_menuTitleFont) ImGui::PopFont();
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    {
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        draw->AddRectFilled(ImVec2(cursor.x + 14.0f, cursor.y),
+                            ImVec2(cursor.x + contentWidth, cursor.y + 1.0f),
+                            IM_COL32(255, 255, 255, 60));
+    }
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+
+    // Multiplayer keeps running behind this screen, and saying nothing about
+    // that would be the screen lying: a player who reads "PAUSED" and walks
+    // away comes back dead. The warning is part of the frame, above the
+    // settings early-out, so it stays visible in the settings panel too.
+    if (MultiplayerActive()) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+        ImGui::TextColored(UITheme::kWarning, "MULTIPLAYER  -  GAME STILL LIVE");
+        ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    }
+
+    // Settings replace the rows below the wordmark rather than opening over
+    // them, which is exactly how the main menu shows the same panel.
+    if (g_showPauseSettings) {
+        // Closes the pause screen's own flag, so BACK returns to these rows
+        // and the main menu is left exactly as the player left it.
+        RenderSettingsMenu(g_showPauseSettings);
+        ImGui::End();
+        return;
+    }
+
+    ImGui::SetWindowFontScale(1.7f);
+    if (UIMenuRow("RESUME"))
+        TogglePauseMenu(hwnd);
+    if (UIMenuRow("SETTINGS"))
+        g_showPauseSettings = true;
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    {
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        draw->AddRectFilled(ImVec2(cursor.x + 14.0f, cursor.y),
+                            ImVec2(cursor.x + contentWidth, cursor.y + 1.0f),
+                            IM_COL32(255, 255, 255, 40));
+    }
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+
+    // Leaving is separated from the rows above by a rule and named for what it
+    // costs. OpenMainMenu banks the wallet on the way out, so progress is not
+    // lost, but the run itself is -- and an unlabelled row next to RESUME is
+    // how the old ESC behaviour surprised people in the first place.
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
+    ImGui::TextColored(UITheme::kTextDim, "Abandons the current mission.");
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::SetWindowFontScale(1.7f);
+    if (UIMenuRow("EXIT TO MENU")) {
+        // Clear the pause before leaving so the cursor state OpenMainMenu sets
+        // is the one that survives, rather than a resume path fighting it.
+        g_gamePaused = false;
+        g_showPauseSettings = false;
+        OpenMainMenu();
+    }
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+
+    ImGui::End();
+}

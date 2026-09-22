@@ -488,12 +488,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (g_heldBandit && g_heldBandit->Held()) {
                 GrabOrThrowBandit();
                 g_suppressFireUntilMouseRelease = true;
-            } else if (cameraLocked && !g_insertionChoicePending) {
+            } else if (cameraLocked && !g_insertionChoicePending &&
+                       !g_gamePaused) {
                 // Click-to-capture, but never on the deployment screen: there the
                 // click is picking a zone marker off the map, and grabbing the
                 // pointer would snap it to the centre mid-selection and hide it.
                 // The screen releases the cursor deliberately and re-captures it
                 // itself on DEPLOY.
+                //
+                // The pause screen is excluded for the same reason: a click
+                // there is aimed at a menu row, and capturing the pointer would
+                // pull it to the window centre on the way to pressing RESUME.
+                // That screen re-captures on resume, exactly like DEPLOY.
                 cameraLocked = false;
                 SetCapture(hwnd); ShowCursor(FALSE);
                 RECT r; GetClientRect(hwnd, &r);
@@ -527,6 +533,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (IsEditorEditing()) {
                 if (!g_levelEditor.IsDirty()) OpenMainMenu();
             }
+            // In a level, ESC pauses rather than abandoning the run. Quitting
+            // to the menu is still one button away on that screen, but it is a
+            // choice now instead of the unconfirmed consequence of a keypress
+            // players reach for expecting a pause.
+            else if (IsGameplayScreen())
+                TogglePauseMenu(hwnd);
             else if (g_game.session.Screen() != GameScreen::MainMenu)
                 OpenMainMenu();
             else PostQuitMessage(0);

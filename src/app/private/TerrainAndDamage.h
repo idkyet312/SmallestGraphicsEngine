@@ -392,9 +392,12 @@ static void ApplyRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
 // different spot, which is what a client's own grenade looked like. Everything
 // else a client sets off -- rocket, C4, barrel -- exists only on its machine,
 // so its request is the only word the host ever gets.
+// depthScale trims the cut without touching its footprint, for a blast that
+// should scorch a wide patch but not dig a pit -- see grenadeCraterDepthScale.
 static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
                                       float blastScale = 1.0f,
-                                      bool hostAuthored = false) {
+                                      bool hostAuthored = false,
+                                      float depthScale = 1.0f) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return;
     if (hostAuthored && ClientOwnedByHost()) return;
 
@@ -421,7 +424,8 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
     // Depth in metres, positive (the Crater op subtracts it). Follows the
     // square root of the width so a strike four times wider digs twice as
     // deep, keeping a big crater a bowl instead of a shaft.
-    crater.value = scene.craterDepth * craterScale * sqrtf(blastScale);
+    crater.value =
+        scene.craterDepth * craterScale * sqrtf(blastScale) * depthScale;
     // Wall exponent: >1 holds the floor flat then turns up hard at the rim.
     crater.strength = scene.craterWallSharpness;
     // Fraction of the radius that stays flat floor before the wall starts.
@@ -548,6 +552,17 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
 // than a setting, so it is not persisted.
 static GameSettings g_settings;
 static bool g_showSettingsMenu = false;
+
+// In-game pause. ESC used to abandon the run outright and drop straight to the
+// main menu, with no confirmation and no way back -- one stray keypress cost
+// the mission. The pause screen is what ESC opens instead, and leaving is now
+// a deliberate second press on a button that says what it does.
+static bool g_gamePaused = false;
+// Settings opened from the pause screen rather than the main menu. Kept apart
+// from g_showSettingsMenu so the two cannot be confused: the same panel is
+// drawn by both, and sharing one flag would leave the main menu showing
+// settings after a paused player opened them and quit to the menu.
+static bool g_showPauseSettings = false;
 
 // Multiplayer session state. Declared here rather than in Multiplayer.h,
 // because Menus.h is included before Multiplayer.h and has to be able to

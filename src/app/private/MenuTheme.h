@@ -194,7 +194,12 @@ static bool UIMenuRow(const char* label, float height = 34.0f) {
 // changes: dragging a slider produces a value per frame, and rewriting the file
 // at that rate would be pointless disk churn for a value the player has not
 // settled on yet.
-static void RenderSettingsMenu() {
+// `openFlag` is the caller's own "settings are showing" state, cleared by the
+// BACK button. Passed in rather than hardcoded because two screens draw this
+// panel -- the main menu and the pause screen -- and each has to close its own
+// flag; sharing one would leave the main menu displaying settings because a
+// paused player happened to open them.
+static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
     UISectionLabel("MOUSE");
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
@@ -315,7 +320,7 @@ static void RenderSettingsMenu() {
     // "cancel" -- say BACK rather than implying unsaved edits are being kept.
     if (UIPrimaryButton("BACK", 44.0f)) {
         SaveGameSettings(g_settings);
-        g_showSettingsMenu = false;
+        openFlag = false;
     }
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
     ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
@@ -324,6 +329,11 @@ static void RenderSettingsMenu() {
 // Defined in Multiplayer.h, which is included after this file because it needs
 // g_bandits and the camera. The menu only needs to be able to call it.
 static void ShutdownMultiplayer();
+
+// Also from Multiplayer.h. The pause screen has to know whether time is shared
+// with other machines, because that decides both whether it may stop the world
+// and whether it has to warn the player that it cannot.
+static bool MultiplayerActive();
 
 // Multiplayer panel. Drawn in place of the menu body exactly like the settings
 // panel above, for the same reason: one column of controls reads better as the
