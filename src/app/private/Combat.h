@@ -1350,6 +1350,24 @@ void BanditDebugText() {
             g_banditGunForeGripRise = -0.206f;
         }
     }
+    if (ImGui::CollapsingHeader("Enemy muzzle flash")) {
+        ImGui::TextDisabled("Flash and smoke placement, on the aim basis");
+        ImGui::SliderFloat("Flash forward", &g_enemyFlashOffsetForward,
+                           -1.00f, 1.00f, "%.3f m");
+        ImGui::SliderFloat("Flash right", &g_enemyFlashOffsetRight,
+                           -0.50f, 0.50f, "%.3f m");
+        ImGui::SliderFloat("Flash up", &g_enemyFlashOffsetUp,
+                           -0.50f, 0.50f, "%.3f m");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Moves only the muzzle flash and its smoke. "
+                              "The round, the tracer and the line-of-sight "
+                              "test all still start at the aim ray origin.");
+        if (ImGui::Button("Reset flash offset")) {
+            g_enemyFlashOffsetForward = 0.0f;
+            g_enemyFlashOffsetRight = -0.168f;
+            g_enemyFlashOffsetUp = 0.0f;
+        }
+    }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
     if (ImGui::CollapsingHeader("Impact Holes")) {
         if (ImGui::Checkbox("Enable bullet holes",

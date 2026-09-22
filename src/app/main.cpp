@@ -2050,9 +2050,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     const float flashScale = bandit->IsShotgunner() ? 1.7f
                                            : bandit->IsSniper()     ? 1.3f
                                                                     : 1.0f;
-                    scene.SpawnWorldMuzzleFlash(shotOrigin, shotDirection,
+                    // AimRayOrigin is where the round and the LOS test start,
+                    // which is not necessarily where the barrel ends on a given
+                    // rig. Nudge the flash and its smoke onto the aim basis so
+                    // the sliders can seat them on the weapon without moving
+                    // the shot itself. Right is built against world up; a shot
+                    // straight up or down would degenerate it, so fall back to
+                    // world +X rather than normalising a zero vector.
+                    XMFLOAT3 flashOrigin = shotOrigin;
+                    {
+                        const XMVECTOR forward = XMVector3Normalize(
+                            XMLoadFloat3(&shotDirection));
+                        const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+                        XMVECTOR right = XMVector3Cross(worldUp, forward);
+                        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+                            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+                        right = XMVector3Normalize(right);
+                        const XMVECTOR up =
+                            XMVector3Normalize(XMVector3Cross(forward, right));
+                        const XMVECTOR offset =
+                            forward * g_enemyFlashOffsetForward +
+                            right   * g_enemyFlashOffsetRight +
+                            up      * g_enemyFlashOffsetUp;
+                        XMStoreFloat3(&flashOrigin,
+                                      XMLoadFloat3(&shotOrigin) + offset);
+                    }
+                    scene.SpawnWorldMuzzleFlash(flashOrigin, shotDirection,
                                                 flashScale);
-                    scene.SpawnWeaponSmoke(shotOrigin, shotDirection,
+                    scene.SpawnWeaponSmoke(flashOrigin, shotDirection,
                                            0.55f * flashScale);
                     // The streak that says "someone is shooting, and that way".
                     // Same visual-speed tracer the networked players use, which
@@ -4917,8 +4942,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         authoredNames = {
                             { "RunForwardSource", true, true, 0 },
                             { "RunBackwardSource", true, true, 1 },
-                            { "RunLeftSource", true, true, 2 },
-                            { "RunRightSource", true, true, 3 },
+                            // The FBX foot axes label these two travel clips opposite
+                            // to gameplay's positive-X right convention.
+                            { "RunLeftSource", true, true, 3 },
+                            { "RunRightSource", true, true, 2 },
                         };
                     bm.authoredDirectional = DirectionalLocomotion::BakeAuthored(
                         bm.skeleton, bm.clips, authoredNames);
@@ -4991,8 +5018,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         marineAuthored = {
                             { "RunForwardSource", true, true, 0 },
                             { "RunBackwardSource", true, true, 1 },
-                            { "RunLeftSource", true, true, 2 },
-                            { "RunRightSource", true, true, 3 },
+                            { "RunLeftSource", true, true, 3 },
+                            { "RunRightSource", true, true, 2 },
                         };
                     mm.authoredDirectional = DirectionalLocomotion::BakeAuthored(
                         mm.skeleton, mm.clips, marineAuthored);

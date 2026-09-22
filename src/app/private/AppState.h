@@ -580,6 +580,16 @@ float                       g_banditGunRearGripInboard = -0.06f;
 float                       g_banditGunRearGripDrop = -0.18f;
 float                       g_banditGunForeGripLateral = 0.253f;
 float                       g_banditGunForeGripRise = -0.206f;
+// Where the world muzzle flash and its smoke sit relative to an enemy's aim
+// ray. The shot itself still leaves AimRayOrigin() untouched -- moving that
+// would drag line of sight and the round's own spawn point along with it --
+// so this is presentation only, placed on the aim basis: forward down the
+// barrel, right across it, up perpendicular to both. The lateral default was
+// tuned in-game: the aim ray leaves the actor's centreline, so an unoffset
+// flash hangs inboard of the barrel the rig is actually holding.
+float                       g_enemyFlashOffsetForward = 0.0f;
+float                       g_enemyFlashOffsetRight = -0.168f;
+float                       g_enemyFlashOffsetUp = 0.0f;
 bool                        g_showEnemyVisionCones = false;
 // Impact decal debug. The marks are a per-pixel volume test with no geometry of
 // their own, so when one lands wrong there is nothing to inspect -- this draws
