@@ -3657,10 +3657,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const float haloR = (std::max)(
             (std::max)(0.012f, scene.projectileScale * 0.16f),
             cameraDistance * 0.0043f);
+        // Hostile fire is red, friendly orange. Same geometry and the same
+        // brightness either way -- only the hue carries the distinction, so an
+        // enemy streak is no more or less visible than an ally's.
+        const XMFLOAT3 haloColor = tracer.hostile
+            ? XMFLOAT3(4.6f, 0.16f, 0.06f) : XMFLOAT3(4.0f, 0.55f, 0.025f);
+        const XMFLOAT3 coreColor = tracer.hostile
+            ? XMFLOAT3(9.5f, 1.1f, 0.55f) : XMFLOAT3(9.0f, 3.2f, 0.45f);
+
         shader.UseAdditive();
         model = XMMatrixScaling(haloR * 2.0f, haloR * 2.0f, len) * tracerBasis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetEmissiveMaterial(XMFLOAT3(4.0f, 0.55f, 0.025f), 0.24f);
+        shader.SetEmissiveMaterial(haloColor, 0.24f);
         DrawCube(geo);
         shader.NextDrawCall();
 
@@ -3668,7 +3676,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         model = XMMatrixScaling(coreR * 2.0f, coreR * 2.0f, len * 0.92f) *
                 tracerBasis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetEmissiveMaterial(XMFLOAT3(9.0f, 3.2f, 0.45f), 0.92f);
+        shader.SetEmissiveMaterial(coreColor, 0.92f);
         DrawCube(geo);
         shader.NextDrawCall();
         shader.Use(scene.wireframeMode);

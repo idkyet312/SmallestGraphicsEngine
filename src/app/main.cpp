@@ -1987,6 +1987,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
+                    // Presentation for a shot fired somewhere out in the world.
+                    // Enemy fire had none of this: the only sign a bandit was
+                    // shooting was the report and whatever the round hit, so a
+                    // firefight gave the player no way to see where it was
+                    // coming from. The shotgun's flash is bigger and the
+                    // sniper's leaner, matching what each gun sounds like.
+                    //
+                    // Flash and tracer only -- no dynamic light, so a night
+                    // firefight does not light the level up, and no explosion
+                    // FX, which would shake the camera and fire the explosion
+                    // audio on every round.
+                    const float flashScale = bandit->IsShotgunner() ? 1.7f
+                                           : bandit->IsSniper()     ? 1.3f
+                                                                    : 1.0f;
+                    scene.SpawnWorldMuzzleFlash(shotOrigin, shotDirection,
+                                                flashScale);
+                    scene.SpawnWeaponSmoke(shotOrigin, shotDirection,
+                                           0.55f * flashScale);
+                    // The streak that says "someone is shooting, and that way".
+                    // Same visual-speed tracer the networked players use, which
+                    // is drawn far slower than the round actually travels so
+                    // the eye can follow it out. Red for a bandit, orange for
+                    // an ally marine -- the squad shares this code path, and
+                    // friendly fire streaking past must not read as incoming.
+                    scene.SpawnRemoteTracer(shotOrigin, shotDirection,
+                                            bandit->faction == Faction::Bandit);
                     if (bandit->IsShotgunner()) {
                         // Cone of individually weak pellets. Overlapping hits at
                         // point-blank are what make it lethal; at range the cone

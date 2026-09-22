@@ -164,6 +164,12 @@ struct RemoteTracerFX {
     // Long enough to carry the streak ~180 m, matching the reach it had at the
     // old speed so nothing lost range by slowing down.
     float maxLife = 1.3f;
+    // Incoming fire, drawn a hostile red instead of the friendly orange. The
+    // orange is deliberate -- another player is on your side, so their fire
+    // must not read as incoming -- and an enemy's has to say the opposite at a
+    // glance, since the whole point of a tracer is telling the player which
+    // way to move.
+    bool hostile = false;
 };
 
 struct PinnedHarpoonFX {
@@ -2082,6 +2088,55 @@ struct Scene {
         muzzleFlashRotation = ((float)std::rand() / RAND_MAX) * XM_2PI;
     }
 
+    // Muzzle flash for a gun firing somewhere in the world, as opposed to
+    // TriggerMuzzleFlash above, which drives the player's own viewmodel and has
+    // no world position to place anything at.
+    //
+    // Deliberately not SpawnExplosionFX, which is what stood in for this
+    // elsewhere: that one shakes the camera of everyone watching, fires the
+    // explosion audio callback and throws 34 sparks plus a smoke burst per
+    // round. A rifle firing is not an explosion. This is the flash only -- a
+    // handful of bright, very short-lived sparks at the muzzle -- and it adds
+    // no light, so a firefight in the dark does not light the level up.
+    void SpawnWorldMuzzleFlash(const XMFLOAT3& muzzle, const XMFLOAT3& direction,
+                               float intensity = 1.0f) {
+        auto unit = [&]() { return (float)std::rand() / RAND_MAX; };
+        auto signedUnit = [&]() { return unit() * 2.0f - 1.0f; };
+        const int shardCount = (std::max)(2, (int)std::lround(4.0f * intensity));
+        for (int shard = 0; shard < shardCount; ++shard) {
+            ImpactParticle flash = {};
+            // Sat just off the muzzle and sprayed along the barrel, so the
+            // flash reads as coming out of the gun rather than surrounding it.
+            const float forwardOffset = 0.02f + unit() * 0.06f;
+            flash.position = {
+                muzzle.x + direction.x * forwardOffset + signedUnit() * 0.015f,
+                muzzle.y + direction.y * forwardOffset + signedUnit() * 0.015f,
+                muzzle.z + direction.z * forwardOffset + signedUnit() * 0.015f };
+            const float forwardSpeed = 1.6f + unit() * 2.4f;
+            flash.velocity = {
+                direction.x * forwardSpeed + signedUnit() * 0.5f,
+                direction.y * forwardSpeed + signedUnit() * 0.5f,
+                direction.z * forwardSpeed + signedUnit() * 0.5f };
+            // Gone in well under a tenth of a second. A muzzle flash that
+            // outlives its own report reads as a flare, and at the fire rates
+            // here a longer life would leave a permanent glow on an actor
+            // holding the trigger down.
+            flash.maxLife = flash.life = 0.035f + unit() * 0.030f;
+            flash.size = (0.030f + unit() * 0.022f) * intensity;
+            // Shrinks as it dies rather than growing like smoke.
+            flash.growth = -0.22f;
+            // Hot core: pushed past 1 so the tonemapper keeps it reading white
+            // at the centre and orange at the edges.
+            flash.color = { 1.6f, 0.92f + unit() * 0.30f, 0.30f + unit() * 0.20f };
+            flash.spark = true;
+            impactParticles.push_back(flash);
+        }
+        if (impactParticles.size() > 900) {
+            impactParticles.erase(impactParticles.begin(),
+                impactParticles.begin() + (impactParticles.size() - 900));
+        }
+    }
+
     void SpawnWeaponSmoke(const XMFLOAT3& muzzle, const XMFLOAT3& direction,
                           float intensity) {
         const int puffCount = (std::max)(1, (int)std::ceil(intensity));
@@ -2973,13 +3028,15 @@ struct Scene {
     }
 
     // The visible half of another player's shot.
-    void SpawnRemoteTracer(const XMFLOAT3& origin, const XMFLOAT3& direction) {
+    void SpawnRemoteTracer(const XMFLOAT3& origin, const XMFLOAT3& direction,
+                           bool hostile = false) {
         const XMVECTOR forward = XMLoadFloat3(&direction);
         if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) return;
         RemoteTracerFX tracer;
         tracer.origin = origin;
         XMStoreFloat3(&tracer.direction, XMVector3Normalize(forward));
         tracer.speed = RemoteTracerFX::kSpeed;
+        tracer.hostile = hostile;
         remoteTracers.push_back(tracer);
     }
 
