@@ -510,12 +510,23 @@ static float g_deploymentFlythroughTime = 0.0f;
 // same aircraft or boat the player does, so it only reaches the ground if that
 // transport does. A crash or a sinking loses everyone aboard.
 static int g_deploymentMarineCount = 0;
-static constexpr int kMaxDeploymentMarines = 8;
+// The wallet is the cap. There is no squad-size limit any more -- whatever the
+// player can afford at $2,000 a head comes along, so a saved-up balance buys a
+// platoon instead of stopping at a fixed eight.
+//
+// A ceiling is still needed, but only as a sanity bound on the slider and the
+// drop loop rather than as balance: it stops a corrupted or absurd balance
+// from asking for tens of thousands of actors, each of which is a skinned
+// mesh with a ragdoll. Set far above anything the economy can reach in
+// practice.
+static constexpr int kMaxDeploymentMarines = 256;
 // What one marine costs to bring along. Unlike an armory item this is not a
 // purchase that stays bought: the squad is consumed by the mission it deploys
 // on, so the same money is spent again next time. That is the whole tension --
-// a full squad is 16000 against a 2500 comm tower, and losing the transport
-// loses the lot.
+// against a 2500 comm tower, every marine is another mission's payout spent up
+// front, and losing the transport loses the lot. With the fixed cap gone the
+// player sets that stake themselves: the bigger the squad, the more a single
+// downed helicopter costs.
 static constexpr int kDeploymentMarinePrice = 2000;
 // Raised for one frame by the ride/release code the moment a transport sets the
 // player down intact. Consumed after both vehicle updates run, because the

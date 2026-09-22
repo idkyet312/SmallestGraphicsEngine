@@ -755,9 +755,12 @@ static DirectX::XMFLOAT3 LeadTargetPoint(const DirectX::XMFLOAT3& muzzle,
 // bandit, enemy gunship}
 // and never the player. Ties favor the player so behavior is unchanged when no
 // marines are alive/nearby.
-// Aircraft are spotted from further off than infantry, for the same reasons the
-// bandits read the insertion craft early: large, loud, skylined. Shared by both
-// sides so the two never disagree about how far an airframe can be seen.
+// Aircraft are spotted from further off than the player, for the same reasons
+// the bandits read the insertion craft early: large, loud, skylined. Shared by
+// both sides so the two never disagree about how far an airframe can be seen.
+// It is only a little further than infantry now read each other -- the actor
+// engagement range closed most of that gap -- which is right: once a squad can
+// see a man across a field, a helicopter over it is not the harder target.
 static constexpr float kAircraftSpotRangeScale = 2.6f;
 
 static DirectX::XMFLOAT3 NearestHostileTarget(const SkinnedEnemy& actor,

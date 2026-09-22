@@ -59,17 +59,41 @@ struct EnemyNoiseEvent {
 };
 extern std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 
-// Pushed by an enemy the instant it takes damage, so squadmates within radius
-// are yanked straight to Combat even without their own line of sight or
-// hearing check -- getting shot next to a friend is unmissable. Cleared each
-// frame alongside noise events.
-struct EnemyAlertEvent { DirectX::XMFLOAT3 position; float radius; };
+// Declared above EnemyAlertEvent because the alert carries one: an alert is
+// addressed to a side, not broadcast to the field.
+enum class Faction : uint8_t { Bandit, Marine };
+
+// Squad radio traffic. Pushed by an enemy the instant it takes damage, so
+// squadmates within radius are yanked straight to Combat even without their own
+// line of sight or hearing check -- getting shot next to a friend is
+// unmissable -- and pushed by an actor that spots an enemy actor, which is what
+// makes one man's contact the whole squad's contact. Cleared each frame
+// alongside noise events.
+struct EnemyAlertEvent {
+    DirectX::XMFLOAT3 position;   // where the call-out was raised
+    float radius;                 // who is close enough to hear it
+    // Who is being told. An alert is squad chatter, not a public siren: a
+    // marine calling a contact must not also wake the bandits it just spotted,
+    // and at squad-intel range an untagged channel would have every casualty on
+    // the field putting the other side into combat.
+    //
+    // Note a networked player body wears Faction::Marine as a render-path
+    // artefact (see Multiplayer.h) and is not a squad member; it never reaches
+    // this channel because it is skipped before Update and takes zero damage.
+    Faction audience = Faction::Bandit;
+    // What was spotted, when the alert is a contact call-out rather than a cry
+    // of being hit. Without it an alert only sets awareness: a marine told
+    // about a contact 60m away would enter Combat still aiming at whatever
+    // NearestHostileTarget handed it, which is its own feet when no bandit is
+    // in its personal line of sight. Carrying the position is what makes this
+    // intel instead of noise.
+    DirectX::XMFLOAT3 contact{ 0.0f, 0.0f, 0.0f };
+    bool hasContact = false;
+};
 extern std::vector<EnemyAlertEvent> g_enemyAlertEvents;
 
 // BanditWeapon and its name/parse helpers live in their own header so the level
 // format and its tests can use them without pulling DX12 in behind them.
-
-enum class Faction : uint8_t { Bandit, Marine };
 
 class SkinnedEnemy {
 public:
@@ -264,6 +288,14 @@ public:
     bool DebugInCover() const { return inCover_; }
     bool DebugHasGunPose() const { return HasGunPose(); }
     int DebugBurstShots() const { return burstShotsRemaining; }
+    enum class FireWaitReason : uint8_t {
+        None, NoContact, Blocked, MovingToCover, Cooldown, Aiming,
+        NoGunPose, Inactive
+    };
+    FireWaitReason fireWaitReason = FireWaitReason::NoContact;
+    bool debugVisibleTarget = false;
+    bool debugSquadContact = false;
+    float debugTargetDistance = 0.0f;
 
     // Vision cone parameters for debug visualization. Half-angle in radians
     // (not the stored cosine) so callers can build cone geometry directly.
@@ -278,6 +310,14 @@ public:
             ? g_enemyVisionScale : 1.0f;
         return kVisionRange * scale;
     }
+    // Sight range against another actor rather than against the player. Built
+    // on VisionRange() and not on kVisionRange, so it still folds in
+    // g_enemyVisionScale: a night insertion shortens squad-vs-squad engagements
+    // in the same proportion it shortens everything else, instead of leaving
+    // two squads trading fire across a field they cannot see.
+    float ActorEngagementRange() const {
+        return VisionRange() * kActorEngagementRangeScale;
+    }
     // The clear-daylight range, before visibility scaling. Exposed so UI can
     // quote a distance without duplicating the constant.
     static constexpr float BaseVisionRange() { return kVisionRange; }
@@ -285,6 +325,16 @@ public:
     static constexpr float GunshotHearingRadius() { return kGunshotHearingRadius; }
     static constexpr float ImpactNoiseRadius() { return kImpactNoiseRadius; }
     float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
+    bool TargetInVisionCone(const DirectX::XMFLOAT3& target) const {
+        if (faction == Faction::Marine || turretGunner) return true;
+        const float dx = target.x - position.x;
+        const float dz = target.z - position.z;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq <= 1e-6f) return false;
+        const float dot = (dx * std::sin(yaw) + dz * std::cos(yaw)) /
+                          std::sqrt(distanceSq);
+        return dot >= kVisionHalfFovCos;
+    }
 
     // Optional authored patrol path. Leave unset and an enemy wanders in a
     // loose loop around its spawn point instead.
@@ -293,8 +343,16 @@ public:
         patrolIndex_ = 0;
     }
 
+    // Bandits keep the 30m the player fight is tuned around: it is the distance
+    // a wounded bandit tries to hold the player at.
+    //
+    // A marine's figure is not a retreat distance -- marines never retreat (see
+    // evasiveRetreat below). It is only ever read as the radius inside which
+    // taking cover is worth doing, so it tracks the range the marine actually
+    // fights at rather than a constant borrowed from the player fight. Left at
+    // 30 it would have meant a marine engaging at 40m never looked for cover.
     float BackoffRange() const {
-        return 30.0f;
+        return faction == Faction::Marine ? ActorEngagementRange() : 30.0f;
     }
 
     bool PlayerInBackoffRange(const DirectX::XMFLOAT3& playerPosition) const {
@@ -308,13 +366,16 @@ public:
         if (dead_ || held_ || rappelling_ || turretGunner || hasCoverTarget_ ||
             coverQueryCooldown_ > 0.0f)
             return false;
-        // Marines take cover and shoot from it. The hazard is that vision range
-        // (28) is shorter than BackoffRange (30), so any target a marine can
-        // see is also inside the cover-query range -- left unguarded it would
-        // re-query every 0.75s and SetCoverTarget's stationaryAimTime_ reset
-        // would starve the aim-up so it never fired. Once settled in cover it
-        // stops asking for a new spot and holds there shooting; it only looks
-        // for fresh cover after the current one is given up.
+        // Marines take cover and shoot from it. A marine's cover-query radius
+        // IS its engagement range (see BackoffRange), so every target it can
+        // perceive is a cover candidate by construction -- there is no distance
+        // at which the range test alone will stop it asking. Unguarded that is
+        // a re-query every 0.75s, and SetCoverTarget resets stationaryAimTime_,
+        // which starves the aim-up so the marine never fires a shot.
+        //
+        // This guard is what turns that into "pick a spot, hold it, shoot from
+        // it": once settled it stops asking, and only looks for fresh cover
+        // after the current one is given up.
         if (faction == Faction::Marine && inCover_) return false;
         return PlayerInBackoffRange(playerPosition);
     }
@@ -582,10 +643,16 @@ public:
         return palettePrevious_[frame]->GetGPUVirtualAddress();
     }
 
-    void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
+    // targetIsActor forwards to PerceivePlayer to select the sight range, and
+    // gates the squad-intel broadcast below. Defaulted so any caller that has
+    // not been taught the difference gets the short player range.
+    void Update(float dt, const DirectX::XMFLOAT3& target, float groundY,
+                bool targetIsActor = false) {
         if (dead_) return;
         playerGunshotMemoryTimer_ =
             (std::max)(0.0f, playerGunshotMemoryTimer_ - dt);
+        spotBroadcastCooldown_ =
+            (std::max)(0.0f, spotBroadcastCooldown_ - dt);
         const DirectX::XMFLOAT3 locomotionStart = position;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
@@ -607,7 +674,7 @@ public:
             spawnCaptured_ = true;
         }
 
-        const bool perceived = PerceivePlayer(target);
+        const bool perceived = PerceivePlayer(target, targetIsActor);
         switch (awareness_) {
         case AwarenessState::Patrol:
             if (perceived) {
@@ -638,6 +705,23 @@ public:
                 }
             }
             break;
+        }
+
+        // Squad intel. An actor holding a live contact on another actor calls
+        // it out, so the rest of its side acts on a target only one of them can
+        // actually see. Gated on targetIsActor: a bandit that spots the PLAYER
+        // must not publish, because that would turn every sighting into a
+        // squad-wide alert and quietly rewrite the stealth game.
+        //
+        // Broadcast from the spotter's position rather than the contact's: the
+        // radius is "who is close enough to the man making the call", and
+        // anchoring it to the enemy would instead alert whoever is standing
+        // near the enemy, which is usually the enemy's own side.
+        if (awareness_ == AwarenessState::Combat && perceived && targetIsActor &&
+            spotBroadcastCooldown_ <= 0.0f) {
+            g_enemyAlertEvents.push_back(
+                { position, kSquadIntelRadius, faction, target, true });
+            spotBroadcastCooldown_ = 2.0f;
         }
 
         if (awareness_ != AwarenessState::Combat) {
@@ -744,10 +828,29 @@ public:
         float speed = 0.0f;
         const bool movingToCover = hasCoverTarget_ && !inCover_;
         const float safeDistance = BackoffRange();
+        // The ring this actor tries to fight from.
+        //
+        // Bandits keep their authored per-loadout radius: the shotgunner's 2.6
+        // is the entire reason that class works, and the sniper's 26 is what
+        // keeps its telegraph survivable.
+        //
+        // Marines instead stand off at a fraction of the distance they can see
+        // a bandit from, which is what makes them read as units rather than as
+        // a mob -- acquire, halt, engage, instead of jogging into knife range
+        // first. Two thirds rather than the full range on purpose: at the very
+        // edge of sight the line-of-sight ray is long and the contact is
+        // fragile, so a unit that halts out there spends the fight losing and
+        // re-acquiring the same target. The floor at orbitRadius means a deep
+        // night, where g_enemyVisionScale collapses the engagement range, falls
+        // back to the old close ring rather than trying to orbit at 3m.
+        const float standoffRadius = faction == Faction::Marine
+            ? (std::max)(orbitRadius, ActorEngagementRange() * 0.66f)
+            : orbitRadius;
         // Backing off is bandit behavior for keeping the player at arm's
-        // length. A marine that did it would retreat from every bandit it
-        // spots (vision range 28 is inside the 30 backoff range), never
-        // closing to engage -- allies push in and orbit instead.
+        // length. Marines are the aggressor in the marine-vs-bandit fight and
+        // the player's fire support; one that gave ground would simply walk
+        // backwards out of its own engagement range and never shoot. Allies
+        // take up a standoff and orbit there instead.
         // Track the peak before comparing, so an undamaged enemy always reads as
         // full and the very first frame cannot register as a hit.
         if (health > peakHealth) peakHealth = health;
@@ -757,11 +860,11 @@ public:
         const bool damaged = health < peakHealth;
         const bool evasiveRetreat = !hasCoverTarget_ && damaged &&
             faction == Faction::Bandit && distance < safeDistance;
-        // Bandits hold at their safe distance; marines always close on the
-        // target so they can actually orbit and shoot it. An unhurt bandit is
-        // excluded: this flag suppresses the whole movement branch below, so
-        // holding it while he no longer retreats would freeze him on the spot
-        // instead of letting him orbit and fight.
+        // Bandits hold at their safe distance; marines move to their standoff
+        // and orbit there, which is their own way of holding a range. An unhurt
+        // bandit is excluded: this flag suppresses the whole movement branch
+        // below, so holding it while he no longer retreats would freeze him on
+        // the spot instead of letting him orbit and fight.
         const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat &&
             damaged && faction == Faction::Bandit;
         if ((distance > 0.1f || movingToCover) && !rooted && !inCover_ &&
@@ -787,13 +890,13 @@ public:
                 moveX = -inwardX;
                 moveZ = -inwardZ;
                 speed = moveSpeed * 1.65f;
-            } else if (distance <= orbitRadius + 2.2f) {
+            } else if (distance <= standoffRadius + 2.2f) {
                 // Grounded version of old hover-enemy controller: preserve a
                 // combat ring while moving tangentially around player.
                 const float tangentX = -inwardZ * orbitDirection;
                 const float tangentZ =  inwardX * orbitDirection;
                 const float radial = (std::max)(-0.7f,
-                    (std::min)(0.9f, (distance - orbitRadius) * 0.75f));
+                    (std::min)(0.9f, (distance - standoffRadius) * 0.75f));
                 moveX = tangentX + inwardX * radial;
                 moveZ = tangentZ + inwardZ * radial;
                 const float moveLength = std::sqrt(moveX*moveX + moveZ*moveZ);
@@ -1032,7 +1135,16 @@ public:
     // the player's position for a bandit, or a marine's position for a bandit
     // targeting an ally, or a bandit's position for a marine. No player-specific
     // logic lives in here despite the name.
-    bool PerceivePlayer(const DirectX::XMFLOAT3& target) const {
+    //
+    // targetIsActor says whether `target` is another soldier rather than the
+    // player, which selects the sight range. The name of this function is
+    // already a lie; this parameter is what keeps the lie harmless. A
+    // soldier-shaped target at 60m is a legitimate contact, the player at 60m
+    // is not, and collapsing the two would hand every bandit a player-detection
+    // range no stealth, fog or night preset was ever balanced against. It
+    // defaults false so the short, safe range is what an un-updated caller gets.
+    bool PerceivePlayer(const DirectX::XMFLOAT3& target,
+                        bool targetIsActor = false) const {
         if (dead_ || held_) return false;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distSq = dx * dx + dz * dz;
@@ -1056,15 +1168,19 @@ public:
             return !g_enemyLineOfSightFn ||
                    g_enemyLineOfSightFn(*this, target);
         }
-        const float sightRange = VisionRange();
+        const float sightRange =
+            targetIsActor ? ActorEngagementRange() : VisionRange();
         if (distSq <= sightRange * sightRange && distSq > 1e-6f) {
             const float invLen = 1.0f / std::sqrt(distSq);
             const float facingX = std::sin(yaw), facingZ = std::cos(yaw);
             const float dot = (dx * invLen) * facingX + (dz * invLen) * facingZ;
-            // Marines get squad awareness -- range and the occlusion raycast
-            // still apply, only the forward cone is waived. A follower's yaw
-            // tracks whatever it is walking toward, so a cone would blind it to
-            // exactly the flanking bandits it exists to deal with.
+            // Marines waive the cone entirely, which at 200 degrees now only
+            // covers the wedge directly behind them. Kept anyway: a follower's
+            // yaw tracks whatever it is walking toward, so the one bandit a
+            // marine is most likely to have at its back is the one that flanked
+            // the squad -- exactly the contact an ally exists to deal with.
+            // Range and the occlusion raycast still apply, so this is squad
+            // awareness rather than x-ray vision.
             const bool ignoreFov = faction == Faction::Marine;
             if (dot >= kVisionHalfFovCos || ignoreFov) {
                 if (g_enemyLineOfSightFn && g_enemyLineOfSightFn(*this, target))
@@ -1075,12 +1191,49 @@ public:
             if (noise.AudibleAt(position)) return true;
         }
         for (const EnemyAlertEvent& alert : g_enemyAlertEvents) {
+            // Only own-side traffic. An enemy casualty is not a friendly
+            // call-out, and without this filter the intel channel would have
+            // each side waking the other.
+            if (alert.audience != faction) continue;
             const float ax = alert.position.x - position.x;
             const float az = alert.position.z - position.z;
             const float radius = alert.radius;
             if (ax * ax + az * az <= radius * radius) return true;
         }
         return false;
+    }
+
+    // Nearest contact this actor's own side has called out to it this frame.
+    //
+    // Read by the target-selection code in main.cpp, which is the only place
+    // that can act on it: Update receives its target already decided, and the
+    // combat aim uses that parameter rather than lastKnownTarget_, so an actor
+    // cannot adopt a handed-over contact from inside its own update.
+    //
+    // The spotter already paid for the range test and the line-of-sight ray.
+    // Whoever receives this gets the contact for free, which is the whole
+    // point -- one man seeing the enemy is the squad seeing the enemy. Walls
+    // still matter, because only a spotter with a clear line ever publishes,
+    // and the receiver still needs its own line of sight before it may fire.
+    bool SquadContact(DirectX::XMFLOAT3& outContact) const {
+        if (dead_ || held_) return false;
+        bool found = false;
+        float bestDistSq = FLT_MAX;
+        for (const EnemyAlertEvent& alert : g_enemyAlertEvents) {
+            if (!alert.hasContact || alert.audience != faction) continue;
+            const float ax = alert.position.x - position.x;
+            const float az = alert.position.z - position.z;
+            if (ax * ax + az * az > alert.radius * alert.radius) continue;
+            const float cx = alert.contact.x - position.x;
+            const float cz = alert.contact.z - position.z;
+            const float d = cx * cx + cz * cz;
+            if (d < bestDistSq) {
+                bestDistSq = d;
+                outContact = alert.contact;
+                found = true;
+            }
+        }
+        return found;
     }
 
     bool HeardPlayerGunshot() const {
@@ -1302,11 +1455,10 @@ public:
         // tighter cone -- the telegraph is the counterplay, not bad aim.
         float spread = IsSniper() ? 0.004f : 0.018f;
         float verticalSpread = IsSniper() ? 0.003f : 0.012f;
-        // Marines miss a lot on purpose: allies that shot as well as bandits
+        // Marines miss on purpose: allies that shot as well as bandits
         // trivialized fights the player is supposed to carry. Only the cone is
         // widened -- damage is untouched, so a landed hit still does the normal
-        // 20 and five connected hits still kill. The budget is ~30 rounds
-        // fired per kill, i.e. roughly one shot in six connects.
+        // 20 and five connected hits still kill.
         //
         // The offset below is added to a non-normalized aim vector, so a fixed
         // spread shrinks with range -- marines would spray point-blank and
@@ -1315,10 +1467,16 @@ public:
         // at every distance, which is what makes a shots-per-kill budget mean
         // anything.
         if (faction == Faction::Marine) {
-            // Hit chance falls as the cone area grows, so ~1-in-6 needs the
-            // linear spread at roughly sqrt(6) times the width that would put
-            // the cone edge on a torso.
-            constexpr float kMarineSpreadScale = 6.0f;
+            // Hit chance falls with the square of the cone width, so this is
+            // the one number that sets how long a marine-vs-bandit firefight
+            // runs. Cut from 6.0: at that width a squad could trade fire with a
+            // bandit group for most of a minute without either side dropping,
+            // which read as two mobs standing in a field rather than a
+            // contact. 3.5 is roughly three times the hit rate -- half-angle
+            // 0.018*3.5 = 0.063 rad, about 3.6 degrees -- while staying far
+            // wider than the player's near-zero cone, which is what keeps the
+            // fight the player's to carry.
+            constexpr float kMarineSpreadScale = 3.5f;
             const float range = std::sqrt(
                 XMVectorGetX(XMVector3LengthSq(aim)));
             spread *= kMarineSpreadScale * range;
@@ -2238,6 +2396,13 @@ private:
     DirectX::XMFLOAT3 lastKnownTarget_{ 0.0f, 0.0f, 0.0f };
     float alertTimer_ = 0.0f;
     float combatMemoryTimer_ = 0.0f;
+    // Throttles the spotted-contact broadcast. Re-announcing a contact every
+    // frame for as long as it stays visible would push one event per actor per
+    // frame, and every other actor scans the whole list -- that is quadratic in
+    // squad size against a 256-marine cap. One call-out every couple of seconds
+    // is what a squad actually does on the radio, and is frequent enough to
+    // keep a listener's 4s combat memory topped up without a gap.
+    float spotBroadcastCooldown_ = 0.0f;
     float playerGunshotMemoryTimer_ = 0.0f;
     bool spawnCaptured_ = false;
     DirectX::XMFLOAT3 spawnPosition_{ 0.0f, 0.0f, 0.0f };
@@ -2246,14 +2411,38 @@ private:
     DirectX::XMFLOAT3 patrolWaypoint_{ 0.0f, 0.0f, 0.0f };
     float patrolPauseTimer_ = 0.0f;
     static constexpr float kVisionRange = 28.0f;
+    // How much further an actor picks out another *actor* than it picks out the
+    // player. A squad in the field is a bigger contact than one man: several
+    // bodies moving together, upright, in a different uniform, usually shooting.
+    // The player is a single target that can stop, crouch and use the terrain,
+    // and the whole stealth game is tuned around the bare kVisionRange.
+    //
+    // Scaling here rather than raising kVisionRange is what keeps the two
+    // independent. kVisionRange stays the number the stealth balance, the debug
+    // cone in WorldOverlays.h and the time-of-day readout in Menus.h all quote;
+    // none of them shift because two squads can now see each other across a
+    // field. Raising the shared constant instead would have handed every bandit
+    // a 63m player-detection range that no fog or night preset was balanced for.
+    static constexpr float kActorEngagementRangeScale = 2.25f;
     // Mounted-optic reach for a turret gunner. Deliberately not scaled by
     // g_enemyVisionScale: darkness and fog already gate the gunner through the
     // line-of-sight check, and folding the scale in here would drop its night
     // range below a foot bandit's daylight range, which reads as broken rather
     // than as stealth working.
     static constexpr float kTurretGunnerVisionRange = 70.0f;
-    static constexpr float kVisionHalfFovCos = 0.173648f; // cos(80 deg): 160 deg cone
+    // cos(100 deg): a 200 degree cone, reaching past the shoulder line on both
+    // sides so only a target almost directly astern is unseen. Wide on purpose:
+    // a soldier is not a camera, and a 160 degree cone let a man walk diagonally
+    // across another's front at conversational distance without being noticed.
+    // The blind wedge behind is what keeps a rear approach worth making.
+    static constexpr float kVisionHalfFovCos = -0.173648f;
     static constexpr float kAlertBroadcastRadius = 19.0f;
+    // A spotted-contact call-out carries further than an "I'm hit" shout,
+    // because it is a radio report rather than a yell: a contact one man sees
+    // is a contact the fireteam acts on even spread across a compound. Matched
+    // to the engagement range so a squad fighting at a 40m standoff is not
+    // silently split into the men who know and the men who do not.
+    static constexpr float kSquadIntelRadius = 70.0f;
     static constexpr float kGunshotHearingRadius = 40.0f;
     // How far a landing round is heard from where it struck. Short on purpose:
     // the muzzle report (kGunshotHearingRadius) is what wakes a whole compound,
@@ -2282,7 +2471,11 @@ private:
         // shot itself: snap straight to Combat and pull in nearby squadmates.
         awareness_ = AwarenessState::Combat;
         combatMemoryTimer_ = 4.0f;
-        g_enemyAlertEvents.push_back({ position, kAlertBroadcastRadius });
+        // No contact position: being shot tells you that YOU are under fire,
+        // not where the shooter is. Inventing a direction here would hand the
+        // squad a target the casualty never actually saw.
+        g_enemyAlertEvents.push_back(
+            { position, kAlertBroadcastRadius, faction, {}, false });
     }
 
     static bool ContainsNoCase(const std::string& value, const char* needle) {

@@ -218,6 +218,16 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
         return false;
     if (HitTerrainSegment(origin, target, rayRadius, hit)) return false;
     if (g_trees.BlocksSegment(origin, target, rayRadius)) return false;
+    // Precomputed for the cheap sphere reject inside the loop. The whole actor
+    // list is walked per ray, so at a 256-marine cap this loop is the dominant
+    // cost of perception; almost none of those actors are anywhere near the
+    // segment, and BlocksProjectile is far too expensive to ask about each one.
+    const float segDx = target.x - origin.x;
+    const float segDz = target.z - origin.z;
+    const XMFLOAT3 segMid{ (origin.x + target.x) * 0.5f, 0.0f,
+                           (origin.z + target.z) * 0.5f };
+    const float segHalfLength =
+        std::sqrt(segDx * segDx + segDz * segDz) * 0.5f;
     for (const auto& bandit : g_bandits) {
         if (!bandit || bandit.get() == &shooter || bandit->Dead()) continue;
         // Human shield must not stop enemies from taking the shot. The hostile
@@ -234,6 +244,17 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
         const float tdx = bandit->position.x - target.x;
         const float tdz = bandit->position.z - target.z;
         if (tdx * tdx + tdz * tdz < 1.0f) continue;
+        // Cheap bounding reject before the real capsule test. Anything further
+        // from the segment's midpoint than half the segment plus a generous
+        // body radius cannot touch the segment at all, whatever its pose, so
+        // this changes no result -- it only stops the far end of a large squad
+        // being asked the expensive question. The margin is deliberately loose
+        // (a body plus the ray radius plus slack) because a false keep costs
+        // one capsule test while a false reject would punch a hole in cover.
+        const float mdx = bandit->position.x - segMid.x;
+        const float mdz = bandit->position.z - segMid.z;
+        const float reach = segHalfLength + 1.5f;
+        if (mdx * mdx + mdz * mdz > reach * reach) continue;
         if (bandit->BlocksProjectile(origin, target, rayRadius)) return false;
     }
     return true;
@@ -1256,18 +1277,31 @@ void BanditDebugText() {
     ImGui::Text("Bandits: live=%zu marines=%zu total=%zu bones=%zu parts=%d tex=%d",
                 LiveBanditCount(), LiveMarineCount(), g_bandits.size(),
                 g_banditModel.skeleton.BoneCount(), parts, textured);
-    // TEMP DEBUG: per-marine firing gate state.
+    // Show the gate that kept each live actor from firing this frame.
     for (const auto& actor : g_bandits) {
-        if (!actor || actor->faction != Faction::Marine || actor->Dead()) continue;
+        if (!actor || actor->Dead()) continue;
         const char* state =
             actor->Awareness() == SkinnedEnemy::AwarenessState::Combat ? "COMBAT"
             : actor->Awareness() == SkinnedEnemy::AwarenessState::Alert ? "Alert"
             : "Patrol";
-        ImGui::Text("  marine %s cd=%.2f prep=%d aim=%.2f cover=%d/%d pose=%d burst=%d",
-                    state, actor->fireCooldown, (int)actor->DebugPreparingShot(),
-                    actor->DebugStationaryAimTime(), (int)actor->DebugHasCoverTarget(),
-                    (int)actor->DebugInCover(), (int)actor->DebugHasGunPose(),
-                    actor->DebugBurstShots());
+        const char* reason = "fired";
+        using FireWait = SkinnedEnemy::FireWaitReason;
+        switch (actor->fireWaitReason) {
+        case FireWait::NoContact: reason = "no contact"; break;
+        case FireWait::Blocked: reason = "blocked sight"; break;
+        case FireWait::MovingToCover: reason = "moving to cover"; break;
+        case FireWait::Cooldown: reason = "cooldown"; break;
+        case FireWait::Aiming: reason = "aiming"; break;
+        case FireWait::NoGunPose: reason = "no gun pose"; break;
+        case FireWait::Inactive: reason = "inactive"; break;
+        default: break;
+        }
+        ImGui::Text("  %s %s: %s | target %.0fm %s%s | cd %.1fs aim %.1fs",
+                    actor->faction == Faction::Marine ? "marine" : "bandit",
+                    state, reason, actor->debugTargetDistance,
+                    actor->debugVisibleTarget ? "visible" : "unseen",
+                    actor->debugSquadContact ? " (squad contact)" : "",
+                    actor->fireCooldown, actor->DebugStationaryAimTime());
     }
     ImGui::Text("Weapon: %s  (mouse wheel)", GunModel::SelectedWeaponName());
     if (GunModel::C4Selected())

@@ -216,6 +216,21 @@ static void ResolveBanditPrefabCollisions(SkinnedEnemy& bandit) {
 
     // Per-triangle geometry first, so an actor can walk through a doorway
     // instead of being stopped by the box wrapping the whole building.
+    //
+    // The capsule resolve also reports the walkable surface under the actor,
+    // found with the same step allowance it uses to climb. Taking it is what
+    // lets an actor step up onto a kerb, a road shoulder or a stair tread
+    // instead of walking along at terrain height with its shins through the
+    // edge: Update() snaps position.y to the terrain heightfield, which knows
+    // nothing about prefab geometry, and PrefabSurfaceSupports earlier in the
+    // frame only probes straight down, so it finds a deck the actor is already
+    // on top of but never one whose lip is in front of it.
+    //
+    // Highest wins across instances, and only ever upward -- a raised floor
+    // must lift the actor, but nothing here may drop it, or the same result
+    // would pull an actor down through the terrain it is standing on.
+    float steppedFloorY = 0.0f;
+    bool hasSteppedFloor = false;
     for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
         const XMFLOAT3 base(bandit.position.x, feet, bandit.position.z);
         const CollisionMeshPushout pushout = CollisionMeshInstanceResolveCapsule(
@@ -223,6 +238,18 @@ static void ResolveBanditPrefabCollisions(SkinnedEnemy& bandit) {
         if (!pushout.touched) continue;
         bandit.position.x += pushout.displacement.x;
         bandit.position.z += pushout.displacement.z;
+        if (pushout.hasFloor &&
+            (!hasSteppedFloor || pushout.floorY > steppedFloorY)) {
+            steppedFloorY = pushout.floorY;
+            hasSteppedFloor = true;
+        }
+    }
+    if (hasSteppedFloor) {
+        // floorY is where the feet belong; position.y is the actor's origin,
+        // which sits footOffset below them.
+        const float steppedPositionY = steppedFloorY - bandit.footOffset;
+        if (steppedPositionY > bandit.position.y)
+            bandit.position.y = steppedPositionY;
     }
 
     for (const PrefabCollider& collider : g_prefabColliders) {

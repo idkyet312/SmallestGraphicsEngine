@@ -1638,8 +1638,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
+            static std::unordered_map<SkinnedEnemy*,
+                std::pair<XMFLOAT3, float>> lastVisibleTarget;
             bool burnedBanditDied = false;
             bool coverQuerySpent = false;
+            // Actor-vs-actor sight rays are the one part of perception that got
+            // meaningfully more expensive with the long engagement range. The
+            // ray itself walks every live actor as a potential occluder, so the
+            // frame cost is quadratic in squad size, and the deployment cap is
+            // 256 marines. The old 28m gate hid this by rejecting most pairs on
+            // distance before any ray was cast; at 63m the area is five times
+            // larger and far more pairs reach the raycast.
+            //
+            // A fixed budget rather than a shorter range, because the range is
+            // the feature. An actor that does not get its rays this frame keeps
+            // the awareness it had -- combat memory runs 4s and the squad intel
+            // channel costs nothing, so it re-confirms its own contact a frame
+            // or two later instead of forgetting it. Same per-frame idiom as
+            // coverQuerySpent above, with a larger allowance because target
+            // selection may test more than one candidate per actor.
+            int targetSelectionRayBudget = 96;
+            static unsigned targetScanFrame = 0;
+            ++targetScanFrame;
+            size_t targetActorOrdinal = 0;
             // Gathered once per frame so each actor's target can be resolved
             // without rescanning g_bandits per actor: bandits aim at the
             // nearest of {player, live marine}, marines aim at the nearest
@@ -1678,6 +1699,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
+                const size_t scanStride = g_bandits.size() <= 24 ? 1
+                    : (g_bandits.size() <= 48 ? 2 : 8);
+                const bool scanTargets =
+                    targetActorOrdinal % scanStride == targetScanFrame % scanStride;
+                ++targetActorOrdinal;
                 if (bandit->UpdateBurning(
                         deltaTime, scene.molotovDamagePerSecond))
                     burnedBanditDied = true;
@@ -1780,7 +1806,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bandit->HeardPlayerGunshot();
                 if (heardPlayerGunshot)
                     bandit->ForcePlayerGunshotTarget(scene.camera.Position);
-                const XMFLOAT3 target = attackingInsertionVehicle
+                XMFLOAT3 target = attackingInsertionVehicle
                     ? insertionVehicleTarget
                     : ((heardPlayerGunshot ||
                         bandit->PlayerGunshotMemoryActive())
@@ -1789,8 +1815,143 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             *bandit, scene.camera.Position,
                             liveMarinePositions, liveBanditPositions,
                             liveAircraftPositions));
+                bool visibleTarget = attackingInsertionVehicle;
+                bool squadTarget = false;
+                bool haveTarget = attackingInsertionVehicle;
+                bool selectedActorTarget = false;
+                if (!attackingInsertionVehicle && !heardPlayerGunshot &&
+                    !bandit->PlayerGunshotMemoryActive()) {
+                    struct Candidate { XMFLOAT3 position; float score; bool actor; };
+                    std::vector<Candidate> candidates;
+                    const auto addCandidate = [&](const XMFLOAT3& p, bool actor,
+                                                  float range) {
+                        if (!bandit->TargetInVisionCone(p)) return;
+                        const float dx = p.x - bandit->position.x;
+                        const float dz = p.z - bandit->position.z;
+                        const float distanceSq = dx * dx + dz * dz;
+                        if (distanceSq > range * range) return;
+                        candidates.push_back({ p, distanceSq, actor });
+                    };
+                    if (bandit->faction == Faction::Bandit) {
+                        addCandidate(scene.camera.Position, false,
+                                     bandit->VisionRange());
+                        for (const XMFLOAT3& p : liveMarinePositions)
+                            addCandidate(p, true, bandit->ActorEngagementRange());
+                    } else {
+                        for (const XMFLOAT3& p : liveBanditPositions)
+                            addCandidate(p, true, bandit->ActorEngagementRange());
+                        for (const XMFLOAT3& p : liveAircraftPositions)
+                            addCandidate(p, false,
+                                bandit->VisionRange() * kAircraftSpotRangeScale);
+                    }
+                    std::sort(candidates.begin(), candidates.end(),
+                        [](const Candidate& a, const Candidate& b) {
+                            return a.score < b.score;
+                        });
+                    auto previous = lastVisibleTarget.find(bandit.get());
+                    int actorSelectionRays = 0;
+                    if (previous != lastVisibleTarget.end()) {
+                        previous->second.second -= deltaTime;
+                        if (previous->second.second > 0.0f || !scanTargets) {
+                            for (const Candidate& candidate : candidates) {
+                                const float px = candidate.position.x -
+                                                 previous->second.first.x;
+                                const float pz = candidate.position.z -
+                                                 previous->second.first.z;
+                                if (px * px + pz * pz >= 25.0f) continue;
+                                bool stillVisible = !scanTargets;
+                                if (scanTargets && targetSelectionRayBudget > 0) {
+                                    --targetSelectionRayBudget;
+                                    ++actorSelectionRays;
+                                    stillVisible = BanditHasLineOfSight(
+                                        *bandit, candidate.position);
+                                }
+                                if (stillVisible) {
+                                    target = candidate.position;
+                                    visibleTarget = true;
+                                    haveTarget = true;
+                                    selectedActorTarget = candidate.actor;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // Bound the extra sight rays in large fights. The nearest
+                    // three plausible contacts cover the common blocked-target
+                    // case without testing every pair in a full deployment.
+                    const size_t sightCandidates = (std::min)(candidates.size(), size_t{3});
+                    for (size_t i = 0; scanTargets && !visibleTarget &&
+                                       targetSelectionRayBudget > 0 &&
+                                       actorSelectionRays < 3 &&
+                                       i < sightCandidates; ++i) {
+                        --targetSelectionRayBudget;
+                        ++actorSelectionRays;
+                        if (!BanditHasLineOfSight(*bandit, candidates[i].position))
+                            continue;
+                        target = candidates[i].position;
+                        visibleTarget = true;
+                        haveTarget = true;
+                        selectedActorTarget = candidates[i].actor;
+                        lastVisibleTarget[bandit.get()] = { target, 0.75f };
+                        break;
+                    }
+                    if (!visibleTarget) {
+                        XMFLOAT3 contact{};
+                        if (bandit->SquadContact(contact)) {
+                            target = contact;
+                            squadTarget = true;
+                            haveTarget = true;
+                            selectedActorTarget = true;
+                        } else {
+                            haveTarget = !candidates.empty();
+                        }
+                    }
+                } else if (!attackingInsertionVehicle) {
+                    haveTarget = true;
+                    visibleTarget = BanditHasLineOfSight(*bandit, target);
+                }
+                if (squadTarget && targetSelectionRayBudget > 0) {
+                    --targetSelectionRayBudget;
+                    visibleTarget = BanditHasLineOfSight(*bandit, target);
+                }
+                bandit->debugVisibleTarget = visibleTarget;
+                bandit->debugSquadContact = squadTarget;
+                const float targetDx = target.x - bandit->position.x;
+                const float targetDz = target.z - bandit->position.z;
+                bandit->debugTargetDistance =
+                    std::sqrt(targetDx * targetDx + targetDz * targetDz);
                 if (attackingInsertionVehicle)
                     bandit->ForceCombatTarget(target);
+                // Whether this actor is looking at another soldier rather than
+                // at the player, which selects its sight range and gates the
+                // squad-intel broadcast. The exact float compare is the same
+                // test the lead-velocity code below uses: the position either
+                // came straight off the camera or it did not.
+                const bool targetIsPlayer =
+                    !attackingInsertionVehicle &&
+                    target.x == scene.camera.Position.x &&
+                    target.y == scene.camera.Position.y &&
+                    target.z == scene.camera.Position.z;
+                bool targetIsAircraft = false;
+                for (const XMFLOAT3& aircraft : liveAircraftPositions) {
+                    if (target.x == aircraft.x && target.y == aircraft.y &&
+                        target.z == aircraft.z) {
+                        targetIsAircraft = true;
+                        break;
+                    }
+                }
+                bool targetIsActor = selectedActorTarget ||
+                    (!targetIsPlayer && !attackingInsertionVehicle &&
+                     !targetIsAircraft);
+                if (visibleTarget && targetIsAircraft)
+                    bandit->ForceCombatTarget(target);
+                // Spend the frame's sight-ray budget. Actors already in combat
+                // The sight-ray budget lives in the target selection above
+                // (targetSelectionRayBudget), which is where the rays are
+                // actually cast. Nothing is clamped here: that selection has
+                // already established whether this actor can see its target,
+                // and downgrading targetIsActor afterwards would shorten the
+                // sight range of an actor that just proved it has the contact.
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
@@ -1899,6 +2060,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         kBanditPrefabSupportDrop, prefabSurfaceY);
                     if (onPrefabSurface)
                         groundY = (std::max)(groundY, prefabSurfaceY);
+                    // A kerb or slab edge the actor is walking INTO rather than
+                    // already standing on. The probe above only casts straight
+                    // down, so it finds a deck underfoot but never a lip in
+                    // front -- and Update() below assigns groundY straight to
+                    // position.y, so without this the step-up applied after the
+                    // move is simply overwritten on the next frame. That is the
+                    // "climbs up, falls back down" case: the climb worked, the
+                    // terrain height just won the following frame.
+                    //
+                    // Probed at the actor's own radius ahead of its facing,
+                    // with the same step allowance used everywhere else, and it
+                    // may only ever raise the ground.
+                    if (!bandit->Dead() && !bandit->Held() &&
+                        !bandit->turretGunner) {
+                        constexpr float kStepProbeReach = 0.42f;
+                        const XMFLOAT3 ahead{
+                            bandit->position.x +
+                                std::sin(bandit->yaw) * kStepProbeReach,
+                            bandit->position.y,
+                            bandit->position.z +
+                                std::cos(bandit->yaw) * kStepProbeReach };
+                        float aheadSurfaceY = 0.0f;
+                        if (PrefabSurfaceSupports(ahead, bandit->position.y,
+                                                  kBanditPrefabSupportDrop,
+                                                  aheadSurfaceY) &&
+                            aheadSurfaceY > groundY &&
+                            aheadSurfaceY - groundY <= kBanditMaxStepDown) {
+                            groundY = aheadSurfaceY;
+                        }
+                    }
                     const XMFLOAT3 preMovePosition = bandit->position;
                     // Another player's body: the network owns where it is and
                     // which way it faces, so the AI must not steer, path or
@@ -1911,7 +2102,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // start and diverging within seconds -- each player would
                     // end up killing a private copy the other never saw fall.
                     if (ClientOwnedByHost()) continue;
-                    bandit->Update(banditDeltaTime, target, groundY);
+                    bandit->Update(banditDeltaTime, target, groundY,
+                                   targetIsActor);
                     // Keep an actor on the platform it started the frame on.
                     // The navmesh is terrain-only, so steering happily walks a
                     // bandit off a watchtower deck; without this it would path
@@ -2002,11 +2194,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // returns marine and bandit positions, and the insertion craft
                 // is a separate target again -- leading those with the player's
                 // velocity would push the aim somewhere meaningless.
-                const bool targetIsPlayer =
-                    !attackingInsertionVehicle &&
-                    target.x == scene.camera.Position.x &&
-                    target.y == scene.camera.Position.y &&
-                    target.z == scene.camera.Position.z;
+                // targetIsPlayer is computed with the target above, since the
+                // sight range needs the same answer before Update runs.
                 const XMFLOAT3 leadVelocity =
                     targetIsPlayer ? g_playerVelocity : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
                 const bool playerControlsMountedTurret = g_drivingHumvee &&
@@ -2019,6 +2208,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection,
                         leadVelocity, scene.projectileSpeed);
+                using FireWait = SkinnedEnemy::FireWaitReason;
+                if (fired) bandit->fireWaitReason = FireWait::None;
+                else if (bandit->Dead() || bandit->Held() ||
+                         bandit->Rappelling() || playerControlsMountedTurret)
+                    bandit->fireWaitReason = FireWait::Inactive;
+                else if (!bandit->DebugHasGunPose())
+                    bandit->fireWaitReason = FireWait::NoGunPose;
+                else if (!haveTarget ||
+                         bandit->Awareness() != SkinnedEnemy::AwarenessState::Combat)
+                    bandit->fireWaitReason = FireWait::NoContact;
+                else if (bandit->DebugHasCoverTarget() &&
+                         !bandit->DebugInCover())
+                    bandit->fireWaitReason = FireWait::MovingToCover;
+                else if (!visibleTarget || !hasLineOfSight)
+                    bandit->fireWaitReason = FireWait::Blocked;
+                else if (bandit->fireCooldown > 0.0f)
+                    bandit->fireWaitReason = FireWait::Cooldown;
+                else bandit->fireWaitReason = FireWait::Aiming;
                 // Spotted/attack shouts are positional: hearing which direction
                 // you were called out from is the whole point of the cue.
                 if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {

@@ -259,6 +259,21 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     marine->grenadeCooldown = kMarineGrenadeCooldownMin +
         RandomUnit() * (kMarineGrenadeCooldownMax - kMarineGrenadeCooldownMin);
     // No ApplyBanditLoadout(): marines stay on the default Rifle loadout for v1.
+    //
+    // A touch quicker than a bandit on the same rifle. Marines cover more
+    // ground than anyone else on the field: they hold a long standoff, they
+    // drop it and follow the player between fights, and the squad intel
+    // channel hands them contacts well outside their own sight, so the back of
+    // a squad spent much of a firefight still walking to it.
+    //
+    // Safe to scale because every gait and animation threshold downstream is
+    // expressed as a multiple of moveSpeed (the walk/run split at
+    // moveSpeed * 1.2, the playback reference at * 1.65), so they all move with
+    // it and the legs keep matching the travel. The absolute limits have room:
+    // the 0.45m per-tick travel clamp only bites below about 7fps, and the
+    // 0.55m waypoint-advance threshold has better than twice the headroom even
+    // at the 15Hz distant-actor update tier.
+    marine->moveSpeed *= 1.1f;
     marine->PlayClip("Walk");
     g_bandits.push_back(std::move(marine));
     g_game.mission.RecordFriendlyDeployed();
@@ -388,19 +403,41 @@ static void DropDeploymentMarines() {
     // Wide enough that the ring clears the transport's own hull, tight enough
     // that the squad still reads as having come off it together.
     constexpr float kRingRadius = 4.5f;
+    // One ring only held a fixed squad. With the size now bounded by the
+    // wallet, a single circle of this radius puts a large squad shoulder to
+    // shoulder and then inside each other -- the actors spend the opening
+    // seconds shoving apart, which is the exact failure the fixed count used
+    // to avoid by being small.
+    //
+    // Spacing is what is held constant instead of radius: each ring takes as
+    // many as fit at kPerMarineArc, and the next one starts further out. A
+    // small squad is unchanged, since the first ring still holds it at 4.5 m.
+    constexpr float kPerMarineArc = 1.6f;   // metres of arc per marine
+    constexpr float kRingSpacing  = 2.5f;   // metres between concentric rings
     int dropped = 0;
-    for (int index = 0; index < requested; ++index) {
-        const float angle = XM_2PI * static_cast<float>(index) /
-                            static_cast<float>(requested);
-        const float x = g_marineDropOrigin.x + std::sin(angle) * kRingRadius;
-        const float z = g_marineDropOrigin.z + std::cos(angle) * kRingRadius;
-        // Sampled per marine rather than reusing the drop-off height: the ring
-        // can straddle a slope or a shoreline, where one shared Y buries half
-        // the squad and leaves the rest hanging.
-        const XMFLOAT3 stand{ x, GroundHeightAt(x, z), z };
-        // Facing outward, away from the player and into whatever the landing
-        // zone is surrounded by.
-        if (SpawnMarine(stand, angle)) ++dropped;
+    int index = 0;
+    int ring = 0;
+    while (index < requested) {
+        const float radius = kRingRadius + kRingSpacing * static_cast<float>(ring);
+        // How many fit on this ring at the spacing above, and never fewer than
+        // one, so the loop cannot stall on a degenerate radius.
+        const int ringCapacity = (std::max)(1,
+            static_cast<int>((XM_2PI * radius) / kPerMarineArc));
+        const int ringCount = (std::min)(ringCapacity, requested - index);
+        for (int slot = 0; slot < ringCount; ++slot, ++index) {
+            const float angle = XM_2PI * static_cast<float>(slot) /
+                                static_cast<float>(ringCount);
+            const float x = g_marineDropOrigin.x + std::sin(angle) * radius;
+            const float z = g_marineDropOrigin.z + std::cos(angle) * radius;
+            // Sampled per marine rather than reusing the drop-off height: the
+            // ring can straddle a slope or a shoreline, where one shared Y
+            // buries half the squad and leaves the rest hanging.
+            const XMFLOAT3 stand{ x, GroundHeightAt(x, z), z };
+            // Facing outward, away from the player and into whatever the
+            // landing zone is surrounded by.
+            if (SpawnMarine(stand, angle)) ++dropped;
+        }
+        ++ring;
     }
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Deployment marines landed: " + std::to_string(dropped) + " of " +
