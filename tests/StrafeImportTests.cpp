@@ -325,19 +325,30 @@ int main(int argc, char** argv) {
               " as " + cycles[0].name + " (" + std::to_string(floors[i]) +
               " vs " + std::to_string(floors[0]) + ")");
 
-    // The rifle idle ships from the same Mixamo download path as the cycles
-    // and is played on this rig too, so it has to survive the bone rename and
-    // stand on the cycles' ground. It travels nowhere by design, so it is
-    // checked here rather than in the direction loop above.
-    {
+    // The three standing poses ship from the same Mixamo download path as the
+    // cycles and are played on this rig too, so each has to survive the bone
+    // rename and stand on the cycles' ground. They travel nowhere by design,
+    // so they are checked here rather than in the direction loop above.
+    //
+    // RifleAimingIdle is the shouldered hold once the player is known about,
+    // RifleIdleRelaxed the lowered carry before that, RifleReload the one-shot
+    // played at the end of a burst, and RifleFire the pose held while one is
+    // going out.
+    struct StandingPose { const char* file; const char* label; };
+    for (const StandingPose& standing : {
+            StandingPose{ "RifleAimingIdle", "Rifle idle" },
+            StandingPose{ "RifleIdleRelaxed", "Relaxed rifle idle" },
+            StandingPose{ "RifleReload", "Rifle reload" },
+            StandingPose{ "RifleFire", "Rifle fire" } }) {
         Assimp::Importer importer;
-        const aiScene* scene =
-            importer.ReadFile(mixamoDir + "Animations/RifleAimingIdle.fbx", 0);
+        const aiScene* scene = importer.ReadFile(
+            mixamoDir + "Animations/" + standing.file + ".fbx", 0);
         AnimationClip idle;
         if (!ReadClip(scene, skeleton, "Idle", idle)) {
-            Check(false, "Read the rifle idle");
+            Check(false, std::string("Read the ") + standing.label);
         } else {
-            Check(idle.duration > 0.0f, "Rifle idle has a duration");
+            Check(idle.duration > 0.0f,
+                  std::string(standing.label) + " has a duration");
             AnimationInstance instance;
             instance.Play(&idle);
             std::vector<XMFLOAT4X4> pose;
@@ -367,7 +378,7 @@ int main(int argc, char** argv) {
                     lowest = (std::min)(lowest, (&p.x)[up]);
                 }
             }
-            Check(finite, "Rifle idle poses are finite");
+            Check(finite, std::string(standing.label) + " poses are finite");
 
             // The idle holds its ground while a cycle carries the body a
             // stride. MeasureDirection's own "no travel" epsilon is a fixed
@@ -379,13 +390,14 @@ int main(int argc, char** argv) {
                 cycleSweep = (std::max)(cycleSweep, FootSweep(skeleton, cycle, up));
             const float idleSweep = FootSweep(skeleton, idle, up);
             Check(cycleSweep > 0.0f && idleSweep < cycleSweep * 0.05f,
-                  "Rifle idle stands in place (sweeps " +
+                  std::string(standing.label) + " stands in place (sweeps " +
                   std::to_string(idleSweep) + " against " +
                   std::to_string(cycleSweep) + " for a run cycle)");
-            // Stopping crossfades the idle against a run slot, so a
+            // Stopping crossfades the pose against a run slot, so a
             // disagreeing floor would drop the enemy as it comes to rest.
             Check(!floors.empty() && std::abs(lowest - floors[0]) < 2.0f,
-                  "Rifle idle plants its feet at the cycles' height (" +
+                  std::string(standing.label) +
+                  " plants its feet at the cycles' height (" +
                   std::to_string(lowest) + " vs " +
                   std::to_string(floors.empty() ? 0.0f : floors[0]) + ")");
         }

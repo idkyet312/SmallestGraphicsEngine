@@ -140,9 +140,11 @@ public:
     // so these are expressed in that bone's space rather than in world axes:
     // the offsets travel and rotate with the wrist, and the Euler angles line
     // the receiver up with however the hand happens to be authored.
-    float             gunHandOffsetX = 0.033f;
-    float             gunHandOffsetY = 0.022f;
-    float             gunHandOffsetZ = -0.037f;
+    // Tuned live on the debug HUD against the authored Mixamo cycles, which
+    // hold the rifle further out and lower than the values these replace.
+    float             gunHandOffsetX = 0.282f;
+    float             gunHandOffsetY = -0.168f;
+    float             gunHandOffsetZ = -0.033f;
     float             gunHandPitchDegrees = -138.5f;
     float             gunHandYawDegrees = 94.9f;
     float             gunHandRollDegrees = 93.6f;
@@ -1325,9 +1327,13 @@ public:
         // Single-shot loadouts bypass the burst machinery: one trigger pull, then
         // a long recovery. Bolt cycling and shell pumping are what keeps them
         // from out-damaging the rifle despite hitting far harder per shot.
+        // Single shots get the pose too, but only briefly: what follows is a
+        // bolt cycle or a pump, not more firing, so it reads as the one round
+        // going out rather than as a volley.
         if (IsSniper()) {
             attackEventPending_ = true;
             fireCooldown = 4.5f + ((float)std::rand() / RAND_MAX) * 2.5f;
+            firingTimer_ = 0.3f;
             return true;
         }
         if (IsShotgunner()) {
@@ -1335,6 +1341,7 @@ public:
             fireCooldown = 1.5f + ((float)std::rand() / RAND_MAX) * 1.1f;
             preparingShot_ = false;
             stationaryAimTime_ = 0.0f;
+            firingTimer_ = 0.3f;
             return true;
         }
 
@@ -1348,10 +1355,26 @@ public:
         --burstShotsRemaining;
         if (burstShotsRemaining > 0) {
             fireCooldown = 0.11f + ((float)std::rand() / RAND_MAX) * 0.12f;
+            // Hold the firing pose past the gap to the next round, so a burst
+            // reads as one continuous action instead of flickering back to the
+            // idle between shots. The longest gap is 0.23s; the margin covers
+            // it and drops out on its own once the volley stops.
+            firingTimer_ = 0.35f;
         } else {
             fireCooldown = 1.2f + ((float)std::rand() / RAND_MAX) * 2.8f;
             preparingShot_ = false;
             stationaryAimTime_ = 0.0f;
+            // Shorter than the mid-burst hold: the round still needs to read as
+            // fired, but the reload below is queued on this same frame and the
+            // firing pose outranks it, so a long tail here would just delay it.
+            firingTimer_ = 0.15f;
+            // The volley that just ended emptied the magazine, and the pause
+            // before the next one is the window the reload plays in. Requested
+            // rather than started here: the clip only reads while the body is
+            // standing, and this fires whether or not it is, so UpdateLocomotion
+            // decides. It stays pending until then, so a bandit that breaks
+            // cover mid-burst reloads once it settles rather than losing it.
+            reloadPending_ = kReloadEnabled;
         }
         return true;
     }
@@ -1867,6 +1890,12 @@ private:
         using namespace DirectX;
         dead_ = true;
         held_ = false;
+        // A burst that ran dry on the frame the body died leaves a reload
+        // queued; the ragdoll drives the pose from here, so drop it rather
+        // than let a revived or re-held actor play it much later.
+        reloadPending_ = false;
+        reloadPlaying_ = false;
+        firingTimer_ = 0.0f;
         deathEventPending_ = true;
         killCreditPending_ = playerCredit;
         // Sticky, unlike the one-shot above, because the host publishes this
@@ -1958,6 +1987,80 @@ private:
     bool  hasLocomotionHistory_ = false;
     float stillTime_ = 0.0f;
 
+    // Off for now: the firing pose carries the whole engagement and the reload
+    // cut into it at every burst end. The clip is still loaded and the state
+    // below still works -- flip this back to re-enable it.
+    static constexpr bool kReloadEnabled = false;
+
+    // Set when a burst runs dry, cleared once the reload has actually played.
+    bool reloadPending_ = false;
+    bool reloadPlaying_ = false;
+    // Seconds of firing pose still owed, counted down every frame. A timer
+    // rather than a flag because rounds arrive discretely while the pose has to
+    // span the gaps between them.
+    float firingTimer_ = 0.0f;
+
+    // True while a shot is recent enough to still be reading as fired.
+    //
+    // Unlike the reload this is not gated on standing: a bandit firing as it
+    // advances should still shoulder the rifle, so the caller runs this ahead
+    // of the stillness test and the pose plays over a moving body.
+    bool UpdateFiringPose(float dt) {
+        firingTimer_ = (std::max)(0.0f, firingTimer_ - dt);
+        if (firingTimer_ <= 0.0f) return false;
+        if (dead_ || held_ || rappelling_) return false;
+        const AnimationClip* fire = model.FindClip("Fire");
+        if (!fire) return false;
+        // Firing outranks a queued reload -- the magazine is not empty until
+        // the volley actually stops -- but it must not eat it: the request
+        // stays pending and plays once the timer runs out. Interrupting a
+        // reload mid-clip hands `loop` back, since Play() leaves it alone and
+        // the reload had cleared it.
+        reloadPlaying_ = false;
+        if (anim.clip != fire) anim.Play(fire);
+        anim.loop = true;
+        anim.Advance(dt);
+        return true;
+    }
+
+    // Picks the pose a standing body holds, and returns true once it has taken
+    // the frame over -- the caller then leaves the gait alone entirely.
+    //
+    // Three poses, in priority order: the one-shot reload, then the shouldered
+    // aim once the player is known about, then the lowered carry before that.
+    // Awareness rather than distance decides between the two idles, so a bandit
+    // that has heard something but not found it (Alert) is already up and
+    // holding, which is what makes the lowered stance read as "hasn't seen you"
+    // rather than as a range check.
+    bool UpdateStandingPose(float dt) {
+        const AnimationClip* reload = model.FindClip("Reload");
+        if (reloadPlaying_ && reload && anim.clip == reload) {
+            anim.Advance(dt);
+            // Non-looping, so time saturates at the end rather than wrapping.
+            if (anim.time < reload->duration) return true;
+            // Play() does not touch `loop`, so the flag has to be handed back
+            // or every cycle that follows would sit frozen on its last frame.
+            reloadPlaying_ = false;
+            anim.loop = true;
+        } else if (reloadPending_ && reload && !dead_ && !held_ && !rappelling_) {
+            reloadPending_ = false;
+            reloadPlaying_ = true;
+            anim.Play(reload);
+            anim.loop = false;
+            anim.Advance(dt);
+            return true;
+        }
+
+        // Only the undetected stance is new behaviour; everything else keeps
+        // playing the aim idle the gun overlay was built against.
+        const bool detected = awareness_ != AwarenessState::Patrol;
+        const AnimationClip* relaxed = model.FindClip("IdleRelaxed");
+        if (detected || !relaxed) return false;
+        if (anim.clip != relaxed) { anim.Play(relaxed); anim.loop = true; }
+        anim.Advance(dt);
+        return true;
+    }
+
     void UpdateLocomotion(float dt, const DirectX::XMFLOAT3& start,
                           float requestedSpeed, float fallbackPlaybackRate = 1.0f) {
         const float inverseDt = dt > 1e-5f ? 1.0f / dt : 0.0f;
@@ -1973,6 +2076,19 @@ private:
         const bool still = MeasureStillness(dt, start);
         if (still) { vx = 0.0f; vz = 0.0f; }
         directionalMoving_ = vx * vx + vz * vz > 0.01f;
+
+        // A standing body is the only one that can be showing a standing pose,
+        // so the reload and the two idles are resolved before the blend space
+        // is asked for a gait. Moving cancels a running reload outright rather
+        // than letting it play on over a run: the clip is authored standing.
+        // Firing is checked first and without the stillness gate, so a bandit
+        // shooting on the move keeps the rifle up instead of dropping back to a
+        // plain run. It also counts the timer down, so it has to run every
+        // frame rather than only while standing.
+        if (UpdateFiringPose(dt)) return;
+        if (still && UpdateStandingPose(dt)) return;
+        if (reloadPlaying_) { reloadPlaying_ = false; anim.loop = true; }
+
         const float c = std::cos(yaw), s = std::sin(yaw);
         const AnimationClip* pose = (model.authoredDirectional || directionalLocomotionIK)
             ? locomotion_.Update(dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)

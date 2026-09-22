@@ -4787,18 +4787,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // The forward cycle is embedded in this mesh. All four clips
                 // share its rig; mixing the old UE gait keys into it changes
                 // bone lengths and local axes.
-                // The idle comes last so the four run cycles keep the slots
-                // the blend space names below, whatever the file stems are.
+                // The standing poses come last so the four run cycles keep the
+                // slots the blend space names below, whatever the file stems
+                // are.
                 std::vector<std::string> clips = {
                     mixamoDir + "Animations/RunBackward.fbx",
                     mixamoDir + "Animations/RunLeft.fbx",
                     mixamoDir + "Animations/RunRight.fbx",
                     mixamoDir + "Animations/RifleAimingIdle.fbx",
+                    mixamoDir + "Animations/RifleIdleRelaxed.fbx",
+                    mixamoDir + "Animations/RifleReload.fbx",
+                    mixamoDir + "Animations/RifleFire.fbx",
                 };
                 SkinnedModel bm = SkinnedFBXImporter::Load(
                     mixamoDir + "SK_BanditMixamo.fbx", clips,
                     g_dx12.device, g_dx12.commandList, 0.01f, false);
-                if (bm.valid && bm.clips.size() == 5) {
+                if (bm.valid && bm.clips.size() == 8) {
                     constexpr size_t kIdleClip = 4;
                     bm.clips[0].name = "RunForwardSource";
                     for (size_t i = 1; i < kIdleClip; ++i)
@@ -4806,7 +4810,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // The authored rifle idle replaces the held rest pose the
                     // rig shipped with, so stopping keeps the aim the gun IK
                     // overlay is built on rather than freezing a run frame.
+                    //
+                    // Two standing poses, picked by awareness rather than by
+                    // gait: "Idle" is the shouldered aim a bandit holds once it
+                    // has the player, "IdleRelaxed" the lowered carry it stands
+                    // in before it has seen anything. "Reload" runs once at the
+                    // end of a burst and "Fire" for as long as one is going
+                    // out. All of them ship from the same Mixamo download path
+                    // as the cycles and play on this rig untouched.
                     bm.clips[kIdleClip].name = "Idle";
+                    bm.clips[kIdleClip + 1].name = "IdleRelaxed";
+                    bm.clips[kIdleClip + 2].name = "Reload";
+                    bm.clips[kIdleClip + 3].name = "Fire";
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         authoredNames = {
                             { "RunForwardSource", true, true, 0 },
@@ -4832,7 +4847,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         g_banditModel = std::move(bm);
                     else std::cerr << "Bandit four-way animation setup failed\n";
                 } else {
-                    std::cerr << "Bandit mesh or one of its four run cycles failed to load\n";
+                    std::cerr << "Bandit mesh, one of its four run cycles or a "
+                                 "standing pose failed to load\n";
                 }
             }
 
@@ -4846,15 +4862,60 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // is connected, replicated and invisible.
             if (!g_baseMode || MultiplayerActive()) {
                 const std::string marineDir = "Content/Models/MarineAlly/";
-                const std::string marineAnimDir = marineDir + "Animations/Demo/";
+                // The marine is the same Mixamo rig as the bandit, so it runs
+                // the identical import: mesh, four authored run cycles and the
+                // standing rifle poses, all native to this skeleton with no
+                // retargeting anywhere. The mesh lives under MarineAlly/ rather
+                // than being loaded from the bandit's folder because the
+                // importer resolves textures from the model's directory and
+                // defers to the parent when a variant folder has no Textures/
+                // of its own -- which is exactly what puts the marine's
+                // recolored set on this body instead of the bandit's.
+                const std::string marineMixamoDir = marineDir + "Mixamo/";
+                const std::string banditAnimDir =
+                    "Content/Models/MilitaryMercenaryBandit/Mixamo/Animations/";
                 std::vector<std::string> marineClips = {
-                    marineAnimDir + "ThirdPersonIdle.FBX",
-                    marineAnimDir + "ThirdPersonWalk.FBX",
-                    marineAnimDir + "ThirdPersonRun.FBX",
+                    banditAnimDir + "RunBackward.fbx",
+                    banditAnimDir + "RunLeft.fbx",
+                    banditAnimDir + "RunRight.fbx",
+                    banditAnimDir + "RifleAimingIdle.fbx",
+                    banditAnimDir + "RifleIdleRelaxed.fbx",
+                    banditAnimDir + "RifleFire.fbx",
                 };
                 SkinnedModel mm = SkinnedFBXImporter::Load(
-                    marineDir + "SK_Bandit.FBX", marineClips, g_dx12.device, g_dx12.commandList);
-                mm.ragdoll = T3DPhysicsAsset::Load(marineDir + "Phy_Bandit_PhysicsAsset.T3D");
+                    marineMixamoDir + "SK_MarineMixamo.fbx", marineClips,
+                    g_dx12.device, g_dx12.commandList, 0.01f, false);
+                // The old UE physics asset is bone-local and was authored
+                // against the UE rest pose, so it needs the same fit the bandit
+                // gives it rather than being loaded straight onto this rig.
+                if (mm.valid && mm.clips.size() == 7) {
+                    constexpr size_t kIdleClip = 4;
+                    mm.clips[0].name = "RunForwardSource";
+                    for (size_t i = 1; i < kIdleClip; ++i)
+                        mm.clips[i].name += "Source";
+                    mm.clips[kIdleClip].name = "Idle";
+                    mm.clips[kIdleClip + 1].name = "IdleRelaxed";
+                    mm.clips[kIdleClip + 2].name = "Fire";
+                    const std::vector<DirectionalLocomotion::AuthoredCycle>
+                        marineAuthored = {
+                            { "RunForwardSource", true, true, 0 },
+                            { "RunBackwardSource", true, true, 1 },
+                            { "RunLeftSource", true, true, 2 },
+                            { "RunRightSource", true, true, 3 },
+                        };
+                    mm.authoredDirectional = DirectionalLocomotion::BakeAuthored(
+                        mm.skeleton, mm.clips, marineAuthored);
+                    mm.rootPitch = 0.0f;
+                    mm.groundOffset = 0.022f;
+                    const Skeleton marineReference =
+                        SkinnedFBXImporter::LoadSkeleton(marineDir + "SK_Bandit.FBX");
+                    mm.ragdoll = T3DPhysicsAsset::Load(
+                        marineDir + "Phy_Bandit_PhysicsAsset.T3D");
+                    mm.ragdoll = RagdollRigFit::Fit(marineReference, mm.skeleton,
+                        mm.ragdoll, XMMatrixRotationX(-XM_PIDIV2));
+                } else {
+                    std::cerr << "Marine mesh or one of its Mixamo clips failed to load\n";
+                }
                 if (mm.valid) {
                     // The marine's kit has single-sided shells -- webbing,
                     // straps, the jacket's open front -- that vanish from

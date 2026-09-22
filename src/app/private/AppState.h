@@ -559,9 +559,9 @@ bool                        g_freeArmsNoWeaponIK = true;
 // frame, so a value tuned here holds as the wrist moves through the clip.
 // Tuned against the Mixamo bandit's hand: the large Euler angles are the
 // authored wrist axes, not a correction on top of a near-identity pose.
-float                       g_gunHandOffsetX = 0.033f;
-float                       g_gunHandOffsetY = 0.022f;
-float                       g_gunHandOffsetZ = -0.037f;
+float                       g_gunHandOffsetX = 0.282f;
+float                       g_gunHandOffsetY = -0.168f;
+float                       g_gunHandOffsetZ = -0.033f;
 float                       g_gunHandPitchDegrees = -138.5f;
 float                       g_gunHandYawDegrees = 94.9f;
 float                       g_gunHandRollDegrees = 93.6f;
