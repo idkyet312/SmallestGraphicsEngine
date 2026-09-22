@@ -383,6 +383,62 @@ static void ReportLocalShots() {
         scene.localShotDirection.y, scene.localShotDirection.z);
 }
 
+// How far a tracer's line travels before the world stops it, measured along
+// the shot's own ray out to the furthest the streak could reach anyway.
+//
+// The streak is presentation, but it is presentation the player reads as
+// information -- it says "fire is coming from over there" -- so drawing it
+// through a hillside or a hangar wall points them at cover the round never
+// crossed. The blockers are the ones BanditHasLineOfSight already uses, minus
+// the trees: terrain, solid props and destructibles. Chain-link stays
+// transparent for the same reason it does there, since a round crosses it and
+// a streak dying on the panel would read as cover that is not there.
+//
+// Palms are left out because g_trees.BlocksSegment answers yes/no and hands
+// back no hit point, so stopping on one would mean bisecting the segment for a
+// distance it does not report -- a second, disagreeing notion of where a trunk
+// was struck. The visible cost is a streak grazing a palm; a trunk is narrow
+// and the streak is moving, which is nothing like a ridge line.
+//
+// Actors are deliberately not tested. A round that hits a body was settled on
+// the shooter's machine and its streak should still reach the victim, and a
+// teammate crossing the line mid-flight must not chop the streak short.
+static float ResolveRemoteTracerRange(const XMFLOAT3& origin,
+                                      const XMFLOAT3& direction) {
+    XMVECTOR forward = XMLoadFloat3(&direction);
+    if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) return FLT_MAX;
+    forward = XMVector3Normalize(forward);
+    // The whole distance the streak could cover in its lifetime. Casting
+    // further would pay for geometry the tracer expires before reaching.
+    const float reach = RemoteTracerFX::kSpeed * RemoteTracerFX::kMaxLife;
+    const XMVECTOR originV = XMLoadFloat3(&origin);
+    XMFLOAT3 end;
+    XMStoreFloat3(&end, originV + forward * reach);
+
+    // Matches the ray radius the bandit sight check uses, so a streak and the
+    // shot it stands for agree about what counts as clipping a surface.
+    constexpr float kRayRadius = 0.04f;
+    float best = FLT_MAX;
+    auto consider = [&](const XMFLOAT3& hit) {
+        const XMVECTOR delta = XMLoadFloat3(&hit) - originV;
+        // Projected onto the ray rather than taken as a straight length: the
+        // streak advances along `direction`, so that is the axis the stop
+        // distance has to be measured on.
+        const float along = XMVectorGetX(XMVector3Dot(delta, forward));
+        if (along > 0.0f && along < best) best = along;
+    };
+
+    XMFLOAT3 hit;
+    if (HitPrefabColliderSegment(origin, end, kRayRadius, hit, nullptr, nullptr,
+                                 /*fencePanelsTransparent=*/true))
+        consider(hit);
+    if (HitTerrainSegment(origin, end, kRayRadius, hit)) consider(hit);
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegmentForVision(origin, end, kRayRadius, hit))
+        consider(hit);
+    return best;
+}
+
 // Present the rounds other players fired. Purely presentation: the muzzle
 // flash, the smoke and the report, at the place the shot actually came from.
 // Nothing here damages anything -- what a round hits is settled by the
@@ -408,7 +464,12 @@ static void PresentRemoteShots(float deltaTime) {
         // and dust per round, and an ApplyExplosionImpulse that shook the
         // camera of anyone watching. One puff of smoke is the whole effect,
         // matching how the helicopter door gunner presents its own fire.
-        scene.SpawnRemoteTracer(muzzle, direction);
+        // Same world stop as enemy fire. A remote player's shot is reported
+        // from their machine and drawn here with no projectile behind it, so
+        // without this an ally firing from inside a building put a streak out
+        // through its wall.
+        scene.SpawnRemoteTracer(muzzle, direction, /*hostile=*/false,
+                                ResolveRemoteTracerRange(muzzle, direction));
         scene.SpawnWeaponSmoke(muzzle, direction, 0.55f);
         g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.8f,
                           0.98f + ((float)std::rand() / RAND_MAX) * 0.05f);

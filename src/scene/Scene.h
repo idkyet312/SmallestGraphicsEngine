@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <cfloat>
 #include <cmath>
 #include <functional>
 
@@ -155,6 +156,10 @@ struct RemoteTracerFX {
     // is what reads as a tracer, and consecutive frames overlap into a
     // continuous streak instead of a dotted line.
     static constexpr float kLength = 7.0f;
+    // Lifetime, as a constant so the range a tracer is collision-tested over
+    // is derived from the distance it can actually fly. Held apart, a longer
+    // life would outrun the cast and fly the tail of its path through walls.
+    static constexpr float kMaxLife = 1.3f;
 
     XMFLOAT3 origin = {};
     XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
@@ -163,13 +168,24 @@ struct RemoteTracerFX {
     float life = 0.0f;
     // Long enough to carry the streak ~180 m, matching the reach it had at the
     // old speed so nothing lost range by slowing down.
-    float maxLife = 1.3f;
+    float maxLife = kMaxLife;
     // Incoming fire, drawn a hostile red instead of the friendly orange. The
     // orange is deliberate -- another player is on your side, so their fire
     // must not read as incoming -- and an enemy's has to say the opposite at a
     // glance, since the whole point of a tracer is telling the player which
     // way to move.
     bool hostile = false;
+    // How far the streak may travel before the world stops it: the range to
+    // terrain or a prop along its own line, resolved once at spawn because the
+    // path is a fixed ray and re-casting it every frame would pay for the same
+    // answer ~78 times over a 1.3 s life. FLT_MAX is "nothing in the way",
+    // which is also what a tracer spawned without a resolver gets, so a caller
+    // that cannot run the query keeps the old unobstructed flight.
+    //
+    // Without this the streak drew straight through hills and hangar walls: a
+    // bandit firing from below a ridge put a red line out the far side of it,
+    // pointing the player at cover the round never crossed.
+    float maxDistance = FLT_MAX;
 };
 
 struct PinnedHarpoonFX {
@@ -759,6 +775,12 @@ struct Scene {
     // sits, how much of the radius stays flat before the wall starts, and how
     // abruptly that wall turns up (>1 = sharper, closer to a vertical face).
     float craterDepth          = 1.6f;   // metres at the floor
+    // Depth-only multiplier for a thrown grenade, applied on top of craterDepth
+    // and kept separate from grenadeBlastScale because that one also sets the
+    // radius: a frag should scoop a shallow dish rather than dig a pit the
+    // player can fall into, while still leaving a crater as wide as its blast.
+    // Rockets, C4 and barrels are untouched and keep the full depth.
+    float grenadeCraterDepthScale = 0.45f;
     // Share of the radius that is flat floor: the inner (floor) radius is
     // exactly half the outer, so the wall occupies the outer half.
     float craterFloorFraction  = 0.5f;
@@ -3018,6 +3040,15 @@ struct Scene {
         for (RemoteTracerFX& tracer : remoteTracers) {
             tracer.distance += tracer.speed * dt;
             tracer.life += dt;
+            // Stop at whatever the shot's line hit. The streak dies here
+            // instead of pinning itself to the surface: a tracer is a round in
+            // flight, and one parked on a wall would read as a laser sight. The
+            // head is clamped as well as retired so the last frame ends at the
+            // impact point rather than a step past it.
+            if (tracer.distance >= tracer.maxDistance) {
+                tracer.distance = tracer.maxDistance;
+                tracer.life = tracer.maxLife;
+            }
         }
         remoteTracers.erase(
             std::remove_if(remoteTracers.begin(), remoteTracers.end(),
@@ -3028,8 +3059,15 @@ struct Scene {
     }
 
     // The visible half of another player's shot.
+    //
+    // maxDistance is how far the world lets the streak fly, which the caller
+    // resolves: the terrain and prop queries live up in the app layer, above
+    // this header, so the range comes in already measured rather than the
+    // scene reaching up for it. Callers that leave it at FLT_MAX get the old
+    // unobstructed flight.
     void SpawnRemoteTracer(const XMFLOAT3& origin, const XMFLOAT3& direction,
-                           bool hostile = false) {
+                           bool hostile = false,
+                           float maxDistance = FLT_MAX) {
         const XMVECTOR forward = XMLoadFloat3(&direction);
         if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) return;
         RemoteTracerFX tracer;
@@ -3037,6 +3075,7 @@ struct Scene {
         XMStoreFloat3(&tracer.direction, XMVector3Normalize(forward));
         tracer.speed = RemoteTracerFX::kSpeed;
         tracer.hostile = hostile;
+        tracer.maxDistance = maxDistance;
         remoteTracers.push_back(tracer);
     }
 

@@ -2011,8 +2011,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // the eye can follow it out. Red for a bandit, orange for
                     // an ally marine -- the squad shares this code path, and
                     // friendly fire streaking past must not read as incoming.
-                    scene.SpawnRemoteTracer(shotOrigin, shotDirection,
-                                            bandit->faction == Faction::Bandit);
+                    // Stopped at the first thing its line hits, so a shot from
+                    // behind a ridge or inside a hangar does not streak out
+                    // through the geometry and advertise a firing position on
+                    // the wrong side of the cover.
+                    scene.SpawnRemoteTracer(
+                        shotOrigin, shotDirection,
+                        bandit->faction == Faction::Bandit,
+                        ResolveRemoteTracerRange(shotOrigin, shotDirection));
                     if (bandit->IsShotgunner()) {
                         // Cone of individually weak pellets. Overlapping hits at
                         // point-blank are what make it lethal; at range the cone

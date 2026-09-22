@@ -3650,13 +3650,19 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // pixels wherever the shot is, and leaves it at the old size up close
         // where the fixed width was already right.
         //
-        // 0.0043 rad is ~4 px tall at 1080p through the 60 degree vertical FOV.
+        // 0.0026 rad is ~2.5 px tall at 1080p through the 60 degree vertical
+        // FOV, down from the ~4 px the streak used to hold. Four was sized to
+        // be unmissable and read as a fat bar of light rather than a round in
+        // flight, which is the wrong impression for something the player is
+        // meant to place and then move away from. Two and a half still holds a
+        // clean line at 100 m -- the screen-space floor is what keeps it
+        // visible at range, and that is unchanged in kind, only in width.
         const XMVECTOR toCamera = XMLoadFloat3(&scene.camera.Position) - center;
         const float cameraDistance =
             XMVectorGetX(XMVector3Length(toCamera));
         const float haloR = (std::max)(
-            (std::max)(0.012f, scene.projectileScale * 0.16f),
-            cameraDistance * 0.0043f);
+            (std::max)(0.008f, scene.projectileScale * 0.10f),
+            cameraDistance * 0.0026f);
         // Hostile fire is red, friendly orange. Same geometry and the same
         // brightness either way -- only the hue carries the distinction, so an
         // enemy streak is no more or less visible than an ally's.
