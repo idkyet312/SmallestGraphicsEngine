@@ -1304,8 +1304,8 @@ void BanditDebugText() {
             ImGui::SliderFloat("Hand gun scale", &g_gunHandScale,
                                0.20f, 1.50f, "%.2f x");
             if (ImGui::Button("Reset weapon on hand")) {
-                g_gunHandOffsetX = 0.282f;
-                g_gunHandOffsetY = -0.168f;
+                g_gunHandOffsetX = 0.363f;
+                g_gunHandOffsetY = -0.227f;
                 g_gunHandOffsetZ = -0.033f;
                 g_gunHandPitchDegrees = -138.5f;
                 g_gunHandYawDegrees = 94.9f;
