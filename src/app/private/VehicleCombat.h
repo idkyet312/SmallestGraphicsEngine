@@ -303,3 +303,101 @@ static bool ResolveBanditHumveeCollision(SkinnedEnemy& bandit) {
     }
     return false;
 }
+
+// Keeps actors out of each other. Props and vehicles were the only things that
+// ever pushed an actor aside, so nothing stopped two from standing in the same
+// spot: a squad ordered to one position converged on it and merged into a
+// single body with five heads, and a marine following the player walked through
+// anyone already there.
+//
+// One pass over all actors AFTER the update loop, not a resolve inside it. A
+// pair has to be settled once, symmetrically: resolving per-actor mid-loop
+// pushes each pair twice, and the second actor would be shoved off a position
+// the first had already been corrected against, which walks a crowd sideways
+// instead of spreading it. Splitting the overlap between the two also means a
+// jam resolves from both ends at once rather than one body bulldozing another.
+static void ResolveActorSeparation() {
+    // Chest-width, not the 0.42 used against props. A prop pushout has to let
+    // an actor through a doorway, so its radius is the shoulder; two bodies
+    // only have to stop visibly interpenetrating, and a pair of 0.42s leaves
+    // them still clipping at the torso. 0.34 each gives 0.68 between centres,
+    // which reads as shoulder to shoulder and still fits a squad through a gap.
+    constexpr float kActorRadius = 0.34f;
+    constexpr float kMinSeparation = kActorRadius * 2.0f;
+    // Vertical reach of a body. Without it an actor on a container roof is
+    // shoved by someone standing underneath it, which is the same mistake the
+    // prefab box resolve avoids with its own vertical overlap test.
+    constexpr float kActorHeight = 1.75f;
+
+    // Held, mounted and rappelling actors have their position owned by
+    // something else -- a grab, a turret seat, a rope -- and pushing them would
+    // fight that owner every frame. Dead bodies are left alone so a corpse
+    // stays where it fell instead of being nudged around by the living, and a
+    // network-controlled actor's position belongs to the machine that owns it.
+    const auto movable = [](const SkinnedEnemy& actor) {
+        return !actor.Dead() && !actor.Held() && !actor.turretGunner &&
+               !actor.Rappelling() && !actor.networkControlled;
+    };
+
+    // Who was actually pushed, so the prop re-resolve below only pays for the
+    // handful of actors in a jam rather than every actor in the level.
+    std::vector<bool> separated(g_bandits.size(), false);
+
+    for (size_t i = 0; i < g_bandits.size(); ++i) {
+        SkinnedEnemy* a = g_bandits[i].get();
+        if (!a || !movable(*a)) continue;
+        for (size_t j = i + 1; j < g_bandits.size(); ++j) {
+            SkinnedEnemy* b = g_bandits[j].get();
+            if (!b || !movable(*b)) continue;
+
+            const float aFeet = a->position.y + a->footOffset;
+            const float bFeet = b->position.y + b->footOffset;
+            if (aFeet >= bFeet + kActorHeight ||
+                bFeet >= aFeet + kActorHeight)
+                continue;
+
+            float dx = b->position.x - a->position.x;
+            float dz = b->position.z - a->position.z;
+            float distanceSquared = dx * dx + dz * dz;
+            if (distanceSquared >= kMinSeparation * kMinSeparation) continue;
+
+            float distance = std::sqrt(distanceSquared);
+            if (distance < 1e-4f) {
+                // Exactly coincident, which spawning a squad on one point
+                // does produce. There is no separating axis to read off, so
+                // pick a deterministic one from the pair's index rather than
+                // a random direction: a random push would jitter a stuck pair
+                // differently every frame instead of settling.
+                const float angle = static_cast<float>(i + j) * 2.39996f;
+                dx = std::cos(angle);
+                dz = std::sin(angle);
+                distance = 0.0f;
+            } else {
+                dx /= distance;
+                dz /= distance;
+            }
+
+            // Half each, so neither actor wins the exchange.
+            const float push = (kMinSeparation - distance) * 0.5f;
+            a->position.x -= dx * push;
+            a->position.z -= dz * push;
+            b->position.x += dx * push;
+            b->position.z += dz * push;
+            separated[i] = true;
+            separated[j] = true;
+        }
+    }
+
+    // This pass runs after the per-actor prop resolve, so a push just now could
+    // have put someone inside a wall -- two marines jammed against a container
+    // separate along the only axis they have, which is into it. Re-resolving
+    // the ones that actually moved keeps the geometry authoritative: the worst
+    // case becomes a pair still touching because the prop will not let them
+    // apart, which is correct, rather than one of them standing in the crate.
+    for (size_t i = 0; i < g_bandits.size(); ++i) {
+        if (!separated[i]) continue;
+        SkinnedEnemy* actor = g_bandits[i].get();
+        if (!actor) continue;
+        ResolveBanditPrefabCollisions(*actor);
+    }
+}

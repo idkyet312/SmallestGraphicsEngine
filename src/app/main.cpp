@@ -2076,6 +2076,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                       0.29f, pitch, 70.0f);
                 }
             }
+            // After every actor has moved, so a pair is separated once from
+            // final positions. Inside the loop each pair would be resolved
+            // twice and against a half-updated frame, which slides a crowd
+            // rather than spreading it.
+            ResolveActorSeparation();
             if (burnedBanditDied) PlayBanditDeathEvents();
             UpdateHelicopterRotorKills();
             // Clear after every enemy has had a chance to read this frame's
