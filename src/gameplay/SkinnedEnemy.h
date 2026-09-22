@@ -1160,6 +1160,20 @@ public:
                preparingShot_ && stationaryAimTime_ >= AimUpSeconds();
     }
 
+    // Play the throw wind-up. Called by whoever actually spawned the grenade,
+    // so the body and the round can never disagree about whether a throw
+    // happened -- the decision, the roll and the cooldown all live with the
+    // caller, and this is only the animation.
+    //
+    // Cancels the firing pose outright: the burst that led into the throw is
+    // over, and leaving its timer running would put the rifle back up the
+    // moment the wind-up ends.
+    void PlayGrenadeThrow() {
+        if (dead_ || held_ || rappelling_) return;
+        throwPlaying_ = true;
+        firingTimer_ = 0.0f;
+    }
+
     // targetVelocity lets the shot be led: the aim point becomes where the
     // target will be when the round lands, not where it is now. Defaults to
     // zero, which reproduces the old aim-at-the-current-position behaviour.
@@ -1895,6 +1909,7 @@ private:
         // than let a revived or re-held actor play it much later.
         reloadPending_ = false;
         reloadPlaying_ = false;
+        throwPlaying_ = false;
         firingTimer_ = 0.0f;
         deathEventPending_ = true;
         killCreditPending_ = playerCredit;
@@ -1995,10 +2010,35 @@ private:
     // Set when a burst runs dry, cleared once the reload has actually played.
     bool reloadPending_ = false;
     bool reloadPlaying_ = false;
+    // The throw animation, driven exactly like the reload above but triggered
+    // from outside: the grenade is spawned by the caller that rolled for it,
+    // and this is the body catching up with the round already in the air.
+    bool throwPlaying_ = false;
     // Seconds of firing pose still owed, counted down every frame. A timer
     // rather than a flag because rounds arrive discretely while the pose has to
     // span the gaps between them.
     float firingTimer_ = 0.0f;
+
+    // Runs the throw to its end once started, over a moving body and ahead of
+    // everything else. A grenade leaves the hand at one instant, so unlike the
+    // reload this cannot be deferred until the actor happens to stand still --
+    // by then the grenade is already mid-air and the wind-up reads as a body
+    // miming a throw it did not make.
+    bool UpdateThrowPose(float dt) {
+        if (!throwPlaying_) return false;
+        if (dead_ || held_ || rappelling_) { throwPlaying_ = false; return false; }
+        const AnimationClip* toss = model.FindClip("ThrowGrenade");
+        if (!toss) { throwPlaying_ = false; return false; }
+        if (anim.clip != toss) { anim.Play(toss); anim.loop = false; }
+        anim.Advance(dt);
+        // Non-looping, so time saturates at the end rather than wrapping.
+        if (anim.time < toss->duration) return true;
+        // Play() leaves `loop` alone, so hand it back or every cycle after
+        // this one sits frozen on its last frame.
+        throwPlaying_ = false;
+        anim.loop = true;
+        return false;
+    }
 
     // True while a shot is recent enough to still be reading as fired.
     //
@@ -2085,6 +2125,10 @@ private:
         // shooting on the move keeps the rifle up instead of dropping back to a
         // plain run. It also counts the timer down, so it has to run every
         // frame rather than only while standing.
+        // Ahead of the firing pose: a thrower has committed to the grenade and
+        // is not shooting during the wind-up, and the firing timer is often
+        // still counting down from the burst that preceded the throw.
+        if (UpdateThrowPose(dt)) return;
         if (UpdateFiringPose(dt)) return;
         if (still && UpdateStandingPose(dt)) return;
         if (reloadPlaying_) { reloadPlaying_ = false; anim.loop = true; }

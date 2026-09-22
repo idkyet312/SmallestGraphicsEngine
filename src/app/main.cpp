@@ -1977,9 +1977,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (inBand && hasLineOfSight && blastSafe) {
                             const float chance = marineThrower
                                 ? kMarineGrenadeChance : kBanditGrenadeChance;
-                            if (RandomUnit() < chance)
+                            if (RandomUnit() < chance) {
                                 BanditThrowGrenade(
                                     *bandit, target, !marineThrower);
+                                // Only on the roll that actually threw, so a
+                                // thrower that declined does not mime it.
+                                bandit->PlayGrenadeThrow();
+                            }
                             // Re-arm whether or not the roll passed, so a
                             // thrower that declines does not retry every frame.
                             const float cooldownMin = marineThrower
@@ -4914,12 +4918,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     mixamoDir + "Animations/RifleIdleRelaxed.fbx",
                     mixamoDir + "Animations/RifleReload.fbx",
                     mixamoDir + "Animations/RifleFire.fbx",
+                    mixamoDir + "Animations/TossGrenade.fbx",
                 };
                 SkinnedModel bm = SkinnedFBXImporter::Load(
                     mixamoDir + "SK_BanditMixamo.fbx", clips,
                     g_dx12.device, g_dx12.commandList, 0.01f, false);
-                if (bm.valid && bm.clips.size() == 8) {
-                    constexpr size_t kIdleClip = 4;
+                // The mandatory clips are the four cycles plus the two standing
+                // poses; anything past those is optional and the code that
+                // plays it already copes with FindClip returning null.
+                //
+                // Deliberately not an exact count. That made every clip
+                // load-bearing: one animation FBX that resolved no tracks --
+                // a rig whose channel names miss this skeleton, say -- threw
+                // away the mesh, the ragdoll and the six working clips with
+                // it, and the squad dropped to frozen bodies with no
+                // indication which file was at fault.
+                constexpr size_t kIdleClip = 4;
+                constexpr size_t kRequiredClips = kIdleClip + 2;
+                if (bm.valid && bm.clips.size() >= kRequiredClips) {
                     bm.clips[0].name = "RunForwardSource";
                     for (size_t i = 1; i < kIdleClip; ++i)
                         bm.clips[i].name += "Source";
@@ -4936,8 +4952,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // as the cycles and play on this rig untouched.
                     bm.clips[kIdleClip].name = "Idle";
                     bm.clips[kIdleClip + 1].name = "IdleRelaxed";
-                    bm.clips[kIdleClip + 2].name = "Reload";
-                    bm.clips[kIdleClip + 3].name = "Fire";
+                    // Optional, and named by position, so each one is claimed
+                    // only if the import actually produced it. A clip that
+                    // yields no tracks is dropped by the importer, which would
+                    // otherwise shift every name after it onto the wrong
+                    // motion. "ThrowGrenade" is a one-shot like the reload,
+                    // played when a thrower commits to a grenade.
+                    const char* const optionalClips[] = {
+                        "Reload", "Fire", "ThrowGrenade" };
+                    for (size_t i = 0; i < std::size(optionalClips); ++i) {
+                        const size_t slot = kIdleClip + 2 + i;
+                        if (slot < bm.clips.size()) {
+                            bm.clips[slot].name = optionalClips[i];
+                            continue;
+                        }
+                        // Name the file, not just the clip. The importer drops
+                        // an AnimStack that resolves no tracks onto this
+                        // skeleton, so the usual cause is a download whose
+                        // channels do not match these bone names -- and
+                        // without the path there is nothing to go and look at.
+                        // clips[0] is the cycle embedded in the mesh FBX, so an
+                        // animation-only file at model slot N came from
+                        // animPaths[N - 1].
+                        std::cerr << "Bandit clip missing: " << optionalClips[i]
+                                  << " (expected from " << clips[slot - 1]
+                                  << "); the actor loads without it\n";
+                    }
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         authoredNames = {
                             { "RunForwardSource", true, true, 0 },
@@ -4966,7 +5006,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     else std::cerr << "Bandit four-way animation setup failed\n";
                 } else {
                     std::cerr << "Bandit mesh, one of its four run cycles or a "
-                                 "standing pose failed to load\n";
+                                 "standing pose failed to load (valid="
+                              << (int)bm.valid << " clips=" << bm.clips.size()
+                              << " need>=" << kRequiredClips << ")\n";
                 }
             }
 
@@ -4999,6 +5041,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     banditAnimDir + "RifleAimingIdle.fbx",
                     banditAnimDir + "RifleIdleRelaxed.fbx",
                     banditAnimDir + "RifleFire.fbx",
+                    banditAnimDir + "TossGrenade.fbx",
                 };
                 SkinnedModel mm = SkinnedFBXImporter::Load(
                     marineMixamoDir + "SK_MarineMixamo.fbx", marineClips,
@@ -5006,14 +5049,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // The old UE physics asset is bone-local and was authored
                 // against the UE rest pose, so it needs the same fit the bandit
                 // gives it rather than being loaded straight onto this rig.
-                if (mm.valid && mm.clips.size() == 7) {
-                    constexpr size_t kIdleClip = 4;
+                // Same rule as the bandit above: the cycles and the two idles
+                // are required, the rest are optional and named only if the
+                // import produced them.
+                constexpr size_t kIdleClip = 4;
+                constexpr size_t kRequiredMarineClips = kIdleClip + 2;
+                if (mm.valid && mm.clips.size() >= kRequiredMarineClips) {
                     mm.clips[0].name = "RunForwardSource";
                     for (size_t i = 1; i < kIdleClip; ++i)
                         mm.clips[i].name += "Source";
                     mm.clips[kIdleClip].name = "Idle";
                     mm.clips[kIdleClip + 1].name = "IdleRelaxed";
-                    mm.clips[kIdleClip + 2].name = "Fire";
+                    // The marine has no reload clip, so the throw lands one
+                    // slot earlier here than it does on the bandit.
+                    const char* const optionalMarineClips[] = {
+                        "Fire", "ThrowGrenade" };
+                    for (size_t i = 0; i < std::size(optionalMarineClips); ++i) {
+                        const size_t slot = kIdleClip + 2 + i;
+                        if (slot < mm.clips.size()) {
+                            mm.clips[slot].name = optionalMarineClips[i];
+                            continue;
+                        }
+                        std::cerr << "Marine clip missing: "
+                                  << optionalMarineClips[i]
+                                  << " (expected from " << marineClips[slot - 1]
+                                  << "); the actor loads without it\n";
+                    }
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         marineAuthored = {
                             { "RunForwardSource", true, true, 0 },
@@ -5032,7 +5093,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     mm.ragdoll = RagdollRigFit::Fit(marineReference, mm.skeleton,
                         mm.ragdoll, XMMatrixRotationX(-XM_PIDIV2));
                 } else {
-                    std::cerr << "Marine mesh or one of its Mixamo clips failed to load\n";
+                    std::cerr << "Marine mesh or one of its Mixamo clips failed "
+                                 "to load (valid=" << (int)mm.valid
+                              << " clips=" << mm.clips.size()
+                              << " need>=" << kRequiredMarineClips << ")\n";
                 }
                 if (mm.valid) {
                     // The marine's kit has single-sided shells -- webbing,

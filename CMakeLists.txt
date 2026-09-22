@@ -580,6 +580,9 @@ if(BUILD_TESTING)
     add_executable(InspectArms tests/InspectArms.cpp)
     target_link_libraries(InspectArms PRIVATE assimp::assimp)
 
+    add_executable(InspectClipBones tests/InspectClipBones.cpp)
+    target_link_libraries(InspectClipBones PRIVATE assimp::assimp)
+
     add_executable(DXRProbeLayoutTests tests/DXRProbeLayoutTests.cpp)
     target_link_libraries(DXRProbeLayoutTests PRIVATE
         SGEProjectHeaders nlohmann_json::nlohmann_json)
