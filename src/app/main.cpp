@@ -1646,6 +1646,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // live bandit.
             std::vector<XMFLOAT3> liveMarinePositions;
             std::vector<XMFLOAT3> liveBanditPositions;
+            // Live enemy gunships, as targets the marines may engage. Gathered
+            // here with the actor lists so a squad of ten costs one check of
+            // the airframes rather than ten. A dead-but-still-falling craft is
+            // excluded: it is going down regardless and shooting the wreck on
+            // the way in wastes the squad's fire.
+            std::vector<XMFLOAT3> liveAircraftPositions;
+            if (!g_emptyLevelMode && scene.showHelicopter && g_helicopterModel) {
+                if (!g_helicopterDead)
+                    liveAircraftPositions.push_back(g_helicopterPosition);
+                if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead)
+                    liveAircraftPositions.push_back(
+                        g_secondaryHelicopterPosition);
+            }
             XMFLOAT3 insertionVehicleTarget{};
             const bool insertionVehicleOccupied =
                 OccupiedInsertionVehicleTarget(insertionVehicleTarget);
@@ -1774,7 +1787,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         ? scene.camera.Position
                         : NearestHostileTarget(
                             *bandit, scene.camera.Position,
-                            liveMarinePositions, liveBanditPositions));
+                            liveMarinePositions, liveBanditPositions,
+                            liveAircraftPositions));
                 if (attackingInsertionVehicle)
                     bandit->ForceCombatTarget(target);
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
@@ -3170,7 +3184,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
                                 nullptr, 20.0f * projectile.damageMultiplier,
-                                true, projectile.playerOwned);
+                                /*allowHeadshotKill=*/!projectile.aircraftGun,
+                                projectile.playerOwned);
                         }
                         if (hitBandit) {
                             const bool killed = bandit->Dead();

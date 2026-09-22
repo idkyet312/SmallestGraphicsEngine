@@ -48,6 +48,13 @@ struct Projectile {
     // Marine rounds share the friendly collision path, so hostile=false alone
     // cannot identify ownership.
     bool     playerOwned = false;
+    // Fired by a gunship door gun rather than a rifle. Mechanically identical
+    // to any other hostile round except that it cannot score an instant
+    // headshot kill: the door gun puts out a long burst at a leading aim
+    // point, and letting one of those rounds clip a skull would delete a
+    // marine from full health with nothing the squad could do about it. The
+    // airframe still kills, it just has to do it with accumulated hits.
+    bool     aircraftGun = false;
     bool     accuracyHitRecorded = false;
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
@@ -3004,7 +3011,8 @@ struct Scene {
 
     void SpawnHostileProjectile(const XMFLOAT3& origin, const XMFLOAT3& direction,
                                 float damageMultiplier = 1.0f,
-                                float speedMultiplier = 1.0f) {
+                                float speedMultiplier = 1.0f,
+                                bool aircraftGun = false) {
         Projectile p = {};
         p.position = p.previousPosition = origin;
         p.direction = direction;
@@ -3013,6 +3021,7 @@ struct Scene {
         p.active = true;
         p.hostile = true;
         p.damageMultiplier = damageMultiplier;
+        p.aircraftGun = aircraftGun;
         projectiles.push_back(p);
     }
 

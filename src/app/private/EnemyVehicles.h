@@ -343,6 +343,67 @@ static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
     }
 }
 
+// Defined in Combat.h, which is included after this header. The gunships need
+// the same line-of-sight test the infantry use: a door gun that shoots marines
+// through a hangar roof is not a fight, it is a turret with x-ray vision.
+static bool HelicopterHasLineOfSightTo(const XMFLOAT3& muzzle,
+                                       const XMFLOAT3& target);
+
+// Who a gunship's door gun is shooting at. The airframe used to know only the
+// player, so a squad of marines could stand in the open under a hovering
+// gunship and neither one acknowledged the other.
+//
+// Nearest live target of {player, each marine}, by squared distance from the
+// muzzle -- the same contest NearestHostileTarget runs for infantry, so a
+// gunship prefers whatever is actually closest rather than always the player or
+// always the squad. The player wins ties, which keeps single-player behaviour
+// identical when no marines are alive.
+struct HelicopterGunTarget {
+    XMFLOAT3 aim{};        // lead-corrected point to fire at
+    XMFLOAT3 position{};   // where the target actually is
+    bool valid = false;
+    bool isPlayer = false;
+};
+static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
+    HelicopterGunTarget best;
+    float bestDistSq = FLT_MAX;
+    auto consider = [&](const XMFLOAT3& p, bool isPlayer) {
+        const float dx = p.x - muzzle.x;
+        const float dy = p.y - muzzle.y;
+        const float dz = p.z - muzzle.z;
+        const float distSq = dx * dx + dy * dy + dz * dz;
+        // The same window the door gun always used: too close to depress onto,
+        // or past the engagement range entirely.
+        if (distSq < 4.0f ||
+            distSq > kHelicopterEngagementRange * kHelicopterEngagementRange)
+            return;
+        if (distSq >= bestDistSq) return;
+        if (!HelicopterHasLineOfSightTo(muzzle, p)) return;
+        bestDistSq = distSq;
+        best.position = p;
+        // Only the player's velocity is tracked, so only the player's shots get
+        // led. A marine is led by nothing rather than by the player's motion,
+        // which would throw the burst toward wherever the player was running.
+        best.aim = isPlayer
+            ? LeadTargetPoint(muzzle, p, g_playerVelocity, scene.projectileSpeed)
+            : p;
+        best.isPlayer = isPlayer;
+        best.valid = true;
+    };
+    if (scene.player.health > 0.0f && !scene.player.downed)
+        consider(scene.camera.Position, true);
+    for (const auto& actor : g_bandits) {
+        if (!actor || actor->Dead()) continue;
+        if (actor->faction != Faction::Marine) continue;
+        // Torso rather than feet, matching the infantry sight tests: a ray
+        // aimed at ground level dives into the terrain over any real distance.
+        consider({ actor->position.x,
+                   actor->position.y + actor->footOffset + 1.35f,
+                   actor->position.z }, false);
+    }
+    return best;
+}
+
 static void UpdateHelicopter(float dt) {
     if (!g_helicopterModel || !scene.showHelicopter) return;
     const bool rotorPowered = !g_helicopterDead ||
@@ -425,8 +486,25 @@ static void UpdateHelicopter(float dt) {
         std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
         std::cos(g_helicopterHoverTime * 0.27f) * 0.55f;
 
-    const float targetX = scene.camera.Position.x - g_helicopterPosition.x;
-    const float targetZ = scene.camera.Position.z - g_helicopterPosition.z;
+    // The nose follows whatever the door gun is actually working on, not the
+    // player unconditionally -- an airframe raking a squad while pointed at a
+    // player on the far side of the valley reads as a bug.
+    //
+    // Resolved once here and reused by the firing block below. Each call costs
+    // a line-of-sight sweep per candidate (terrain, prefabs, destruction), and
+    // a full squad plus the player is nine of them -- picking the target twice
+    // a frame per airframe would pay for all of it to steer the nose.
+    const XMFLOAT3 gunForward{
+        std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
+    const XMFLOAT3 gunMuzzle{
+        g_helicopterPosition.x + gunForward.x * 3.75f,
+        g_helicopterPosition.y - 0.65f,
+        g_helicopterPosition.z + gunForward.z * 3.75f };
+    const HelicopterGunTarget gunTarget = PickHelicopterGunTarget(gunMuzzle);
+    const XMFLOAT3 facePoint =
+        gunTarget.valid ? gunTarget.position : scene.camera.Position;
+    const float targetX = facePoint.x - g_helicopterPosition.x;
+    const float targetZ = facePoint.z - g_helicopterPosition.z;
     const float desiredYaw = std::atan2(targetX, targetZ);
     const float yawDelta = std::atan2(
         std::sin(desiredYaw - g_helicopterYaw),
@@ -460,25 +538,16 @@ static void UpdateHelicopter(float dt) {
         return;
     }
     g_helicopterFireCooldown -= dt;
-    if (scene.player.health <= 0.0f || g_helicopterFireCooldown > 0.0f) return;
-    const XMFLOAT3 forward{
-        std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
-    const XMFLOAT3 muzzle{
-        g_helicopterPosition.x + forward.x * 3.75f,
-        g_helicopterPosition.y - 0.65f,
-        g_helicopterPosition.z + forward.z * 3.75f };
-    XMVECTOR direction = XMLoadFloat3(&scene.camera.Position) - XMLoadFloat3(&muzzle);
-    const float distanceSq = XMVectorGetX(XMVector3LengthSq(direction));
-    if (distanceSq < 4.0f ||
-        distanceSq > kHelicopterEngagementRange * kHelicopterEngagementRange) {
+    if (g_helicopterFireCooldown > 0.0f) return;
+    // No longer gated on the player being alive: the marines are a target in
+    // their own right, so the gunship keeps working the squad over a body.
+    // Range, sight and lead all came from gunTarget above.
+    if (!gunTarget.valid) {
         g_helicopterFireCooldown = 0.10f;
         return;
     }
-    // Lead the player rather than firing at where they stand. The door gun
-    // engages out to kHelicopterEngagementRange, far enough that flight time is
-    // what let a running player walk out from under a burst untouched.
-    const XMFLOAT3 helicopterAim = PrimaryHelicopterWeaponAimPoint();
-    direction = XMLoadFloat3(&helicopterAim) - XMLoadFloat3(&muzzle);
+    const XMFLOAT3& muzzle = gunMuzzle;
+    XMVECTOR direction = XMLoadFloat3(&gunTarget.aim) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     const float randomX = ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f;
     const float randomY = ((float)std::rand() / RAND_MAX - 0.5f) * 0.012f;
@@ -486,7 +555,10 @@ static void UpdateHelicopter(float dt) {
     direction = XMVector3Normalize(direction) + XMVectorSet(randomX, randomY, randomZ, 0.0f);
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
-    scene.SpawnHostileProjectile(muzzle, shotDirection);
+    // aircraftGun: a door gun round damages like any other hostile bullet but
+    // never scores an instant headshot kill -- see Projectile::aircraftGun.
+    scene.SpawnHostileProjectile(muzzle, shotDirection, 1.0f, 1.0f,
+                                 /*aircraftGun=*/true);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
     g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.68f,
                       0.82f + ((float)std::rand() / RAND_MAX) * 0.08f, 120.0f);
@@ -959,8 +1031,20 @@ static void UpdateSecondaryHelicopter(float dt) {
         std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
         std::cos(g_secondaryHelicopterHoverTime * 0.25f) * 0.55f;
 
-    const float targetX = scene.camera.Position.x - g_secondaryHelicopterPosition.x;
-    const float targetZ = scene.camera.Position.z - g_secondaryHelicopterPosition.z;
+    // Same nose-follows-target rule as the primary airframe, resolved once and
+    // reused by the firing block below for the same reason.
+    const XMFLOAT3 gunForward{
+        std::sin(g_secondaryHelicopterYaw), 0.0f,
+        std::cos(g_secondaryHelicopterYaw) };
+    const XMFLOAT3 gunMuzzle{
+        g_secondaryHelicopterPosition.x + gunForward.x * 3.75f,
+        g_secondaryHelicopterPosition.y - 0.65f,
+        g_secondaryHelicopterPosition.z + gunForward.z * 3.75f };
+    const HelicopterGunTarget gunTarget = PickHelicopterGunTarget(gunMuzzle);
+    const XMFLOAT3 facePoint =
+        gunTarget.valid ? gunTarget.position : scene.camera.Position;
+    const float targetX = facePoint.x - g_secondaryHelicopterPosition.x;
+    const float targetZ = facePoint.z - g_secondaryHelicopterPosition.z;
     const float desiredYaw = std::atan2(targetX, targetZ);
     const float yawDelta = std::atan2(
         std::sin(desiredYaw - g_secondaryHelicopterYaw),
@@ -991,27 +1075,14 @@ static void UpdateSecondaryHelicopter(float dt) {
         return;
     }
     g_secondaryHelicopterFireCooldown -= dt;
-    if (scene.player.health <= 0.0f ||
-        g_secondaryHelicopterFireCooldown > 0.0f)
-        return;
-    const XMFLOAT3 forward{
-        std::sin(g_secondaryHelicopterYaw), 0.0f,
-        std::cos(g_secondaryHelicopterYaw) };
-    const XMFLOAT3 muzzle{
-        g_secondaryHelicopterPosition.x + forward.x * 3.75f,
-        g_secondaryHelicopterPosition.y - 0.65f,
-        g_secondaryHelicopterPosition.z + forward.z * 3.75f };
-    XMVECTOR direction =
-        XMLoadFloat3(&scene.camera.Position) - XMLoadFloat3(&muzzle);
-    const float distanceSq = XMVectorGetX(XMVector3LengthSq(direction));
-    if (distanceSq < 4.0f ||
-        distanceSq > kHelicopterEngagementRange * kHelicopterEngagementRange) {
+    if (g_secondaryHelicopterFireCooldown > 0.0f) return;
+    // Player or nearest marine, exactly as the primary does -- from gunTarget.
+    if (!gunTarget.valid) {
         g_secondaryHelicopterFireCooldown = 0.10f;
         return;
     }
-    // Same lead as the primary door gun above.
-    const XMFLOAT3 secondaryAim = SecondaryHelicopterWeaponAimPoint();
-    direction = XMLoadFloat3(&secondaryAim) - XMLoadFloat3(&muzzle);
+    const XMFLOAT3& muzzle = gunMuzzle;
+    XMVECTOR direction = XMLoadFloat3(&gunTarget.aim) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     direction = XMVector3Normalize(direction) + XMVectorSet(
         ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f,
@@ -1019,7 +1090,10 @@ static void UpdateSecondaryHelicopter(float dt) {
         ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f, 0.0f);
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
-    scene.SpawnHostileProjectile(muzzle, shotDirection);
+    // aircraftGun: a door gun round damages like any other hostile bullet but
+    // never scores an instant headshot kill -- see Projectile::aircraftGun.
+    scene.SpawnHostileProjectile(muzzle, shotDirection, 1.0f, 1.0f,
+                                 /*aircraftGun=*/true);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
     g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.68f,
                       0.82f + ((float)std::rand() / RAND_MAX) * 0.08f, 120.0f);

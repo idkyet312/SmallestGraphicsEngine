@@ -239,6 +239,40 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
     return true;
 }
 
+// The gunships' version of the test above, declared in EnemyVehicles.h and
+// defined here because the segment tests it needs live in this header.
+//
+// Origin is the door gun's muzzle rather than an actor's eye, and no actor is
+// excluded as "the shooter": an aircraft is not standing in g_bandits, so the
+// only actor that has to be skipped is the one being aimed at. Trees are
+// deliberately not tested -- the gun looks down through a canopy from above,
+// where the trunk sphere the infantry test uses is not what is in the way.
+static bool HelicopterHasLineOfSightTo(const XMFLOAT3& muzzle,
+                                       const XMFLOAT3& target) {
+    constexpr float rayRadius = 0.04f;
+    XMFLOAT3 hit;
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegmentForVision(muzzle, target, rayRadius, hit))
+        return false;
+    if (HitPrefabColliderSegment(muzzle, target, rayRadius, hit, nullptr,
+                                 nullptr, /*fencePanelsTransparent=*/true))
+        return false;
+    // The one that matters most for an airframe: a target behind a ridge or
+    // inside a bowl is not shootable from a hover, however open the sky is.
+    if (HitTerrainSegment(muzzle, target, rayRadius, hit)) return false;
+    for (const auto& actor : g_bandits) {
+        if (!actor || actor->Dead()) continue;
+        if (actor->Held()) continue;
+        // Same body-sized tolerance as the infantry test: whoever is standing
+        // on the endpoint is the target, not cover in front of it.
+        const float tdx = actor->position.x - target.x;
+        const float tdz = actor->position.z - target.z;
+        if (tdx * tdx + tdz * tdz < 1.0f) continue;
+        if (actor->BlocksProjectile(muzzle, target, rayRadius)) return false;
+    }
+    return true;
+}
+
 EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
 std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 std::vector<EnemyAlertEvent> g_enemyAlertEvents;

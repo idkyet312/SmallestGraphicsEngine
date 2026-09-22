@@ -751,13 +751,20 @@ static DirectX::XMFLOAT3 LeadTargetPoint(const DirectX::XMFLOAT3& muzzle,
 }
 
 // Nearest position this actor should perceive/aim/shoot at: bandits target the
-// nearest of {player, each live marine}; marines target the nearest live bandit
+// nearest of {player, each live marine}; marines target the nearest of {live
+// bandit, enemy gunship}
 // and never the player. Ties favor the player so behavior is unchanged when no
 // marines are alive/nearby.
+// Aircraft are spotted from further off than infantry, for the same reasons the
+// bandits read the insertion craft early: large, loud, skylined. Shared by both
+// sides so the two never disagree about how far an airframe can be seen.
+static constexpr float kAircraftSpotRangeScale = 2.6f;
+
 static DirectX::XMFLOAT3 NearestHostileTarget(const SkinnedEnemy& actor,
                                                const DirectX::XMFLOAT3& playerPosition,
                                                const std::vector<DirectX::XMFLOAT3>& marinePositions,
-                                               const std::vector<DirectX::XMFLOAT3>& banditPositions) {
+                                               const std::vector<DirectX::XMFLOAT3>& banditPositions,
+                                               const std::vector<DirectX::XMFLOAT3>& aircraftPositions) {
     auto distSq = [&](const DirectX::XMFLOAT3& p) {
         const float dx = p.x - actor.position.x;
         const float dy = p.y - actor.position.y;
@@ -783,6 +790,25 @@ static DirectX::XMFLOAT3 NearestHostileTarget(const SkinnedEnemy& actor,
     for (const auto& p : banditPositions) {
         const float d = distSq(p);
         if (d < bestDistSq) { bestDistSq = d; best = p; }
+    }
+    // Enemy gunships join the same contest. The squad used to ignore them
+    // completely: a marine could be shot off its feet by a door gun and would
+    // keep hunting infantry, because only bandit positions were ever
+    // candidates here. Marine rounds already damaged the airframe (they take
+    // the friendly collision path, which tests the helicopter), so nothing but
+    // the aiming was missing.
+    //
+    // Entered at the aircraft spot range, the same multiplier the bandits use
+    // on the insertion craft: an airframe is large, loud and skylined, so it
+    // is picked out from further off than a man on foot. The perception and
+    // line-of-sight gates at the call site still decide whether the marine may
+    // actually shoot.
+    for (const DirectX::XMFLOAT3& aircraft : aircraftPositions) {
+        const float d = distSq(aircraft);
+        const float spotRange =
+            actor.VisionRange() * kAircraftSpotRangeScale;
+        if (d > spotRange * spotRange) continue;
+        if (d < bestDistSq) { bestDistSq = d; best = aircraft; }
     }
     return best;
 }
