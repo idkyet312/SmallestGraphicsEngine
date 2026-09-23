@@ -690,6 +690,15 @@ static void ApplyGameSettings() {
     // level comes up in the mode the player chose rather than the default.
     // UpdateBodycamAim is left to the frame loop; this only sets the intent.
     scene.camera.BodycamAiming = g_settings.realisticAiming;
+    // Push the saved mix onto the live submix graph. Safe before the device is
+    // up: AudioDevice stores the value and applies it to the voice when one
+    // exists, which is what lets this run at boot as well as on every change.
+    AudioDevice::SetMasterVolume(g_settings.masterVolume);
+    AudioDevice::SetBusVolume(AudioBus::Weapons,  g_settings.weaponsVolume);
+    AudioDevice::SetBusVolume(AudioBus::Voices,   g_settings.voicesVolume);
+    AudioDevice::SetBusVolume(AudioBus::Ambience, g_settings.ambienceVolume);
+    AudioDevice::SetBusVolume(AudioBus::UI,       g_settings.uiVolume);
+    AudioDevice::SetBusVolume(AudioBus::Music,    g_settings.musicVolume);
 }
 
 // Player velocity in full 3D, differenced from the camera position each frame.

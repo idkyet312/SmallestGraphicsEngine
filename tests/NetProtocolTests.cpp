@@ -80,12 +80,35 @@ int main() {
                   "header must lead");
     static_assert(offsetof(ServerTerrainDeformMessage, header) == 0,
                   "header must lead");
+    static_assert(std::is_trivially_copyable<ClientChatMessage>::value,
+                  "ClientChatMessage must stay memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerChatMessage>::value,
+                  "ServerChatMessage must stay memcpy-able");
+    static_assert(offsetof(ClientChatMessage, header) == 0, "header must lead");
+    static_assert(offsetof(ServerChatMessage, header) == 0, "header must lead");
+    // Room for the longest line plus its terminator, so a receiver can always
+    // re-terminate at the last byte without cutting a legal message short.
+    static_assert(sizeof(ClientChatMessage::text) == kMaxChatTextLength + 1,
+                  "chat text buffer must hold the limit plus a terminator");
+    static_assert(sizeof(ServerChatMessage::text) == kMaxChatTextLength + 1,
+                  "chat text buffer must hold the limit plus a terminator");
+    Check(ClientChatMessage{}.header.type == MessageType::ClientChatMessage,
+          "ClientChatMessage has the wrong default type");
+    Check(ServerChatMessage{}.header.type == MessageType::ServerChatMessage,
+          "ServerChatMessage has the wrong default type");
 
     // The version must be bumped whenever a struct in the file changes shape.
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 17, "protocol version was not bumped");
+    Check(kProtocolVersion == 19, "protocol version was not bumped");
+
+    // God mode claimed PlayerSnapshot's last padding byte rather than adding a
+    // field, so the struct keeps its size and `reviveProgress` stays on the
+    // 4-byte boundary the wire layout depends on. Pinned because the next flag
+    // added here has no spare byte left and will grow the struct.
+    static_assert(offsetof(PlayerSnapshot, reviveProgress) % 4 == 0,
+                  "reviveProgress must stay 4-byte aligned");
 
     // `killer` cost four bytes per enemy, not zero: id is a uint16, so the flag
     // bytes were already full and alignment re-padded to the next float. Pinned

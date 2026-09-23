@@ -147,6 +147,19 @@ struct LocalPlayerStatus {
     PlayerId reviver = kInvalidPlayerId;
 };
 
+// One chat line as the game should display it. Carries the speaker's id rather
+// than a formatted name: the session knows nothing about how the HUD wants to
+// label a player, and the id is what every machine already agrees on.
+struct ChatLine {
+    PlayerId speaker = kInvalidPlayerId;
+    // std::string rather than the wire's char buffer: by this point the text
+    // has been terminated and validated, and the consumer is ordinary C++.
+    std::string text;
+    // True for the local player's own line, so the HUD can tint it. Resolved
+    // here because the session is what knows which id is local.
+    bool fromLocalPlayer = false;
+};
+
 // A life-state transition that just happened, drained once per frame by the
 // game so it can fire one-shot effects. Populated from the reliable event on a
 // client and directly by the host, so both ends run the same code.
@@ -221,6 +234,9 @@ struct LocalPlayerState {
     InsertionHelicopterState helicopter;
     PlayerInput input;
     float x = 0.0f, y = 0.0f, z = 0.0f;
+    // This machine's god mode toggle. Only the host's is read: it becomes the
+    // session's, and a client's is replaced by whatever the host says.
+    bool godMode = false;
 };
 
 class NetSession {
@@ -312,6 +328,9 @@ public:
         players_ = {};
         peerToPlayer_.clear();
         stateChanges_.clear();
+        chatLines_.clear();
+        sessionGodMode_ = false;
+        sessionGodModeKnown_ = false;
         hostEnemies_.clear();
         remoteEnemies_.clear();
         remoteShots_.clear();
@@ -370,6 +389,12 @@ public:
     }
 
     Role CurrentRole() const { return role_; }
+    // Session god mode, which is the host's toggle. A client mirrors this onto
+    // its own player; `known` stays false until the first snapshot lands.
+    bool SessionGodMode(bool& known) const {
+        known = role_ == Role::Host || sessionGodModeKnown_;
+        return sessionGodMode_;
+    }
     bool Active() const { return role_ != Role::Offline; }
     PlayerId LocalId() const { return localId_; }
 
@@ -427,6 +452,9 @@ public:
                 local.input.Held(PlayerInput::Sprint) ? 1 : 0;
             slot.current.aiming =
                 local.input.Held(PlayerInput::Aim) ? 1 : 0;
+            // The host's own toggle is the session's god mode. A client's is
+            // ignored here: it mirrors the host's from the snapshot instead.
+            if (role_ == Role::Host) sessionGodMode_ = local.godMode;
             // Health and downed are NOT written from local state: the host owns
             // them for every player including itself, so they flow the other
             // way -- out through the snapshot, and back via LocalStatus.
@@ -927,6 +955,11 @@ public:
         if (target >= kMaxPlayers || target == shooter) return;
         PlayerSlot& slot = players_[target];
         if (!slot.active || slot.downed) return;
+        // Session god mode, checked here rather than at each call site because
+        // this is the one door every source of player damage comes through --
+        // a local shot, a client's hit report, a bandit, a fall. It is the
+        // host's toggle, so while it is on nobody in the session takes damage.
+        if (sessionGodMode_) return;
         // Clamp rather than trust. A negative would heal, and a NaN or a wild
         // value would put the slot somewhere no later arithmetic recovers from.
         if (!(damage >= 0.0f)) return;   // false for NaN, which is the point
@@ -1012,6 +1045,42 @@ public:
     void DrainStateChanges(std::vector<PlayerStateChange>& out) {
         out.clear();
         out.swap(stateChanges_);
+    }
+
+    // Send a line the local player typed. The host stamps and broadcasts its
+    // own immediately; a client hands it up and waits for it to come back, so
+    // both ends see the same ordering rather than a local echo that jumps the
+    // queue whenever the host is busy.
+    void SendChat(const char* text) {
+        if (!Active() || localId_ == kInvalidPlayerId || !text) return;
+        // An empty or whitespace-only line is a stray Enter, not a message.
+        bool printable = false;
+        for (const char* c = text; *c; ++c)
+            if (static_cast<unsigned char>(*c) > ' ') { printable = true; break; }
+        if (!printable) return;
+
+        if (role_ == Role::Host) {
+            ServerChatMessage message;
+            message.speaker = localId_;
+            CopyChatText(message.text, text);
+            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+            // The host is not in its own broadcast, so it queues its own line
+            // directly rather than waiting for a copy that never arrives.
+            QueueChat(localId_, message.text);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientChatMessage message;
+        CopyChatText(message.text, text);
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Drained once per frame like the state changes above, and for the same
+    // reason: each line has to reach the log exactly once.
+    void DrainChat(std::vector<ChatLine>& out) {
+        out.clear();
+        out.swap(chatLines_);
     }
 
     // Any player's life state, not just the local one. Used by the HUD to show
@@ -1534,6 +1603,12 @@ private:
         case MessageType::ServerChargeDetonate:
             if (role_ == Role::Client) HandleServerChargeDetonate(event);
             break;
+        case MessageType::ClientChatMessage:
+            if (role_ == Role::Host) HandleClientChat(event);
+            break;
+        case MessageType::ServerChatMessage:
+            if (role_ == Role::Client) HandleServerChat(event);
+            break;
         case MessageType::ClientShotFired:
             if (role_ == Role::Host) HandleClientShotFired(event);
             break;
@@ -1812,6 +1887,12 @@ private:
         const uint8_t count =
             snapshot.playerCount < kMaxPlayers ? snapshot.playerCount
                                                : kMaxPlayers;
+        // The host's god mode. Every entry carries it, so the first will do;
+        // a snapshot with no players in it says nothing and changes nothing.
+        if (count > 0) {
+            sessionGodMode_ = snapshot.players[0].godMode != 0;
+            sessionGodModeKnown_ = true;
+        }
         for (uint8_t i = 0; i < count; ++i) {
             const PlayerSnapshot& incoming = snapshot.players[i];
             if (incoming.id >= kMaxPlayers) continue;
@@ -1873,6 +1954,8 @@ private:
             // writer and it is host-only, so this send is the single thing that
             // makes the number exist anywhere else.
             snapshot.players[count].reviveProgress = players_[i].reviveProgress;
+            // Same value on every entry: it is the session's, not the player's.
+            snapshot.players[count].godMode = sessionGodMode_ ? 1 : 0;
             ++count;
         }
         snapshot.playerCount = count;
@@ -1943,6 +2026,67 @@ private:
         ServerChargeDetonateMessage out;
         out.owner = it->second;
         transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+    }
+
+    // Copies a line into a wire buffer, truncating rather than refusing, and
+    // always leaving it NUL-terminated. Control characters are dropped: a tab
+    // or a stray newline would break the single-line layout the log draws, and
+    // a lone CR could hide the rest of a line entirely.
+    static void CopyChatText(char (&destination)[kMaxChatTextLength + 1],
+                             const char* source) {
+        size_t written = 0;
+        for (const char* c = source; *c && written < kMaxChatTextLength; ++c) {
+            const unsigned char value = static_cast<unsigned char>(*c);
+            // Printable ASCII only, DEL and above included in the rejection:
+            // the HUD reads text as UTF-8, and a stray high byte from a peer
+            // would draw as a broken glyph on every machine.
+            if (value < ' ' || value > '~') continue;
+            destination[written++] = *c;
+        }
+        destination[written] = '\0';
+    }
+
+    void QueueChat(PlayerId speaker, const char* text) {
+        ChatLine line;
+        line.speaker = speaker;
+        line.text = text ? text : "";
+        line.fromLocalPlayer = speaker == localId_;
+        // Bounded so a long session cannot grow this without limit if nothing
+        // ever drains it -- the oldest line is the one worth losing.
+        constexpr size_t kMaxQueued = 64;
+        if (chatLines_.size() >= kMaxQueued) chatLines_.erase(chatLines_.begin());
+        chatLines_.push_back(std::move(line));
+    }
+
+    void HandleClientChat(Event& event) {
+        if (event.payload.size() < sizeof(ClientChatMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        ClientChatMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        // The sender's terminator is not trusted: 128 non-zero bytes would run
+        // every later read off the end of the buffer.
+        message.text[kMaxChatTextLength] = '\0';
+
+        ServerChatMessage out;
+        out.speaker = it->second;
+        // Re-copied rather than forwarded, so a client cannot inject control
+        // characters into everyone else's log.
+        CopyChatText(out.text, message.text);
+        if (out.text[0] == '\0') return;
+        transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+        // Broadcast reaches the clients; the host queues its own copy.
+        QueueChat(out.speaker, out.text);
+    }
+
+    void HandleServerChat(Event& event) {
+        if (event.payload.size() < sizeof(ServerChatMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerChatMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        message.text[kMaxChatTextLength] = '\0';
+        if (message.text[0] == '\0') return;
+        QueueChat(message.speaker, message.text);
     }
 
     void HandleServerChargeDetonate(Event& event) {
@@ -2378,6 +2522,13 @@ private:
 
     // Life-state edges waiting to be drained by the game this frame.
     std::vector<PlayerStateChange> stateChanges_;
+    std::vector<ChatLine> chatLines_;
+    // The host's god mode toggle. Written by the host from its own local state
+    // every Update, and by a client from each snapshot.
+    bool sessionGodMode_ = false;
+    // Client-side: whether a snapshot has told us yet. Until one has, the
+    // client keeps its own toggle rather than being switched off by a default.
+    bool sessionGodModeKnown_ = false;
 
     // Enemy replication. hostEnemies_ is what the host published this frame;
     // remoteEnemies_ is what a client was last told. Only one is ever populated

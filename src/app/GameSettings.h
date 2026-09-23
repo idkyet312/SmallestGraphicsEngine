@@ -67,6 +67,30 @@ struct GameSettings {
     // picture rather than a HUD overlay.
     bool showCrosshair = true;
 
+    // Audio mix, 0..1 each. These mirror the submix graph in GunAudio.h: one
+    // master trim and one fader per bus. Stored here rather than left on the
+    // AudioDevice because the device's values are runtime-only -- the editor
+    // panel has always written straight through to the live voices, so a mix
+    // set there was gone on the next launch. A player who turns the music down
+    // expects it to stay down.
+    //
+    // Defaults match AudioDevice's own, so a missing file and a fresh device
+    // agree the same way the sensitivity above does.
+    float masterVolume = 1.0f;
+    float weaponsVolume = 1.0f;
+    float voicesVolume = 1.0f;
+    float ambienceVolume = 1.0f;
+    float uiVolume = 1.0f;
+    // Music sits under the rest by default, matching AudioDevice's own table:
+    // a score that competes with gunfire and callouts is a score the player
+    // turns off. Deliberately not 1.0 -- defaulting it flat here would quietly
+    // undo that mix for everyone who never opens this menu.
+    float musicVolume = 0.55f;
+
+    static constexpr float kDefaultMasterVolume = 1.0f;
+    static constexpr float kDefaultBusVolume = 1.0f;
+    static constexpr float kDefaultMusicVolume = 0.55f;
+
     static constexpr bool  kDefaultRealisticAiming = false;
     static constexpr bool  kDefaultShowCrosshair = true;
     static constexpr bool  kDefaultDebugLoadingScreen = false;
@@ -81,6 +105,19 @@ struct GameSettings {
         seeThroughWeaponStrength =
             (std::max)(kMinSeeThroughStrength,
             (std::min)(kMaxSeeThroughStrength, seeThroughWeaponStrength));
+        // A hand-edited or corrupt file must not be able to drive a voice above
+        // unity, which clips, or below zero, which XAudio2 rejects outright.
+        // NaN fails both comparisons and falls through to 0, which is silent
+        // rather than undefined -- the same posture the sensitivity takes.
+        const auto volume = [](float& value) {
+            value = value > 0.0f ? (value < 1.0f ? value : 1.0f) : 0.0f;
+        };
+        volume(masterVolume);
+        volume(weaponsVolume);
+        volume(voicesVolume);
+        volume(ambienceVolume);
+        volume(uiVolume);
+        volume(musicVolume);
     }
 
     void ResetToDefaults() {
@@ -90,6 +127,12 @@ struct GameSettings {
         realisticAiming = kDefaultRealisticAiming;
         showCrosshair = kDefaultShowCrosshair;
         debugLoadingScreen = kDefaultDebugLoadingScreen;
+        masterVolume = kDefaultMasterVolume;
+        weaponsVolume = kDefaultBusVolume;
+        voicesVolume = kDefaultBusVolume;
+        ambienceVolume = kDefaultBusVolume;
+        uiVolume = kDefaultBusVolume;
+        musicVolume = kDefaultMusicVolume;
     }
 };
 
@@ -156,6 +199,27 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.debugLoadingScreen =
                 value == "1" || value == "true" || value == "yes";
         }
+        // strtof for the same reason as the sensitivity: a malformed value
+        // yields 0 and the clamp turns it into silence rather than throwing
+        // out of a file read.
+        else if (key == "MasterVolume") {
+            out.masterVolume = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "WeaponsVolume") {
+            out.weaponsVolume = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "VoicesVolume") {
+            out.voicesVolume = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "AmbienceVolume") {
+            out.ambienceVolume = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "UIVolume") {
+            out.uiVolume = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "MusicVolume") {
+            out.musicVolume = std::strtof(value.c_str(), nullptr);
+        }
     }
 
     // Whatever the file said, the result has to be usable.
@@ -180,6 +244,13 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "[HUD]\n"
          << "ShowCrosshair="
          << (settings.showCrosshair ? 1 : 0) << "\n"
+         << "[Audio]\n"
+         << "MasterVolume=" << settings.masterVolume << "\n"
+         << "WeaponsVolume=" << settings.weaponsVolume << "\n"
+         << "VoicesVolume=" << settings.voicesVolume << "\n"
+         << "AmbienceVolume=" << settings.ambienceVolume << "\n"
+         << "UIVolume=" << settings.uiVolume << "\n"
+         << "MusicVolume=" << settings.musicVolume << "\n"
          << "[Debug]\n"
          << "DebugLoadingScreen="
          << (settings.debugLoadingScreen ? 1 : 0) << "\n";

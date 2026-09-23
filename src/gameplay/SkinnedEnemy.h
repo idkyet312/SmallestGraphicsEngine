@@ -10,6 +10,7 @@
 #include "DX12Core.h"
 #include "DestructionDX12.h"
 #include "NavigationSystem.h"
+#include "EngineLogger.h"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cfloat>
@@ -420,7 +421,23 @@ public:
         if (!model.valid) return false;
         rootPitch = model.rootPitch;
         footOffset = model.groundOffset;
-        locomotion_.Initialize(model.skeleton, model.clips, model.rebasedClips);
+        // A failed bake is not fatal -- the fallback in UpdateNetworkedPose and
+        // UpdateLocomotion both cope -- but it is invisible from the outside,
+        // and the symptom (a body stuck in its bind pose) reads as a rendering
+        // or networking fault rather than a missing clip. Say which it is.
+        if (!locomotion_.Initialize(model.skeleton, model.clips,
+                                    model.rebasedClips) &&
+            model.authoredDirectional) {
+            std::string names;
+            for (const AnimationClip& clip : model.clips) {
+                if (!names.empty()) names += ", ";
+                names += clip.name;
+            }
+            SGE_LOG("LogAnimation", EngineLog::Level::Warning,
+                    "directional blend space unavailable for a body with "
+                    "authored cycles; it will fall back to Idle. clips=" +
+                    names);
+        }
         // One palette upload buffer per in-flight frame so we never overwrite a
         // palette the GPU is still reading.
         const UINT bytes = (UINT)(model.skeleton.BoneCount() * sizeof(DirectX::XMFLOAT4X4));
@@ -459,6 +476,11 @@ public:
     void UpdateNetworkedPose(float dt, bool moving, bool sprinting,
                              bool aiming = false) {
         netAiming = aiming;
+        // Kept on the signature for the callers, but not read: the blend space
+        // picks walk or run from the speed measured below, which is what the
+        // legs have to match. A sprint flag held against a wall would otherwise
+        // run the legs in place.
+        (void)sprinting;
         if (netDowned) {
             // Hold whatever pose they were in and let the roll below lay the
             // body out. Advancing the clip would have a downed player jogging
@@ -473,15 +495,21 @@ public:
         // forever while the snapshots put them in the same spot. Stand them up
         // once the position says they have stopped.
         const bool netStill = MeasureStillness(dt, position);
-        PlayClip(moving && !netStill ? (sprinting ? "Run" : "Walk") : "Idle");
+        // Deliberately NOT "Run"/"Walk": neither rig has a clip by either name.
+        // Both the marine and the bandit carry the Mixamo set, whose cycles are
+        // named RunForwardSource..RunRightSource and are consumed by the blend
+        // space below rather than played directly. PlayClip is a silent no-op
+        // on a name it cannot find, so asking for "Walk" here assigned nothing
+        // at all and left a standing remote player in its bind pose.
+        //
+        // Idle is the one name that does exist on both rigs. It is seeded only
+        // in the fallback below, not here: while the blend space is live it
+        // owns anim.clip, and seeding Idle every frame would swap the clip and
+        // reset its time on every frame the body is moving.
 
-        // Play the cycle at the rate the body is actually travelling instead of
-        // the clip's authored speed. A networked body is moved by snapshots, so
-        // nothing here had measured how fast it was going and the legs ran at
-        // 1.0 whatever the ground covered. These clips are authored for a
-        // bandit's 1.8 m/s while a player walks 5 and sprints past 7, so a
-        // remote player crossed open ground at nearly three times the pace of
-        // their own legs.
+        // How fast the body is actually travelling. A networked body is moved
+        // by snapshots, so nothing else here measures it; the blend space needs
+        // it to pick the gait and the cadence the legs step at.
         //
         // Speed comes from the position delta because that is the only honest
         // source: the snapshot carries where they are, not how fast.
@@ -495,15 +523,14 @@ public:
         netPreviousPosition_ = position;
         netHasPreviousPosition_ = true;
 
-        const float referenceSpeed = moveSpeed * (sprinting ? 1.65f : 1.0f);
-        // Ceiling well above the AI's 1.15: that one exists because a bandit
-        // never outruns its own clip by much, which is not true of a sprinting
-        // player. The floor keeps a body crawling along a wall from stepping in
-        // slow motion.
-        const float playbackRate = speed > 0.01f && referenceSpeed > 0.01f
-            ? (std::max)(0.75f, (std::min)(2.2f, speed / referenceSpeed))
-            : 1.0f;
-        if (model.authoredDirectional) {
+        // Gated on the blend space actually being usable, not just on the model
+        // claiming authored cycles. Initialize needs all nine clips -- the two
+        // gaits in four directions plus Idle -- and gives up if the bake missed
+        // any of them, after which Update returns null on every call. Keying
+        // this on authoredDirectional alone made the else branch unreachable
+        // for exactly the bodies whose bake had failed, so nothing advanced a
+        // clip and the body rendered its bind pose forever.
+        if (model.authoredDirectional && locomotion_.Ready()) {
             const float c = std::cos(yaw), s = std::sin(yaw);
             const bool travelling = moving && !netStill && speed > 0.01f &&
                                     speed < kTeleportSpeed;
@@ -515,7 +542,13 @@ public:
                 if (anim.clip != pose) anim.Play(pose);
             }
         } else {
-            anim.Advance(dt * playbackRate);
+            // No usable blend space: stand in Idle rather than the bind pose.
+            // A standing clip, so it plays at its own rate -- the travel-speed
+            // scaling above is for gait cycles.
+            PlayClip("Idle");
+            directionalMoving_ = moving && !netStill && speed > 0.01f &&
+                                 speed < kTeleportSpeed;
+            anim.Advance(dt);
         }
         ComputePose(dt);
     }

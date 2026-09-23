@@ -283,6 +283,62 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
                              "is where you shoot.");
 
     ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    UISectionLabel("AUDIO");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    // Master first and indented buses under it, because that is the shape of
+    // the submix graph: master trims everything including the reverb tail,
+    // while the buses are independent of it and of each other.
+    //
+    // Each writes live on drag and saves on release, the same two-step the
+    // sensitivity uses -- a mix can only be judged by ear while it moves, and
+    // writing the file on every frame of a drag would be a write per frame.
+    struct VolumeRow {
+        const char* label;
+        const char* id;
+        float* value;
+        AudioBus bus;
+        bool master;
+    };
+    const VolumeRow rows[] = {
+        { "MASTER",   "##volmaster",   &g_settings.masterVolume,
+          AudioBus::Weapons,  true  },
+        { "WEAPONS",  "##volweapons",  &g_settings.weaponsVolume,
+          AudioBus::Weapons,  false },
+        { "VOICES",   "##volvoices",   &g_settings.voicesVolume,
+          AudioBus::Voices,   false },
+        { "AMBIENCE", "##volambience", &g_settings.ambienceVolume,
+          AudioBus::Ambience, false },
+        { "MUSIC",    "##volmusic",    &g_settings.musicVolume,
+          AudioBus::Music,    false },
+        { "INTERFACE","##volui",       &g_settings.uiVolume,
+          AudioBus::UI,       false },
+    };
+    for (const VolumeRow& row : rows) {
+        if (!row.master) ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::TextColored(UITheme::kTextDim, "%s", row.label);
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        // Shown 0-100 rather than 0.00-1.00: a volume is the one control
+        // players already read as a percentage. The slider edits a scaled
+        // copy because ImGui formats whatever value it is given, so a 0..1
+        // slider with a %% format would read "1%" at full volume.
+        float percent = *row.value * 100.0f;
+        if (ImGui::SliderFloat(row.id, &percent, 0.0f, 100.0f, "%.0f%%",
+                               ImGuiSliderFlags_AlwaysClamp)) {
+            *row.value = percent / 100.0f;
+            if (row.master) AudioDevice::SetMasterVolume(*row.value);
+            else            AudioDevice::SetBusVolume(row.bus, *row.value);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            g_settings.Clamp();
+            ApplyGameSettings();
+            SaveGameSettings(g_settings);
+        }
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Master trims everything. The rest are independent.");
+
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
     UISectionLabel("HUD");
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 

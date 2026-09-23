@@ -523,6 +523,78 @@ void EnemyReplication() {
     }
 }
 
+// God mode is session-wide and belongs to the host. While the host has it on,
+// nobody takes damage -- the host itself, a client, or anyone hit by the
+// environment -- and switching it off restores normal damage straight away.
+void GodModeFollowsHost() {
+    Fixture fixture;
+    LocalPlayerState local;
+    local.godMode = true;
+    fixture.session.Update(0.0f, local);
+
+    bool known = false;
+    Check(fixture.session.SessionGodMode(known) && known,
+          "the host's toggle should become the session's god mode");
+
+    fixture.Body(0, 1);
+    fixture.Head(0, 1);
+    fixture.session.ApplyHitToPlayer(kInvalidPlayerId, 1, 100.0f, false,
+                                     0, 0, 0);
+    Check(fixture.Status(1).health == kMaxPlayerHealth,
+          "a client must take no damage while the host has god mode on");
+    Check(!fixture.Status(1).downed,
+          "a client must not be downed while the host has god mode on");
+    fixture.session.ApplyHitToPlayer(kInvalidPlayerId, 0, 100.0f, false,
+                                     0, 0, 0);
+    Check(fixture.Status(0).health == kMaxPlayerHealth,
+          "the host must take no damage with its own god mode on");
+
+    local.godMode = false;
+    fixture.session.Update(0.0f, local);
+    fixture.Body(0, 1);
+    Check(fixture.Status(1).health == kMaxPlayerHealth - kBodyShotDamage,
+          "damage must apply again once the host turns god mode off");
+}
+
+// The host's own chat line: queued locally (the host is not in its own
+// broadcast), attributed to the host, and cleaned before anyone sees it.
+void HostChat() {
+    Fixture fixture;
+    std::vector<ChatLine> lines;
+
+    fixture.session.SendChat("hello squad");
+    fixture.session.DrainChat(lines);
+    Check(lines.size() == 1, "the host should see its own line");
+    Check(lines[0].speaker == 0, "the host's line should name the host");
+    Check(lines[0].fromLocalPlayer, "the host's line should read as its own");
+    Check(lines[0].text == "hello squad", "the line should arrive intact");
+
+    // A stray Enter is not a message.
+    fixture.session.SendChat("");
+    fixture.session.SendChat("   ");
+    fixture.session.DrainChat(lines);
+    Check(lines.empty(), "blank lines must not be sent");
+
+    // Control characters would break the one-line layout, and a high byte
+    // would draw as a broken glyph on every other machine.
+    fixture.session.SendChat("a\tb\nc\x7F" "d\xE9" "e");
+    fixture.session.DrainChat(lines);
+    Check(lines.size() == 1 && lines[0].text == "abcde",
+          "control and non-ASCII bytes must be stripped");
+
+    // Truncated to the wire limit rather than refused.
+    const std::string longLine(300, 'x');
+    fixture.session.SendChat(longLine.c_str());
+    fixture.session.DrainChat(lines);
+    Check(lines.size() == 1 &&
+              lines[0].text.size() == kMaxChatTextLength,
+          "an overlong line should be truncated to the limit");
+
+    // Draining empties the queue, so a line is shown exactly once.
+    fixture.session.DrainChat(lines);
+    Check(lines.empty(), "a drained line must not come back");
+}
+
 } // namespace
 
 int main() {
@@ -532,6 +604,8 @@ int main() {
     ReviveRules();
     OutOfOrderSnapshotsDoNotResurrect();
     EnemyReplication();
+    GodModeFollowsHost();
+    HostChat();
     std::cout << "NetPvP tests passed\n";
     return 0;
 }

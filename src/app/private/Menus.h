@@ -1769,12 +1769,21 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // God mode is not only invulnerability: PlayerState::AmmoEnforced() is tied
     // to it, so turning it on also disables magazines, reserves and reloading.
     // That is why the label says supplies rather than just damage.
+    // In a session god mode belongs to the host and a client mirrors it every
+    // frame, so a client's checkbox would flip back on the next tick. Disabled
+    // rather than hidden, so the player can still see which way it is set.
+    const bool setByHost =
+        g_netSession.CurrentRole() == net::Role::Client;
+    ImGui::BeginDisabled(setByHost);
     if (ImGui::Checkbox("God mode (no damage, unlimited ammo)",
                         &scene.player.godMode)) {
         // Coming back from god mode leaves the magazines in whatever state the
         // unenforced path left them, so restock to a clean loadout.
         if (!scene.player.godMode) scene.player.RestoreAmmo();
     }
+    ImGui::EndDisabled();
+    if (setByHost)
+        ImGui::TextDisabled("Set by the host for everyone in the session.");
     if (scene.player.godMode)
         ImGui::TextDisabled(
             "All weapons stay available and ammo is not tracked.");

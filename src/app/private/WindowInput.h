@@ -402,6 +402,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_MOUSEWHEEL:
+        // Typing owns the input: a click or a wheel turn must not fire,
+        // aim or swap weapons mid-sentence.
+        if (ChatPromptOpen()) return 0;
         // Editor camera-speed scrolling is handled earlier; here it zooms the
         // deployment overview, and otherwise cycles the weapon during gameplay.
         if (!ImGui::GetIO().WantCaptureMouse) {
@@ -459,6 +462,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_RBUTTONDOWN:
+        // Typing owns the input: a click or a wheel turn must not fire,
+        // aim or swap weapons mid-sentence.
+        if (ChatPromptOpen()) return 0;
         // Deployment right-drag is read from ImGui in
         // RenderInsertionChoiceScreen; Win32 capture remains editor-only.
         if (IsEditorEditing() && !ImGui::GetIO().WantCaptureMouse) {
@@ -478,6 +484,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_LBUTTONDOWN:
+        // Typing owns the input: a click or a wheel turn must not fire,
+        // aim or swap weapons mid-sentence.
+        if (ChatPromptOpen()) return 0;
         if (!ImGui::GetIO().WantCaptureMouse) {
             if (g_drivingHumvee) {
                 FireHumveeTurret();
@@ -526,7 +535,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    // Typed text, already translated from keycodes to characters by the
+    // keyboard layout -- which is why the prompt accepts a non-US layout
+    // without this having to know anything about one.
+    case WM_CHAR:
+        if (ChatPromptOpen()) {
+            ChatPromptChar(static_cast<unsigned int>(wParam));
+            return 0;
+        }
+        break;
+
     case WM_KEYDOWN:
+        // Chat owns the keyboard while its prompt is open, so this runs ahead
+        // of every other binding -- including ESC, which must close the prompt
+        // rather than pause the run out from under someone mid-sentence.
+        if (ChatPromptOpen()) {
+            if (wParam == VK_ESCAPE) CloseChatPrompt();
+            else if (wParam == VK_RETURN) SubmitChatPrompt();
+            // Everything else is a character, and arrives on WM_CHAR. Swallowed
+            // here so a movement key cannot also drive the player while typing.
+            return 0;
+        }
+        // T opens it. Gameplay only, and not while the editor has the keyboard
+        // for its own shortcuts.
+        if (wParam == 'T' && !IsEditorEditing() && ChatAvailable() &&
+            !g_gamePaused &&
+            !(showUI && ImGui::GetIO().WantCaptureKeyboard)) {
+            OpenChatPrompt();
+            return 0;
+        }
         if (wParam == VK_ESCAPE) {
             if (IsEditorPlaying())
                 g_game.commands.Request(GameCommand::EditorStopPlay);

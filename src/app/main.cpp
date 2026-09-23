@@ -150,6 +150,9 @@ using namespace DirectX;
 #include "private/MultiplayerInsertion.h"
 // After Multiplayer.h: the status line it sends says whether this is a session.
 #include "private/SteamPresence.h"
+// After Multiplayer.h for g_netSession and MultiplayerActive, and before
+// WindowInput.h, which routes T and the typed characters into it.
+#include "private/Chat.h"
 #include "private/WindowInput.h"
 #include "private/Boot.h"
 #include "private/EnemyDeathSmoke.h"
@@ -1074,6 +1077,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // roster changes while a player sits in the menu, and the notices have
         // to clear themselves when the session ends from any screen.
         UpdateNetPlayerNotices(deltaTime);
+        // Same placement and reason: chat lines arrive and the log has to clear
+        // itself when a session ends, whatever screen the player is on.
+        UpdateChat(deltaTime);
         // Both beside the session poll: a shot fired on the frame a level ends
         // still belongs on the wire, and the presentation of someone else's
         // fire must not wait on the gameplay gate either.
@@ -6648,6 +6654,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // Outside the insertion-choice gate: someone joining while you are
             // still picking a landing spot is exactly when you want to know.
             DrawNetPlayerNotices();
+            // Same reasoning, and the same gate: chat is most useful while the
+            // squad is deciding where to land.
+            DrawChat();
             if (g_ddgiCornellTestMode) {
                 const DXRDDGIRenderer::Status& status = g_dxrDDGI.GetStatus();
                 ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_Always);

@@ -51,6 +51,14 @@ namespace net {
 //     objectives a charge is the only thing allowed to destroy -- the comm
 //     tower, the objective aircraft -- replicate instead of collapsing on the
 //     machine that set the charge and standing on every other one.
+// 19: text chat. Clients send a typed line to the host, which stamps it with
+//     the speaker and broadcasts it to everyone including the sender, so every
+//     machine shows the same lines in the same order.
+// 18: god mode is session-wide and follows the host. The host owns every
+//     player's health, so a client's own toggle was a flag the damage path
+//     never consulted. The host's toggle now rides in PlayerSnapshot's last
+//     padding byte, the host skips all player damage while it is on, and
+//     clients mirror it. The struct keeps its size.
 // 17: enemy snapshots name the player who killed the body. Without it a client
 //     could only be told an enemy was dead, never by whom, so every machine
 //     paid itself for every death anywhere on the map. EnemySnapshot grows
@@ -58,7 +66,7 @@ namespace net {
 //     filled the four bytes before the first float and alignment re-pads. At
 //     16 enemies that is 576 bytes of payload, still inside one datagram.
 // 16: host-authoritative exfil boat state.
-inline constexpr uint32_t kProtocolVersion = 17;
+inline constexpr uint32_t kProtocolVersion = 19;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -108,6 +116,8 @@ enum class MessageType : uint8_t {
     ServerChargeStuck,        // host -> clients, reliable
     ClientChargeDetonate,     // client -> host, reliable
     ServerChargeDetonate,     // host -> clients, reliable
+    ClientChatMessage,        // client -> host, reliable
+    ServerChatMessage,        // host -> clients, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -199,7 +209,12 @@ struct PlayerSnapshot {
     // from the padding, so the struct keeps its size and `reviveProgress` stays
     // on the 4-byte boundary the comment below relies on.
     uint8_t aiming = 0;
-    uint8_t padding[1] = {};
+    // The session's god mode, which is the host's toggle. Every entry carries
+    // the same value; it rides here rather than in its own message because the
+    // snapshot already arrives every tick and self-heals a missed change.
+    // Claimed from the last padding byte, so the struct keeps its size and
+    // `reviveProgress` stays on the 4-byte boundary.
+    uint8_t godMode = 0;
     // Seconds of hold the host has credited, NOT normalised -- receivers divide
     // by kReviveSeconds themselves (PlayerStatus, LocalStatus, GetRemotePlayers
     // all already do), so normalising here would divide twice.
@@ -410,6 +425,38 @@ struct ServerChargeDetonateMessage {
     MessageHeader header{ MessageType::ServerChargeDetonate, {} };
     PlayerId owner = kInvalidPlayerId;
     uint8_t padding[3] = {};
+};
+
+// Longest chat line that goes on the wire, not counting the terminator. Fixed
+// rather than variable-length because every other message here is a flat struct
+// the transport memcpy's whole -- a length-prefixed payload would be the only
+// one of its kind, and 127 characters is a chat line, not a document.
+inline constexpr uint8_t kMaxChatTextLength = 127;
+
+// A line the local player typed. The host decides what happens to it: it is
+// the only machine that can attribute it to a player id the others agree on,
+// which is why a client never broadcasts its own.
+struct ClientChatMessage {
+    MessageHeader header{ MessageType::ClientChatMessage, {} };
+    // Team chat rather than all chat. There are no opposing teams yet, so this
+    // rides along as 0 and reserves the concept without a later version bump.
+    uint8_t team = 0;
+    uint8_t padding[2] = {};
+    // Always NUL-terminated by the sender, and re-terminated by the host before
+    // it is trusted: a client could ship 128 non-zero bytes and every read
+    // after that would run off the end of the buffer.
+    char text[kMaxChatTextLength + 1] = {};
+};
+
+// The host's copy of a line, stamped with who said it and sent to everyone
+// including the original sender. The sender displays this rather than its own
+// text so every machine shows the same ordering.
+struct ServerChatMessage {
+    MessageHeader header{ MessageType::ServerChatMessage, {} };
+    PlayerId speaker = kInvalidPlayerId;
+    uint8_t team = 0;
+    uint8_t padding[1] = {};
+    char text[kMaxChatTextLength + 1] = {};
 };
 
 // A client's round connected with an enemy. Same shooter-authoritative bargain

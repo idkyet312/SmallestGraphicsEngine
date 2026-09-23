@@ -1299,6 +1299,8 @@ static void UpdateMultiplayerSession(float frameDelta,
 
     net::LocalPlayerState local;
     local.input = localInput;
+    // Only the host's is used: it becomes the session's god mode.
+    local.godMode = scene.player.godMode;
     local.x = scene.camera.Position.x;
     // Report the feet rather than the eye: a remote body is placed by its feet,
     // and sending the eye would sink every other player waist-deep in terrain.
@@ -1342,6 +1344,21 @@ static void UpdateMultiplayerSession(float frameDelta,
         scene.player.health = status.health;
         scene.player.downed = status.downed;
         scene.player.reviveProgress = status.reviveProgress;
+    }
+
+    // A client follows the host's god mode. The host already skips all player
+    // damage while it is on; mirroring it here is what makes the rest of the
+    // client agree -- the death gate, unlimited ammo, the reward cap and the
+    // GOD MODE label all read scene.player.godMode.
+    if (g_netSession.CurrentRole() == net::Role::Client) {
+        bool known = false;
+        const bool hostGodMode = g_netSession.SessionGodMode(known);
+        if (known && scene.player.godMode != hostGodMode) {
+            scene.player.godMode = hostGodMode;
+            // Same restock the menu does when god mode is switched off: the
+            // unenforced path leaves magazines in whatever state it left them.
+            if (!hostGodMode) scene.player.RestoreAmmo();
+        }
     }
 
     // Life-state edges. Drained every frame whether or not anything is

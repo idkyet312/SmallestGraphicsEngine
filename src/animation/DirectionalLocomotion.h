@@ -483,6 +483,12 @@ public:
         return w;
     }
 
+    // Whether Initialize found every clip the blend space needs. Callers that
+    // have no other source of motion have to know: Update returns null forever
+    // once this is false, and a body that never gets a clip assigned renders
+    // its bind pose -- a T-pose -- rather than standing still.
+    bool Ready() const { return ready_; }
+
     const AnimationClip* Update(float dt, float right, float forward, float walkSpeed) {
         using namespace DirectX;
         if (!ready_) return nullptr;
