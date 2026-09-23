@@ -832,7 +832,8 @@ static void DetonateBarrel(size_t firstBarrel, bool fromPlayer) {
     scene.explosiveBarrels[firstBarrel].vortexHoldTime = 0.0f;
     for (size_t cursor = 0; cursor < pending.size(); ++cursor) {
         const XMFLOAT3 center = scene.explosiveBarrels[pending[cursor]].position;
-        AddExplosionTerrainCrater(center);
+        // No terrain crater: a barrel is a surface fuel burst, not a buried
+        // charge, so it scorches and shoves but leaves the ground intact.
         SpawnBarrelExplosionFX(center);
 
         for (auto& bandit : g_bandits) {

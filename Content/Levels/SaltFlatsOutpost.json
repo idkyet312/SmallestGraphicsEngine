@@ -889,7 +889,7 @@
         "replace": 0.0,
         "rotation": 0.0,
         "strength": 1.0,
-        "texture": "HM_Islands_07_Ex.PNG",
+        "texture": "SaltFlatsOutpost/HM_Islands_07_Ex.PNG",
         "value": 2.4000000953674316,
         "x": -21.266239166259766,
         "z": -83.94485473632813
@@ -901,7 +901,7 @@
         "replace": 0.0,
         "rotation": 0.0,
         "strength": 1.0,
-        "texture": "HM_Islands_07_Ex.PNG",
+        "texture": "SaltFlatsOutpost/HM_Islands_07_Ex.PNG",
         "value": 2.4000000953674316,
         "x": -103.63446807861328,
         "z": -29.774017333984375
@@ -913,7 +913,7 @@
         "replace": 0.0,
         "rotation": 0.0,
         "strength": 1.0,
-        "texture": "HM_Islands_07_Ex.PNG",
+        "texture": "SaltFlatsOutpost/HM_Islands_07_Ex.PNG",
         "value": 2.4000000953674316,
         "x": -7.381416320800781,
         "z": 68.42909240722656
@@ -925,7 +925,7 @@
         "replace": 0.0,
         "rotation": 0.0,
         "strength": 1.0,
-        "texture": "HM_Islands_07_Ex.PNG",
+        "texture": "SaltFlatsOutpost/HM_Islands_07_Ex.PNG",
         "value": 2.4000000953674316,
         "x": 107.6645278930664,
         "z": -23.149810791015625

@@ -78,7 +78,7 @@ bool WriteGray16PNG(const std::filesystem::path& path,
 struct TerrainBakeResult {
     bool ok = false;
     std::string error;
-    std::string texture;      // filename written into TerrainStampDirectory()
+    std::string texture;      // stamp name written; see ResolveTerrainStampPath
     size_t bakedStamps = 0;   // how many stamps were folded in
     float metresPerTexel = 0.0f;
 };
@@ -171,9 +171,11 @@ TerrainBakeResult BakeTerrainSculptToStamp(
             (std::min)(65535.0f, (std::max)(0.0f, encoded)) + 0.5f);
     }
 
+    // Resolved like any other stamp name, so "Map/HM_Baked_Map.png" lands in
+    // that map's folder and a bare name still lands in the shared library.
     std::error_code error;
-    std::filesystem::create_directories(TerrainStampDirectory(), error);
-    const std::filesystem::path path = TerrainStampDirectory() / outputName;
+    const std::filesystem::path path = ResolveTerrainStampPath(outputName);
+    std::filesystem::create_directories(path.parent_path(), error);
     if (!WriteGray16PNG(path, gray, resolution, resolution, compress)) {
         result.error = "Failed to write " + path.string();
         return result;

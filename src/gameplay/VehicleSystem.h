@@ -82,6 +82,12 @@ struct VehicleSystem {
         int shotsLeftInBurst = 0;
         // Barrels spin down after firing; cosmetic, drives the muzzle glow.
         float heat = 0.0f;
+        // Set for emplacements placed from a level prefab; 0 for the scripted
+        // comm-tower gun. The ordinal separates several turrets nested in one
+        // entity. Together they let a prefab rebuild find the gun it placed
+        // last time instead of stacking a fresh one on top of it.
+        uint64_t prefabEntityId = 0;
+        uint32_t prefabOrdinal = 0;
 
         bool Active() const { return !dead; }
 
@@ -114,6 +120,38 @@ struct VehicleSystem {
         turret.position = position;
         aaTurrets.push_back(turret);
         return aaTurrets.size() - 1;
+    }
+
+    // Prefab placement. Every editor edit rebuilds the prefab world, and
+    // placing unconditionally stacked a duplicate gun at the same spot on each
+    // rebuild until the cap -- then refused real ones. An existing emplacement
+    // for this entity is moved and kept, health and aim intact.
+    size_t PlacePrefabAATurret(uint64_t entityId, uint32_t ordinal,
+                               const DirectX::XMFLOAT3& position) {
+        for (size_t i = 0; i < aaTurrets.size(); ++i) {
+            AATurret& turret = aaTurrets[i];
+            if (turret.prefabEntityId != entityId ||
+                turret.prefabOrdinal != ordinal) continue;
+            turret.position = position;
+            return i;
+        }
+        const size_t index = PlaceAATurret(position);
+        if (index < aaTurrets.size()) {
+            aaTurrets[index].prefabEntityId = entityId;
+            aaTurrets[index].prefabOrdinal = ordinal;
+        }
+        return index;
+    }
+
+    // Drops prefab emplacements whose entity the last rebuild did not place --
+    // deleted in the editor, or the prefab lost its "aaTurret" component.
+    template <typename IsPlaced>
+    void PrunePrefabAATurrets(IsPlaced isPlaced) {
+        aaTurrets.erase(std::remove_if(aaTurrets.begin(), aaTurrets.end(),
+            [&](const AATurret& turret) {
+                return turret.prefabEntityId != 0 &&
+                    !isPlaced(turret.prefabEntityId, turret.prefabOrdinal);
+            }), aaTurrets.end());
     }
 
     // True while any emplacement is still standing. Callers that need a

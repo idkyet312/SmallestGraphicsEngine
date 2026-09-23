@@ -478,12 +478,30 @@ static void LogFrameSpike(float deltaTimeSeconds) {
     const double frameMs = double(deltaTimeSeconds) * 1000.0;
     if (frameMs < kSpikeThresholdMs) return;
 
-    std::ofstream log("logs/frame_spikes.log", std::ios::app);
-    if (!log) return;
-
     const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm localNow{};
     localtime_s(&localNow, &now);
+
+    // One file per run. Appending forever grew this to 47 MB across two months
+    // of sessions with no boundary between them, so one run could not be told
+    // apart from the rest. The previous run is kept beside it.
+    static std::ofstream log;
+    static bool opened = false;
+    if (!opened) {
+        opened = true;
+        std::error_code ec;
+        const std::filesystem::path current = "logs/frame_spikes.log";
+        const std::filesystem::path previous = "logs/frame_spikes.previous.log";
+        if (std::filesystem::exists(current, ec)) {
+            std::filesystem::remove(previous, ec);
+            std::filesystem::rename(current, previous, ec);
+        }
+        log.open(current, std::ios::trunc);
+        if (log)
+            log << "# session " << std::put_time(&localNow, "%Y-%m-%d %H:%M:%S")
+                << "\n";
+    }
+    if (!log) return;
 
     log << std::put_time(&localNow, "%H:%M:%S") << " frame=" << std::fixed
         << std::setprecision(2) << frameMs << "ms";
@@ -497,8 +515,9 @@ static void LogFrameSpike(float deltaTimeSeconds) {
         log << " " << label << "=[";
         // 5 was too few to attribute a spike: a nested scope's own phases sort
         // below the outer scope plus the always-present ImGui/post entries, so
-        // the breakdown that explains the cost is exactly what got cut.
-        for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
+        // the breakdown that explains the cost is exactly what got cut. 12 in
+        // turn cut the VB children that sort below their own parent.
+        for (size_t i = 0; i < sorted.size() && i < 20; ++i) {
             if (i) log << ", ";
             log << sorted[i].name << ":" << std::setprecision(2) << sorted[i].milliseconds << "ms";
         }
@@ -506,5 +525,6 @@ static void LogFrameSpike(float deltaTimeSeconds) {
     };
     logTopSamples("cpu", g_profiler.CpuSamples());
     logTopSamples("gpu", g_profiler.GpuSamples());
-    log << "\n";
+    // Flushed per line so a crash still leaves the spikes that preceded it.
+    log << "\n" << std::flush;
 }

@@ -922,7 +922,14 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     }
     drawItems.swap(registeredItems);
 
-    vb.UploadBuffers(g_dx12.commandList.Get());
+    // Every GPU pass inside "Visibility Buffer" has its own scope. The parent
+    // read ~10.8 ms against ~2.6 ms of timed children before these existed, so
+    // the untimed work was invisible to the profiler.
+    {
+        ProfilerDX12::Scope uploadScope(
+            g_profiler, "VB Upload", g_dx12.commandList.Get());
+        vb.UploadBuffers(g_dx12.commandList.Get());
+    }
 
     // Pass 1: GPU cull and compact the actual ExecuteIndirect stream.
     // PSO state cannot change inside ExecuteIndirect. Keep separate compacted
@@ -1019,6 +1026,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         // a 0 here would shrink the test instead of widening it.
         cull.frustumRadiusScale =
             std::clamp(scene.meshletFrustumRadiusScale, 0.1f, 3.0f);
+        ProfilerDX12::Scope cullScope(
+            g_profiler, "VB Cull", g_dx12.commandList.Get());
         if (culledCount > 0) {
             cull.commandCount = culledCount;
             gpuCulled.Cull(g_dx12.commandList.Get(), cull, hzb);
@@ -1263,6 +1272,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         mainLight.enableShadows = scene.enableShadows && shadowResource ? 1 : 0;
         const int pointLightCount = (std::min)(
             (int)scene.clusteredRenderer.lights.size(), 64);
+        ProfilerDX12::Scope probeScope(
+            g_profiler, "VB DDGI Probes", g_dx12.commandList.Get());
         g_ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(),
             shader.pointLightsBuffer.GetGPUAddress(shader.ViewFrameIndex()),
             pointLightCount,
@@ -1293,7 +1304,11 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // the active depth buffer to the caller's terrain, water, foliage and
     // viewmodel draws. It is also the only thing that returns depth to
     // DEPTH_WRITE after Resolve moved it to an SRV state in order to read it.
-    vb.BeginForwardExtensions(g_dx12.commandList.Get());
+    {
+        ProfilerDX12::Scope beginExtensionsScope(
+            g_profiler, "VB Begin Extensions", g_dx12.commandList.Get());
+        vb.BeginForwardExtensions(g_dx12.commandList.Get());
+    }
     // The scope has no extensions pass. It goes straight from the resolve to
     // CopyResolveOutputTo, whose barrier declares outputTexture as
     // NON_PIXEL_SHADER_RESOURCE; leaving the pass open left it in

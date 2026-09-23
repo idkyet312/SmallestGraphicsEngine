@@ -15,6 +15,7 @@
 #include "NvBlastTkGroup.h"
 #include "NvBlastTypes.h"
 #include "PhysicsImpactPolicy.h"
+#include "ProfilerDX12.h"
 #include <box3d/box3d.h>
 
 #include <algorithm>
@@ -28,10 +29,13 @@
 #include <future>
 #include <iostream>
 #include <list>
+#include <optional>
 #include <deque>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+extern ProfilerDX12 g_profiler;
 
 using namespace DirectX;
 using namespace Nv::Blast;
@@ -72,6 +76,9 @@ constexpr uint32_t MaxStructuresPerSolverSlice = 2;
 // fraction of a second rather than dropping a frame, and quality is back to
 // full within about a second of the load easing.
 constexpr double DestructionBudgetMs = 4.0;
+// Per-frame cap on creating merged spatial-batch buffers. One primitive is
+// ~2 ms, so this admits one per frame, sometimes two.
+constexpr double SpatialUploadBudgetMs = 1.5;
 // Above this the scale falls; below it, the scale recovers. The gap between
 // them is deliberate hysteresis -- a single threshold makes the quality
 // oscillate frame to frame, which is more visible than either level alone.
@@ -619,6 +626,11 @@ struct DestructionDX12::Impl {
     bool batchBuildInFlight = false;
     std::future<SpatialBatchBuildResult> spatialBatchBuildFuture;
     bool spatialBatchBuildInFlight = false;
+    // A finished spatial build whose GPU buffers are still being created, a
+    // few primitives per frame. See PollSpatialBatchBuild.
+    std::optional<SpatialBatchBuildResult> pendingSpatialUpload;
+    std::vector<MeshPrimitive*> pendingSpatialPrimitives;
+    size_t pendingSpatialNext = 0;
     bool initialBatchBuild = true;
     uint64_t nextActorRenderId = 1;
     uint64_t renderItemRebuildCount = 0;
@@ -712,6 +724,17 @@ struct DestructionDX12::Impl {
     };
     std::vector<RuntimeBlastAsset> runtimeBlastAssets;
     TkGroup* group = nullptr;
+    // Actors to take out of the group once it has finished processing. Split
+    // events are dispatched from inside TkGroup::endProcess while the group
+    // still reports isProcessing(), so removeFromGroup() from the event handler
+    // is refused ("cannot alter Group while processing", ~28 per session) and
+    // the actor stays queued in the group for good.
+    std::vector<TkActor*> pendingGroupRemovals;
+    void ProcessGroup() {
+        group->process();
+        for (TkActor* actor : pendingGroupRemovals) actor->removeFromGroup();
+        pendingGroupRemovals.clear();
+    }
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
     b3HeightFieldData* terrainHeightField = nullptr;
@@ -2209,7 +2232,7 @@ struct DestructionDX12::Impl {
             static_cast<uint32_t>(splitMask.size()) };
         const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
         actor->damage(isolate, &splitParams);
-        group->process();
+        ProcessGroup();
         return true;
     }
 
@@ -2645,6 +2668,23 @@ struct DestructionDX12::Impl {
         return result;
     }
 
+    // Same walk and skip rule as UploadMergedNode, collecting instead of
+    // uploading so the work can be spread over frames.
+    static void CollectUnuploadedPrimitives(
+        const std::shared_ptr<SceneNode>& node,
+        std::vector<MeshPrimitive*>& out) {
+        if (!node) return;
+        if (node->mesh) {
+            for (MeshPrimitive& primitive : node->mesh->primitives) {
+                if (primitive.vertexBuffer &&
+                    primitive.vbv.BufferLocation != 0) continue;
+                out.push_back(&primitive);
+            }
+        }
+        for (const auto& child : node->children)
+            CollectUnuploadedPrimitives(child, out);
+    }
+
     static bool UploadMergedNode(const std::shared_ptr<SceneNode>& node,
                                  ID3D12Device* uploadDevice) {
         if (!node) return false;
@@ -2727,8 +2767,13 @@ struct DestructionDX12::Impl {
             runtime->failedBatchHash = result.chunkHash;
             return true;
         }
-        if (!UploadMergedNode(result.colourNode, device) ||
-            !UploadMergedNode(result.shadowNode, device)) {
+        bool uploaded = false;
+        {
+            ProfilerDX12::CpuScope profile(g_profiler, "Destruction/BatchUpload");
+            uploaded = UploadMergedNode(result.colourNode, device) &&
+                UploadMergedNode(result.shadowNode, device);
+        }
+        if (!uploaded) {
             runtime->failedBatchHash = result.chunkHash;
             return true;
         }
@@ -2752,14 +2797,52 @@ struct DestructionDX12::Impl {
     }
 
     bool PollSpatialBatchBuild() {
-        if (!spatialBatchBuildInFlight ||
-            spatialBatchBuildFuture.wait_for(std::chrono::seconds(0)) !=
+        // A merged cell is a handful of ~200k-vertex primitives, and creating
+        // their buffers took 8-13 ms in one go on the render thread -- the
+        // whole "Destruction Update" spike. Upload a primitive at a time under
+        // a per-frame budget instead; the build stays in flight (so no new one
+        // launches) until the last primitive lands and the cell is swapped in.
+        if (!spatialBatchBuildInFlight) return false;
+        if (!pendingSpatialUpload) {
+            if (spatialBatchBuildFuture.wait_for(std::chrono::seconds(0)) !=
                 std::future_status::ready) return false;
-        SpatialBatchBuildResult result = spatialBatchBuildFuture.get();
+            pendingSpatialUpload = spatialBatchBuildFuture.get();
+            pendingSpatialPrimitives.clear();
+            pendingSpatialNext = 0;
+            if (!pendingSpatialUpload->colourNode ||
+                !pendingSpatialUpload->shadowNode) {
+                pendingSpatialUpload.reset();
+                spatialBatchBuildInFlight = false;
+                return true;
+            }
+            CollectUnuploadedPrimitives(pendingSpatialUpload->colourNode,
+                                        pendingSpatialPrimitives);
+            CollectUnuploadedPrimitives(pendingSpatialUpload->shadowNode,
+                                        pendingSpatialPrimitives);
+        }
+        {
+            ProfilerDX12::CpuScope profile(g_profiler, "Destruction/SpatialUpload");
+            const auto begin = std::chrono::steady_clock::now();
+            while (pendingSpatialNext < pendingSpatialPrimitives.size()) {
+                if (!GLBImporter::BuildMeshletData(
+                        *pendingSpatialPrimitives[pendingSpatialNext], device,
+                        false)) {
+                    pendingSpatialUpload.reset();
+                    pendingSpatialPrimitives.clear();
+                    spatialBatchBuildInFlight = false;
+                    return true;
+                }
+                ++pendingSpatialNext;
+                if (std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - begin).count() >=
+                    SpatialUploadBudgetMs) break;
+            }
+        }
+        if (pendingSpatialNext < pendingSpatialPrimitives.size()) return false;
+        SpatialBatchBuildResult result = std::move(*pendingSpatialUpload);
+        pendingSpatialUpload.reset();
+        pendingSpatialPrimitives.clear();
         spatialBatchBuildInFlight = false;
-        if (!result.colourNode || !result.shadowNode) return true;
-        if (!UploadMergedNode(result.colourNode, device) ||
-            !UploadMergedNode(result.shadowNode, device)) return true;
 
         const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
         const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
@@ -3371,7 +3454,7 @@ struct DestructionDX12::Impl {
         // Drop the intact panel's render and collision ownership before Blast
         // emits its split event. Only the generated fragments may replace it.
         RetireChunkFromRuntime(*target, chunkIndex);
-        group->process();
+        ProcessGroup();
 
         // A destroyed one-chunk actor may produce no visible child, leaving an
         // empty runtime for us to retire explicitly.
@@ -3429,7 +3512,7 @@ struct DestructionDX12::Impl {
                     (uint32_t)chunkGroupByAsset.size(), hitGroup };
                 const NvBlastDamageProgram isolateGroup = { IsolateGroupShader, nullptr };
                 hitActor->actor->damage(isolateGroup, &groupParams);
-                group->process();
+                ProcessGroup();
                 return true;
             }
         }
@@ -3449,7 +3532,7 @@ struct DestructionDX12::Impl {
         IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
         const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
         hitActor->actor->damage(isolate, &isolateParams);
-        group->process();
+        ProcessGroup();
         return true;
     }
 
@@ -3739,7 +3822,7 @@ struct DestructionDX12::Impl {
                 }
             }
         if (anyMarked)
-            group->process();  // next dirty slice evaluates the new islands
+            ProcessGroup();  // next dirty slice evaluates the new islands
         return anyMarked;
     }
 
@@ -3887,7 +3970,12 @@ void DestructionDX12::Shutdown() {
                   << " full rebuilds, " << m->renderValidationCount
                   << " reference comparisons\n";
     if (m->spatialBatchBuildInFlight) {
-        m->spatialBatchBuildFuture.wait();
+        // Already consumed when a result is mid-upload; waiting on the spent
+        // future would be undefined.
+        if (m->spatialBatchBuildFuture.valid())
+            m->spatialBatchBuildFuture.wait();
+        m->pendingSpatialUpload.reset();
+        m->pendingSpatialPrimitives.clear();
         m->spatialBatchBuildInFlight = false;
     }
     if (m->batchBuildInFlight) {
@@ -3922,6 +4010,7 @@ void DestructionDX12::Shutdown() {
         const uint32_t count = m->family->getActorCount();
         std::vector<TkActor*> familyActors(count);
         m->family->getActors(familyActors.data(), count);
+        m->pendingGroupRemovals.clear();
         for (TkActor* actor : familyActors) actor->removeFromGroup();
         m->family->release();
     }
@@ -4140,10 +4229,23 @@ size_t DestructionDX12::VehicleCount() const {
 void DestructionDX12::Update(float dt) {
     if (!m->initialized) return;
     const auto updateBegin = std::chrono::steady_clock::now();
-    const bool batchCompleted = m->PollBatchBuild();
-    const bool spatialBatchCompleted = m->PollSpatialBatchBuild();
-    const bool structuralBroke = m->UpdateStructuralSolver(dt);
-    const bool fireBroke = m->UpdateBurningChunks(dt);
+    // Phase scopes nest under "Destruction Update". That scope alone read 5-19
+    // ms with nothing to say which phase owned it.
+    bool batchCompleted = false, spatialBatchCompleted = false;
+    bool structuralBroke = false, fireBroke = false;
+    {
+        ProfilerDX12::CpuScope profile(g_profiler, "Destruction/Batches");
+        batchCompleted = m->PollBatchBuild();
+        spatialBatchCompleted = m->PollSpatialBatchBuild();
+    }
+    {
+        ProfilerDX12::CpuScope profile(g_profiler, "Destruction/Structural");
+        structuralBroke = m->UpdateStructuralSolver(dt);
+    }
+    {
+        ProfilerDX12::CpuScope profile(g_profiler, "Destruction/Fire");
+        fireBroke = m->UpdateBurningChunks(dt);
+    }
     const bool heavyDestructionScene = m->actors.size() > 512;
     const float maintenanceStep = 1.0f / 30.0f;
     bool maintenanceDue = true;
@@ -4206,6 +4308,8 @@ void DestructionDX12::Update(float dt) {
     bool anyImpactBroke = false;
     bool physicsStepped = false;
     const auto physicsBegin = std::chrono::steady_clock::now();
+    std::optional<ProfilerDX12::CpuScope> physicsProfile;
+    physicsProfile.emplace(g_profiler, "Destruction/Physics");
     while (m->accumulator >= step) {
         physicsStepped = true;
         m->RefreshPinnedHarpoonJoints();
@@ -4294,8 +4398,11 @@ void DestructionDX12::Update(float dt) {
             break;
         }
     }
+    physicsProfile.reset();
     const double physicsMilliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - physicsBegin).count();
+    std::optional<ProfilerDX12::CpuScope> maintenanceProfile;
+    maintenanceProfile.emplace(g_profiler, "Destruction/Maintenance");
     // Dense debris piles can jitter below visible motion forever and Box3D then
     // keeps thousands of tiny actors awake. Promote genuinely low-energy pieces
     // to sleep so they enter spatial render batches. Any later contact/impulse
@@ -4352,6 +4459,7 @@ void DestructionDX12::Update(float dt) {
         m->EnforceDebrisBudget();
     m->UpdateEnemyTargetVelocity(dt);
     m->UpdateEnemyFire(dt);
+    maintenanceProfile.reset();
 
     // Only rebuild when something could actually have moved. An intact house is
     // fully static, so this walk over ~588 chunks was pure waste on every frame
@@ -4372,6 +4480,7 @@ void DestructionDX12::Update(float dt) {
         structuralBroke || fireBroke || debrisBudgetChanged ||
         batchCompleted || spatialBatchCompleted) {
         const auto rebuildBegin = std::chrono::steady_clock::now();
+        ProfilerDX12::CpuScope rebuildProfile(g_profiler, "Destruction/Rebuild");
         if (anyImpactBroke || structuralBroke || fireBroke || debrisBudgetChanged ||
             batchCompleted || spatialBatchCompleted || !m->TryUpdateRenderTransforms())
             m->RebuildRenderItems();
@@ -5002,7 +5111,7 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         }
     }
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
-    m->group->process();
+    m->ProcessGroup();
     for (uint32_t structureId : damagedStructures)
         m->MarkStructureDirty(structureId);
     m->RebuildRenderItems();
@@ -5097,7 +5206,7 @@ void DestructionDX12::ReleaseProtectedChunks(const XMFLOAT3& worldPosition,
             runtime->actor->damage(isolate, &paramStore.back());
         }
     }
-    m->group->process();
+    m->ProcessGroup();
     for (uint32_t structureId : damagedStructures)
         m->MarkStructureDirty(structureId);
     m->RebuildRenderItems();
@@ -5215,7 +5324,7 @@ void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
 
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
     if (anyMarked) {
-        m->group->process();
+        m->ProcessGroup();
         for (uint32_t structureId : damagedStructures)
             m->MarkStructureDirty(structureId);
         m->RebuildRenderItems();
@@ -5316,7 +5425,7 @@ void DestructionDX12::UndermineSupports(const XMFLOAT3& worldPosition,
     }
 
     if (!anyMarked) return;
-    m->group->process();
+    m->ProcessGroup();
     for (uint32_t structureId : damagedStructures)
         m->MarkStructureDirty(structureId);
     m->RebuildRenderItems();
@@ -6204,7 +6313,7 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                     runtime->chunks.push_back(globalChunk);
             }
             if (runtime->chunks.empty()) {
-                child->removeFromGroup();
+                m->pendingGroupRemovals.push_back(child);
                 continue;
             }
             runtime->structureId = m->chunks[runtime->chunks.front()].structureId;
@@ -6229,7 +6338,7 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                 !m->chunks[runtime->chunks.front()].persistentFenceFragment &&
                 m->ActorMaxExtent(*runtime) <= TinyDebrisMaxExtent) {
                 child->userData = nullptr;
-                child->removeFromGroup();
+                m->pendingGroupRemovals.push_back(child);
                 m->EmitTinyDebris(*runtime, &seed);
                 if (m->stressStats.running) m->stressStats.tinyParticles += 3;
                 continue;

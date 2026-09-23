@@ -674,6 +674,24 @@ public:
     UINT persistentAuthoredTriangleCount = 0;
     bool geometryUploaded = false;
     bool geometryDirty = false;
+    // Element spans written since the last successful geometry upload. Only
+    // these are copied: re-sending the whole high-water prefix cost ~6 ms of
+    // GPU copy per registration (~48 MB on the full level), and destruction
+    // registers meshes every one to three frames.
+    struct DirtySpan {
+        UINT begin = UINT_MAX;
+        UINT end = 0;
+        void Add(UINT offset, UINT count) {
+            if (count == 0) return;
+            begin = (std::min)(begin, offset);
+            end = (std::max)(end, offset + count);
+        }
+        bool Empty() const { return begin >= end; }
+        void Clear() { begin = UINT_MAX; end = 0; }
+    };
+    DirtySpan dirtyVertices;
+    DirtySpan dirtyIndices;
+    DirtySpan dirtyTriangles;
     UINT postFrameIndex = 0;
     float exposure = 1.15f;
     float bloomStrength = 0.16f;
@@ -1704,6 +1722,9 @@ public:
         }
         if (transient) transientMeshSlots.insert(meshID);
         else transientMeshSlots.erase(meshID);
+        dirtyVertices.Add(vertexOffset, vertexCount);
+        if (mesh.hasIndices) dirtyIndices.Add(indexOffset, indexCount);
+        dirtyTriangles.Add(triangleOffset, triangleCount);
         geometryDirty = true;
         return meshID;
     }
@@ -1981,58 +2002,41 @@ public:
         // holding the previous frame's contents and, more importantly, never
         // transitioned into COPY_DEST. The barrier block below is keyed off
         // geometryDirty, so this flag keeps the pass dirty: the transitions are
-        // skipped for a frame and the whole geometry upload is retried on the
+        // skipped for a frame and the dirty spans are kept and retried on the
         // next one, rather than promoting buffers that were never written.
         bool geometryUploadFailed = false;
 
-        if (geometryDirty && persistentVertexCount > 0) {
+        // Copies [span.begin, span.end) of one CPU mirror into its DEFAULT
+        // buffer through this frame's upload buffer, at the same offset in all
+        // three. Only freshly allocated ranges are ever in a span, and the pool
+        // quarantines released ranges, so no in-flight frame reads them.
+        auto uploadSpan = [&](const DirtySpan& span, const void* source,
+                              UINT elementSize, ID3D12Resource* upload,
+                              ID3D12Resource* destination) {
+            if (span.Empty()) return;
+            const UINT64 offset = UINT64(span.begin) * elementSize;
+            const UINT64 size = UINT64(span.end - span.begin) * elementSize;
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            if (SUCCEEDED(vertexDataUpload[frameSlot]->Map(0, &readRange,
-                                                           &mapped)) && mapped) {
-                memcpy(mapped, cpuVertices.data(), persistentVertexCount * sizeof(VBPackedVertex));
-                vertexDataUpload[frameSlot]->Unmap(0, nullptr);
-
-                cmdList->CopyBufferRegion(vertexDataBuffer.Get(), 0,
-                    vertexDataUpload[frameSlot].Get(), 0,
-                    persistentVertexCount * sizeof(VBPackedVertex));
+            if (SUCCEEDED(upload->Map(0, &readRange, &mapped)) && mapped) {
+                memcpy(static_cast<uint8_t*>(mapped) + offset,
+                       static_cast<const uint8_t*>(source) + offset, size);
+                D3D12_RANGE written = { SIZE_T(offset), SIZE_T(offset + size) };
+                upload->Unmap(0, &written);
+                cmdList->CopyBufferRegion(destination, offset, upload, offset,
+                                          size);
             } else {
                 geometryUploadFailed = true;
             }
-        }
-
-        if (geometryDirty && persistentIndexCount > 0) {
-            void* mapped = nullptr;
-            D3D12_RANGE readRange = { 0, 0 };
-            if (SUCCEEDED(indexDataUpload[frameSlot]->Map(0, &readRange,
-                                                          &mapped)) && mapped) {
-                memcpy(mapped, cpuIndices.data(), persistentIndexCount * sizeof(UINT));
-                indexDataUpload[frameSlot]->Unmap(0, nullptr);
-
-                cmdList->CopyBufferRegion(indexDataBuffer.Get(), 0,
-                    indexDataUpload[frameSlot].Get(), 0,
-                    persistentIndexCount * sizeof(UINT));
-            } else {
-                geometryUploadFailed = true;
-            }
-        }
-
-        if (geometryDirty && persistentTriangleCount > 0) {
-            void* mapped = nullptr;
-            D3D12_RANGE readRange = { 0, 0 };
-            if (SUCCEEDED(stableTriangleDataUpload[frameSlot]->Map(0, &readRange,
-                                                                   &mapped)) &&
-                mapped) {
-                memcpy(mapped, cpuStableTriangleIDs.data(),
-                    persistentTriangleCount * sizeof(UINT));
-                stableTriangleDataUpload[frameSlot]->Unmap(0, nullptr);
-
-                cmdList->CopyBufferRegion(stableTriangleDataBuffer.Get(), 0,
-                    stableTriangleDataUpload[frameSlot].Get(), 0,
-                    persistentTriangleCount * sizeof(UINT));
-            } else {
-                geometryUploadFailed = true;
-            }
+        };
+        if (geometryDirty) {
+            uploadSpan(dirtyVertices, cpuVertices.data(), sizeof(VBPackedVertex),
+                       vertexDataUpload[frameSlot].Get(), vertexDataBuffer.Get());
+            uploadSpan(dirtyIndices, cpuIndices.data(), sizeof(UINT),
+                       indexDataUpload[frameSlot].Get(), indexDataBuffer.Get());
+            uploadSpan(dirtyTriangles, cpuStableTriangleIDs.data(), sizeof(UINT),
+                       stableTriangleDataUpload[frameSlot].Get(),
+                       stableTriangleDataBuffer.Get());
         }
 
         // Barriers: transition structured buffers from copy dest to SRV
@@ -2057,6 +2061,9 @@ public:
             barrierCount = 5;
             geometryUploaded = true;
             geometryDirty = false;
+            dirtyVertices.Clear();
+            dirtyIndices.Clear();
+            dirtyTriangles.Clear();
         }
         cmdList->ResourceBarrier(barrierCount, barriers);
     }

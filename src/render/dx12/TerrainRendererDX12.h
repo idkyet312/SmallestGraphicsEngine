@@ -5,6 +5,7 @@
 #include "GLBImporter.h"
 #include "LevelDefinition.h"
 #include "TerrainStampLibrary.h"
+#include "EngineLogger.h"
 #include "TextureUploadArenaDX12.h"
 #include <array>
 #include <cstdint>
@@ -1507,7 +1508,7 @@ private:
             return static_cast<UINT>(layer);
         if (loadState == 2u && !s_stampHotReloadEnabled)
             return UINT_MAX;
-        const std::filesystem::path path = TerrainStampDirectory() / texture;
+        const std::filesystem::path path = ResolveTerrainStampPath(texture);
         std::error_code writeTimeError;
         const std::filesystem::file_time_type writeTime =
             std::filesystem::last_write_time(path, writeTimeError);
@@ -1522,10 +1523,21 @@ private:
         int width = 0, height = 0;
         if (!GLBImporter::LoadPixelsGray16(path.string(), source, width, height) ||
             width <= 0 || height <= 0) {
+            // Say which: the importer reports a missing file as "not 16-bit",
+            // which is how a heightmap left out of a build hid for a patch.
+            std::error_code existsError;
+            SGE_LOG("LogTerrain", EngineLog::Level::Error,
+                std::string(std::filesystem::exists(path, existsError)
+                                ? "Terrain stamp unreadable (needs 16-bit grey PNG): "
+                                : "Terrain stamp missing: ") + path.string());
             loadState = 2u;
             if (!writeTimeError) writeTimeRecord = writeTime;
             return UINT_MAX;
         }
+        // Once per slot load, never per frame: resolved slots return above.
+        SGE_LOG("LogTerrain", EngineLog::Level::Display,
+            "Terrain stamp loaded: " + path.string() + " (" +
+            std::to_string(width) + "x" + std::to_string(height) + ")");
 
         // A bake covers the whole sculpted level, so it resolves into the
         // dedicated 4K region past the atlas rather than being box-filtered

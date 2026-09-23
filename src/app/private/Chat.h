@@ -44,10 +44,19 @@ static bool g_chatSwallowNextChar = false;
 
 static bool ChatPromptOpen() { return g_chatPromptOpen; }
 
-// Chat only exists in a session. Asking for it in single player would open a
-// prompt that can never send anything.
+// Any gameplay screen, session or not. In single player a line has nowhere to
+// go, so it lands straight in the local log -- which is still what a player
+// pressing T expects to see, and keeps the prompt testable without a second
+// machine.
 static bool ChatAvailable() {
-    return MultiplayerActive() && IsGameplayScreen();
+    return IsGameplayScreen();
+}
+
+static void AppendChatLog(const std::string& text, bool fromLocalPlayer) {
+    ChatLogEntry entry;
+    entry.text = text;
+    entry.fromLocalPlayer = fromLocalPlayer;
+    g_chatLog.push_back(std::move(entry));
 }
 
 static void OpenChatPrompt() {
@@ -72,7 +81,19 @@ static void CloseChatPrompt() {
 // what keeps the ordering the same on every machine.
 static void SubmitChatPrompt() {
     if (!g_chatPromptOpen) return;
-    if (g_chatInputLength > 0) g_netSession.SendChat(g_chatInput);
+    if (g_chatInputLength > 0) {
+        if (MultiplayerActive()) {
+            g_netSession.SendChat(g_chatInput);
+        } else {
+            // No host to bounce it off, so it is shown directly. Blank lines
+            // are dropped here for the same reason the session drops them.
+            bool printable = false;
+            for (size_t i = 0; i < g_chatInputLength; ++i)
+                if (g_chatInput[i] != ' ') { printable = true; break; }
+            if (printable)
+                AppendChatLog(std::string("You: ") + g_chatInput, true);
+        }
+    }
     CloseChatPrompt();
 }
 
@@ -103,28 +124,29 @@ static void ChatPromptChar(unsigned int character) {
 
 // Drains whatever the session received and ages what is already on screen.
 static void UpdateChat(float dt) {
-    if (!MultiplayerActive()) {
-        // Leaving a session clears the log rather than carrying someone else's
-        // conversation into the next one.
-        if (!g_chatLog.empty()) g_chatLog.clear();
-        CloseChatPrompt();
-        return;
+    // Joining or leaving a session clears the log rather than carrying one
+    // conversation into the next.
+    static bool wasInSession = false;
+    const bool inSession = MultiplayerActive();
+    if (inSession != wasInSession) {
+        g_chatLog.clear();
+        wasInSession = inSession;
     }
     // The level can end, or the run be abandoned, while the prompt is open.
     // Left open it would keep blanking every held key on the next screen.
     if (g_chatPromptOpen && !ChatAvailable()) CloseChatPrompt();
 
-    g_netSession.DrainChat(g_chatScratch);
-    for (const net::ChatLine& line : g_chatScratch) {
-        ChatLogEntry entry;
-        // Formatted here rather than in the session: this is the layer that
-        // knows the game calls them Player-1 and Player-2 on the scoreboard.
-        char label[48];
-        std::snprintf(label, sizeof(label), "Player-%d",
-                      static_cast<int>(line.speaker) + 1);
-        entry.text = std::string(label) + ": " + line.text;
-        entry.fromLocalPlayer = line.fromLocalPlayer;
-        g_chatLog.push_back(std::move(entry));
+    if (inSession) {
+        g_netSession.DrainChat(g_chatScratch);
+        for (const net::ChatLine& line : g_chatScratch) {
+            // Formatted here rather than in the session: this is the layer
+            // that knows the game calls them Player-1 and Player-2.
+            char label[48];
+            std::snprintf(label, sizeof(label), "Player-%d",
+                          static_cast<int>(line.speaker) + 1);
+            AppendChatLog(std::string(label) + ": " + line.text,
+                          line.fromLocalPlayer);
+        }
     }
 
     // Age everything, then drop what has fully faded. Held at zero while the
@@ -150,7 +172,6 @@ static void UpdateChat(float dt) {
 }
 
 static void DrawChat() {
-    if (!MultiplayerActive()) return;
     if (g_chatLog.empty() && !g_chatPromptOpen) return;
     if (!IsGameplayScreen()) return;
 
@@ -159,10 +180,24 @@ static void DrawChat() {
 
     // Bottom left, above where the prompt sits. Sized off the display so the
     // placement holds at any resolution rather than being tuned for one.
-    const float margin = display.x * 0.02f;
+    float margin = display.x * 0.02f;
     const float lineHeight = ImGui::GetTextLineHeight() + 2.0f;
     const float promptHeight = lineHeight + 8.0f;
-    const float bottom = display.y * 0.78f;
+    float bottom = display.y * 0.78f;
+    float promptMinWidth = display.x * 0.25f;
+    // The deploy screen's left and right thirds are the mission briefing and
+    // the planning panel: 430 wide at a 24 margin each (Menus.h), running to
+    // 36 above the bottom edge. The gameplay placement lands on the briefing
+    // text, so here the chat moves into the map between them, at its foot,
+    // where there is nothing but terrain to cover.
+    if (DeploymentPlanningVisible()) {
+        constexpr float kSidePanelExtent = 24.0f + 430.0f;
+        margin = kSidePanelExtent + 20.0f;
+        // Puts the prompt's lower edge 40 px above the bottom of the screen.
+        bottom = display.y - 40.0f - lineHeight;
+        const float mapStrip = display.x - 2.0f * kSidePanelExtent - 40.0f;
+        promptMinWidth = (std::max)(120.0f, (std::min)(mapStrip, 480.0f));
+    }
 
     // Newest at the bottom, walking upward, so the eye lands on the most
     // recent line where it expects to.
@@ -201,12 +236,15 @@ static void DrawChat() {
     // The prompt itself. A caret is appended rather than blinked: at 60 Hz a
     // blink is one more thing to time, and a static caret still says where the
     // text will land.
-    const float promptY = bottom - promptHeight + 4.0f;
+    // Its own row under the newest line. The log's bottom line starts at
+    // bottom - promptHeight and is one lineHeight tall, so this clears it with
+    // a few pixels between the two panels instead of drawing over it.
+    const float promptY = bottom - promptHeight + lineHeight + 6.0f;
     const std::string prompt = std::string("Say: ") + g_chatInput + "_";
     const ImVec2 size = ImGui::CalcTextSize(prompt.c_str());
     draw->AddRectFilled(
         ImVec2(margin - 6.0f, promptY - 3.0f),
-        ImVec2(margin + (std::max)(size.x, display.x * 0.25f) + 6.0f,
+        ImVec2(margin + (std::max)(size.x, promptMinWidth) + 6.0f,
                promptY + lineHeight + 1.0f),
         IM_COL32(0, 0, 0, 190), 3.0f);
     draw->AddText(ImVec2(margin, promptY), IM_COL32(255, 255, 255, 255),

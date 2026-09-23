@@ -302,10 +302,14 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path);
 LevelSaveResult SaveLevel(const LevelDefinition& level,
                           const std::filesystem::path& path);
 
-// Where a level's painted terrain weights live: the level path with its
-// extension replaced by "_splat.png". Exposed so the editor can report and
-// delete the sidecar without duplicating the naming rule.
+// Where a level's painted terrain weights live: the map's own folder,
+// <dir>/<Map>/<Map>_splat.png. Exposed so the editor can report and delete the
+// sidecar without duplicating the naming rule.
 std::filesystem::path TerrainSplatSidecarPath(
+    const std::filesystem::path& levelPath);
+// Where they lived before maps had folders, <dir>/<Map>_splat.png. Read as a
+// fallback on load and removed on save.
+std::filesystem::path LegacyTerrainSplatSidecarPath(
     const std::filesystem::path& levelPath);
 
 // Samples a Catmull-Rom curve through a spline's control points. Interpolating,

@@ -545,7 +545,6 @@ struct Scene {
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
     float projectileScale    = 0.1f;
-    float rocketTurnRate     = 2.8f;    // radians/sec; aim crosshair guides missile
     bool  autoFire           = true;    // hold mouse to keep firing
     float fireInterval       = 0.1f;    // seconds between auto-fire shots
     float fireCooldown       = 0.0f;    // time left before next shot may fire
@@ -1743,22 +1742,7 @@ struct Scene {
                 p.lifetime -= dt;
                 if (p.lifetime <= 0.0f) p.harpoonExpired = true;
             } else {
-                if (p.rocket) {
-                    // Battlefield 2-style wire guidance: rocket bends toward the
-                    // player's current crosshair, with finite steering authority.
-                    const XMVECTOR aim = XMLoadFloat3(&camera.Position) +
-                                         XMLoadFloat3(&camera.GetAimFront()) * 500.0f;
-                    const XMVECTOR position = XMLoadFloat3(&p.position);
-                    const XMVECTOR current = XMVector3Normalize(XMLoadFloat3(&p.direction));
-                    const XMVECTOR desired = XMVector3Normalize(aim - position);
-                    const float dot = (std::max)(-1.0f, (std::min)(1.0f,
-                        XMVectorGetX(XMVector3Dot(current, desired))));
-                    const float angle = std::acos(dot);
-                    const float blend = angle > 1e-4f
-                        ? (std::min)(1.0f, rocketTurnRate * dt / angle) : 1.0f;
-                    XMStoreFloat3(&p.direction,
-                        XMVector3Normalize(XMVectorLerp(current, desired, blend)));
-                }
+                // Rockets are unguided: they hold their launch direction.
                 p.position.x += p.direction.x * p.speed * dt;
                 p.position.y += p.direction.y * p.speed * dt;
                 p.position.z += p.direction.z * p.speed * dt;

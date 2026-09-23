@@ -102,7 +102,7 @@ constexpr int kStampPreviewGrid = 64;
 bool LoadStampPreview(const std::string& filename, std::vector<float>& out) {
     out.assign(static_cast<size_t>(kStampPreviewGrid) * kStampPreviewGrid, 0.5f);
     if (!IsTerrainStampFilename(filename)) return false;
-    const std::string path = (TerrainStampDirectory() / filename).string();
+    const std::string path = ResolveTerrainStampPath(filename).string();
     int width = 0, height = 0, components = 0;
     // 16-bit for the authored heightmaps; stb widens 8-bit sources for free, so
     // a stamp exported at 8 bits still previews instead of showing nothing.
@@ -3176,20 +3176,16 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     // and the loop runs one iteration.
     if (ImGui::Button("Bake to One Stamp")) {
         const LevelDefinition before = level_;
-        // One bake target per level, so baking two levels does not have the
-        // second overwrite the first's heightmap. Stamp filenames must be
-        // simple names inside the stamp directory (IsTerrainStampFilename),
-        // so anything unusual in the level name is folded to an underscore.
-        std::string safeLevel;
-        for (char c : level_.name) {
-            const unsigned char u = static_cast<unsigned char>(c);
-            safeLevel.push_back(
-                (std::isalnum(u) || c == '-' || c == '_') ? c : '_');
-        }
-        if (safeLevel.empty()) safeLevel = "level";
-        if (safeLevel.size() > 64) safeLevel.resize(64);
-        const std::string bakeName =
-            std::string(kTerrainStampBakePrefix) + safeLevel + ".png";
+        // One bake per map, named after it and written into its own folder:
+        // Content/Levels/<Map>/<Map>_baked.png, beside <Map>_splat.png. The
+        // map is the level file when it has been saved and the level's name
+        // when it has not. Kept with the map so the heightmap travels with it,
+        // rather than sitting in the shared stamp library where every copy of
+        // the level left it behind.
+        const std::string folder = TerrainLevelFolderName(
+            currentPath_.empty() ? level_.name
+                                 : currentPath_.stem().string());
+        const std::string bakeName = TerrainLevelBakeName(folder);
         TerrainSculptStamp baked;
         const TerrainBakeResult result = BakeTerrainSculptToStamp(
             level_.terrainSculpt, terrainHeight,
@@ -3240,8 +3236,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ImGui::EndDisabled();
         ImGui::TextWrapped(
             "Painted weights override the procedural slope/height blend. "
-            "Unpainted ground keeps its automatic materials. Saved beside the "
-            "level as <name>_splat.png.");
+            "Unpainted ground keeps its automatic materials. Saved in the "
+            "map's folder as <name>/<name>_splat.png.");
     }
 
     ImGui::SeparatorText("Island Builder");

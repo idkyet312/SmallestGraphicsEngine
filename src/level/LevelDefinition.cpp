@@ -704,9 +704,12 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         // procedural terrain, which is strictly better than refusing to open a
         // map because its paint data is damaged.
         {
-            const std::filesystem::path splatPath =
-                TerrainSplatSidecarPath(path);
+            // The map folder first; beside the JSON is where sidecars lived
+            // before maps had folders, and a level saved then still loads.
+            std::filesystem::path splatPath = TerrainSplatSidecarPath(path);
             std::error_code ignored;
+            if (!std::filesystem::exists(splatPath, ignored))
+                splatPath = LegacyTerrainSplatSidecarPath(path);
             if (std::filesystem::exists(splatPath, ignored)) {
                 std::vector<unsigned char> pixels;
                 int width = 0, height = 0;
@@ -730,6 +733,14 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
 }
 
 std::filesystem::path TerrainSplatSidecarPath(
+    const std::filesystem::path& levelPath) {
+    // <dir>/<Map>/<Map>_splat.png: in the map's own folder, beside its
+    // heightmaps, so the level's images travel together.
+    const std::string stem = levelPath.stem().string();
+    return levelPath.parent_path() / stem / (stem + "_splat.png");
+}
+
+std::filesystem::path LegacyTerrainSplatSidecarPath(
     const std::filesystem::path& levelPath) {
     std::filesystem::path sidecar = levelPath;
     sidecar.replace_extension();
@@ -880,11 +891,21 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         // was not written. A level with no painting deletes any stale sidecar
         // instead of leaving one behind for the next load to pick up.
         const std::filesystem::path splatPath = TerrainSplatSidecarPath(path);
+        // The pre-folder location is retired on every save, painted or not:
+        // left behind it would be a second copy that no longer matches.
+        {
+            std::error_code ignored;
+            std::filesystem::remove(LegacyTerrainSplatSidecarPath(path),
+                                    ignored);
+        }
         const size_t expectedSplatBytes =
             static_cast<size_t>(level.terrainSplatResolution) *
             level.terrainSplatResolution * 4u;
         if (level.terrainSplatResolution > 0 &&
             level.terrainSplatRGBA.size() == expectedSplatBytes) {
+            std::error_code folderError;
+            std::filesystem::create_directories(splatPath.parent_path(),
+                                                folderError);
             const int written = stbi_write_png(
                 splatPath.string().c_str(),
                 static_cast<int>(level.terrainSplatResolution),

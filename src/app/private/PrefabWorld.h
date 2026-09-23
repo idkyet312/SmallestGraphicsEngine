@@ -59,6 +59,15 @@ static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
     // behind after its aircraft is gone is both a prompt on empty air and a
     // stale index the panel would read.
     dropById(g_prefabTravelPoints);
+    // An AA-turret prefab's gun lives in the vehicle system, not a prefab list.
+    {
+        const size_t before = g_game.vehicles.aaTurrets.size();
+        g_game.vehicles.PrunePrefabAATurrets(
+            [entityId](uint64_t turretEntity, uint32_t) {
+                return turretEntity != entityId;
+            });
+        if (g_game.vehicles.aaTurrets.size() != before) removed = true;
+    }
     g_meshCollisionEntities.erase(entityId);
     g_prefabHealth.erase(entityId);
 
@@ -368,6 +377,8 @@ static void RebuildPrefabRenderBatches() {
     // Entity ids of the aircraft this pass actually registered, so the ones it
     // did not can be pruned afterwards.
     std::unordered_set<uint64_t> seenObjectivePlanes;
+    // Turrets placed this pass, per entity, for the same pruning.
+    std::unordered_map<uint64_t, uint32_t> placedTurretCounts;
     // `skipRenderBatch` suppresses only the drawing of an instance, leaving its
     // collision, light, audio, destructible and spawner components registered
     // like any other prefab's. The comm tower needs exactly that: it is drawn
@@ -419,7 +430,9 @@ static void RebuildPrefabRenderBatches() {
             XMFLOAT3 turretOrigin;
             XMStoreFloat3(&turretOrigin,
                           XMVector3TransformCoord(XMVectorZero(), world));
-            if (g_game.vehicles.PlaceAATurret(turretOrigin) >=
+            const uint32_t ordinal = placedTurretCounts[entityId]++;
+            if (g_game.vehicles.PlacePrefabAATurret(
+                    entityId, ordinal, turretOrigin) >=
                     VehicleSystem::kMaxAATurrets) {
                 SGE_LOG("LogGameplay", EngineLog::Level::Warning,
                     "AA turret prefab ignored: at the turret cap");
@@ -783,6 +796,12 @@ static void RebuildPrefabRenderBatches() {
                            return !seenObjectivePlanes.count(plane.entityId);
                        }),
         g_objectivePlanes.end());
+    g_game.vehicles.PrunePrefabAATurrets(
+        [&](uint64_t entityId, uint32_t ordinal) {
+            const auto placed = placedTurretCounts.find(entityId);
+            return placed != placedTurretCounts.end() &&
+                ordinal < placed->second;
+        });
     // AA emplacements. Drawn from a code-built model rather than a prefab batch
     // per entity, because they are placed by gameplay (beside the comm tower,
     // and from the editor's turret prefab) and are not level entities.

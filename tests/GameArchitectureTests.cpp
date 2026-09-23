@@ -207,10 +207,19 @@ int main() {
     CHECK(runtime.rank.LifetimeKills() == 1);
     CHECK(runtime.rank.SessionXp() == 0);
 
+    // A fresh loadout carries only the issued charge in both slots, so picking
+    // the same weapon for the other slot swaps the charge back into slot 0.
     MissionLoadout loadout;
+    CHECK(loadout.Empty());
+    CHECK(loadout.Valid());
     loadout.SelectWeapon(0, 2);
     CHECK(loadout.weapons[0] == 2);
+    CHECK(loadout.weapons[1] == MissionLoadout::kIssuedChargeWeapon);
     loadout.SelectWeapon(1, 2);
+    CHECK(loadout.weapons[0] == MissionLoadout::kIssuedChargeWeapon);
+    CHECK(loadout.weapons[1] == 2);
+    // The grading below expects a shotgun + RPG kit.
+    loadout.SelectWeapon(0, 1);
     CHECK(loadout.weapons[0] == 1);
     CHECK(loadout.weapons[1] == 2);
     CHECK(loadout.Valid());

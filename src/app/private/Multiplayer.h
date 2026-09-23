@@ -885,15 +885,33 @@ static void UpdateClientEnemies(float frameDelta) {
     // Drop bodies the host has stopped sending. An enemy that fell out of the
     // nearest-N window is gone from this client's view until it comes back,
     // which is what keeps a distant firefight off the wire.
+    size_t localStrays = 0;
     RetireNetworkActors(
-                       [&enemies](const SkinnedEnemy& actor) {
+                       [&enemies, &localStrays](const SkinnedEnemy& actor) {
                            if (actor.networkControlled) return false;
-                           if (actor.netEnemyId == net::kInvalidEnemyId)
-                               return false;
+                           // No host id means this client spawned it itself:
+                           // the level load and restart paths still run the
+                           // squad, turret-gunner and marine spawns here. Ids
+                           // are only handed out by the host, and the client
+                           // never runs AI on its own actors, so a body like
+                           // that never got a clip and stood in its bind pose
+                           // -- the T-posed marines only player 2 could see,
+                           // beside the host's real ones arriving by snapshot.
+                           // One rule here covers every spawn site.
+                           if (actor.netEnemyId == net::kInvalidEnemyId) {
+                               ++localStrays;
+                               return true;
+                           }
                            for (const net::RemoteEnemy& remote : enemies)
                                if (remote.id == actor.netEnemyId) return false;
                            return true;
                        });
+    // Once per spawn wave (load, restart), never per frame: after this there
+    // are none left to count.
+    if (localStrays > 0)
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+                "client: removed " + std::to_string(localStrays) +
+                " locally spawned actors; the host's squad arrives by snapshot");
 }
 
 // Grenades are simulated by the host. A client may keep its locally thrown

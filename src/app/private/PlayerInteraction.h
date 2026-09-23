@@ -450,7 +450,7 @@ static void RenderArmoryShopPanel(HWND hwnd) {
 //
 // Each destination names a preview image. The art is optional on purpose: a
 // missing file draws a labelled placeholder card instead of failing, so the
-// screen works today and dropping a PNG into Content/Textures/Islands is the
+// screen works today and dropping a preview.png into the map's folder is the
 // only step needed to illustrate it later.
 struct TravelDestination {
     const char* name;
@@ -471,12 +471,12 @@ static const std::array<TravelDestination, 2> kTravelDestinations = { {
       { "Content/Levels/Islandv10.json",
         "levels/Islandv10.json",
         "build/Content/Levels/Islandv10.json" },
-      "Content/Textures/Islands/island1.png" },
+      "Content/Levels/Islandv10/preview.png" },
     { "MILITARY AIRFIELD", "Strike - aircraft on the ground",
       { "Content/Levels/BigIslandv33.json",
         "levels/BigIslandv33.json",
         "build/Content/Levels/BigIslandv33.json" },
-      "Content/Textures/Islands/airfield.png" },
+      "Content/Levels/BigIslandv33/preview.png" },
 } };
 
 

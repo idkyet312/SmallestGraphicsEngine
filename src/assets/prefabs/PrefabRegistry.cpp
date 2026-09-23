@@ -159,6 +159,35 @@ std::vector<std::string> ValidateImportedModel(
         if (triangles > 250000)
             warnings.push_back("High triangle count: " + std::to_string(triangles));
         if (!hasUv) warnings.push_back("Model has no UV channel 0");
+        // The importers fall back to a filename match anywhere under the model's
+        // folder (FBXImporter's texture lookup), so a reference to the author's
+        // own disk still loads when the file ships beside the model. Mirroring
+        // that here keeps this warning for textures that are really absent --
+        // it reported 138, most of which render fine.
+        std::unordered_set<std::string> shippedTextureNames;
+        bool shippedTexturesScanned = false;
+        const auto lowerName = [](std::string name) {
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return name;
+        };
+        const auto shipsBesideModel = [&](const std::string& raw) {
+            if (!shippedTexturesScanned) {
+                shippedTexturesScanned = true;
+                std::error_code scanError;
+                for (std::filesystem::recursive_directory_iterator it(
+                         path.parent_path(), scanError), end;
+                     !scanError && it != end; it.increment(scanError)) {
+                    if (it->is_regular_file(scanError))
+                        shippedTextureNames.insert(
+                            lowerName(it->path().filename().string()));
+                }
+            }
+            std::string normalized = raw;
+            std::replace(normalized.begin(), normalized.end(), '\\', '/');
+            return shippedTextureNames.count(lowerName(
+                std::filesystem::path(normalized).filename().string())) != 0;
+        };
         for (unsigned materialIndex = 0; materialIndex < scene->mNumMaterials;
              ++materialIndex) {
             const aiMaterial* material = scene->mMaterials[materialIndex];
@@ -173,7 +202,7 @@ std::vector<std::string> ValidateImportedModel(
                     if (raw.empty() || raw[0] == '*') continue;
                     std::filesystem::path texture = raw;
                     if (!texture.is_absolute()) texture = path.parent_path() / texture;
-                    if (!std::filesystem::exists(texture))
+                    if (!std::filesystem::exists(texture) && !shipsBesideModel(raw))
                         warnings.push_back("Missing texture: " + raw);
                 }
             }

@@ -1,5 +1,6 @@
 #include "LevelDefinition.h"
 #include "BanditWeapon.h"
+#include "TerrainStampLibrary.h"
 
 #include <algorithm>
 #include <cmath>
@@ -449,6 +450,75 @@ int main() {
         const LevelLoadResult legacy = LoadLevel(legacyPath);
         CHECK(legacy.ok);
         CHECK(legacy.level.splines.empty());
+    }
+
+    // Stamp names: a bare name is the shared library, "Map/file.png" is that
+    // map's folder under Content/Levels, and nothing else is accepted -- a
+    // level must not be able to point a stamp anywhere else on disk.
+    {
+        CHECK(IsTerrainStampFilename("HM_Islands_07_Ex.PNG"));
+        CHECK(IsTerrainStampFilename("BigIslandv33/HM_Baked_mil.png"));
+        CHECK(!IsTerrainStampFilename("/HM.png"));
+        CHECK(!IsTerrainStampFilename("Map/"));
+        CHECK(!IsTerrainStampFilename("A/B/HM.png"));
+        CHECK(!IsTerrainStampFilename("../HM.png"));
+        CHECK(!IsTerrainStampFilename("Map/../HM.png"));
+        CHECK(!IsTerrainStampFilename("Map\\HM.png"));
+        CHECK(!IsTerrainStampFilename("C:/HM.png"));
+        CHECK(!IsTerrainStampFilename("Map/HM.jpg"));
+
+        CHECK(ResolveTerrainStampPath("HM.png") ==
+              TerrainStampDirectory() / "HM.png");
+        CHECK(ResolveTerrainStampPath("Map/HM.png") ==
+              std::filesystem::path("Content/Levels") / "Map/HM.png");
+
+        // Bakes are named after their map and route to the high-resolution
+        // slot; the pre-folder HM_Baked_ name still routes for old levels.
+        CHECK(TerrainLevelBakeName("BigIslandv33") ==
+              "BigIslandv33/BigIslandv33_baked.png");
+        CHECK(IsTerrainStampFilename(TerrainLevelBakeName("BigIslandv33")));
+        CHECK(IsTerrainStampBakeFilename("BigIslandv33/BigIslandv33_baked.png"));
+        CHECK(IsTerrainStampBakeFilename("Map/Map_BAKED.PNG"));
+        CHECK(IsTerrainStampBakeFilename("HM_Baked_mil.png"));
+        CHECK(IsTerrainStampBakeFilename("BigIslandv33/HM_Baked_mil.png"));
+        CHECK(!IsTerrainStampBakeFilename("HM_Islands_07_Ex.PNG"));
+        CHECK(!IsTerrainStampBakeFilename("Map/Map_splat.png"));
+        CHECK(!IsTerrainStampBakeFilename("baked/HM_Islands.png"));
+
+        CHECK(TerrainLevelFolderName("Big Island v3") == "Big_Island_v3");
+        CHECK(TerrainLevelFolderName("") == "level");
+    }
+
+    // Splat sidecars live in the map's folder. One written beside the JSON
+    // before maps had folders is retired by the next save, so a level never
+    // carries two copies that disagree. (Reading pixels back is not tested
+    // here: this target links GLBImporterPixelStub, whose loader always fails.)
+    {
+        const std::filesystem::path splatRoot = root / "splat";
+        std::filesystem::create_directories(splatRoot);
+        const std::filesystem::path levelPath = splatRoot / "Isle.json";
+        CHECK(TerrainSplatSidecarPath(levelPath) ==
+              splatRoot / "Isle" / "Isle_splat.png");
+        CHECK(LegacyTerrainSplatSidecarPath(levelPath) ==
+              splatRoot / "Isle_splat.png");
+
+        // An old save's sidecar, beside the JSON.
+        { std::ofstream legacy(LegacyTerrainSplatSidecarPath(levelPath),
+                               std::ios::binary); legacy << "old"; }
+
+        LevelDefinition painted = MakeFlatLevelTemplate();
+        painted.terrainSplatResolution = 4;
+        painted.terrainSplatRGBA.assign(4 * 4 * 4, 0);
+        painted.terrainSplatRGBA[0] = 255;
+        CHECK(SaveLevel(painted, levelPath).ok);
+        CHECK(std::filesystem::exists(TerrainSplatSidecarPath(levelPath)));
+        CHECK(!std::filesystem::exists(
+            LegacyTerrainSplatSidecarPath(levelPath)));
+
+        // Unpainted: the folder's sidecar goes too, as it always did.
+        LevelDefinition unpainted = MakeFlatLevelTemplate();
+        CHECK(SaveLevel(unpainted, levelPath).ok);
+        CHECK(!std::filesystem::exists(TerrainSplatSidecarPath(levelPath)));
     }
 
     std::error_code ignored;

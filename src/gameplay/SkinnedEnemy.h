@@ -846,12 +846,22 @@ public:
             const float gunHeight = position.y + footOffset + 1.48f;
             aimPitch = (std::max)(-0.55f, (std::min)(
                 0.55f, std::atan2(target.y - gunHeight, distance)));
-            if (inCover_) {
-                const float turn = std::atan2(
-                    std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
-                const float maxTurn = 5.5f * dt;
-                yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
-            }
+            // Turn the body onto the target. This used to live in the movement
+            // branch and in the in-cover branch only, so an actor that was
+            // stationary for any other reason kept whatever yaw it last had and
+            // fired across its own shoulder: rooted for a shot wind-up, holding
+            // at its safe distance, or simply already standing where it wanted
+            // to be. Those are exactly the moments it is shooting, so the wrong
+            // facing was most visible when it mattered most.
+            //
+            // Run unconditionally here instead, where aimYaw is set -- the
+            // movement branch below no longer turns, and the upper body still
+            // twists the remainder through the spine so a small correction
+            // reads as a look rather than a pivot.
+            const float turn = std::atan2(
+                std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
+            const float maxTurn = 5.5f * dt;
+            yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
         }
         if (preparingShot_) stationaryAimTime_ += dt;
         // A sniper walking while its laser is up would drag the beam across the
@@ -989,13 +999,9 @@ public:
             const float travel = (std::min)(speed * dt, 0.45f);
             position.x += moveX * travel;
             position.z += moveZ * travel;
-            const auto angleDelta = [](float from, float to) {
-                return std::atan2(std::sin(to - from), std::cos(to - from));
-            };
-            // Facing stays on the target; local velocity selects the leg gait.
-            const float turn = angleDelta(yaw, aimYaw);
-            const float maxTurn = 5.5f * dt;
-            yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
+            // Facing is turned onto the target where aimYaw is set, for every
+            // actor rather than only a moving one; local velocity selects the
+            // leg gait, so a strafing orbit still plays sideways steps.
         }
         const bool running = speed > moveSpeed * 1.2f;
         const float referenceSpeed = running ? moveSpeed * 1.65f : moveSpeed;

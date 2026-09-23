@@ -7415,6 +7415,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_destruction.Shutdown();
+    // Every GunAudio global must be shut down here, before AudioDevice below
+    // releases the engine. One that is left for its static destructor calls
+    // DestroyVoice on voices the engine already freed, which crashed on exit
+    // (GunAudio::Shutdown, read of freed memory) whenever any of these four had
+    // loaded -- a helicopter, the Black Hawk alarm or a fire in the level.
+    g_helicopterHoverAudio.Shutdown();
+    g_blackHawkAlarmAudio.Shutdown();
+    g_fireLoopAudio.Shutdown();
+    g_fireIgnitionAudio.Shutdown();
     g_banditHitVoiceAudio.Shutdown();
     g_banditDeathAudio.Shutdown();
     g_banditAttackAudio.Shutdown();
