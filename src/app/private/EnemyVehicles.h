@@ -695,6 +695,24 @@ static float GroundHeightAt(float x, float z) {
     return TerrainRendererDX12::HeightAt(params, x, z);
 }
 
+// Where an AA emplacement's base plate belongs. The authored gun's base is a
+// flat-bottomed box, so any height above the terrain shows as a gap: measured on
+// BigIslandv33, the level's turret placements sit up to 1.17 m over the ground
+// they were dropped on. Anything authored within kSnap of the terrain is seated
+// on it; further off is taken to be deliberate (a rooftop, a platform) and kept.
+// The lowest of five samples across the ~2.4 m footprint is used, so on a slope
+// the downhill edge meets the ground and the uphill edge sinks in, never a gap.
+static float AATurretSeatHeight(float x, float z, float authoredY) {
+    constexpr float kSnap = 1.5f;
+    constexpr float kFootprint = 1.2f;
+    float ground = GroundHeightAt(x, z);
+    if (std::abs(authoredY - ground) > kSnap) return authoredY;
+    for (const float dx : { -kFootprint, kFootprint })
+        for (const float dz : { -kFootprint, kFootprint })
+            ground = (std::min)(ground, GroundHeightAt(x + dx, z + dz));
+    return ground;
+}
+
 // Squad size per wave, escalating: the first call-in is a probe, later ones
 // commit. Capped so a long run cannot bury the player in bodies.
 static int DropshipWaveTroopCount(uint32_t waveIndex) {

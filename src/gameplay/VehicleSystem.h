@@ -65,8 +65,9 @@ struct VehicleSystem {
     static constexpr float AATurretPitchRate = 1.1f;     // rad/s elevation
     static constexpr float AATurretMinPitch = -0.12f;
     static constexpr float AATurretMaxPitch = 1.30f;     // ~75 deg, near vertical
-    // Muzzle sits at the end of the barrels, measured from the turret origin.
-    static constexpr float AATurretBarrelLength = 2.35f;
+    // Muzzle sits at the end of the barrel, measured from the trunnion: the
+    // authored gun's muzzle brake ends 3.60 m out (scripts/split-antiair.py).
+    static constexpr float AATurretBarrelLength = 3.60f;
     static constexpr float AATurretMountHeight = 1.85f;
 
     // One emplacement. Held in a vector rather than as loose fields on the

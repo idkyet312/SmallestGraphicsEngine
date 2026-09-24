@@ -213,6 +213,9 @@ static void PlaceAATurretNearCommTower() {
             params.heightScale = scene.terrainHeightScale;
             groundY = (std::max)(0.0f,
                 TerrainRendererDX12::HeightAt(params, x, z));
+            // Seated across the whole footprint, not just the centre sample,
+            // so a slope does not leave the base plate hanging off one edge.
+            groundY = (std::max)(0.0f, AATurretSeatHeight(x, z, groundY));
         }
         g_game.vehicles.PlaceAATurret(XMFLOAT3(x, groundY, z));
         SGE_LOG("LogGameplay", EngineLog::Level::Display,
@@ -366,8 +369,18 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
 static void UpdateAATurret(float deltaTime) {
     for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i)
         UpdateOneAATurret(i, deltaTime);
-    // No posing here: each turret's model clone is aimed where the render
-    // batches are built, from that turret's own pitch and yaw.
+    // Pose each drawn gun after its slew, so the barrel matches the angles
+    // just solved. The render batches are only built on a prefab rebuild, and
+    // posing there alone left every gun frozen at its spawn attitude while it
+    // fired in other directions. Clone i draws turret i (see
+    // RebuildPrefabRenderBatches); one placed since then has no clone yet.
+    const size_t posed = (std::min)(g_game.vehicles.aaTurrets.size(),
+                                    g_aaTurretModelInstances.size());
+    for (size_t i = 0; i < posed; ++i) {
+        const VehicleSystem::AATurret& turret = g_game.vehicles.aaTurrets[i];
+        PoseAATurretModelInstance(g_aaTurretModelInstances[i], turret.pitch,
+                                  turret.yaw);
+    }
 }
 
 // The comm-tower entity whose mast contains `position`, or 0 for none. Used to

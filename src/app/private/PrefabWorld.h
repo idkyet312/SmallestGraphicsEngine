@@ -138,24 +138,27 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
         if (depth > 16) return;
         const PrefabAsset* prefab = g_prefabRegistry.Find(prefabId);
         if (!prefab) return;
-        PrefabModelCacheEntry* cachedModel = nullptr;
-        const auto cached = g_prefabModelCache.find(prefab->id);
-        if (cached != g_prefabModelCache.end())
-            cachedModel = &cached->second;
-        else if (loadMissingModels)
-            cachedModel = LoadPrefabModel(*prefab);
-        if (!cachedModel) {
-            missingVisual = true;
-            return;
-        }
-
         const nlohmann::json components = MergePrefabComponents(
             prefab->components, overrides);
+        // The AA turret is drawn from its own posed model, so its prefab mesh
+        // is never needed here (see RebuildPrefabRenderBatches).
+        const bool drawnAsTurret = components.contains("aaTurret");
+        PrefabModelCacheEntry* cachedModel = nullptr;
+        if (!drawnAsTurret) {
+            const auto cached = g_prefabModelCache.find(prefab->id);
+            if (cached != g_prefabModelCache.end())
+                cachedModel = &cached->second;
+            else if (loadMissingModels)
+                cachedModel = LoadPrefabModel(*prefab);
+            if (!cachedModel) {
+                missingVisual = true;
+                return;
+            }
+        }
         const bool castShadow = components.contains("staticMesh")
             ? components.at("staticMesh").value("castShadow", prefab->castShadow)
             : prefab->castShadow;
-        const bool drawnByRuntimeSystem =
-            components.contains("aaTurret") ||
+        const bool drawnByRuntimeSystem = drawnAsTurret ||
             (IsNvBlastStructurePrefab(prefabId) && scene.useDestruction &&
              g_destruction.IsInitialized());
         if (!drawnByRuntimeSystem) {
@@ -408,15 +411,20 @@ static void RebuildPrefabRenderBatches() {
                 "Level entity references missing prefab: " + prefabId);
             return;
         }
+        const nlohmann::json components = MergePrefabComponents(
+            prefab->components, overrides);
+        // An AA turret draws its own posed model (LoadAATurretModel), so the
+        // prefab mesh -- there for the asset-browser thumbnail -- would only
+        // sit in VRAM. Nothing below reads the model for it: its render batch
+        // and bounds collider are both skipped.
+        const bool drawnAsTurret = components.contains("aaTurret");
         PrefabModelCacheEntry* cachedModel = nullptr;
-        {
+        if (!drawnAsTurret) {
             ProfilerDX12::CpuScope modelLoadProfile(
                 g_profiler, "PrefabRebuild/ModelLoad");
             cachedModel = LoadPrefabModel(*prefab);
+            if (!cachedModel) return;
         }
-        if (!cachedModel) return;
-        const nlohmann::json components = MergePrefabComponents(
-            prefab->components, overrides);
         const bool castShadow = components.contains("staticMesh")
             ? components.at("staticMesh").value("castShadow", prefab->castShadow)
             : prefab->castShadow;
@@ -436,7 +444,15 @@ static void RebuildPrefabRenderBatches() {
             XMFLOAT3 turretOrigin;
             XMStoreFloat3(&turretOrigin,
                           XMVector3TransformCoord(XMVectorZero(), world));
+            const float authoredY = turretOrigin.y;
+            turretOrigin.y = AATurretSeatHeight(
+                turretOrigin.x, turretOrigin.z, authoredY);
             const uint32_t ordinal = placedTurretCounts[entityId]++;
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "AA turret prefab at " + std::to_string(turretOrigin.x) +
+                ", " + std::to_string(turretOrigin.y) + ", " +
+                std::to_string(turretOrigin.z) + " (authored y " +
+                std::to_string(authoredY) + ")");
             if (g_game.vehicles.PlacePrefabAATurret(
                     entityId, ordinal, turretOrigin) >=
                     VehicleSystem::kMaxAATurrets) {
@@ -491,7 +507,7 @@ static void RebuildPrefabRenderBatches() {
         //
         // Keyed on entity id so a rebuild (an asset edit, a prefab reload)
         // preserves a countdown already in flight rather than restarting it.
-        if (prefabId == kObjectivePlanePrefabId) {
+        if (prefabId == kObjectivePlanePrefabId && cachedModel) {
             seenObjectivePlanes.insert(entityId);
             const auto existing = std::find_if(
                 g_objectivePlanes.begin(), g_objectivePlanes.end(),

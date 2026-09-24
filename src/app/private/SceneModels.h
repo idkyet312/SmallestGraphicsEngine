@@ -185,275 +185,67 @@ static std::shared_ptr<SceneNode> CreateAATurretModel() {
 
 // Authored AA turret, replacing the box-built one above.
 //
-// PoseAATurretModel drives the mount by finding a direct child of the root named
-// "Gun" and writing its local transform, so the loaded hierarchy has to present
-// that contract. The GLB's traverse node is called "Y-Rotation" and sits several
-// levels down (Spaceship-Turrent > .001 > master > Y-Rotation), so this lifts it
-// out and reparents it as "Gun" with the rest of the model kept as the static
-// base. Nothing about the firing code changes.
+// PoseAATurretModelInstance drives the mount through two nodes under the root:
+// "Gun", which traverses, and "Elevation" beneath it, which pitches the barrel
+// alone -- the housing on this gun is ~3 m long, and pitching it with the
+// barrel would swing the whole block into the air. The model arrives as three
+// files cut by scripts/split-antiair.py, because the cook flattens every node
+// into one mesh and a part found by name would not survive it:
 //
-// Returns null if anything is missing, and the caller falls back to the box
+//   AntiAir_Base       static, origin on the ground under the traverse axis
+//   AntiAir_Traverse   origin at the trunnion, AATurretMountHeight up
+//   AntiAir_Elevation  origin at the trunnion, barrel down +Z
+//
+// The split already scaled them to metres and put the trunnion at the mount
+// height the firing code uses, so nothing is scaled here.
+//
+// Returns null if any part is missing, and the caller falls back to the box
 // model rather than drawing nothing.
+static std::shared_ptr<SceneNode> LoadAATurretPart(
+        const std::filesystem::path& source) {
+    std::string cookedError;
+    std::shared_ptr<SceneNode> part = CookedAssetLoader::LoadForSource(
+        source, g_dx12.device, g_dx12.commandList, &cookedError);
+    if (part) return part;
+    // The source GLB carries PNGs that upload as uncompressed RGBA8;
+    // without the cook the gun costs roughly four times the VRAM.
+    SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+        "AA turret part not cooked (" + source.generic_string() + "): " +
+        cookedError + "; using source importer");
+    return GLBImporter::LoadGLB(source.string(), g_dx12.device,
+                                g_dx12.commandList);
+}
+
 static std::shared_ptr<SceneNode> LoadAATurretModel() {
-    auto loaded = GLBImporter::LoadGLB("Content/Models/Turret/Turret.glb",
-                                       g_dx12.device, g_dx12.commandList);
-    if (!loaded) {
+    const std::shared_ptr<SceneNode> basePart =
+        LoadAATurretPart("Content/Models/AntiAir/AntiAir_Base.glb");
+    const std::shared_ptr<SceneNode> traversePart =
+        LoadAATurretPart("Content/Models/AntiAir/AntiAir_Traverse.glb");
+    const std::shared_ptr<SceneNode> elevationPart =
+        LoadAATurretPart("Content/Models/AntiAir/AntiAir_Elevation.glb");
+    if (!basePart || !traversePart || !elevationPart) {
         SGE_LOG("LogGameplay", EngineLog::Level::Warning,
-            "AA turret model missing, using the built-in box turret");
+            "AA turret model incomplete, using the built-in box turret");
+        // Parts that did load have already recorded uploads on the open
+        // command list; keep them alive until the cold-load fence drains.
+        for (const std::shared_ptr<SceneNode>& part :
+             { basePart, traversePart, elevationPart })
+            if (part) g_rejectedUploadModels.push_back(part);
         return nullptr;
     }
-
-    // Scale so the model's traverse ring lands at AATurretMountHeight. That
-    // constant is not cosmetic -- the firing code uses it for the shell origin
-    // and for the aim solution -- so matching it matters more than matching the
-    // old model's footprint width, which ends up 4.9 m against the box turret's
-    // 4.3 m and reads as a slightly heavier emplacement.
-    constexpr float kAuthoredMountHeight = 1.16f;  // "Y-Rotation" node height
-    constexpr float kModelScale =
-        VehicleSystem::AATurretMountHeight / kAuthoredMountHeight;
-
-    // Depth-first search for the traverse node.
-    std::function<std::shared_ptr<SceneNode>(const std::shared_ptr<SceneNode>&)>
-        findTraverse = [&](const std::shared_ptr<SceneNode>& node)
-        -> std::shared_ptr<SceneNode> {
-        if (!node) return nullptr;
-        if (node->name == "Y-Rotation") return node;
-        for (const std::shared_ptr<SceneNode>& child : node->children)
-            if (auto found = findTraverse(child)) return found;
-        return nullptr;
-    };
-    std::shared_ptr<SceneNode> traverse = findTraverse(loaded);
-    if (!traverse) {
-        SGE_LOG("LogGameplay", EngineLog::Level::Warning,
-            "AA turret model has no Y-Rotation node, using the box turret");
-        g_rejectedUploadModels.push_back(std::move(loaded));
-        return nullptr;
-    }
-
-    // Detach the traverse subtree from wherever it sits, so it can be posed
-    // independently of the base instead of inheriting the base's transform.
-    std::function<bool(const std::shared_ptr<SceneNode>&)> detach =
-        [&](const std::shared_ptr<SceneNode>& node) -> bool {
-        if (!node) return false;
-        auto found = std::find(node->children.begin(), node->children.end(),
-                               traverse);
-        if (found != node->children.end()) {
-            node->children.erase(found);
-            return true;
-        }
-        for (const std::shared_ptr<SceneNode>& child : node->children)
-            if (detach(child)) return true;
-        return false;
-    };
-    detach(loaded);
 
     auto root = std::make_shared<SceneNode>("AA Turret");
-
-    // Barrel fallback.
-    //
-    // Earlier exports of this model had no barrel geometry: in Blender the
-    // barrels come from an Array modifier on "Gun barrel 200 cal.016", and while
-    // that node was an Empty the exporter wrote the node and nothing else. The
-    // current asset has them baked, so this normally does nothing.
-    //
-    // Kept, and gated on the barrel node actually carrying a mesh, so a
-    // re-export that loses them again leaves a usable gun rather than a mount
-    // with no barrels -- and so the generated tubes can never double up on top
-    // of real ones.
-    bool hasAuthoredBarrels = false;
-    {
-        std::function<void(const std::shared_ptr<SceneNode>&)> findBarrels =
-            [&](const std::shared_ptr<SceneNode>& node) {
-            if (!node || hasAuthoredBarrels) return;
-            // Match the authored barrel node by name, and require real geometry:
-            // the node existing is not enough, which is exactly how the missing
-            // barrels slipped through before.
-            if (node->name.rfind("Gun barrel", 0) == 0 && node->mesh &&
-                !node->mesh->primitives.empty()) {
-                hasAuthoredBarrels = true;
-                return;
-            }
-            for (const std::shared_ptr<SceneNode>& child : node->children)
-                findBarrels(child);
-        };
-        findBarrels(loaded);
-    }
-
-    if (traverse && !hasAuthoredBarrels) {
-        // Find "spin-ey": the rings hang off it, so building in its space puts
-        // the barrels through them without recomputing the 120-degree rotation
-        // that orients the whole assembly.
-        std::function<std::shared_ptr<SceneNode>(const std::shared_ptr<SceneNode>&)>
-            findSpin = [&](const std::shared_ptr<SceneNode>& node)
-            -> std::shared_ptr<SceneNode> {
-            if (!node) return nullptr;
-            if (node->name == "spin-ey") return node;
-            for (const std::shared_ptr<SceneNode>& child : node->children)
-                if (auto found = findSpin(child)) return found;
-            return nullptr;
-        };
-
-        if (std::shared_ptr<SceneNode> spin = findSpin(traverse)) {
-            // Borrow the metal material off a ring so the barrels match the rest
-            // of the gun instead of needing their own texture.
-            std::shared_ptr<SceneMaterial> barrelMaterial;
-            for (const std::shared_ptr<SceneNode>& child : spin->children) {
-                if (!child || !child->mesh) continue;
-                for (const MeshPrimitive& primitive : child->mesh->primitives)
-                    if (primitive.material) { barrelMaterial = primitive.material; break; }
-                if (barrelMaterial) break;
-            }
-
-            auto barrels = std::make_shared<SceneNode>("Barrels");
-            barrels->mesh = std::make_shared<SceneMesh>();
-            MeshPrimitive tubes;
-            tubes.material = barrelMaterial;
-
-            // Four tubes on the same 0.223 m circle the collars use, quartered
-            // so each sits where a barrel passes through the ring.
-            constexpr int kBarrelCount = 4;
-            constexpr int kSides = 10;          // sides per tube
-            constexpr float kRingRadius = 0.223f;
-            constexpr float kBarrelRadius = 0.052f;
-            constexpr float kStart = 0.35f;     // just inside the breech
-            constexpr float kEnd = 2.15f;       // past the outermost collar
-            for (int barrel = 0; barrel < kBarrelCount; ++barrel) {
-                const float spin_ = XM_2PI * static_cast<float>(barrel) /
-                                    kBarrelCount + XM_PIDIV4;
-                const float cx = std::cos(spin_) * kRingRadius;
-                const float cz = std::sin(spin_) * kRingRadius;
-                const UINT base = static_cast<UINT>(tubes.vertices.size() / 12u);
-                for (int side = 0; side <= kSides; ++side) {
-                    const float angle = XM_2PI * static_cast<float>(side) / kSides;
-                    const float nx = std::cos(angle);
-                    const float nz = std::sin(angle);
-                    // Local +Y is the forward axis in spin-ey space (verified
-                    // against the collar spacing), so the tube runs along Y.
-                    for (int end = 0; end < 2; ++end) {
-                        const float y = end == 0 ? kStart : kEnd;
-                        const float vertex[12] = {
-                            cx + nx * kBarrelRadius, y, cz + nz * kBarrelRadius,
-                            nx, 0.0f, nz,
-                            static_cast<float>(side) / kSides,
-                            static_cast<float>(end),
-                            0.0f, 1.0f, 0.0f, 1.0f
-                        };
-                        tubes.vertices.insert(tubes.vertices.end(),
-                                              vertex, vertex + 12);
-                    }
-                }
-                for (int side = 0; side < kSides; ++side) {
-                    const UINT a = base + side * 2u;
-                    tubes.indices.insert(tubes.indices.end(),
-                        { a, a + 1u, a + 2u, a + 1u, a + 3u, a + 2u });
-                }
-            }
-            // Same finalisation the box turret's boxes go through: without the
-            // meshlet/GPU data the primitive carries vertices but never draws.
-            if (GLBImporter::BuildMeshletData(tubes, g_dx12.device.Get(), false)) {
-                barrels->mesh->primitives.push_back(std::move(tubes));
-                spin->AddChild(barrels);
-                SGE_LOG("LogGameplay", EngineLog::Level::Display,
-                    "AA turret barrels generated: the model has none");
-            } else {
-                SGE_LOG("LogGameplay", EngineLog::Level::Warning,
-                    "AA turret barrel geometry failed to build");
-            }
-        }
-    }
-
-    // Scale is set through the TRS fields, not by writing localTransform:
-    // UpdateGlobalTransform calls UpdateLocalTransform first, which rebuilds
-    // localTransform from translation/rotation/scale and would discard anything
-    // written directly into the matrix.
-    const auto setScale = [](const std::shared_ptr<SceneNode>& node, float s) {
-        node->scale = { s, s, s };
-        node->UpdateLocalTransform();
-    };
-
-    // One material in the GLB ("Gun Metal.003", on the mount's centre block) is
-    // left untextured with a yellow base colour of [0.60, 0.44, 0.00], while the
-    // other four share a metal basecolour map. That renders as a bright yellow
-    // slab in the middle of a dark grey emplacement, so give it the same texture
-    // its siblings use and drop it to gunmetal.
-    //
-    // Both subtrees have to be walked: `traverse` was detached from `loaded`
-    // above, and the yellow part (TurrentCenter) lives inside the detached gun.
-    // Walking only `loaded` -- as this did at first -- silently missed it and
-    // left the block yellow.
-    {
-        ComPtr<ID3D12Resource> sharedBaseColor;
-        std::function<void(const std::shared_ptr<SceneNode>&)> collect =
-            [&](const std::shared_ptr<SceneNode>& node) {
-            if (!node || sharedBaseColor) return;
-            if (node->mesh)
-                for (const MeshPrimitive& primitive : node->mesh->primitives)
-                    if (primitive.material &&
-                        primitive.material->baseColorTexture) {
-                        sharedBaseColor = primitive.material->baseColorTexture;
-                        return;
-                    }
-            for (const std::shared_ptr<SceneNode>& child : node->children)
-                collect(child);
-        };
-        collect(loaded);
-        collect(traverse);
-
-        // Dark, slightly blued steel. Applied as the base colour factor, which
-        // multiplies the borrowed texture, so the part keeps the surrounding
-        // metal's surface detail instead of becoming a flat grey block.
-        constexpr float kGunmetal[3] = { 0.30f, 0.32f, 0.35f };
-        std::function<void(const std::shared_ptr<SceneNode>&)> retint =
-            [&](const std::shared_ptr<SceneNode>& node) {
-            if (!node) return;
-            if (node->mesh)
-                for (MeshPrimitive& primitive : node->mesh->primitives) {
-                    if (!primitive.material) continue;
-                    // Only the untextured offender. Anything already carrying a
-                    // basecolour map is authored correctly and is left alone.
-                    if (primitive.material->baseColorTexture) continue;
-                    if (sharedBaseColor)
-                        primitive.material->baseColorTexture = sharedBaseColor;
-                    primitive.material->baseColorFactor = XMFLOAT4(
-                        kGunmetal[0], kGunmetal[1], kGunmetal[2], 1.0f);
-                    // Read as metal rather than painted plastic.
-                    primitive.material->metallicFactor = 0.90f;
-                    primitive.material->roughnessFactor = 0.42f;
-                }
-            for (const std::shared_ptr<SceneNode>& child : node->children)
-                retint(child);
-        };
-        retint(loaded);
-        retint(traverse);
-    }
-
-    // Static base: everything the GLB has left after the gun was removed.
     auto base = std::make_shared<SceneNode>("Base");
-    setScale(base, kModelScale);
-    base->AddChild(loaded);
+    base->AddChild(basePart);
     root->AddChild(base);
 
-    // The posed mount. PoseAATurretModel writes this node's localTransform every
-    // frame, so the scale has to live on a node underneath rather than here --
-    // the pose would otherwise replace it and the gun would snap back to model
-    // units while the base stayed scaled.
+    // PoseAATurretModelInstance writes the transforms of both of these every
+    // frame; the parts hang underneath so the pose never overwrites them.
     auto gun = std::make_shared<SceneNode>("Gun");
-    auto gunScale = std::make_shared<SceneNode>("GunScale");
-    setScale(gunScale, kModelScale);
-
-    // Zero the traverse node's own placement before reparenting it.
-    //
-    // "Y-Rotation" sits 1.161 m up inside the GLB, and the "Gun" node above it
-    // is translated to AATurretMountHeight as well -- keeping both stacked the
-    // two lifts and floated the barrels about 1.9 m above the mount, which is
-    // what put them up in the air. Its ROTATION must be preserved: the barrels
-    // are oriented by a 120-degree quaternion on the child "spin-ey" node, and
-    // the traverse node's own orientation is part of that chain.
-    traverse->translation = { 0.0f, 0.0f, 0.0f };
-    traverse->UpdateLocalTransform();
-
-    gunScale->AddChild(traverse);
-    gun->AddChild(gunScale);
+    gun->AddChild(traversePart);
+    auto elevation = std::make_shared<SceneNode>("Elevation");
+    elevation->AddChild(elevationPart);
+    gun->AddChild(elevation);
     root->AddChild(gun);
 
     XMFLOAT4X4 identity;
@@ -480,6 +272,25 @@ static void PoseAATurretModelInstance(const std::shared_ptr<SceneNode>& model,
     if (!model) return;
     for (const std::shared_ptr<SceneNode>& child : model->children) {
         if (!child || child->name != "Gun") continue;
+        // The authored gun elevates its barrel on its own node: the mount
+        // takes the yaw and the barrel the pitch, both pivoting on the
+        // trunnion. The box fallback has no such node and pitches the whole
+        // mount, as below.
+        const auto elevation = std::find_if(child->children.begin(),
+            child->children.end(), [](const std::shared_ptr<SceneNode>& node) {
+                return node && node->name == "Elevation";
+            });
+        if (elevation != child->children.end()) {
+            XMStoreFloat4(&child->rotation,
+                          XMQuaternionRotationRollPitchYaw(0.0f, yaw, 0.0f));
+            child->translation = {
+                0.0f, VehicleSystem::AATurretMountHeight, 0.0f };
+            child->UpdateLocalTransform();
+            XMStoreFloat4(&(*elevation)->rotation,
+                          XMQuaternionRotationRollPitchYaw(-pitch, 0.0f, 0.0f));
+            (*elevation)->UpdateLocalTransform();
+            break;
+        }
         // Pitch about X first (barrels elevate about the trunnion), then yaw
         // about Y (the whole mount traverses), then lift to the trunnion height.
         // Negated pitch: the model points down +Z, where a positive rotation

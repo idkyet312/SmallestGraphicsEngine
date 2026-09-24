@@ -21,10 +21,10 @@ carry the hull's track textures.
 
 Usage: py scripts/split-abrams-tank.py
 """
-import json
-import struct
 import sys
 from pathlib import Path
+
+from glb_split import build, read_glb, write_glb
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "Content/Models/AbramsTank/AbramsLow.glb"
@@ -38,157 +38,6 @@ DROP_FROM_HULL = {
     "Abrams_CaterpillarCurveL",
     "Abrams_CaterpillarCurveR",
 }
-
-
-def read_glb(path):
-    data = path.read_bytes()
-    magic, version, _ = struct.unpack_from("<III", data, 0)
-    if magic != 0x46546C67 or version != 2:
-        raise SystemExit(f"{path}: not a glTF 2.0 binary")
-    offset = 12
-    doc = None
-    binary = b""
-    while offset < len(data):
-        length, kind = struct.unpack_from("<II", data, offset)
-        chunk = data[offset + 8: offset + 8 + length]
-        if kind == 0x4E4F534A:
-            doc = json.loads(chunk)
-        elif kind == 0x004E4942:
-            binary = chunk
-        offset += 8 + length
-    return doc, binary
-
-
-def write_glb(path, doc, binary):
-    text = json.dumps(doc, separators=(",", ":")).encode("utf-8")
-    text += b" " * ((4 - len(text) % 4) % 4)
-    binary += b"\0" * ((4 - len(binary) % 4) % 4)
-    total = 12 + 8 + len(text) + 8 + len(binary)
-    with open(path, "wb") as out:
-        out.write(struct.pack("<III", 0x46546C67, 2, total))
-        out.write(struct.pack("<II", len(text), 0x4E4F534A))
-        out.write(text)
-        out.write(struct.pack("<II", len(binary), 0x004E4942))
-        out.write(binary)
-
-
-def build(doc, binary, nodes, root_nodes):
-    """Returns a compacted document holding `nodes` (already remapped: each
-    node's "children" indexes into `nodes`) and only the data they reach."""
-    mesh_map, material_map, texture_map, image_map = {}, {}, {}, {}
-    sampler_map, accessor_map, view_map = {}, {}, {}
-    out = {"asset": doc["asset"], "scene": 0,
-           "scenes": [{"name": "Scene", "nodes": root_nodes}],
-           "nodes": [], "meshes": [], "materials": [], "textures": [],
-           "images": [], "samplers": [], "accessors": [], "bufferViews": [],
-           "buffers": []}
-    blob = bytearray()
-
-    def view(index):
-        if index not in view_map:
-            source = dict(doc["bufferViews"][index])
-            start = source.get("byteOffset", 0)
-            chunk = binary[start:start + source["byteLength"]]
-            blob.extend(b"\0" * ((4 - len(blob) % 4) % 4))
-            source["buffer"] = 0
-            source["byteOffset"] = len(blob)
-            blob.extend(chunk)
-            view_map[index] = len(out["bufferViews"])
-            out["bufferViews"].append(source)
-        return view_map[index]
-
-    def accessor(index):
-        if index not in accessor_map:
-            source = dict(doc["accessors"][index])
-            if "sparse" in source:
-                raise SystemExit("sparse accessors are not handled")
-            if "bufferView" in source:
-                source["bufferView"] = view(source["bufferView"])
-            accessor_map[index] = len(out["accessors"])
-            out["accessors"].append(source)
-        return accessor_map[index]
-
-    def sampler(index):
-        if index not in sampler_map:
-            sampler_map[index] = len(out["samplers"])
-            out["samplers"].append(doc["samplers"][index])
-        return sampler_map[index]
-
-    def image(index):
-        if index not in image_map:
-            source = dict(doc["images"][index])
-            if "bufferView" in source:
-                source["bufferView"] = view(source["bufferView"])
-            image_map[index] = len(out["images"])
-            out["images"].append(source)
-        return image_map[index]
-
-    def texture(index):
-        if index not in texture_map:
-            source = dict(doc["textures"][index])
-            if "source" in source:
-                source["source"] = image(source["source"])
-            if "sampler" in source:
-                source["sampler"] = sampler(source["sampler"])
-            texture_map[index] = len(out["textures"])
-            out["textures"].append(source)
-        return texture_map[index]
-
-    def remap_texture_refs(value):
-        if isinstance(value, dict):
-            result = {}
-            for key, item in value.items():
-                if key.endswith("Texture") and isinstance(item, dict) \
-                        and "index" in item:
-                    item = dict(item)
-                    item["index"] = texture(item["index"])
-                    result[key] = remap_texture_refs(item)
-                else:
-                    result[key] = remap_texture_refs(item)
-            return result
-        if isinstance(value, list):
-            return [remap_texture_refs(item) for item in value]
-        return value
-
-    def material(index):
-        if index not in material_map:
-            material_map[index] = len(out["materials"])
-            out["materials"].append(None)
-            out["materials"][material_map[index]] = remap_texture_refs(
-                doc["materials"][index])
-        return material_map[index]
-
-    def mesh(index):
-        if index not in mesh_map:
-            source = json.loads(json.dumps(doc["meshes"][index]))
-            for primitive in source["primitives"]:
-                primitive["attributes"] = {
-                    key: accessor(value)
-                    for key, value in primitive["attributes"].items()}
-                if "indices" in primitive:
-                    primitive["indices"] = accessor(primitive["indices"])
-                if "material" in primitive:
-                    primitive["material"] = material(primitive["material"])
-                if "targets" in primitive:
-                    raise SystemExit("morph targets are not handled")
-            mesh_map[index] = len(out["meshes"])
-            out["meshes"].append(source)
-        return mesh_map[index]
-
-    for node in nodes:
-        node = dict(node)
-        if "mesh" in node:
-            node["mesh"] = mesh(node["mesh"])
-        out["nodes"].append(node)
-
-    for key in ("textures", "images", "samplers", "materials"):
-        if not out[key]:
-            del out[key]
-    for extension in ("extensionsUsed", "extensionsRequired"):
-        if extension in doc:
-            out[extension] = doc[extension]
-    out["buffers"] = [{"byteLength": len(blob)}]
-    return out, bytes(blob)
 
 
 def main():

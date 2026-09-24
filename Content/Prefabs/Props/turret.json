@@ -4,9 +4,9 @@
   "name": "Turret",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/Turret/Turret.glb",
+      "path": "Content/Models/AntiAir/AntiAir.glb",
       "defaultScale": [1.0, 1.0, 1.0],
-      "targetSize": 4.5,
+      "targetSize": 0.0,
       "castShadow": true,
       "useMaterials": true,
       "materialAmbientScale": 1.0,
