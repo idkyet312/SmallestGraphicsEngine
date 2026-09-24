@@ -4301,6 +4301,42 @@ bool DestructionDX12::GetVehicleTransform(size_t vehicleIndex,
     return true;
 }
 
+bool DestructionDX12::SetVehiclePose(size_t vehicleIndex,
+                                     const XMFLOAT3& position,
+                                     const XMFLOAT4& rotation) {
+    if (!VehicleReady(vehicleIndex)) return false;
+    Impl::VehicleRuntime& vehicle = m->vehicles[vehicleIndex];
+    const b3Pos oldPosition = b3Body_GetPosition(vehicle.chassis);
+    const b3Quat oldRotation = b3Body_GetRotation(vehicle.chassis);
+    const b3Quat newRotation = { { rotation.x, rotation.y, rotation.z },
+                                 rotation.w };
+    // Each wheel keeps its pose relative to the chassis, so the joints see
+    // no violation and the suspension does not kick on the next step.
+    for (uint32_t i = 0; i < vehicle.spec.wheelCount; ++i) {
+        const b3BodyId wheel = vehicle.wheels[i];
+        if (B3_IS_NULL(wheel)) continue;
+        const b3Pos wheelPosition = b3Body_GetPosition(wheel);
+        const b3Vec3 local = b3InvRotateVector(oldRotation, {
+            (float)(wheelPosition.x - oldPosition.x),
+            (float)(wheelPosition.y - oldPosition.y),
+            (float)(wheelPosition.z - oldPosition.z) });
+        const b3Vec3 moved = b3RotateVector(newRotation, local);
+        const b3Quat wheelRotation = b3MulQuat(newRotation,
+            b3InvMulQuat(oldRotation, b3Body_GetRotation(wheel)));
+        b3Body_SetTransform(wheel, { position.x + moved.x,
+            position.y + moved.y, position.z + moved.z }, wheelRotation);
+        b3Body_SetLinearVelocity(wheel, { 0.0f, 0.0f, 0.0f });
+        b3Body_SetAngularVelocity(wheel, { 0.0f, 0.0f, 0.0f });
+        b3Body_SetAwake(wheel, true);
+    }
+    b3Body_SetTransform(vehicle.chassis,
+        { position.x, position.y, position.z }, newRotation);
+    b3Body_SetLinearVelocity(vehicle.chassis, { 0.0f, 0.0f, 0.0f });
+    b3Body_SetAngularVelocity(vehicle.chassis, { 0.0f, 0.0f, 0.0f });
+    b3Body_SetAwake(vehicle.chassis, true);
+    return true;
+}
+
 bool DestructionDX12::VehicleReady(size_t vehicleIndex) const {
     return m && m->initialized && vehicleIndex < m->vehicles.size() &&
            !B3_IS_NULL(m->vehicles[vehicleIndex].chassis);

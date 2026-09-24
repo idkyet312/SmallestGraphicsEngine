@@ -101,7 +101,30 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 19, "protocol version was not bumped");
+    Check(kProtocolVersion == 21, "protocol version was not bumped");
+
+    // The whole armor set rides in one datagram; pinned so growing the caps or
+    // a snapshot is a deliberate decision about packet size.
+    static_assert(sizeof(EnemyTankSnapshot) == 48,
+                  "EnemyTankSnapshot size changed unexpectedly");
+    static_assert(sizeof(EnemyHumveeSnapshot) == 36,
+                  "EnemyHumveeSnapshot size changed unexpectedly");
+    static_assert(sizeof(AATurretSnapshot) == 28,
+                  "AATurretSnapshot size changed unexpectedly");
+    static_assert(sizeof(ServerArmorStateMessage) <= 1200,
+                  "ServerArmorStateMessage no longer fits one datagram");
+    static_assert(std::is_trivially_copyable<ServerArmorStateMessage>::value,
+                  "ServerArmorStateMessage must be memcpy-safe");
+    static_assert(std::is_trivially_copyable<ServerEnemyFireMessage>::value,
+                  "ServerEnemyFireMessage must be memcpy-safe");
+    static_assert(offsetof(ServerArmorStateMessage, header) == 0,
+                  "header must lead");
+    static_assert(offsetof(ServerEnemyFireMessage, header) == 0,
+                  "header must lead");
+    Check(ServerArmorStateMessage{}.header.type == MessageType::ServerArmorState,
+          "ServerArmorStateMessage has the wrong default type");
+    Check(ServerEnemyFireMessage{}.header.type == MessageType::ServerEnemyFire,
+          "ServerEnemyFireMessage has the wrong default type");
 
     // God mode claimed PlayerSnapshot's last padding byte rather than adding a
     // field, so the struct keeps its size and `reviveProgress` stays on the

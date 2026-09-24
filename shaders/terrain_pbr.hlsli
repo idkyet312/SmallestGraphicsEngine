@@ -92,8 +92,9 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
 // fills the crevices between the stones, so the boundary becomes an interlock
 // rather than a gradient.
 //
-// `heights` are the per-layer displacement proxies -- the packed PBR .r channel,
-// which these scans store as occlusion: high on raised stone, low in the gaps.
+// `heights` come from the packed PBR .a channel. The .r channel remains AO;
+// using it as height made layers without an AO scan (dirt and rock) stand at
+// maximum height and win transitions regardless of their actual surface.
 // The standard formulation is
 //     raised_i = weight_i + height_i * contrast
 // keeping only layers within `contrast` of the tallest, then renormalising.
@@ -232,7 +233,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // visually identical.
     const float kLayerEpsilon = 0.002;
 
-    // Height-blend pre-pass. The packed map's .r channel is this layer's height
+    // Height-blend pre-pass. The packed map's .a channel is this layer's height
     // proxy, and it must be known for EVERY contributing layer before any of
     // them are weighted -- which layer wins at this texel is a comparison
     // across all four. Only layers that already pass the epsilon test are
@@ -245,7 +246,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
         layerHeights[heightLayer] = SampleTerrainArray(
             metalRoughMap, worldPos, projectionWeights, heightLayer,
-            scales[heightLayer], heightGrads).r;
+            scales[heightLayer], heightGrads).a;
     }
     const float4 blendWeights =
         TerrainHeightBlend(layerWeights, layerHeights);

@@ -151,7 +151,19 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             else if (loadMissingModels)
                 cachedModel = LoadPrefabModel(*prefab);
             if (!cachedModel) {
-                missingVisual = true;
+                // Ask for a loading pass only when this one skipped loading.
+                // A pass that tried and still came up short has a model that
+                // will not load, and re-arming on it would re-run the whole
+                // visual sync every frame. The Refresh button still retries.
+                if (!loadMissingModels) missingVisual = true;
+                // Once per prefab: a model that will not load is worth one
+                // line, and it is otherwise invisible -- just a gap.
+                static std::unordered_set<std::string> reported;
+                if (loadMissingModels && reported.insert(prefab->id).second)
+                    SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                        "Editor: prefab " + prefab->id +
+                        " has no loadable model (" +
+                        prefab->modelPath.string() + ")");
                 return;
             }
         }
@@ -235,8 +247,15 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
         }
     };
 
+    // One merge attempt per house template. A kind whose merge fails (no
+    // meshes on that side of the split) fails identically on every retry, and
+    // retrying from here re-armed the refresh below, so the editor re-ran this
+    // whole visual sync -- and everything it re-applies -- every frame.
+    static const SceneNode* housePreviewTemplateTried = nullptr;
     if (g_houseTemplate &&
+        g_houseTemplate.get() != housePreviewTemplateTried &&
         (!g_editorWoodHousePreviewModel || !g_editorMetalHousePreviewModel)) {
+        housePreviewTemplateTried = g_houseTemplate.get();
         const auto meanX = [](const std::shared_ptr<SceneNode>& node) {
             double sum = 0.0;
             size_t count = 0;
@@ -313,8 +332,9 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
                 // House previews come from the destructible house template,
                 // which finishes loading after the editor itself opens. Keep a
                 // manual refresh armed until that template is available just
-                // as we do for an uncached prefab model above.
-                missingVisual = true;
+                // as we do for an uncached prefab model above. Once it is and
+                // the merge still produced nothing, a refresh cannot help.
+                if (!g_houseTemplate) missingVisual = true;
                 continue;
             }
             const float sourceX = entity.type == LevelEntityType::WoodHouse

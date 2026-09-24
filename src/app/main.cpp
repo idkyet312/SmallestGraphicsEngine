@@ -147,6 +147,7 @@ using namespace DirectX;
 #include "private/PlayerMovement.h"
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
+#include "private/EnemyHumvees.h"
 #include "private/Multiplayer.h"
 #include "private/MultiplayerInsertion.h"
 // After Multiplayer.h: the status line it sends says whether this is a session.
@@ -1525,8 +1526,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // rather than one that is already a frame stale.
             UpdateAATurret(deltaTime);
             // Inputs only; the pose lands after the physics step below.
-            if (IsSceneScreen() && !g_game.loading.Active())
+            if (IsSceneScreen() && !g_game.loading.Active()) {
                 UpdateEnemyTanks(deltaTime);
+                UpdateEnemyHumvees(deltaTime);
+            }
         }
         // Listener follows the camera, so every PlayAt this frame pans against
         // where the player actually is. Written before any audio is triggered
@@ -2989,7 +2992,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             // depth; only the thrown frag digs shallower.
                             AddExplosionTerrainCrater(
                                 center, blastScale,
-                                /*hostAuthored=*/projectile.netGrenadeId != 0,
+                                /*hostAuthored=*/projectile.netGrenadeId != 0 ||
+                                    projectile.netHostRound,
                                 /*depthScale=*/projectile.rocket
                                     ? 1.0f : scene.grenadeCraterDepthScale);
                             AddExplosionBuildingHole(center, blastScale);
@@ -3108,7 +3112,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                            ? VehicleSystem::AATurretMaxHealth
                                            : enemyDamage) * falloff;
                                 DamageAATurret(ti, damage, turret,
-                                               projectile.playerOwned);
+                                               projectile.playerOwned,
+                                               projectile.netGrenadeId != 0);
                             }
                         }
                         // Enemy tanks answer to explosives only, measured to
@@ -3118,7 +3123,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             DamageEnemyTanksFromBlast(
                                 center, enemyRadius, c4Blast,
                                 projectile.rocket, projectile.missile,
-                                enemyDamage, projectile.playerOwned);
+                                enemyDamage, projectile.playerOwned,
+                                projectile.netGrenadeId != 0);
                         // Grenades hurt the player too. Previously only enemies
                         // took blast damage, because every grenade in the game
                         // was thrown BY the player -- enemy grenades made the
@@ -4400,8 +4406,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (IsSceneScreen() && !g_game.loading.Active())
             UpdatePrefabRigidBodies();
         // And the tanks, for the same reason.
-        if (IsSceneScreen() && !g_game.loading.Active())
-            SyncEnemyTankPoses();
+        if (IsSceneScreen() && !g_game.loading.Active()) {
+            SyncEnemyTankPoses(deltaTime);
+            SyncEnemyHumveePoses(deltaTime);
+        }
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         // Adaptive Forward Extensions quality. Driven from the delayed GPU
@@ -6521,6 +6529,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     total += sample.milliseconds;
                 }
                 dump << "--- sum of passes: " << total << " ms ---\n";
+                // CPU scopes and VRAM too: a slow frame is either GPU work,
+                // CPU work, or the card paging -- and only these tell which.
+                dump << "--- CPU scopes ---\n";
+                for (const auto& sample : g_profiler.CpuSamples())
+                    dump << sample.name << ": " << sample.milliseconds
+                         << " ms\n";
+                dump << "--- recording (nested, do not sum) ---\n";
+                for (const auto& sample : g_profiler.RecordingSamples())
+                    dump << sample.name << ": " << sample.milliseconds
+                         << " ms\n";
+                const VideoMemoryStatsDX12 vram = GetVideoMemoryStatsDX12();
+                dump << "--- VRAM: " << (vram.usageBytes >> 20) << " / "
+                     << (vram.budgetBytes >> 20) << " MB budget ("
+                     << (vram.dedicatedBytes >> 20) << " MB dedicated) ---\n";
+                dump << "screen: " << static_cast<int>(g_game.session.Screen())
+                     << " backbuffer: " << g_dx12.screenWidth << "x"
+                     << g_dx12.screenHeight << "\n";
                 g_profileDumpWritten = true;
             }
         }

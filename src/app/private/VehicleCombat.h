@@ -157,6 +157,10 @@ static void UpdateHumveeImpacts(float dt) {
                 g_drivingHumvee && g_activeHumveeIndex == vehicleIndex;
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
+                // An enemy-driven Humvee hunting the player does not plough
+                // through its own side on the way.
+                if (state.aiDriving && bandit->faction == Faction::Bandit)
+                    continue;
                 XMFLOAT3 impact;
                 if (!bandit->ApplyDebrisImpact(vehicleImpact, &impact,
                                                playerDriving)) continue;

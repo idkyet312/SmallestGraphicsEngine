@@ -1945,7 +1945,7 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     // No quad-derivative constraint here, so the weight test can gate the
     // gradient computation as well -- unlike the forward path, which must
     // evaluate gradients unconditionally to keep ddx/ddy uniform across a quad.
-    // Height-blend pre-pass. The packed map's .r channel is this layer's height
+    // Height-blend pre-pass. The packed map's .a channel is this layer's height
     // proxy, and it must be known for every contributing layer before any of
     // them are weighted -- which layer wins at this texel is a comparison
     // across all four. A pixel covered by a single layer pays one extra fetch
@@ -1966,11 +1966,11 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         packedLayers[heightLayer] = SampleTerrainVBArray(
             terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
             scales[heightLayer], heightGrads);
-        const float sampledHeight = packedLayers[heightLayer].r;
+        const float sampledHeight = packedLayers[heightLayer].a;
 #else
         const float sampledHeight = SampleTerrainVBArray(
             terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
-            scales[heightLayer], heightGrads).r;
+            scales[heightLayer], heightGrads).a;
 #endif
         if (heightLayer == 0) layerHeights.x = sampledHeight;
         else if (heightLayer == 1) layerHeights.y = sampledHeight;

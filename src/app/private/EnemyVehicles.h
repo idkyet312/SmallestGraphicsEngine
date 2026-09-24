@@ -127,33 +127,105 @@ static bool HitAATurretSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     return found;
 }
 
-// Wrecks the emplacement: cooks off the ammo boxes and leaves it burning.
-// `fromPlayer` gates the payout only; the turret takes the damage and the
-// mission records the wreck either way.
-static void DamageAATurret(size_t turretIndex, float damage,
-                           const XMFLOAT3& hit, bool fromPlayer) {
-    const VehicleSystem::DamageResult result =
-        g_game.vehicles.DamageAATurret(turretIndex, damage);
-    if (!result.applied) return;
-    scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
-    if (!result.destroyed) return;
-    const XMFLOAT3 base = result.position;
+// Cooks off the ammo boxes and leaves the mount burning. Runs where the kill
+// was decided and, in a session, on each client when the host's armor state
+// first says the gun is dead. `localKill` gates the payout only; the mission
+// records the wreck either way. `hostAuthored` is a client replaying the
+// host's kill, whose crater the host has already cut and sent.
+static void WreckAATurret(const XMFLOAT3& base, bool localKill,
+                          bool hostAuthored) {
     const XMFLOAT3 center{ base.x,
         base.y + VehicleSystem::AATurretMountHeight, base.z };
     scene.SpawnExplosionFX(center, 6.5f, 1.0f);
     scene.SpawnSmokeBurst(center, 2.2f, 2.4f);
-    AddExplosionTerrainCrater(base);
+    AddExplosionTerrainCrater(base, 1.0f, hostAuthored);
     if (g_destruction.IsInitialized()) {
-        if (fromPlayer) CreditPlayerDestruction();
+        if (localKill) CreditPlayerDestruction();
         g_destruction.ApplyExplosion(center, 6.0f, 45.0f, 10.0f);
         g_destruction.ApplyRagdollExplosion(center, 6.0f, 90.0f);
     }
     g_pendingExplosionAudio.push_back({ 0.0f, 0.95f, 0.80f, false });
     if (g_game.session.TimerRunning()) {
         g_game.mission.RecordDestruction();
-        if (fromPlayer) AwardCombatEvent(MoneyEvent::PropDestroyed);
+        if (localKill) AwardCombatEvent(MoneyEvent::PropDestroyed);
     }
     SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
+}
+
+// Authoritative damage: offline, or on the host. `killer` is the player id the
+// host credits in a session.
+static void ApplyAATurretDamage(size_t turretIndex, float damage,
+                                const XMFLOAT3& hit, bool fromPlayer,
+                                uint8_t killer) {
+    const VehicleSystem::DamageResult result =
+        g_game.vehicles.DamageAATurret(turretIndex, damage);
+    if (!result.applied) return;
+    scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
+    if (!result.destroyed) return;
+    g_game.vehicles.aaTurrets[turretIndex].netKiller = killer;
+    WreckAATurret(result.position, fromPlayer, /*hostAuthored=*/false);
+}
+
+// Every hit on an emplacement. In a session the host owns its health: a
+// client reports its own player's hits and leaves the rest -- enemy fire, a
+// host grenade it is replaying (`hostAuthored`) -- to the host, which sees
+// those itself. The host applies directly.
+static void DamageAATurret(size_t turretIndex, float damage,
+                           const XMFLOAT3& hit, bool fromPlayer,
+                           bool hostAuthored = false) {
+    if (!g_netSession.Active()) {
+        ApplyAATurretDamage(turretIndex, damage, hit, fromPlayer, 0xFF);
+        return;
+    }
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        ApplyAATurretDamage(turretIndex, damage, hit, fromPlayer,
+                            fromPlayer ? g_netSession.LocalId()
+                                       : net::kInvalidPlayerId);
+        return;
+    }
+    if (!fromPlayer || hostAuthored || damage <= 0.0f ||
+        turretIndex >= g_game.vehicles.aaTurrets.size() ||
+        !g_game.vehicles.aaTurrets[turretIndex].Active()) return;
+    scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
+    // The index is only a hint: the host finds the gun nearest the hit, since
+    // the two machines are not promised to hold their guns in the same order.
+    g_netSession.ReportWorldImpact(turretIndex, damage, hit.x, hit.y, hit.z,
+                                   /*kind=*/5);
+}
+
+// Host-side: a client's reported hit. The hinted index is trusted only if that
+// gun stands where the hit landed; otherwise the nearest live gun takes it.
+// Every hit arrives within a few metres of its mount -- a round on the 2 m hit
+// sphere, a blast reported at the base -- and guns stand far further apart.
+static void ApplyReportedAATurretDamage(size_t hint, float damage,
+                                        const XMFLOAT3& hit,
+                                        net::PlayerId shooter) {
+    const auto& turrets = g_game.vehicles.aaTurrets;
+    const auto distanceSq = [&hit](const VehicleSystem::AATurret& turret) {
+        const float dx = turret.position.x - hit.x;
+        const float dy = turret.position.y +
+            VehicleSystem::AATurretMountHeight * 0.6f - hit.y;
+        const float dz = turret.position.z - hit.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+    constexpr float kReachSq = 6.0f * 6.0f;
+    size_t index = turrets.size();
+    if (hint < turrets.size() && turrets[hint].Active() &&
+        distanceSq(turrets[hint]) <= kReachSq) {
+        index = hint;
+    } else {
+        float bestSq = kReachSq;
+        for (size_t i = 0; i < turrets.size(); ++i) {
+            if (!turrets[i].Active()) continue;
+            const float dSq = distanceSq(turrets[i]);
+            if (dSq > bestSq) continue;
+            bestSq = dSq;
+            index = i;
+        }
+    }
+    if (index >= turrets.size()) return;
+    ApplyAATurretDamage(index, damage, hit, shooter == g_netSession.LocalId(),
+                        shooter);
 }
 
 // The insertion BlackHawk's hull, for as long as there is an airframe to hit.

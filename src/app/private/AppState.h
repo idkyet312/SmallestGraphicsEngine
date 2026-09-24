@@ -1034,6 +1034,28 @@ struct HumveeGameplayState {
     XMFLOAT3 aimPoint{};
     float turretYaw = 0.0f;
     float turretFireCooldown = 0.0f;
+    // Enemy drive (EnemyHumvees.h): a Humvee whose turret gunner is alive
+    // hunts the player like an enemy tank. `aiDriving` is this frame's answer;
+    // `aiEverDriven` latches, so a client keeps showing the host's pose after
+    // the gunner dies and the Humvee stops wherever it was.
+    bool aiDriving = false;
+    bool aiEverDriven = false;
+    float aiStuckTime = 0.0f;
+    float aiReverseTime = 0.0f;
+    float aiReverseSteer = 1.0f;
+    // Last frame's drive solution, for the trace.
+    float aiHeadingError = 0.0f;
+    float aiThrottle = 0.0f;
+    float aiSteering = 0.0f;
+    float aiTargetDistance = 0.0f;
+    // Client-side: the host's latest pose, eased toward each frame.
+    bool netPosed = false;
+    XMFLOAT3 netPosition{};
+    XMFLOAT4 netRotation{ 0.0f, 0.0f, 0.0f, 1.0f };
+    XMFLOAT3 drawPosition{};
+    XMFLOAT4 drawRotation{ 0.0f, 0.0f, 0.0f, 1.0f };
+    float netTurretYaw = 0.0f;
+    bool netTurretSeen = false;
 };
 static std::vector<HumveeGameplayState> g_humveeGameplay;
 static std::shared_ptr<SceneNode> g_houseTemplate;

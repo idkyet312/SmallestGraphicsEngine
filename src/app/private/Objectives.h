@@ -233,11 +233,38 @@ static void PlaceAATurretNearCommTower() {
 // Runs one emplacement: target selection, slew and firing. Each turret solves
 // independently, so several can engage the same helicopter or split between it
 // and an airborne player.
+// One AA round and its report. Shared by the gun that fired it and, in a
+// session, by each client flying the host's round (`hostReplica`), so both
+// present the same thing.
+static void SpawnAATurretRound(const XMFLOAT3& muzzle,
+                               const XMFLOAT3& direction, bool hostReplica) {
+    scene.SpawnHostileProjectile(muzzle, direction,
+                                 VehicleSystem::AATurretShellDamage,
+                                 VehicleSystem::AATurretShellSpeed);
+    scene.projectiles.back().netHostRound = hostReplica;
+    // Muzzle flash as a small, short-lived world explosion: TriggerMuzzleFlash
+    // drives the player's own viewmodel and has no world position, so it cannot
+    // represent a gun firing across the map.
+    scene.SpawnExplosionFX(muzzle, 0.9f, 0.09f);
+    scene.SpawnWeaponSmoke(muzzle, direction, 1.1f);
+
+    g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.85f,
+                      0.62f + ((float)std::rand() / RAND_MAX) * 0.06f,
+                      VehicleSystem::AATurretAirRange);
+}
+
+// Host-side scratch for the other players' insertion aircraft, which the gun
+// engages the same way it does the host's own.
+static std::vector<net::RemotePlayer> g_aaRemotePlayers;
+
 static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
     VehicleSystem& vehicles = g_game.vehicles;
     if (turretIndex >= vehicles.aaTurrets.size()) return;
     VehicleSystem::AATurret& emplacement = vehicles.aaTurrets[turretIndex];
     if (!emplacement.Active()) return;
+    // A client's guns are the host's: aim, bursts and health all arrive in the
+    // armor state, and the rounds as ServerEnemyFire.
+    if (ClientOwnedByHost()) return;
 
     XMFLOAT3 target{};
     XMFLOAT3 velocity{};
@@ -257,6 +284,29 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
                           VehicleSystem::AATurretAirRange) {
             target = p;
             velocity = vehicles.BlackHawkVelocity();
+            hasTarget = true;
+            targetIsAircraft = true;
+        }
+    }
+
+    // Every other player's insertion aircraft, on the host. Their own copy of
+    // each round is what can hit them, so the gun has to be shooting at them
+    // here for any of it to reach their machine. No velocity is replicated, so
+    // these are shot where they are; the burst's dispersion covers the rest.
+    if (!hasTarget && g_netSession.Active() &&
+        g_netSession.CurrentRole() == net::Role::Host) {
+        float bestSq = VehicleSystem::AATurretAirRange *
+                       VehicleSystem::AATurretAirRange;
+        g_netSession.GetRemotePlayers(g_aaRemotePlayers);
+        for (const net::RemotePlayer& remote : g_aaRemotePlayers) {
+            if (!remote.helicopter.visible) continue;
+            const XMFLOAT3 p{ remote.helicopter.x, remote.helicopter.y,
+                              remote.helicopter.z };
+            const float d2 = rangeSq(p);
+            if (d2 > bestSq) continue;
+            bestSq = d2;
+            target = p;
+            velocity = {};
             hasTarget = true;
             targetIsAircraft = true;
         }
@@ -352,18 +402,12 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
 
-    scene.SpawnHostileProjectile(muzzle, shotDirection,
-                                 VehicleSystem::AATurretShellDamage,
-                                 VehicleSystem::AATurretShellSpeed);
-    // Muzzle flash as a small, short-lived world explosion: TriggerMuzzleFlash
-    // drives the player's own viewmodel and has no world position, so it cannot
-    // represent a gun firing across the map.
-    scene.SpawnExplosionFX(muzzle, 0.9f, 0.09f);
-    scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.1f);
-
-    g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.85f,
-                      0.62f + ((float)std::rand() / RAND_MAX) * 0.06f,
-                      VehicleSystem::AATurretAirRange);
+    SpawnAATurretRound(muzzle, shotDirection, /*hostReplica=*/false);
+    if (g_netSession.Active() &&
+        g_netSession.CurrentRole() == net::Role::Host)
+        g_netSession.PublishEnemyFire(net::EnemyFireKind::AAShell,
+            muzzle.x, muzzle.y, muzzle.z,
+            shotDirection.x, shotDirection.y, shotDirection.z);
 }
 
 static void UpdateAATurret(float deltaTime) {

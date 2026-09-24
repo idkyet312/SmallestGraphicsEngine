@@ -89,6 +89,12 @@ struct VehicleSystem {
         // last time instead of stacking a fresh one on top of it.
         uint64_t prefabEntityId = 0;
         uint32_t prefabOrdinal = 0;
+        // Multiplayer: the player id the host credits with the kill (0xFF for
+        // nobody), and whether a client has had this gun named by the host
+        // yet -- one already dead in the first word it gets is laid down
+        // without replaying an explosion from before it joined.
+        uint8_t netKiller = 0xFF;
+        bool netSeen = false;
 
         bool Active() const { return !dead; }
 

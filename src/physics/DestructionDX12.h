@@ -225,6 +225,11 @@ public:
                              DirectX::XMFLOAT3* position = nullptr,
                              DirectX::XMFLOAT3* forward = nullptr,
                              DirectX::XMFLOAT3* linearVelocity = nullptr) const;
+    // Places a Humvee's chassis at `position`/`rotation` and carries its wheels
+    // with it, all at rest. A multiplayer client uses it to show the host's
+    // AI-driven Humvee; moving the chassis alone would tear the wheel joints.
+    bool SetVehiclePose(size_t vehicleIndex, const DirectX::XMFLOAT3& position,
+                        const DirectX::XMFLOAT4& rotation);
     bool VehicleReady(size_t vehicleIndex) const;
     size_t VehicleCount() const;
     // Handle-based vehicles for gameplay-driven machines (the enemy tank). Kept

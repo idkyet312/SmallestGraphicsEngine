@@ -102,6 +102,10 @@ struct Projectile {
     // The report is a one-shot: the client's copy sits on its detonate frame
     // until the host's edge arrives, and would otherwise send every frame.
     bool     netDetonationReported = false;
+    // A client's copy of a round a host tank or AA gun fired. It flies and
+    // hurts this machine's player like the original, but the world damage its
+    // blast does -- the crater above all -- is the host's, already replicated.
+    bool     netHostRound = false;
     // Called-in strike rather than a thrown frag. It shares the grenade blast
     // path but scales every radius by missileBlastScale, so the strike can be
     // tuned without moving what a hand grenade does.

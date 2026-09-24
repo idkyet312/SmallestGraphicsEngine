@@ -93,6 +93,19 @@ struct EnemyTankState {
     float reloadSeconds = 6.0f;
     float shellSpeed = 45.0f;
     float turretRate = 0.55f;   // rad/s
+    // Multiplayer. The host drives every tank; a client draws the host's pose
+    // and runs no physics body or AI of its own. `killer` is the player the
+    // host credits with the wreck (net::kInvalidPlayerId for nobody).
+    net::PlayerId killer = net::kInvalidPlayerId;
+    // Client-side: the host's latest pose, eased toward each frame so a tank
+    // does not step at the net tick rate.
+    XMFLOAT3 netPosition{};
+    XMFLOAT4 netRotation{ 0.0f, 0.0f, 0.0f, 1.0f };
+    float netTurretYaw = 0.0f;
+    // Whether any armor state has named this tank yet. A tank that is already
+    // a wreck in the first one is laid down silently: it died before this
+    // machine joined, and the explosion belongs to that moment, not this one.
+    bool netSeen = false;
 };
 static std::vector<EnemyTankState> g_enemyTanks;
 
@@ -286,9 +299,15 @@ static void RegisterEnemyTank(uint64_t entityId, const PrefabAsset& prefab,
     XMStoreFloat4(&tank.rotation, XMQuaternionRotationRollPitchYaw(0.0f, yaw, 0.0f));
     tank.safePosition = tank.position;
     tank.safeRotation = tank.rotation;
-    tank.physicsHandle = g_destruction.CreateGroundVehicle(
-        tank.spec, tank.position, yaw);
-    if (tank.physicsHandle == 0) {
+    tank.netPosition = tank.position;
+    tank.netRotation = tank.rotation;
+    // A client drives nothing: the host's solver owns where the tank is, and a
+    // second body here would roll off on its own and shove the player about.
+    const bool hostOwned = ClientOwnedByHost();
+    if (!hostOwned)
+        tank.physicsHandle = g_destruction.CreateGroundVehicle(
+            tank.spec, tank.position, yaw);
+    if (tank.physicsHandle == 0 && !hostOwned) {
         SGE_LOG("LogGameplay", EngineLog::Level::Warning,
             "Enemy tank " + prefab.id + " declined: no physics body");
         return;
@@ -343,13 +362,16 @@ static XMMATRIX EnemyTankTurretWorld(const EnemyTankState& tank,
 // Every non-hostile explosion. Measured to the hull box's surface, so a rocket
 // that detonated on the glacis counts as a direct hit however far the prefab
 // origin is from it.
-static void DamageEnemyTank(EnemyTankState& tank, float damage,
-                            const XMFLOAT3& hit, bool fromPlayer);
+static void RouteEnemyTankDamage(EnemyTankState& tank, float damage,
+                                 const XMFLOAT3& hit, bool fromPlayer,
+                                 bool hostAuthored);
 
+// `hostAuthored`: a blast this machine is replaying from the host (a
+// replicated grenade), which the host has already applied to every tank.
 static void DamageEnemyTanksFromBlast(const XMFLOAT3& center, float reach,
                                       bool remoteCharge, bool rocket,
                                       bool missile, float fragDamage,
-                                      bool fromPlayer) {
+                                      bool fromPlayer, bool hostAuthored) {
     for (EnemyTankState& tank : g_enemyTanks) {
         if (tank.dead) continue;
         const auto collider = std::find_if(g_prefabColliders.begin(),
@@ -382,12 +404,50 @@ static void DamageEnemyTanksFromBlast(const XMFLOAT3& center, float reach,
             // strategy.
             damage = fragDamage * 0.2f * falloff;
         }
-        DamageEnemyTank(tank, damage, center, fromPlayer);
+        RouteEnemyTankDamage(tank, damage, center, fromPlayer, hostAuthored);
     }
 }
 
+// The wreck: the explosion, the crater, the payout and the entity switched off.
+// Runs on the machine that killed the tank and, in a session, on every client
+// when the host's armor state first says it is dead. `localKill` gates the
+// payout only; `hostAuthored` is a client replaying the host's kill, whose
+// crater the host has already cut and sent.
+static void WreckEnemyTank(EnemyTankState& tank, bool localKill,
+                           bool hostAuthored) {
+    tank.dead = true;
+    tank.health = 0.0f;
+    tank.wreckTime = 0.0f;
+    g_destruction.SetGroundVehicleInput(tank.physicsHandle, 0.0f, 0.0f, true);
+    XMFLOAT3 center;
+    XMStoreFloat3(&center, XMVector3TransformCoord(
+        XMLoadFloat3(&tank.boxCenterLocal), EnemyTankHullWorld(tank)));
+    scene.SpawnExplosionFX(center, 9.0f, 1.2f);
+    scene.SpawnSmokeBurst(center, 3.0f, 2.6f);
+    AddExplosionTerrainCrater(center, 1.0f, hostAuthored);
+    if (g_destruction.IsInitialized()) {
+        g_destruction.ApplyExplosion(center, 7.0f, 60.0f, 14.0f);
+        g_destruction.ApplyRagdollExplosion(center, 7.0f, 110.0f);
+    }
+    g_pendingExplosionAudio.push_back({ 0.0f, 1.0f, 0.7f, false });
+    if (localKill) CreditPlayerDestruction();
+    if (g_game.session.TimerRunning()) {
+        g_game.mission.RecordDestruction();
+        if (localKill) AwardCombatEvent(MoneyEvent::PropDestroyed);
+    }
+    // The wreck keeps drawing out of the live batches. Disabling the entity
+    // means a later prefab rebuild leaves it gone rather than resurrecting a
+    // full-health tank where it was placed.
+    for (LevelEntity& entity : g_game.world.Level().entities)
+        if (entity.id == tank.entityId) entity.enabled = false;
+    SGE_LOG("LogGameplay", EngineLog::Level::Display, "Enemy tank destroyed");
+}
+
+// Authoritative damage: offline, or on the host. `killer` is who the host
+// credits in a session; offline it goes unused.
 static void DamageEnemyTank(EnemyTankState& tank, float damage,
-                            const XMFLOAT3& hit, bool fromPlayer) {
+                            const XMFLOAT3& hit, bool fromPlayer,
+                            net::PlayerId killer) {
     if (tank.dead || damage <= 0.0f) return;
     tank.health -= damage;
     PlayMetalHitAudio(hit, 0.8f);
@@ -399,33 +459,47 @@ static void DamageEnemyTank(EnemyTankState& tank, float damage,
         std::to_string((std::max)(0.0f, tank.health)) + "/" +
         std::to_string(tank.maxHealth));
     if (!destroyed) return;
+    tank.killer = killer;
+    WreckEnemyTank(tank, fromPlayer, /*hostAuthored=*/false);
+}
 
-    tank.dead = true;
-    tank.health = 0.0f;
-    tank.wreckTime = 0.0f;
-    g_destruction.SetGroundVehicleInput(tank.physicsHandle, 0.0f, 0.0f, true);
-    XMFLOAT3 center;
-    XMStoreFloat3(&center, XMVector3TransformCoord(
-        XMLoadFloat3(&tank.boxCenterLocal), EnemyTankHullWorld(tank)));
-    scene.SpawnExplosionFX(center, 9.0f, 1.2f);
-    scene.SpawnSmokeBurst(center, 3.0f, 2.6f);
-    AddExplosionTerrainCrater(center);
-    if (g_destruction.IsInitialized()) {
-        g_destruction.ApplyExplosion(center, 7.0f, 60.0f, 14.0f);
-        g_destruction.ApplyRagdollExplosion(center, 7.0f, 110.0f);
+// Every explosive hit on a tank goes through here. In a session the host owns
+// the tank's health: a client reports only its own player's explosives and
+// leaves everything else -- a host grenade it is replaying, an enemy blast --
+// to the host, which sees those itself. The host applies directly.
+static void RouteEnemyTankDamage(EnemyTankState& tank, float damage,
+                                 const XMFLOAT3& hit, bool fromPlayer,
+                                 bool hostAuthored) {
+    if (tank.dead || damage <= 0.0f) return;
+    if (!g_netSession.Active()) {
+        DamageEnemyTank(tank, damage, hit, fromPlayer, net::kInvalidPlayerId);
+        return;
     }
-    g_pendingExplosionAudio.push_back({ 0.0f, 1.0f, 0.7f, false });
-    if (fromPlayer) CreditPlayerDestruction();
-    if (g_game.session.TimerRunning()) {
-        g_game.mission.RecordDestruction();
-        if (fromPlayer) AwardCombatEvent(MoneyEvent::PropDestroyed);
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        DamageEnemyTank(tank, damage, hit, fromPlayer,
+                        fromPlayer ? g_netSession.LocalId()
+                                   : net::kInvalidPlayerId);
+        return;
     }
-    // The wreck keeps drawing out of the live batches. Disabling the entity
-    // means a later prefab rebuild leaves it gone rather than resurrecting a
-    // full-health tank where it was placed.
-    for (LevelEntity& entity : g_game.world.Level().entities)
-        if (entity.id == tank.entityId) entity.enabled = false;
-    SGE_LOG("LogGameplay", EngineLog::Level::Display, "Enemy tank destroyed");
+    if (!fromPlayer || hostAuthored) return;
+    // The shooter sees its hit now; the outcome arrives in the armor state.
+    PlayMetalHitAudio(hit, 0.8f);
+    scene.SpawnSmokeBurst(hit, 0.6f, 0.35f);
+    scene.TriggerHitMarker(false);
+    g_netSession.ReportWorldImpact(tank.entityId, damage, hit.x, hit.y, hit.z,
+                                   /*kind=*/4);
+}
+
+// Host-side: a client's reported hit, drained from the world-impact queue.
+static void ApplyReportedEnemyTankDamage(uint64_t entityId, float damage,
+                                         const XMFLOAT3& hit,
+                                         net::PlayerId shooter) {
+    for (EnemyTankState& tank : g_enemyTanks) {
+        if (tank.entityId != entityId) continue;
+        DamageEnemyTank(tank, damage, hit,
+                        shooter == g_netSession.LocalId(), shooter);
+        return;
+    }
 }
 
 // A hostile shell meeting the player's body. The rocket sweep checks enemies,
@@ -467,6 +541,64 @@ static bool HostileShellHitsPlayer(const XMFLOAT3& start, const XMFLOAT3& end,
     return true;
 }
 
+// The shell and its report. `hostReplica` is a client flying the host's round:
+// its blast is the host's, so the crater it would dig is already on the way
+// as a replicated terrain cut.
+static void SpawnEnemyTankShell(const XMFLOAT3& muzzle,
+                                const XMFLOAT3& direction, float speed,
+                                float lifetime, bool hostReplica) {
+    Projectile shell = {};
+    shell.position = shell.previousPosition = muzzle;
+    shell.direction = direction;
+    shell.speed = speed;
+    shell.lifetime = lifetime;
+    shell.active = true;
+    shell.rocket = true;
+    shell.hostile = true;
+    shell.netHostRound = hostReplica;
+    scene.projectiles.push_back(shell);
+
+    scene.SpawnExplosionFX(muzzle, 2.4f, 0.14f);
+    scene.SpawnWeaponSmoke(muzzle, direction, 3.2f);
+    g_rpgFireAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 1.0f, 0.5f, 320.0f);
+}
+
+// The player a tank should fight: the nearest living one inside `range`. On
+// the host that includes every other player's body -- a tank that only ever
+// hunted whoever happened to be hosting would let everyone else walk past it.
+// Returns the target's eye point, which is what the local player's camera is.
+static bool NearestEnemyTankTarget(const XMFLOAT3& from, float range,
+                                   XMFLOAT3& eye) {
+    float bestSq = range * range;
+    bool found = false;
+    const bool localTargetable = scene.player.health > 0.0f &&
+        !scene.player.downed && !g_insertionChoicePending &&
+        !g_game.vehicles.blackHawkCarryingPlayer;
+    if (localTargetable) {
+        const XMFLOAT3 p = scene.camera.Position;
+        const float dx = p.x - from.x, dz = p.z - from.z;
+        const float dSq = dx * dx + dz * dz;
+        if (dSq <= bestSq) { bestSq = dSq; eye = p; found = true; }
+    }
+    if (!g_netSession.Active() ||
+        g_netSession.CurrentRole() != net::Role::Host) return found;
+    for (const auto& actor : g_bandits) {
+        if (!actor || !actor->networkControlled || actor->netDowned ||
+            actor->netHealth <= 0.0f) continue;
+        const XMFLOAT3 feet = actor->position;
+        // Well clear of the ground is a player still riding their insertion
+        // in, the remote equivalent of blackHawkCarryingPlayer above.
+        if (feet.y - GroundHeightAt(feet.x, feet.z) > 4.0f) continue;
+        const float dx = feet.x - from.x, dz = feet.z - from.z;
+        const float dSq = dx * dx + dz * dz;
+        if (dSq > bestSq) continue;
+        bestSq = dSq;
+        eye = { feet.x, feet.y + scene.camera.PlayerHeight, feet.z };
+        found = true;
+    }
+    return found;
+}
+
 static void FireEnemyTankShell(EnemyTankState& tank, const XMMATRIX& turretWorld,
                                const XMFLOAT3& target) {
     XMFLOAT3 muzzle;
@@ -486,19 +618,17 @@ static void FireEnemyTankShell(EnemyTankState& tank, const XMMATRIX& turretWorld
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
 
-    Projectile shell = {};
-    shell.position = shell.previousPosition = muzzle;
-    shell.direction = shotDirection;
-    shell.speed = tank.shellSpeed;
-    shell.lifetime = tank.fireRange * 1.6f / tank.shellSpeed;
-    shell.active = true;
-    shell.rocket = true;
-    shell.hostile = true;
-    scene.projectiles.push_back(shell);
-
-    scene.SpawnExplosionFX(muzzle, 2.4f, 0.14f);
-    scene.SpawnWeaponSmoke(muzzle, shotDirection, 3.2f);
-    g_rpgFireAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 1.0f, 0.5f, 320.0f);
+    const float lifetime = tank.fireRange * 1.6f / tank.shellSpeed;
+    SpawnEnemyTankShell(muzzle, shotDirection, tank.shellSpeed, lifetime,
+                        /*hostReplica=*/false);
+    // Every client flies the same shell. Each one can only hurt its own
+    // player, which is what the host already trusts a client to report.
+    if (g_netSession.Active() &&
+        g_netSession.CurrentRole() == net::Role::Host)
+        g_netSession.PublishEnemyFire(net::EnemyFireKind::TankShell,
+            muzzle.x, muzzle.y, muzzle.z,
+            shotDirection.x, shotDirection.y, shotDirection.z,
+            tank.shellSpeed, lifetime);
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Enemy tank fired from " + std::to_string(muzzle.x) + ", " +
         std::to_string(muzzle.y) + ", " + std::to_string(muzzle.z) +
@@ -571,9 +701,8 @@ static void TraceEnemyTanks(float dt) {
 // from the solver and is applied by SyncEnemyTankPoses after the step.
 static void UpdateEnemyTanks(float dt) {
     if (g_enemyTanks.empty() || dt <= 0.0f || IsEditorEditing()) return;
-    const XMFLOAT3 player = scene.camera.Position;
-    const bool playerTargetable = scene.player.health > 0.0f &&
-        !g_insertionChoicePending && !g_game.vehicles.blackHawkCarryingPlayer;
+    // A client's tanks are the host's. Only the wreck smoke runs here.
+    const bool hostOwned = ClientOwnedByHost();
 
     for (EnemyTankState& tank : g_enemyTanks) {
         if (tank.dead) {
@@ -590,16 +719,19 @@ static void UpdateEnemyTanks(float dt) {
             }
             continue;
         }
+        if (hostOwned) continue;
 
         const XMMATRIX orientation =
             XMMatrixRotationQuaternion(XMLoadFloat4(&tank.rotation));
         XMFLOAT3 forward;
         XMStoreFloat3(&forward, XMVector3TransformNormal(
             XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), orientation));
+        XMFLOAT3 player{};
+        const bool engaged = NearestEnemyTankTarget(
+            tank.position, tank.detectRange, player);
         const float dx = player.x - tank.position.x;
         const float dz = player.z - tank.position.z;
         const float distance = std::sqrt(dx * dx + dz * dz);
-        const bool engaged = playerTargetable && distance <= tank.detectRange;
 
         // ---- Turret -----------------------------------------------------
         // Traverse toward the player in the hull's own frame, at a finite rate:
@@ -748,13 +880,34 @@ static void UpdateEnemyTanks(float dt) {
 // After the physics step: pull each tank's pose back and write it into the
 // hull and turret draws and the hull collider, so what the player sees, shoots
 // and walks into stay the same object.
-static void SyncEnemyTankPoses() {
+static void SyncEnemyTankPoses(float dt) {
     if (IsEditorEditing()) return;
     RegisterPendingEnemyTanks();
     if (g_enemyTanks.empty()) return;
+    const bool hostOwned = ClientOwnedByHost();
+    // Eases the drawn pose toward the host's latest over ~70 ms: the armor
+    // state arrives at the net tick, and snapping to it steps visibly.
+    const float ease = 1.0f - std::exp(-14.0f * (std::max)(0.0f, dt));
     for (EnemyTankState& tank : g_enemyTanks) {
+        if (hostOwned) {
+            // A body registered before the session began (single player,
+            // then joined) is dropped: the host's solver owns this tank now.
+            if (tank.physicsHandle != 0) {
+                g_destruction.DestroyGroundVehicle(tank.physicsHandle);
+                tank.physicsHandle = 0;
+            }
+            XMStoreFloat3(&tank.position, XMVectorLerp(
+                XMLoadFloat3(&tank.position),
+                XMLoadFloat3(&tank.netPosition), ease));
+            XMStoreFloat4(&tank.rotation, XMQuaternionSlerp(
+                XMLoadFloat4(&tank.rotation),
+                XMLoadFloat4(&tank.netRotation), ease));
+            tank.turretYaw += std::atan2(
+                std::sin(tank.netTurretYaw - tank.turretYaw),
+                std::cos(tank.netTurretYaw - tank.turretYaw)) * ease;
+        }
         DestructionBodyPose pose;
-        bool haveBody =
+        bool haveBody = !hostOwned &&
             g_destruction.GetGroundVehiclePose(tank.physicsHandle, pose);
         if (haveBody) {
             tank.position = pose.position;
@@ -780,7 +933,7 @@ static void SyncEnemyTankPoses() {
         // No body: the physics world was rebuilt under it (a destruction
         // reset), or it was just pulled back from below the world. Recreate it
         // where the tank is rather than losing it.
-        if (!haveBody && g_destruction.IsInitialized()) {
+        if (!haveBody && !hostOwned && g_destruction.IsInitialized()) {
             XMFLOAT3 axis;
             XMStoreFloat3(&axis, XMVector3Rotate(
                 XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f),

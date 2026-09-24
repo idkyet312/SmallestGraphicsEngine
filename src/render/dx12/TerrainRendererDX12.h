@@ -7,6 +7,7 @@
 #include "TerrainStampLibrary.h"
 #include "EngineLogger.h"
 #include "TextureUploadArenaDX12.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -325,11 +326,33 @@ public:
         // in chronological order, so trimming the front means the most recent
         // explosion always leaves a hole instead of silently doing nothing.
         const size_t keep = (std::min)(stamps.size(), kMaxTerrainSculptStamps);
-        s_sculptStamps.assign(stamps.end() - keep, stamps.end());
+        // The editor re-applies the level's stamps on every visual sync, and
+        // those are mostly unchanged. Bumping the revisions anyway re-ran the
+        // ocean's whole shoreline solve -- measured 123 ms at 1024^2 -- on
+        // each one, which is every frame while a sync is being re-requested.
+        // A texture re-baked on disk under an unchanged list still counts as a
+        // change, through s_stampContentRevision.
+        const bool sameStamps = keep == s_sculptStamps.size() &&
+            std::equal(stamps.end() - keep, stamps.end(),
+                       s_sculptStamps.begin(), SameSculptStamp);
+        const uint64_t stampContentBefore = s_stampContentRevision;
+        if (!sameStamps)
+            s_sculptStamps.assign(stamps.end() - keep, stamps.end());
         for (const TerrainSculptStamp& stamp : s_sculptStamps)
             if (stamp.operation == TerrainSculptOperation::Heightmap)
                 EnsureHeightStampLoaded(stamp.texture);
+        if (sameStamps && s_stampContentRevision == stampContentBefore)
+            return;
         RefreshSculptDisplacement(true);
+    }
+
+    static bool SameSculptStamp(const TerrainSculptStamp& a,
+                                const TerrainSculptStamp& b) {
+        return a.x == b.x && a.z == b.z && a.radius == b.radius &&
+               a.operation == b.operation && a.value == b.value &&
+               a.strength == b.strength && a.texture == b.texture &&
+               a.rotation == b.rotation && a.replace == b.replace &&
+               a.baseHeight == b.baseHeight && a.edgeFalloff == b.edgeFalloff;
     }
 
     // Adds one runtime stamp without re-running the heightmap residency sweep.
@@ -1167,7 +1190,8 @@ public:
         auto loadTerrainSlice = [&](const char* folder, const char* file,
                                     UINT layer, std::vector<uint8_t>& target,
                                     bool normalSource, bool roughnessSource,
-                                    bool ambientOcclusionSource = false) {
+                                    bool ambientOcclusionSource = false,
+                                    bool heightSource = false) {
             std::vector<unsigned char> source;
             int width = 0, heightPixels = 0;
             if (!GLBImporter::LoadPixelsRGBA(
@@ -1194,7 +1218,14 @@ public:
                 const size_t destination =
                     static_cast<size_t>(layer) * layerBytes +
                     (static_cast<size_t>(y) * side + x) * 4;
-                if (ambientOcclusionSource) {
+                if (heightSource) {
+                    // The grass displacement scan is centred around 83/255.
+                    // Centre it at neutral height so it does not win every
+                    // transition against layers without a displacement scan.
+                    const float centred = 128.0f +
+                        (static_cast<float>(sums[0] / count) - 83.0f) * 0.8f;
+                    target[destination + 3] = byte(centred / 255.0f);
+                } else if (ambientOcclusionSource) {
                     target[destination + 0] =
                         static_cast<uint8_t>(sums[0] / count);
                 } else if (roughnessSource) {
@@ -1213,15 +1244,30 @@ public:
                     target[destination + 1] = byte(decoded.y * 0.5f + 0.5f);
                     target[destination + 2] = byte(decoded.z * 0.5f + 0.5f);
                 } else {
-                    const float exposure = layer == 0 ? 1.25f : 1.0f;
-                    target[destination + 0] = byte(
-                        static_cast<float>(sums[0] / count) / 255.0f * exposure);
-                    target[destination + 1] = byte(
-                        static_cast<float>(sums[1] / count) / 255.0f * exposure);
-                    target[destination + 2] = byte(
-                        static_cast<float>(sums[2] / count) / 255.0f * exposure);
+                    if (layer == 3) {
+                        // The near-black rock scan reads as a black cutout next
+                        // to the beach. Lift its luminance and reduce the warm
+                        // cast while retaining the scan's cracks and grain.
+                        const float luminance = (
+                            0.2126f * sums[0] + 0.7152f * sums[1] +
+                            0.0722f * sums[2]) / (255.0f * count);
+                        const float coastalRock =
+                            0.40f + (luminance - 0.11f) * 1.7f;
+                        target[destination + 0] = byte(coastalRock * 1.04f);
+                        target[destination + 1] = byte(coastalRock);
+                        target[destination + 2] = byte(coastalRock * 0.92f);
+                    } else {
+                        const float exposure = layer == 0 ? 1.25f : 1.0f;
+                        target[destination + 0] = byte(
+                            static_cast<float>(sums[0] / count) / 255.0f * exposure);
+                        target[destination + 1] = byte(
+                            static_cast<float>(sums[1] / count) / 255.0f * exposure);
+                        target[destination + 2] = byte(
+                            static_cast<float>(sums[2] / count) / 255.0f * exposure);
+                    }
                 }
-                target[destination + 3] = 255;
+                if (!heightSource && !ambientOcclusionSource)
+                    target[destination + 3] = roughnessSource ? 128 : 255;
             }
             return true;
         };
@@ -1231,20 +1277,24 @@ public:
             const char* normal;
             const char* roughness;
             const char* ambientOcclusion;
+            const char* height;
         };
         static constexpr TerrainAsset assets[layers] = {
             { "Grass3/Grass004_2K-JPG", "Grass004_2K-JPG_Color.jpg",
               "Grass004_2K-JPG_NormalGL.jpg",
               "Grass004_2K-JPG_Roughness.jpg",
-              "Grass004_2K-JPG_AmbientOcclusion.jpg" },
+              "Grass004_2K-JPG_AmbientOcclusion.jpg",
+              "Grass004_2K-JPG_Displacement.jpg" },
             { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
-              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png", nullptr },
+              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png",
+              nullptr, nullptr },
             { "terrain/aerial_beach_01", "aerial_beach_01_diff_2k.png",
               "aerial_beach_01_nor_gl_2k.png",
               "aerial_beach_01_rough_2k.png",
-              "aerial_beach_01_ao_2k.png" },
+              "aerial_beach_01_ao_2k.png", nullptr },
             { "terrain/dark_rock", "dark_rock_diff_1k.png",
-              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png", nullptr }
+              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png",
+              nullptr, nullptr }
         };
         for (UINT layer = 0; layer < layers; ++layer) {
             const bool albedoLoaded = loadTerrainSlice(
@@ -1258,17 +1308,26 @@ public:
                 maps[2], false, true);
             fillFallbackSlice(layer, !albedoLoaded, !normalLoaded,
                               !roughnessLoaded);
+            if (!roughnessLoaded) {
+                for (size_t texel = 0; texel < layerBytes; texel += 4)
+                    maps[2][static_cast<size_t>(layer) * layerBytes + texel + 3] = 128;
+            }
             const bool aoLoaded = !assets[layer].ambientOcclusion ||
                 loadTerrainSlice(assets[layer].folder,
                     assets[layer].ambientOcclusion, layer,
                     maps[2], false, false, true);
+            const bool heightLoaded = !assets[layer].height ||
+                loadTerrainSlice(assets[layer].folder,
+                    assets[layer].height, layer, maps[2], false, false,
+                    false, true);
             if (!albedoLoaded || !normalLoaded || !roughnessLoaded ||
-                !aoLoaded) {
+                !aoLoaded || !heightLoaded) {
                 std::cerr << "Terrain PBR: " << assets[layer].folder
                           << " maps missing (albedo=" << albedoLoaded
                           << ", normal=" << normalLoaded
                           << ", roughness=" << roughnessLoaded
                           << ", ao=" << aoLoaded
+                          << ", height=" << heightLoaded
                           << "); using generated fallback slice\n";
             }
         }
@@ -1532,8 +1591,10 @@ private:
                                 : "Terrain stamp missing: ") + path.string());
             loadState = 2u;
             if (!writeTimeError) writeTimeRecord = writeTime;
+            ++s_stampContentRevision;
             return UINT_MAX;
         }
+        ++s_stampContentRevision;
         // Once per slot load, never per frame: resolved slots return above.
         SGE_LOG("LogTerrain", EngineLog::Level::Display,
             "Terrain stamp loaded: " + path.string() + " (" +
@@ -1677,6 +1738,9 @@ private:
     inline static std::filesystem::file_time_type s_bakeWriteTime;
     inline static uint64_t s_sculptRevision = 1;
     inline static uint64_t s_bathymetryRevision = 1;
+    // Advances whenever a stamp slot's content is (re)loaded or fails to, so
+    // SetSculptStamps can tell a re-baked PNG from an unchanged re-apply.
+    inline static uint64_t s_stampContentRevision = 0;
     inline static uint64_t s_stampAtlasRevision = 1;
     float m_sculptMaxDisplacement = 0.0f;
 };

@@ -254,8 +254,25 @@ static void ApplyNetworkWorldImpact(uint8_t kind, uint64_t entityId,
                                     float dirX, float dirY, float dirZ,
                                     const XMFLOAT3& hit,
                                     bool spawnImpactFx, bool playerOwned,
-                                    bool remoteCharge) {
+                                    bool remoteCharge,
+                                    net::PlayerId shooter = net::kInvalidPlayerId) {
     const XMFLOAT3 normal{ -dirX, -dirY, -dirZ };
+    if (kind == 4 || kind == 5) {
+        // A client's hit on a tank or an AA gun. Same rule as the gunships:
+        // only the host applies it, and everyone else learns the outcome from
+        // the armor state. The shooter drew its own hit already.
+        if (g_netSession.CurrentRole() == net::Role::Host) {
+            if (kind == 4)
+                ApplyReportedEnemyTankDamage(entityId, damage, hit, shooter);
+            else
+                ApplyReportedAATurretDamage(static_cast<size_t>(entityId),
+                                            damage, hit, shooter);
+        } else if (spawnImpactFx) {
+            PlayMetalHitAudio(hit, 0.8f);
+            scene.SpawnSmokeBurst(hit, 0.3f, 0.15f);
+        }
+        return;
+    }
     if (kind == 1) {
         // spawnImpactFx doubles as "this was not my round": the shot's own
         // machine already marked and sparked at the trigger pull.
@@ -337,7 +354,8 @@ static void UpdateNetworkWorldImpacts() {
                                     impact.impulse, impact.dirX,
                                     impact.dirY, impact.dirZ, hit,
                                     impact.shooter != g_netSession.LocalId(),
-                                    impact.playerOwned, impact.remoteCharge);
+                                    impact.playerOwned, impact.remoteCharge,
+                                    impact.shooter);
             g_netSession.PublishWorldBreak(
                 impact.kind, impact.entityId,
                 impact.damage, impact.radius, impact.impulse,
@@ -354,7 +372,8 @@ static void UpdateNetworkWorldImpacts() {
                                     impact.impulse, impact.dirX,
                                     impact.dirY, impact.dirZ, hit,
                                     impact.shooter != g_netSession.LocalId(),
-                                    impact.playerOwned, impact.remoteCharge);
+                                    impact.playerOwned, impact.remoteCharge,
+                                    impact.shooter);
         }
     }
 }
@@ -609,6 +628,219 @@ static void ApplyNetworkEnemyHelicopters() {
     vehicles.secondaryHelicopterHealth = secondary.health;
     vehicles.secondaryHelicopterDead = secondary.dead;
     vehicles.secondaryHelicopterCrashed = secondary.crashed;
+}
+
+// Enemy tanks and AA guns are the host's. Every machine used to run its own
+// from its own AI: each player fought a private tank that hunted only them,
+// and one killed on one screen drove on, firing, on every other.
+//
+// Plain state, like the gunships -- the pose is continuous and the health only
+// falls, so the latest word is always the right one. The rounds they fire are
+// separate events (ServerEnemyFire), because a round is a thing that happens
+// once and a snapshot can only say where something is.
+static std::vector<net::EnemyTankSnapshot> g_hostTankScratch;
+static std::vector<net::AATurretSnapshot> g_hostTurretScratch;
+static std::vector<net::EnemyHumveeSnapshot> g_hostHumveeScratch;
+
+static void PublishHostArmor() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Host) return;
+    g_hostTankScratch.clear();
+    for (const EnemyTankState& tank : g_enemyTanks) {
+        net::EnemyTankSnapshot out;
+        out.entityId = tank.entityId;
+        out.dead = tank.dead ? 1 : 0;
+        out.killer = tank.killer;
+        out.x = tank.position.x;
+        out.y = tank.position.y;
+        out.z = tank.position.z;
+        out.qx = tank.rotation.x;
+        out.qy = tank.rotation.y;
+        out.qz = tank.rotation.z;
+        out.qw = tank.rotation.w;
+        out.turretYaw = tank.turretYaw;
+        out.health = tank.health;
+        g_hostTankScratch.push_back(out);
+    }
+    g_hostTurretScratch.clear();
+    for (const VehicleSystem::AATurret& turret : g_game.vehicles.aaTurrets) {
+        net::AATurretSnapshot out;
+        out.dead = turret.dead ? 1 : 0;
+        out.killer = turret.netKiller;
+        out.x = turret.position.x;
+        out.z = turret.position.z;
+        out.yaw = turret.yaw;
+        out.pitch = turret.pitch;
+        out.heat = turret.heat;
+        out.health = turret.health;
+        g_hostTurretScratch.push_back(out);
+    }
+    g_hostHumveeScratch.clear();
+    for (size_t index = 0; index < g_humveeGameplay.size() &&
+                           index < net::kMaxReplicatedHumvees; ++index) {
+        XMFLOAT4X4 pose;
+        XMFLOAT3 position;
+        if (!g_destruction.GetVehicleTransform(index, pose, &position))
+            continue;
+        XMFLOAT4 rotation;
+        XMStoreFloat4(&rotation, XMQuaternionNormalize(
+            XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
+        net::EnemyHumveeSnapshot out;
+        out.index = static_cast<uint8_t>(index);
+        out.hostDriven = g_humveeGameplay[index].aiEverDriven ? 1 : 0;
+        out.x = position.x;
+        out.y = position.y;
+        out.z = position.z;
+        out.qx = rotation.x;
+        out.qy = rotation.y;
+        out.qz = rotation.z;
+        out.qw = rotation.w;
+        out.turretYaw = g_humveeGameplay[index].turretYaw;
+        g_hostHumveeScratch.push_back(out);
+    }
+    g_netSession.PublishArmor(g_hostTankScratch.data(),
+                              g_hostTankScratch.size(),
+                              g_hostTurretScratch.data(),
+                              g_hostTurretScratch.size(),
+                              g_hostHumveeScratch.data(),
+                              g_hostHumveeScratch.size());
+}
+
+// Client-side. Writes the host's tanks and guns over the local ones; the
+// render, colliders and model posing all read these same fields, so nothing
+// downstream has to know a session exists. A death seen for the first time
+// plays the wreck here -- unless it is the first thing this machine hears
+// about that tank or gun, which means it died before this client joined.
+static void ApplyNetworkArmor() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Client) return;
+    const net::ServerArmorStateMessage* armor = g_netSession.RemoteArmor();
+    if (!armor) return;
+    const net::PlayerId self = g_netSession.LocalId();
+
+    for (uint8_t i = 0; i < armor->tankCount; ++i) {
+        const net::EnemyTankSnapshot& in = armor->tanks[i];
+        for (EnemyTankState& tank : g_enemyTanks) {
+            if (tank.entityId != in.entityId) continue;
+            tank.netPosition = { in.x, in.y, in.z };
+            XMStoreFloat4(&tank.netRotation, XMQuaternionNormalize(
+                XMVectorSet(in.qx, in.qy, in.qz, in.qw)));
+            tank.netTurretYaw = in.turretYaw;
+            tank.health = in.health;
+            tank.killer = in.killer;
+            if (!tank.netSeen) {
+                // Snap on first sight rather than easing in from wherever
+                // this machine placed it.
+                tank.position = tank.netPosition;
+                tank.rotation = tank.netRotation;
+                tank.turretYaw = tank.netTurretYaw;
+            }
+            if (in.dead && !tank.dead) {
+                if (tank.netSeen) {
+                    WreckEnemyTank(tank, in.killer != net::kInvalidPlayerId &&
+                                             in.killer == self,
+                                   /*hostAuthored=*/true);
+                } else {
+                    tank.dead = true;
+                    tank.health = 0.0f;
+                    tank.wreckTime = kEnemyTankWreckSmokeSeconds;
+                    for (LevelEntity& entity : g_game.world.Level().entities)
+                        if (entity.id == tank.entityId) entity.enabled = false;
+                }
+            }
+            tank.netSeen = true;
+            break;
+        }
+    }
+
+    // Humvees: stored here, applied to the body after the physics step by
+    // SyncEnemyHumveePoses. One the host's AI has never moved is left to this
+    // machine, which is how every Humvee behaved before the AI drove them.
+    for (uint8_t i = 0; i < armor->humveeCount; ++i) {
+        const net::EnemyHumveeSnapshot& in = armor->humvees[i];
+        if (in.index >= g_humveeGameplay.size()) continue;
+        HumveeGameplayState& state = g_humveeGameplay[in.index];
+        state.netTurretYaw = in.turretYaw;
+        state.netTurretSeen = true;
+        if (!in.hostDriven) continue;
+        state.netPosition = { in.x, in.y, in.z };
+        XMStoreFloat4(&state.netRotation, XMQuaternionNormalize(
+            XMVectorSet(in.qx, in.qy, in.qz, in.qw)));
+        if (!state.netPosed) {
+            // Start easing from where the body actually is.
+            XMFLOAT4X4 pose;
+            XMFLOAT3 position;
+            if (g_destruction.GetVehicleTransform(in.index, pose, &position)) {
+                state.drawPosition = position;
+                XMStoreFloat4(&state.drawRotation, XMQuaternionNormalize(
+                    XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
+            } else {
+                state.drawPosition = state.netPosition;
+                state.drawRotation = state.netRotation;
+            }
+        }
+        state.netPosed = true;
+    }
+
+    auto& turrets = g_game.vehicles.aaTurrets;
+    for (uint8_t i = 0; i < armor->turretCount; ++i) {
+        const net::AATurretSnapshot& in = armor->turrets[i];
+        // Nearest local gun in plan view. Both machines seat the same guns
+        // from the same level, so a match is centimetres away; the 3 m
+        // allowance only has to reject a gun this machine does not have.
+        VehicleSystem::AATurret* match = nullptr;
+        float bestSq = 3.0f * 3.0f;
+        for (VehicleSystem::AATurret& turret : turrets) {
+            const float dx = turret.position.x - in.x;
+            const float dz = turret.position.z - in.z;
+            const float dSq = dx * dx + dz * dz;
+            if (dSq > bestSq) continue;
+            bestSq = dSq;
+            match = &turret;
+        }
+        if (!match) continue;
+        match->yaw = in.yaw;
+        match->pitch = in.pitch;
+        match->heat = in.heat;
+        match->health = in.health;
+        match->netKiller = in.killer;
+        if (in.dead && !match->dead) {
+            match->dead = true;
+            match->shotsLeftInBurst = 0;
+            if (match->netSeen)
+                WreckAATurret(match->position,
+                              in.killer != net::kInvalidPlayerId &&
+                                  in.killer == self,
+                              /*hostAuthored=*/true);
+        }
+        match->netSeen = true;
+    }
+}
+
+// Client-side: fly the rounds the host's tanks and guns fired. Each is a live
+// hostile projectile here, so it can hit this machine's player -- which is how
+// it reaches them at all, since the host never simulates anyone's body but
+// its own -- and the damage it does goes back through the usual local report.
+static std::vector<net::RemoteEnemyFire> g_netEnemyFire;
+
+static void PresentEnemyFire() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Client) return;
+    g_netSession.DrainEnemyFire(g_netEnemyFire);
+    for (const net::RemoteEnemyFire& fire : g_netEnemyFire) {
+        const XMFLOAT3 muzzle{ fire.x, fire.y, fire.z };
+        XMFLOAT3 direction;
+        XMStoreFloat3(&direction, XMVector3Normalize(
+            XMVectorSet(fire.dirX, fire.dirY, fire.dirZ, 0.0f)));
+        if (fire.kind == net::EnemyFireKind::TankShell) {
+            if (!(fire.speed > 0.0f) || !(fire.lifetime > 0.0f)) continue;
+            SpawnEnemyTankShell(muzzle, direction, fire.speed,
+                                (std::min)(fire.lifetime, 30.0f),
+                                /*hostReplica=*/true);
+        } else {
+            SpawnAATurretRound(muzzle, direction, /*hostReplica=*/true);
+        }
+    }
 }
 
 // Remote bodies live in g_bandits alongside the AI actors, so they are drawn,
@@ -1350,6 +1582,13 @@ static void UpdateMultiplayerSession(float frameDelta,
     }
     g_netSession.Update(frameDelta, local);
 
+    // Enemy rounds are only flown by UpdateMultiplayerBodies, which runs in a
+    // live level. Off one -- a menu, a load -- they are thrown away as they
+    // arrive, or a client would come out of a loading screen into every AA
+    // burst fired while it was on it.
+    if (!IsGameplayScreen() || g_game.loading.Active())
+        g_netSession.DrainEnemyFire(g_netEnemyFire);
+
     // The host owns our health in a session, so pull it back rather than
     // letting the local copy drift. Everything that reads health -- the bar,
     // the low-health vignette, the death gate -- then works from one number.
@@ -1492,7 +1731,10 @@ static void UpdateMultiplayerBodies(float frameDelta) {
         // After the hits: a gunship brought down by a client's report this
         // frame goes out already dead rather than flying for one more tick.
         PublishHostVehicles();
+        PublishHostArmor();
     } else {
         UpdateClientEnemies(frameDelta);
+        ApplyNetworkArmor();
+        PresentEnemyFire();
     }
 }

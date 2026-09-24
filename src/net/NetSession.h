@@ -101,6 +101,18 @@ struct RemoteShot {
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
 };
 
+// A round a host tank or AA gun fired, for the client to spawn as a live
+// hostile projectile. Unlike RemoteShot this one does damage -- but only to
+// the receiving machine's own player, through the same local hostile-hit path
+// a bandit round takes, which the host already trusts a client to report.
+struct RemoteEnemyFire {
+    EnemyFireKind kind = EnemyFireKind::TankShell;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    float speed = 0.0f;
+    float lifetime = 0.0f;
+};
+
 // One enemy gunship as the gameplay layer sees it. Used in both directions: the
 // host fills it from its vehicle state, a client reads it back to overwrite its
 // own. Mirrors EnemyHelicopterSnapshot without the wire packing.
@@ -345,6 +357,12 @@ public:
         remoteVehicleTick_ = 0;
         hasHostHelicopters_ = false;
         hasRemoteHelicopters_ = false;
+        hostArmor_ = {};
+        remoteArmor_ = {};
+        remoteArmorTick_ = 0;
+        hasHostArmor_ = false;
+        hasRemoteArmor_ = false;
+        enemyFire_.clear();
         enemyHits_.clear();
         worldImpacts_.clear();
         worldBreaks_.clear();
@@ -476,6 +494,7 @@ public:
                 SendSnapshot();
                 SendEnemySnapshots();
                 SendVehicleState();
+                SendArmorState();
             } else {
                 SendInput(local);
             }
@@ -1222,6 +1241,64 @@ public:
         return hasRemoteHelicopters_ ? remoteHelicopters_ : nullptr;
     }
 
+    // Host-side: every tank and AA gun as it stands this tick. Stored and sent
+    // on the net tick, like the gunships. Counts past the wire caps are cut.
+    void PublishArmor(const EnemyTankSnapshot* tanks, size_t tankCount,
+                      const AATurretSnapshot* turrets, size_t turretCount,
+                      const EnemyHumveeSnapshot* humvees, size_t humveeCount) {
+        if (role_ != Role::Host) return;
+        hostArmor_ = ServerArmorStateMessage{};
+        hostArmor_.tankCount = static_cast<uint8_t>(
+            tankCount < kMaxReplicatedTanks ? tankCount : kMaxReplicatedTanks);
+        hostArmor_.turretCount = static_cast<uint8_t>(
+            turretCount < kMaxReplicatedAATurrets ? turretCount
+                                                  : kMaxReplicatedAATurrets);
+        hostArmor_.humveeCount = static_cast<uint8_t>(
+            humveeCount < kMaxReplicatedHumvees ? humveeCount
+                                                : kMaxReplicatedHumvees);
+        for (uint8_t i = 0; i < hostArmor_.tankCount; ++i)
+            hostArmor_.tanks[i] = tanks[i];
+        for (uint8_t i = 0; i < hostArmor_.turretCount; ++i)
+            hostArmor_.turrets[i] = turrets[i];
+        for (uint8_t i = 0; i < hostArmor_.humveeCount; ++i)
+            hostArmor_.humvees[i] = humvees[i];
+        hasHostArmor_ = true;
+    }
+
+    // Client-side: the armor the host last described, or nullptr before the
+    // first message -- the signal to leave the local tanks and guns alone.
+    const ServerArmorStateMessage* RemoteArmor() const {
+        return hasRemoteArmor_ ? &remoteArmor_ : nullptr;
+    }
+
+    // Host-side: a tank or AA gun fired. Sent straight away rather than on the
+    // tick, so the round leaves every client's muzzle as close as possible to
+    // when it left the host's. The host does not queue its own: it spawned
+    // the projectile when it fired.
+    void PublishEnemyFire(EnemyFireKind kind, float x, float y, float z,
+                          float dirX, float dirY, float dirZ,
+                          float speed = 0.0f, float lifetime = 0.0f) {
+        if (role_ != Role::Host || !transport_ || !Finite3(x, y, z) ||
+            !Finite3(dirX, dirY, dirZ) || !std::isfinite(speed) ||
+            !std::isfinite(lifetime)) return;
+        ServerEnemyFireMessage message;
+        message.kind = kind;
+        message.x = x; message.y = y; message.z = z;
+        message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
+        message.speed = speed;
+        message.lifetime = lifetime;
+        transport_->Broadcast(&message, sizeof(message),
+                              kind == EnemyFireKind::TankShell
+                                  ? Channel::Reliable : Channel::Unreliable);
+    }
+
+    // Client-side: the host's rounds to spawn this frame, moved out so each is
+    // spawned exactly once.
+    void DrainEnemyFire(std::vector<RemoteEnemyFire>& out) {
+        out.clear();
+        out.swap(enemyFire_);
+    }
+
     // A round from this machine hit an enemy. On a client this reports to the
     // host; on the host it queues into the same list the reports land in, so
     // both take one identical path into the damage code.
@@ -1305,13 +1382,18 @@ private:
     // world-impact channel rather than a message of its own: a round on a hull
     // is the same shooter-authoritative bargain as a round on a wall, and the
     // dedupe and validation here are exactly what it needs.
-    static bool ValidWorldKind(uint8_t kind) { return kind <= 3; }
+    static bool ValidWorldKind(uint8_t kind) { return kind <= 5; }
     static bool ValidWorldTarget(uint64_t entityId, uint8_t kind,
                                  uint32_t impactId) {
         // Destruction surfaces, trees and gunships have no prefab entity id.
         // Their per-impact id is the stable key used for reliable dedupe.
         // A gunship's entityId is an airframe index, so it must name one.
         if (kind == 3 && entityId >= kEnemyHelicopterCount) return false;
+        // A tank is named by its level entity; there is no tank zero.
+        if (kind == 4 && entityId == 0) return false;
+        // An AA turret's entityId is the sender's index, only a hint -- the
+        // host finds the gun by the reported base position.
+        if (kind == 5 && entityId >= kMaxReplicatedAATurrets) return false;
         return ValidWorldKind(kind) &&
                (entityId != 0 || (kind != 1 && impactId != 0));
     }
@@ -1590,6 +1672,12 @@ private:
             break;
         case MessageType::ServerVehicleState:
             if (role_ == Role::Client) HandleVehicleState(event);
+            break;
+        case MessageType::ServerArmorState:
+            if (role_ == Role::Client) HandleArmorState(event);
+            break;
+        case MessageType::ServerEnemyFire:
+            if (role_ == Role::Client) HandleEnemyFire(event);
             break;
         case MessageType::ClientChargeStuck:
             if (role_ == Role::Host) HandleClientChargeStuck(event);
@@ -1987,6 +2075,13 @@ private:
         transport_->Broadcast(&message, sizeof(message), Channel::Unreliable);
     }
 
+    void SendArmorState() {
+        if (!hasHostArmor_ || !transport_) return;
+        hostArmor_.tick = tick_;
+        transport_->Broadcast(&hostArmor_, sizeof(hostArmor_),
+                              Channel::Unreliable);
+    }
+
     void HandleClientChargeStuck(Event& event) {
         if (event.payload.size() < sizeof(ClientChargeStuckMessage)) return;
         const auto it = peerToPlayer_.find(event.peer);
@@ -2167,6 +2262,64 @@ private:
         remoteEscapeBoat_ = message.escapeBoat;
         remoteVehicleTick_ = message.tick;
         hasRemoteHelicopters_ = true;
+    }
+
+    void HandleArmorState(Event& event) {
+        if (event.payload.size() < sizeof(ServerArmorStateMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerArmorStateMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (hasRemoteArmor_ &&
+            static_cast<int32_t>(message.tick - remoteArmorTick_) <= 0) return;
+        if (message.tankCount > kMaxReplicatedTanks ||
+            message.turretCount > kMaxReplicatedAATurrets ||
+            message.humveeCount > kMaxReplicatedHumvees) return;
+        // Unreliable, so a corrupt packet must not hand the pose code a NaN.
+        for (uint8_t i = 0; i < message.tankCount; ++i) {
+            const EnemyTankSnapshot& tank = message.tanks[i];
+            if (!Finite3(tank.x, tank.y, tank.z) ||
+                !Finite3(tank.qx, tank.qy, tank.qz) ||
+                !std::isfinite(tank.qw) || !std::isfinite(tank.turretYaw) ||
+                !std::isfinite(tank.health)) return;
+        }
+        for (uint8_t i = 0; i < message.turretCount; ++i) {
+            const AATurretSnapshot& turret = message.turrets[i];
+            if (!Finite3(turret.x, turret.z, turret.yaw) ||
+                !Finite3(turret.pitch, turret.heat, turret.health)) return;
+        }
+        for (uint8_t i = 0; i < message.humveeCount; ++i) {
+            const EnemyHumveeSnapshot& humvee = message.humvees[i];
+            if (!Finite3(humvee.x, humvee.y, humvee.z) ||
+                !Finite3(humvee.qx, humvee.qy, humvee.qz) ||
+                !Finite3(humvee.qw, humvee.turretYaw, 0.0f)) return;
+        }
+        remoteArmor_ = message;
+        remoteArmorTick_ = message.tick;
+        hasRemoteArmor_ = true;
+    }
+
+    void HandleEnemyFire(Event& event) {
+        if (event.payload.size() < sizeof(ServerEnemyFireMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerEnemyFireMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.kind != EnemyFireKind::TankShell &&
+            message.kind != EnemyFireKind::AAShell) return;
+        if (!Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.dirX, message.dirY, message.dirZ) ||
+            !std::isfinite(message.speed) ||
+            !std::isfinite(message.lifetime)) return;
+        // Bounded: a client that is not draining (a loading screen) must not
+        // bank minutes of AA bursts and fire them all at once afterwards.
+        if (enemyFire_.size() >= 256) return;
+        RemoteEnemyFire fire;
+        fire.kind = message.kind;
+        fire.x = message.x; fire.y = message.y; fire.z = message.z;
+        fire.dirX = message.dirX; fire.dirY = message.dirY;
+        fire.dirZ = message.dirZ;
+        fire.speed = message.speed;
+        fire.lifetime = message.lifetime;
+        enemyFire_.push_back(fire);
     }
 
     void SendEnemySnapshots() {
@@ -2545,6 +2698,13 @@ private:
     uint32_t remoteVehicleTick_ = 0;
     bool hasHostHelicopters_ = false;
     bool hasRemoteHelicopters_ = false;
+    // Tanks and AA guns: the host's outgoing set, and a client's last received.
+    ServerArmorStateMessage hostArmor_{};
+    ServerArmorStateMessage remoteArmor_{};
+    uint32_t remoteArmorTick_ = 0;
+    bool hasHostArmor_ = false;
+    bool hasRemoteArmor_ = false;
+    std::vector<RemoteEnemyFire> enemyFire_;
     std::vector<EnemyHitRequest> enemyHits_;
     std::vector<WorldImpactRequest> worldImpacts_;
     std::vector<WorldBreakEvent> worldBreaks_;

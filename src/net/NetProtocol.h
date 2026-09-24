@@ -66,7 +66,16 @@ namespace net {
 //     filled the four bytes before the first float and alignment re-pads. At
 //     16 enemies that is 576 bytes of payload, still inside one datagram.
 // 16: host-authoritative exfil boat state.
-inline constexpr uint32_t kProtocolVersion = 19;
+// 20: enemy tanks and AA emplacements are the host's. Their pose, health and
+//     death replicate in ServerArmorState, and each round they fire is a
+//     ServerEnemyFire, so a tank that one player kills stops for everyone and
+//     every player sees -- and can be hit by -- the same shell. World impacts
+//     gained kinds 4 (tank, by level entity id) and 5 (AA turret) for a
+//     client's own hits on them.
+// 21: ServerArmorState carries the level Humvees, whose gunners now drive them
+//     at the player on the host. humveeCount takes a padding byte; the
+//     message grows by 8 x 36 bytes, still inside one datagram.
+inline constexpr uint32_t kProtocolVersion = 21;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -118,6 +127,8 @@ enum class MessageType : uint8_t {
     ServerChargeDetonate,     // host -> clients, reliable
     ClientChatMessage,        // client -> host, reliable
     ServerChatMessage,        // host -> clients, reliable
+    ServerArmorState,         // host -> clients, unreliable, every net tick
+    ServerEnemyFire,          // host -> clients, reliable (tank) / unreliable (AA)
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -379,6 +390,98 @@ struct ServerVehicleStateMessage {
     EscapeBoatSnapshot escapeBoat;
 };
 
+// One enemy tank as the host drives it. Keyed by the level entity id the tank
+// was placed from: both machines load the same level file, so that id names
+// the same placement everywhere, where an index into the host's tank list
+// would shift the moment one was dropped.
+struct EnemyTankSnapshot {
+    uint64_t entityId = 0;
+    uint8_t dead = 0;
+    // Who destroyed it, or kInvalidPlayerId for anything that was not a
+    // player. Only the machine this names pays out for the wreck.
+    PlayerId killer = kInvalidPlayerId;
+    uint8_t padding[2] = {};
+    // Chassis body centre and orientation, exactly as the physics solver
+    // returns them on the host.
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    // Hull-relative traverse, radians.
+    float turretYaw = 0.0f;
+    float health = 0.0f;
+};
+
+// One AA emplacement. Matched on the receiver by where it stands rather than
+// by index: the comm-tower gun and prefab guns are placed from different paths
+// whose order is not something the two machines are promised to agree on.
+struct AATurretSnapshot {
+    uint8_t dead = 0;
+    PlayerId killer = kInvalidPlayerId;
+    uint8_t padding[2] = {};
+    float x = 0.0f, z = 0.0f;
+    // Radians, matching VehicleSystem::AATurret.
+    float yaw = 0.0f, pitch = 0.0f;
+    float heat = 0.0f;
+    float health = 0.0f;
+};
+
+// One level Humvee. Keyed by its spawn index: both machines build the Humvees
+// from the same level file in the same order. `hostDriven` says the host's AI
+// has driven it this level, so the client should show the host's pose rather
+// than its own parked body; the turret yaw applies either way.
+struct EnemyHumveeSnapshot {
+    uint8_t index = 0;
+    uint8_t hostDriven = 0;
+    uint8_t padding[2] = {};
+    // Chassis body centre and orientation, as the host's solver returns them.
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    float turretYaw = 0.0f;
+};
+
+inline constexpr uint8_t kMaxReplicatedTanks = 8;
+inline constexpr uint8_t kMaxReplicatedHumvees = 8;
+// Mirrors VehicleSystem::kMaxAATurrets; this header stays free of engine
+// includes, so the number is repeated rather than shared.
+inline constexpr uint8_t kMaxReplicatedAATurrets = 8;
+
+// Every tank and AA gun in one broadcast. There is no "nearest" to cull by --
+// a level places a handful at most -- and at 48 + 28 bytes each the full set
+// is well inside one datagram.
+struct ServerArmorStateMessage {
+    MessageHeader header{ MessageType::ServerArmorState, {} };
+    uint32_t tick = 0;
+    uint8_t tankCount = 0;
+    uint8_t turretCount = 0;
+    uint8_t humveeCount = 0;
+    uint8_t padding = 0;
+    EnemyTankSnapshot tanks[kMaxReplicatedTanks];
+    AATurretSnapshot turrets[kMaxReplicatedAATurrets];
+    EnemyHumveeSnapshot humvees[kMaxReplicatedHumvees];
+};
+
+enum class EnemyFireKind : uint8_t {
+    TankShell = 0,
+    AAShell,
+};
+
+// A round leaving a tank's gun or an AA emplacement on the host. Every client
+// spawns the same live hostile projectile from it, so the shell a player
+// dodges is the one the host fired, and it hurts that player through the same
+// local hostile-damage path a bandit's round does. Tank shells go reliable --
+// one every few seconds, and a lost one is a lethal round nobody saw -- while
+// AA bursts go unreliable, where a resent round would arrive already late.
+struct ServerEnemyFireMessage {
+    MessageHeader header{ MessageType::ServerEnemyFire, {} };
+    EnemyFireKind kind = EnemyFireKind::TankShell;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
+    // Tank shells carry their tank's authored ballistics; AA rounds use the
+    // fixed emplacement constants and leave these at zero.
+    float speed = 0.0f;
+    float lifetime = 0.0f;
+};
+
 // One round leaving a player's muzzle. Carried purely so everyone else can see
 // and hear it: the damage it does is settled by the hit-report path and nothing
 // here is allowed to hurt anybody. Unreliable because a lost tracer is a missed
@@ -483,7 +586,9 @@ struct ClientEnemyHitReportMessage {
 struct ClientWorldImpactMessage {
     MessageHeader header{ MessageType::ClientWorldImpact, {} };
     uint32_t impactId = 0;
-    uint8_t kind = 0; // 0 = destruction surface, 1 = prefab, 2 = tree
+    // 0 = destruction surface, 1 = prefab, 2 = tree, 3 = gunship,
+    // 4 = enemy tank (entityId = level entity), 5 = AA turret (hit = its base)
+    uint8_t kind = 0;
     // Player fire or not. Some prefabs -- the objective aircraft -- take damage
     // only from a player, so an enemy round replicated as player fire would let
     // the garrison shoot down the objective the players are sent to destroy.
