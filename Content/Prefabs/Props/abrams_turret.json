@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "id": "props/abrams_turret",
+  "name": "Abrams Turret (tank part)",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/AbramsTank/AbramsTurret.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "none"
+    }
+  }
+}

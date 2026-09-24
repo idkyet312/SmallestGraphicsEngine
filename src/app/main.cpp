@@ -131,6 +131,7 @@ using namespace DirectX;
 #include "private/Vegetation.h"
 #include "private/PrefabAssets.h"
 #include "private/SceneModels.h"
+#include "private/EnemyTanks.h"
 #include "private/PrefabWorld.h"
 #include "private/WorldCollision.h"
 #include "private/Objectives.h"
@@ -1523,6 +1524,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // After the aircraft update, so the gun leads this frame's pose
             // rather than one that is already a frame stale.
             UpdateAATurret(deltaTime);
+            // Inputs only; the pose lands after the physics step below.
+            if (IsSceneScreen() && !g_game.loading.Active())
+                UpdateEnemyTanks(deltaTime);
         }
         // Listener follows the camera, so every PlayAt this frame pans against
         // where the player actually is. Written before any audio is triggered
@@ -2811,6 +2815,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (!struck && g_trees.BlocksSegment(
                             projectile.previousPosition, projectile.position, radius))
                         struck = true;
+                    // An enemy tank's shell has to be able to hit the player
+                    // it was fired at; nothing else here tests their body.
+                    if (!struck && projectile.hostile && HostileShellHitsPlayer(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                            "Hostile shell struck the player");
+                    }
                     if (!struck && HitPrefabColliderSegment(
                             projectile.previousPosition, projectile.position,
                             radius, candidate)) {
@@ -3097,6 +3111,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                                projectile.playerOwned);
                             }
                         }
+                        // Enemy tanks answer to explosives only, measured to
+                        // the hull rather than the prefab origin. A tank's own
+                        // shells (hostile) do not hurt the column.
+                        if (!projectile.hostile)
+                            DamageEnemyTanksFromBlast(
+                                center, enemyRadius, c4Blast,
+                                projectile.rocket, projectile.missile,
+                                enemyDamage, projectile.playerOwned);
                         // Grenades hurt the player too. Previously only enemies
                         // took blast damage, because every grenade in the game
                         // was thrown BY the player -- enemy grenades made the
@@ -4377,6 +4399,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // to reach its new pose before LOD selection reads the transform.
         if (IsSceneScreen() && !g_game.loading.Active())
             UpdatePrefabRigidBodies();
+        // And the tanks, for the same reason.
+        if (IsSceneScreen() && !g_game.loading.Active())
+            SyncEnemyTankPoses();
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         // Adaptive Forward Extensions quality. Driven from the delayed GPU

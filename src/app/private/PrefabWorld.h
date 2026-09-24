@@ -59,6 +59,9 @@ static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
     // behind after its aircraft is gone is both a prompt on empty air and a
     // stale index the panel would read.
     dropById(g_prefabTravelPoints);
+    // A tank's body would keep simulating, and its sync would keep writing
+    // into whatever instance next took this id.
+    DropEnemyTank(entityId);
     // An AA-turret prefab's gun lives in the vehicle system, not a prefab list.
     {
         const size_t before = g_game.vehicles.aaTurrets.size();
@@ -362,6 +365,9 @@ static void ReleasePrefabRigidBodies() {
 static void RebuildPrefabRenderBatches() {
     ProfilerDX12::CpuScope prefabBatchProfile(g_profiler, "Editor/PrefabBatches");
     ReleasePrefabRigidBodies();
+    // Same reasoning as the rigid bodies: the batches and colliders the tanks
+    // drive are about to be rebuilt, so the tanks restart from their placements.
+    ReleaseEnemyTanks();
     g_game.world.Prefabs().ClearDerived();
     // Tracks the same instances ClearDerived just dropped; entity ids are reused
     // across levels, so a stale entry here would silently disable the bounds box
@@ -667,6 +673,16 @@ static void RebuildPrefabRenderBatches() {
                         std::to_string(prefab->rigidBody.density));
                 }
             }
+        }
+
+        // A tank drives its own render instances and collider, so it registers
+        // after both exist. Not while editing: the editor places the hull
+        // where it was authored, and a body there would roll it off the spot.
+        if (components.contains("enemyTank") && !skipRenderBatch &&
+            !IsEditorEditing()) {
+            RegisterEnemyTank(entityId, *prefab, components.at("enemyTank"),
+                              world, cachedModel->boundsMinimum,
+                              cachedModel->boundsMaximum);
         }
 
         XMFLOAT3 origin;

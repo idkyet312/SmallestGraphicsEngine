@@ -79,6 +79,32 @@ struct DestructionBodyPose {
     DirectX::XMFLOAT3 linearVelocity = {};
 };
 
+// A wheeled chassis on wheel joints: the Humvee's car physics, sized per model.
+// Offsets are relative to the chassis centre in the vehicle's own frame, +X
+// forward. `wheelSteer` scales the steering angle per wheel, so a long hull can
+// counter-steer its rear axle (-1) to turn inside its own length.
+struct GroundVehicleSpec {
+    static constexpr uint32_t kMaxWheels = 6;
+    DirectX::XMFLOAT3 chassisHalfExtents = { 2.20f, 0.55f, 1.0f };
+    float chassisDensity = 110.0f;
+    float wheelRadius = 0.48f;
+    float wheelDensity = 65.0f;
+    uint32_t wheelCount = 4;
+    DirectX::XMFLOAT3 wheelOffsets[kMaxWheels] = {
+        { 1.55f, -0.58f,  0.92f }, { 1.55f, -0.58f, -0.92f },
+        {-1.55f, -0.58f,  0.92f }, {-1.55f, -0.58f, -0.92f },
+    };
+    float wheelSteer[kMaxWheels] = { 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float maxSteerAngle = 0.42f;
+    float steeringTorque = 850.0f;
+    // Wheel spin at full throttle, rad/s: top speed is this times the radius.
+    float maxWheelSpin = 20.0f;
+    float driveTorque = 520.0f;
+    // Coasting drag with no throttle, so a released vehicle rolls to a stop.
+    float idleTorque = 95.0f;
+    float brakeTorque = 1400.0f;
+};
+
 struct DestructionStressStats {
     bool running = false;
     float elapsedSeconds = 0.0f;
@@ -201,6 +227,19 @@ public:
                              DirectX::XMFLOAT3* linearVelocity = nullptr) const;
     bool VehicleReady(size_t vehicleIndex) const;
     size_t VehicleCount() const;
+    // Handle-based vehicles for gameplay-driven machines (the enemy tank). Kept
+    // apart from the indexed Humvees above: those indices are the level's
+    // Humvee spawn slots, and every consumer of them assumes a Humvee.
+    // Returns 0 when the physics world is not ready. A handle goes stale when
+    // the world is re-initialized; GetGroundVehiclePose then returns false and
+    // the owner recreates the vehicle.
+    uint32_t CreateGroundVehicle(const GroundVehicleSpec& spec,
+                                 const DirectX::XMFLOAT3& chassisCenter,
+                                 float yawRadians);
+    void SetGroundVehicleInput(uint32_t handle, float throttle, float steering,
+                               bool brake);
+    bool GetGroundVehiclePose(uint32_t handle, DestructionBodyPose& pose) const;
+    void DestroyGroundVehicle(uint32_t handle);
     void SetEnemyTarget(const DirectX::XMFLOAT3& target);
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
