@@ -766,8 +766,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // invisible to automated runs.
         const bool godModeUI =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_GODMODE", nullptr, 0) > 0;
-        StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest,
-                      nullptr, godModeUI);
+        // SGE_VISIBILITY_TEST_LEVEL=<path> runs the same test on a saved map
+        // (e.g. Content/Levels/BigIslandv33.json) instead of Level One.
+        char visibilityTestLevel[MAX_PATH] = {};
+        const DWORD visibilityTestLevelLength = GetEnvironmentVariableA(
+            "SGE_VISIBILITY_TEST_LEVEL", visibilityTestLevel,
+            static_cast<DWORD>(std::size(visibilityTestLevel)));
+        if (visibilityTestLevelLength > 0 &&
+            visibilityTestLevelLength < std::size(visibilityTestLevel) &&
+            std::filesystem::exists(visibilityTestLevel)) {
+            StartCustomLevel(hwnd, std::filesystem::path(visibilityTestLevel));
+        } else {
+            StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest,
+                          nullptr, godModeUI);
+        }
         // Level startup may restore renderer defaults. Apply the requested
         // diagnostic afterwards so unattended tests exercise the intended view.
         if (requestedVisibilityDebugMode >= 0)

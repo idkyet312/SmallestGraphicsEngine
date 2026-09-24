@@ -355,6 +355,12 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor, uint2 currentID) {
                 extensionConfidence);
 }
 
+// NaN/Inf test on the bit pattern. FXC compiles this without IEEE strictness
+// and folds isnan() (x != x) to false, so the intrinsic silently never fires.
+bool NonFinite(float3 v) {
+    return any((asuint(v) & 0x7FFFFFFFu) >= 0x7F800000u);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
@@ -370,7 +376,12 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         ldrOutput[pixel] = debugColor;
         return;
     }
-    float3 hdr = TemporalResolve(pixel, CinematicInput(pixel), currentID);
+    // A NaN/Inf scene pixel would otherwise enter TAA history (lerp keeps the
+    // NaN at any weight) and persist, and the tonemap renders NaN as black.
+    float3 current = CinematicInput(pixel);
+    if (NonFinite(current)) current = 0.0;
+    float3 hdr = TemporalResolve(pixel, current, currentID);
+    if (NonFinite(hdr)) hdr = current;
     historyOutput[pixel] = float4(hdr, 1.0);
 
     // History-validity debug view. Temporal quality is a motion property, so
@@ -513,6 +524,8 @@ void main(uint3 threadID : SV_DispatchThreadID) {
             lutSampler, saturate(uv - direction * texel * outputSize.y), 0.0).rgb;
         float3 shiftedB = hdrInput.SampleLevel(
             lutSampler, saturate(uv + direction * texel * outputSize.y), 0.0).rgb;
+        if (NonFinite(shiftedR)) shiftedR = hdr;
+        if (NonFinite(shiftedB)) shiftedB = hdr;
         float3 fringeR = TonemapAgX((shiftedR + lens) * exposure * autoExposure);
         float3 fringeB = TonemapAgX((shiftedB + lens) * exposure * autoExposure);
         fringeR = ApplySceneColorGrade(fringeR);

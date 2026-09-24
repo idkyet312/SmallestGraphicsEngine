@@ -67,13 +67,26 @@ float3 SampleTent(float2 uv)
     return color * (1.0 / 16.0);
 }
 
+// A single NaN/Inf scene pixel must not enter the pyramid: each downsample
+// widens it, and by the coarse mips one texel covers 64 screen pixels, so the
+// upsample paints a large NaN square that the tonemap turns black. Tested on
+// the bit pattern because FXC folds isnan() (x != x) away without IEEE
+// strictness. Checked after filtering, which already spread any bad texel into
+// this sample.
+bool NonFinite(float3 v)
+{
+    return any((asuint(v) & 0x7FFFFFFFu) >= 0x7F800000u);
+}
+
 [numthreads(8, 8, 1)]
 void Downsample(uint3 threadID : SV_DispatchThreadID)
 {
     uint2 pixel = threadID.xy;
     if (any(pixel >= destinationSize)) return;
     float2 uv = (float2(pixel) + 0.5) / float2(destinationSize);
-    bloomDestination[pixel] = float4(Prefilter(SampleDownsample(uv)), 1.0);
+    float3 color = SampleDownsample(uv);
+    if (NonFinite(color)) color = 0.0;
+    bloomDestination[pixel] = float4(Prefilter(color), 1.0);
 }
 
 [numthreads(8, 8, 1)]
