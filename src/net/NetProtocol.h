@@ -75,7 +75,9 @@ namespace net {
 // 21: ServerArmorState carries the level Humvees, whose gunners now drive them
 //     at the player on the host. humveeCount takes a padding byte; the
 //     message grows by 8 x 36 bytes, still inside one datagram.
-inline constexpr uint32_t kProtocolVersion = 21;
+// 22: ServerEnemyFire carries damageScale, so a light gun's shells hurt a
+//     client's player as little as they hurt the host's.
+inline constexpr uint32_t kProtocolVersion = 22;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -480,6 +482,9 @@ struct ServerEnemyFireMessage {
     // fixed emplacement constants and leave these at zero.
     float speed = 0.0f;
     float lifetime = 0.0f;
+    // Tank shells: the blast's scale on the player and the crater (1 = main
+    // gun). AA rounds leave it at 1.
+    float damageScale = 1.0f;
 };
 
 // One round leaving a player's muzzle. Carried purely so everyone else can see

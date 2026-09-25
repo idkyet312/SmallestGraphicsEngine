@@ -111,6 +111,9 @@ struct Projectile {
     // tuned without moving what a hand grenade does.
     bool     missile = false;
     float    fxCooldown = 0.0f;
+    // Scales what a hostile shell's blast does to the player and how deep it
+    // digs: a light gun's round is a smaller burst than a main gun's.
+    float    blastDamageScale = 1.0f;
 };
 
 struct LaserBeamFX {

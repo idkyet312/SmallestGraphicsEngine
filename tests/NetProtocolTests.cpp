@@ -101,7 +101,7 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 21, "protocol version was not bumped");
+    Check(kProtocolVersion == 22, "protocol version was not bumped");
 
     // The whole armor set rides in one datagram; pinned so growing the caps or
     // a snapshot is a deliberate decision about packet size.

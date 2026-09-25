@@ -111,6 +111,7 @@ struct RemoteEnemyFire {
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
     float speed = 0.0f;
     float lifetime = 0.0f;
+    float damageScale = 1.0f;
 };
 
 // One enemy gunship as the gameplay layer sees it. Used in both directions: the
@@ -1277,16 +1278,18 @@ public:
     // the projectile when it fired.
     void PublishEnemyFire(EnemyFireKind kind, float x, float y, float z,
                           float dirX, float dirY, float dirZ,
-                          float speed = 0.0f, float lifetime = 0.0f) {
+                          float speed = 0.0f, float lifetime = 0.0f,
+                          float damageScale = 1.0f) {
         if (role_ != Role::Host || !transport_ || !Finite3(x, y, z) ||
             !Finite3(dirX, dirY, dirZ) || !std::isfinite(speed) ||
-            !std::isfinite(lifetime)) return;
+            !std::isfinite(lifetime) || !std::isfinite(damageScale)) return;
         ServerEnemyFireMessage message;
         message.kind = kind;
         message.x = x; message.y = y; message.z = z;
         message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
         message.speed = speed;
         message.lifetime = lifetime;
+        message.damageScale = damageScale;
         transport_->Broadcast(&message, sizeof(message),
                               kind == EnemyFireKind::TankShell
                                   ? Channel::Reliable : Channel::Unreliable);
@@ -2308,7 +2311,8 @@ private:
         if (!Finite3(message.x, message.y, message.z) ||
             !Finite3(message.dirX, message.dirY, message.dirZ) ||
             !std::isfinite(message.speed) ||
-            !std::isfinite(message.lifetime)) return;
+            !std::isfinite(message.lifetime) ||
+            !std::isfinite(message.damageScale)) return;
         // Bounded: a client that is not draining (a loading screen) must not
         // bank minutes of AA bursts and fire them all at once afterwards.
         if (enemyFire_.size() >= 256) return;
@@ -2319,6 +2323,9 @@ private:
         fire.dirZ = message.dirZ;
         fire.speed = message.speed;
         fire.lifetime = message.lifetime;
+        // Clamped: the scale multiplies damage to this machine's player.
+        fire.damageScale =
+            (std::max)(0.0f, (std::min)(message.damageScale, 4.0f));
         enemyFire_.push_back(fire);
     }
 

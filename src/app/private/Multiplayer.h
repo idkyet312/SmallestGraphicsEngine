@@ -834,9 +834,9 @@ static void PresentEnemyFire() {
             XMVectorSet(fire.dirX, fire.dirY, fire.dirZ, 0.0f)));
         if (fire.kind == net::EnemyFireKind::TankShell) {
             if (!(fire.speed > 0.0f) || !(fire.lifetime > 0.0f)) continue;
-            SpawnEnemyTankShell(muzzle, direction, fire.speed,
+            SpawnEnemyTankShell(muzzle, muzzle, direction, fire.speed,
                                 (std::min)(fire.lifetime, 30.0f),
-                                /*hostReplica=*/true);
+                                fire.damageScale, /*hostReplica=*/true);
         } else {
             SpawnAATurretRound(muzzle, direction, /*hostReplica=*/true);
         }

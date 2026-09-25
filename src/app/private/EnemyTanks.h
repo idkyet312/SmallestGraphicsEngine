@@ -92,6 +92,8 @@ struct EnemyTankState {
     float standoff = 35.0f;
     float reloadSeconds = 6.0f;
     float shellSpeed = 45.0f;
+    // Scales the shell's blast on the player and its crater, 1 = main gun.
+    float shellDamage = 1.0f;
     float turretRate = 0.55f;   // rad/s
     // Multiplayer. The host drives every tank; a client draws the host's pose
     // and runs no physics body or AI of its own. `killer` is the player the
@@ -236,6 +238,8 @@ static void RegisterEnemyTank(uint64_t entityId, const PrefabAsset& prefab,
         (std::max)(0.5f, JsonFloat(settings, "reload", tank.reloadSeconds));
     tank.shellSpeed =
         (std::max)(5.0f, JsonFloat(settings, "shellSpeed", tank.shellSpeed));
+    tank.shellDamage = (std::max)(0.0f,
+        JsonFloat(settings, "shellDamage", tank.shellDamage));
     tank.turretRate = JsonFloat(settings, "turretRate", tank.turretRate);
     const auto muzzle = settings.find("muzzle");
     if (muzzle != settings.end() && muzzle->is_array() && muzzle->size() == 3)
@@ -544,11 +548,14 @@ static bool HostileShellHitsPlayer(const XMFLOAT3& start, const XMFLOAT3& end,
 // The shell and its report. `hostReplica` is a client flying the host's round:
 // its blast is the host's, so the crater it would dig is already on the way
 // as a replicated terrain cut.
-static void SpawnEnemyTankShell(const XMFLOAT3& muzzle,
+// `start` is where the round begins its sweep, which can be ahead of the
+// muzzle the flash comes from (see EnemyTankShellStart).
+static void SpawnEnemyTankShell(const XMFLOAT3& muzzle, const XMFLOAT3& start,
                                 const XMFLOAT3& direction, float speed,
-                                float lifetime, bool hostReplica) {
+                                float lifetime, float damageScale,
+                                bool hostReplica) {
     Projectile shell = {};
-    shell.position = shell.previousPosition = muzzle;
+    shell.position = shell.previousPosition = start;
     shell.direction = direction;
     shell.speed = speed;
     shell.lifetime = lifetime;
@@ -556,11 +563,57 @@ static void SpawnEnemyTankShell(const XMFLOAT3& muzzle,
     shell.rocket = true;
     shell.hostile = true;
     shell.netHostRound = hostReplica;
+    shell.blastDamageScale = damageScale;
     scene.projectiles.push_back(shell);
 
     scene.SpawnExplosionFX(muzzle, 2.4f, 0.14f);
     scene.SpawnWeaponSmoke(muzzle, direction, 3.2f);
     g_rpgFireAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 1.0f, 0.5f, 320.0f);
+}
+
+// Where a shell starts sweeping: past the firing tank's own hull box. The
+// rocket sweep tests every prefab collider from the round's first frame, and
+// a box test from a point inside the box hits at once. The Bradley's short
+// gun leaves its muzzle inside its hull box (stretched up over the turret)
+// whenever the turret is within ~37 degrees of the hull axis, so its shells
+// burst on its own hull. The sweep starts at the box's far side instead.
+static XMFLOAT3 EnemyTankShellStart(const EnemyTankState& tank,
+                                    const XMFLOAT3& muzzle,
+                                    const XMFLOAT3& direction) {
+    const auto collider = std::find_if(g_prefabColliders.begin(),
+        g_prefabColliders.end(), [&](const PrefabCollider& value) {
+            return value.entityId == tank.entityId &&
+                   value.prefabId == tank.hullPrefabId;
+        });
+    if (collider == g_prefabColliders.end()) return muzzle;
+    const XMFLOAT3 origin = PrefabColliderToLocal(*collider, muzzle);
+    const XMFLOAT3 ahead = PrefabColliderToLocal(*collider,
+        { muzzle.x + direction.x, muzzle.y + direction.y,
+          muzzle.z + direction.z });
+    const float o[3] = { origin.x, origin.y, origin.z };
+    const float d[3] = { ahead.x - origin.x, ahead.y - origin.y,
+                         ahead.z - origin.z };
+    // The sweep's own shell radius, plus a margin so the first step is clear.
+    constexpr float kClearance = 0.22f + 0.1f;
+    const float half[3] = { collider->halfExtents.x + kClearance,
+                            collider->halfExtents.y + kClearance,
+                            collider->halfExtents.z + kClearance };
+    float entry = 0.0f;
+    float exit = FLT_MAX;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(d[axis]) < 1e-6f) {
+            if (std::abs(o[axis]) > half[axis]) return muzzle;
+            continue;
+        }
+        float t0 = (-half[axis] - o[axis]) / d[axis];
+        float t1 = (half[axis] - o[axis]) / d[axis];
+        if (t0 > t1) std::swap(t0, t1);
+        entry = (std::max)(entry, t0);
+        exit = (std::min)(exit, t1);
+        if (entry > exit) return muzzle;
+    }
+    return { muzzle.x + direction.x * exit, muzzle.y + direction.y * exit,
+             muzzle.z + direction.z * exit };
 }
 
 // The player a tank should fight: the nearest living one inside `range`. On
@@ -619,16 +672,19 @@ static void FireEnemyTankShell(EnemyTankState& tank, const XMMATRIX& turretWorld
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
 
     const float lifetime = tank.fireRange * 1.6f / tank.shellSpeed;
-    SpawnEnemyTankShell(muzzle, shotDirection, tank.shellSpeed, lifetime,
-                        /*hostReplica=*/false);
+    const XMFLOAT3 start = EnemyTankShellStart(tank, muzzle, shotDirection);
+    SpawnEnemyTankShell(muzzle, start, shotDirection, tank.shellSpeed,
+                        lifetime, tank.shellDamage, /*hostReplica=*/false);
     // Every client flies the same shell. Each one can only hurt its own
     // player, which is what the host already trusts a client to report.
+    // Sent from the cleared start: a client's copy of the hull box is where
+    // the host's tank was, so it would stop the round the same way.
     if (g_netSession.Active() &&
         g_netSession.CurrentRole() == net::Role::Host)
         g_netSession.PublishEnemyFire(net::EnemyFireKind::TankShell,
-            muzzle.x, muzzle.y, muzzle.z,
+            start.x, start.y, start.z,
             shotDirection.x, shotDirection.y, shotDirection.z,
-            tank.shellSpeed, lifetime);
+            tank.shellSpeed, lifetime, tank.shellDamage);
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Enemy tank fired from " + std::to_string(muzzle.x) + ", " +
         std::to_string(muzzle.y) + ", " + std::to_string(muzzle.z) +

@@ -2995,7 +2995,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 /*hostAuthored=*/projectile.netGrenadeId != 0 ||
                                     projectile.netHostRound,
                                 /*depthScale=*/projectile.rocket
-                                    ? 1.0f : scene.grenadeCraterDepthScale);
+                                    ? projectile.blastDamageScale
+                                    : scene.grenadeCraterDepthScale);
                             AddExplosionBuildingHole(center, blastScale);
                         }
                         {
@@ -3141,7 +3142,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 const float falloff = 1.0f - playerRange / reach;
                                 const float blast =
                                     (c4Blast ? 100.0f
-                                             : scene.grenadePlayerDamage) * falloff;
+                                             : scene.grenadePlayerDamage) *
+                                    falloff * projectile.blastDamageScale;
                                 // Only an enemy throw answers to the difficulty
                                 // multiplier. Standing on your own grenade is a
                                 // mistake the player made, and scaling it would

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "id": "props/bradley_turret",
+  "name": "Bradley Turret (tank part)",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/BradleyTank/BradleyTurret.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "none"
+    }
+  }
+}
