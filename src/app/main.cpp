@@ -702,6 +702,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     std::vector<double> terrainLODFrameSamples;
     std::vector<double> terrainLODShadowSamples;
     std::vector<double> terrainResolveSamples;
+    // SGE_CAPTURE_POSE="x,y,z,yaw,pitch" pins the camera once the level is up,
+    // writes the presented frame to SGE_CAPTURE_PATH (.ppm) after
+    // SGE_CAPTURE_FRAMES (default 180) and exits. SGE_CAPTURE_LEVEL picks the
+    // map; SGE_CAPTURE_VBDEBUG sets the visibility-buffer debug view.
+    char capturePoseText[128] = {};
+    float capturePose[5] = {};
+    const bool poseCapture =
+        GetEnvironmentVariableA("SGE_CAPTURE_POSE", capturePoseText,
+                                sizeof(capturePoseText)) > 0 &&
+        sscanf_s(capturePoseText, "%f,%f,%f,%f,%f", &capturePose[0],
+                 &capturePose[1], &capturePose[2], &capturePose[3],
+                 &capturePose[4]) == 5;
+    UINT poseCaptureFrames = 0;
+    UINT poseCaptureTarget = 180;
+    if (poseCapture) {
+        char text[MAX_PATH] = {};
+        if (GetEnvironmentVariableA("SGE_CAPTURE_FRAMES", text, sizeof(text)) > 0)
+            poseCaptureTarget = static_cast<UINT>((std::max)(1, atoi(text)));
+        if (GetEnvironmentVariableA("SGE_CAPTURE_LEVEL", text, sizeof(text)) > 0 &&
+            std::filesystem::exists(text))
+            StartCustomLevel(hwnd, std::filesystem::path(text));
+        if (GetEnvironmentVariableA("SGE_CAPTURE_VBDEBUG", text, sizeof(text)) > 0)
+            visBuffer.debugViewMode = atoi(text);
+    }
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
     bool molotovSmokeInjected = false;
@@ -1259,6 +1283,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         UpdateLightning(deltaTime);
         scene.Update(deltaTime, now);
         scene.burningTargets.clear();
+        if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
+            scene.camera.Position = { capturePose[0], capturePose[1], capturePose[2] };
+            scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSSR", nullptr, 0) > 0)
+                scene.enableScreenSpaceReflections = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
+                scene.useVisibilityBuffer = false;
+            if (++poseCaptureFrames == poseCaptureTarget) {
+                char path[MAX_PATH] = "capture.ppm";
+                GetEnvironmentVariableA("SGE_CAPTURE_PATH", path, sizeof(path));
+                g_frameCapturePath = path;
+            } else if (poseCaptureFrames > poseCaptureTarget + 2) {
+                PostQuitMessage(0);
+            }
+        }
         if (molotovSmokeTest && !molotovSmokeInjected && IsSceneScreen() &&
             !g_game.loading.Active()) {
             const XMFLOAT3& eye = scene.camera.Position;

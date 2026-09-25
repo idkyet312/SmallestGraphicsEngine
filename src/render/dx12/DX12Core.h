@@ -925,24 +925,93 @@ inline void DumpDX12DeviceRemovedData(std::ostream& out) {
     out.flush();
 }
 
+// Set to a .ppm path to read the finished backbuffer back on the next
+// EndFrame. Diagnostic only: it stalls on the GPU, so an unattended run can
+// capture exactly what was presented instead of inferring it from a video.
+inline std::string g_frameCapturePath;
+
 // End frame - present
 inline void EndFrame() {
-    // Transition render target to present state
+    ID3D12Resource* backBuffer = g_dx12.renderTargets[g_dx12.frameIndex].Get();
+    const bool capture = !g_frameCapturePath.empty();
+    ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT captureRows = 0;
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    barrier.Transition.pResource = g_dx12.renderTargets[g_dx12.frameIndex].Get();
+    barrier.Transition.pResource = backBuffer;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (capture) {
+        const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
+        UINT64 totalBytes = 0;
+        g_dx12.device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint,
+                                             &captureRows, nullptr, &totalBytes);
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = totalBytes;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ThrowIfFailed(g_dx12.device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = backBuffer;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        g_dx12.commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    // Transition render target to present state
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_dx12.commandList->ResourceBarrier(1, &barrier);
-    
+
     ThrowIfFailed(g_dx12.commandList->Close());
-    
+
     // Execute command list
     ID3D12CommandList* commandLists[] = { g_dx12.commandList.Get() };
     g_dx12.commandQueue->ExecuteCommandLists(1, commandLists);
-    
+
+    if (capture) {
+        WaitForGPU();
+        void* mapped = nullptr;
+        const D3D12_RANGE readRange{ 0, static_cast<SIZE_T>(
+            footprint.Footprint.RowPitch) * captureRows };
+        if (SUCCEEDED(readback->Map(0, &readRange, &mapped)) && mapped) {
+            const UINT width = footprint.Footprint.Width;
+            std::ofstream out(g_frameCapturePath, std::ios::binary);
+            out << "P6\n" << width << ' ' << captureRows << "\n255\n";
+            std::vector<unsigned char> row(width * 3);
+            for (UINT y = 0; y < captureRows; ++y) {
+                const unsigned char* src = static_cast<const unsigned char*>(mapped) +
+                    static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+                for (UINT x = 0; x < width; ++x) {
+                    row[x * 3 + 0] = src[x * 4 + 0];
+                    row[x * 3 + 1] = src[x * 4 + 1];
+                    row[x * 3 + 2] = src[x * 4 + 2];
+                }
+                out.write(reinterpret_cast<const char*>(row.data()),
+                          static_cast<std::streamsize>(row.size()));
+            }
+            const D3D12_RANGE noWrite{ 0, 0 };
+            readback->Unmap(0, &noWrite);
+            std::cout << "Frame captured: " << g_frameCapturePath << '\n';
+        }
+        g_frameCapturePath.clear();
+    }
+
     // Present. ALLOW_TEARING is only legal on an unsynchronised present, so it
     // has to come off the moment vsync is on -- passing both fails Present.
     const UINT syncInterval = g_dx12.syncInterval;

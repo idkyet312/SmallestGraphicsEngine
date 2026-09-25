@@ -1031,8 +1031,18 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     // Forward imports use a no-cull PSO so foliage cards, rotor blades, and
     // mixed-winding assets remain visible. Orient the shading normal toward
-    // the visible side; otherwise back faces light inside-out.
-    if (dot(normal, viewDir) < 0.0)
+    // the visible side; otherwise back faces light inside-out. The side comes
+    // from the geometric face, not the shading normal: a smoothed vertex normal
+    // on a front face (a slab top averaged with its lip) leans past 90 degrees
+    // from a grazing view, and flipping it turned the whole interpolated strip
+    // upside down -- a dark band that vanished when looking straight down.
+    float3 faceCross = cross(ddx(input.fragPos), ddy(input.fragPos));
+    float faceLengthSq = dot(faceCross, faceCross);
+    float3 faceNormal = faceLengthSq > 1e-20
+        ? faceCross * rsqrt(faceLengthSq) : normal;
+    if (dot(faceNormal, viewDir) < 0.0)
+        faceNormal = -faceNormal;
+    if (dot(normal, faceNormal) < 0.0)
         normal = -normal;
 
     const bool isWater = materialType > 0.5 && materialType < 2.5;

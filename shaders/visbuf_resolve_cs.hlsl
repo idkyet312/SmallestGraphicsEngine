@@ -2227,7 +2227,22 @@ Surface EvaluateSurface(float3 fragPos,
     float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
     // Transform normal to world space
     float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
-    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
+    // Double-sided: pick the visible side from the geometric face, not the
+    // shading normal. A smoothed vertex normal on a front face (a slab top
+    // averaged with its lip) leans past 90 degrees from a grazing view, and
+    // flipping on it turned the whole interpolated strip upside down -- a dark
+    // band that vanished when looking straight down.
+    bool flipNormal = false;
+    if ((dc.flags & 1u) != 0u) {
+        float3 faceCross = cross(wp1 - wp0, wp2 - wp0);
+        float faceLengthSq = dot(faceCross, faceCross);
+        float3 faceNormal = faceLengthSq > 1e-20
+            ? faceCross * rsqrt(faceLengthSq) : normal;
+        if (dot(faceNormal, viewDir) < 0.0)
+            faceNormal = -faceNormal;
+        flipNormal = dot(normal, faceNormal) < 0.0;
+    }
+    if (flipNormal)
         normal = -normal;
 
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
@@ -2365,9 +2380,6 @@ Surface EvaluateSurface(float3 fragPos,
                 material.shadingParams.z * grazingFade));
         }
     }
-    
-    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
-        normal = -normal;
 
     if (metal < 0.25) {
         float variation = MatVarNoise(fragPos * 0.35);
