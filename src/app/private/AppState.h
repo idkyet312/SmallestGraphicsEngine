@@ -796,6 +796,8 @@ GunAudio                    g_r700Audio;
 GunAudio                    g_shotgunAudio;
 // And the AK-74, the first rifle slot with a report of its own.
 GunAudio                    g_ak74Audio;
+// And the Kriss Vector: an SMG report, not the rifle crack.
+GunAudio                    g_krissAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;

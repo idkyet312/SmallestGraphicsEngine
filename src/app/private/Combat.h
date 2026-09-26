@@ -78,12 +78,13 @@ static bool ShootPlayerWeapon() {
         scene.ShootProjectile(weaponStats);
         const float pitch = (weaponStats.suppressed ? 1.18f : 0.96f) +
             ((float)std::rand() / RAND_MAX) * 0.08f;
-        // The M9 and the AK-74 each fire their own sample; the rest of this
-        // path still shares rifle_shot.wav. The suppressed drop applies to all
-        // three, so a canned weapon reads as one whichever it is.
-        GunAudio& report = GunModel::M9Selected()   ? g_m9Audio
-                         : GunModel::AK74Selected() ? g_ak74Audio
-                                                    : g_gunAudio;
+        // The M9, the AK-74 and the Kriss each fire their own sample; the rest of
+        // this path still shares rifle_shot.wav. The suppressed drop applies to
+        // all of them, so a canned weapon reads as one whichever it is.
+        GunAudio& report = GunModel::M9Selected()    ? g_m9Audio
+                         : GunModel::AK74Selected()  ? g_ak74Audio
+                         : GunModel::KrissSelected() ? g_krissAudio
+                                                     : g_gunAudio;
         report.Play(weaponStats.suppressed ? 0.30f : 0.82f, pitch);
     }
     const uint32_t projectileCount = static_cast<uint32_t>(
