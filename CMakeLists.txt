@@ -583,6 +583,12 @@ if(BUILD_TESTING)
     add_executable(InspectClipBones tests/InspectClipBones.cpp)
     target_link_libraries(InspectClipBones PRIVATE assimp::assimp)
 
+    # Diagnostic for the crouch clips: prints hand_l/hand_r world position
+    # relative to spine_03 at t=0, to check whether a clip actually authors a
+    # rifle-holding pose before it is wired in as a crouch overlay.
+    add_executable(InspectCrouchHands tests/InspectCrouchHands.cpp)
+    target_link_libraries(InspectCrouchHands PRIVATE assimp::assimp)
+
     add_executable(DXRProbeLayoutTests tests/DXRProbeLayoutTests.cpp)
     target_link_libraries(DXRProbeLayoutTests PRIVATE
         SGEProjectHeaders nlohmann_json::nlohmann_json)

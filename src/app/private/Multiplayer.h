@@ -1523,6 +1523,7 @@ static void PublishHostEnemies() {
         state.health = actor->health;
         state.dead = actor->Dead();
         state.moving = actor->NetworkMoving();
+        state.crouching = actor->AiCrouching();
         // SkinnedEnemy marks its own player kills with a placeholder rather than
         // a real id, because it has no business knowing about net players. This
         // is where it becomes this host's id; a client's reported kill has
@@ -1665,7 +1666,8 @@ static void UpdateClientEnemies(float frameDelta) {
                         remote.killer == g_netSession.LocalId());
             continue;
         }
-        body->UpdateNetworkedPose(frameDelta, remote.moving, false);
+        body->UpdateNetworkedPose(frameDelta, remote.moving, false,
+                                  /*aiming=*/false, remote.crouching);
     }
 
     // Drop bodies the host has stopped sending. An enemy that fell out of the

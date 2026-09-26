@@ -242,9 +242,26 @@ public:
     // moves itself and already knows its own speed.
     DirectX::XMFLOAT3 netPreviousPosition_{};
     bool              netHasPreviousPosition_ = false;
-    // 0 standing .. 1 fully crouched, eased toward netCrouching. Zero on every
-    // AI actor, which leaves ApplyCrouch a no-op for them.
+    // 0 standing .. 1 fully crouched, eased toward netCrouching for a
+    // networked body or toward aiCrouching_ for an AI actor deciding to
+    // crouch on its own (see RollAiCrouch/UpdateAiCrouch).
     float             crouchBlend_ = 0.0f;
+    // True for the frame(s) ComputePose actually played one of the authored
+    // crouch clips (CrouchIdleAim/CrouchWalk*) rather than the pose-edit
+    // fallback. Set by UpdateStandingPose/UpdateLocomotion/UpdateNetworkedPose
+    // before ComputePose runs; read by ApplyCrouch to skip its pelvis drop so
+    // the two crouch mechanisms never stack.
+    bool              playedCrouchClip_ = false;
+    // AI-only: this actor decided on its own to crouch while it fires, as
+    // opposed to netCrouching, which is the replicated player stance and must
+    // never be touched by AI (see UpdateAiCrouch). False on a networked body.
+    bool              aiCrouching_ = false;
+    // Time left before a finished volley's crouch decision lapses. Zero once
+    // the actor has stopped firing.
+    float             aiCrouchTimer_ = 0.0f;
+    // True from a volley's first round until its linger runs out: the crouch
+    // is rolled once per volley, not per shot.
+    bool              aiCrouchVolley_ = false;
     // Stable network identity for an AI actor, assigned at spawn and never
     // reused within a session. Deliberately not the index in g_bandits: that
     // vector is compacted when bodies are removed, which would renumber every
@@ -491,6 +508,7 @@ public:
     // remote player would slide around frozen in its bind pose.
     void UpdateNetworkedPose(float dt, bool moving, bool sprinting,
                              bool aiming = false, bool crouching = false) {
+        playedCrouchClip_ = false;
         netAiming = aiming;
         netCrouching = crouching && !netDowned;
         // About the pace the owner's own eye drops at (CameraDX12 SetCrouching
@@ -546,6 +564,39 @@ public:
         netPreviousPosition_ = position;
         netHasPreviousPosition_ = true;
 
+        const bool travelling = moving && !netStill && speed > 0.01f &&
+                                speed < kTeleportSpeed;
+        const float c = std::cos(yaw), s = std::sin(yaw);
+        const float vx = travelling ? dx * inverseDt : 0.0f;
+        const float vz = travelling ? dz * inverseDt : 0.0f;
+        // Same discrete crouch cycles as the AI path (UpdateLocomotion), keyed
+        // off crouchBlend_ rather than netCrouching directly so a body only
+        // switches once the pose has actually eased into the crouch -- a
+        // networked player un-crouching mid-stride would otherwise pop
+        // straight from a crouch-walk frame to a standing one.
+        if (travelling && crouchBlend_ > 0.5f) {
+            if (const AnimationClip* crouchWalk = model.FindClip(
+                    CrouchWalkClipName(vx * c - vz * s, vx * s + vz * c))) {
+                directionalMoving_ = true;
+                if (anim.clip != crouchWalk) anim.Play(crouchWalk);
+                anim.loop = true;
+                anim.Advance(dt);
+                playedCrouchClip_ = true;
+                ComputePose(dt);
+                return;
+            }
+        } else if (!travelling && crouchBlend_ > 0.5f) {
+            if (const AnimationClip* crouchIdle = model.FindClip("CrouchIdleAim")) {
+                directionalMoving_ = false;
+                if (anim.clip != crouchIdle) anim.Play(crouchIdle);
+                anim.loop = true;
+                anim.Advance(dt);
+                playedCrouchClip_ = true;
+                ComputePose(dt);
+                return;
+            }
+        }
+
         // Gated on the blend space actually being usable, not just on the model
         // claiming authored cycles. Initialize needs all nine clips -- the two
         // gaits in four directions plus Idle -- and gives up if the bake missed
@@ -554,12 +605,7 @@ public:
         // for exactly the bodies whose bake had failed, so nothing advanced a
         // clip and the body rendered its bind pose forever.
         if (model.authoredDirectional && locomotion_.Ready()) {
-            const float c = std::cos(yaw), s = std::sin(yaw);
-            const bool travelling = moving && !netStill && speed > 0.01f &&
-                                    speed < kTeleportSpeed;
             directionalMoving_ = travelling;
-            const float vx = travelling ? dx * inverseDt : 0.0f;
-            const float vz = travelling ? dz * inverseDt : 0.0f;
             if (const AnimationClip* pose = locomotion_.Update(
                     dt, vx * c - vz * s, vx * s + vz * c, moveSpeed)) {
                 if (anim.clip != pose) anim.Play(pose);
@@ -569,8 +615,7 @@ public:
             // A standing clip, so it plays at its own rate -- the travel-speed
             // scaling above is for gait cycles.
             PlayClip("Idle");
-            directionalMoving_ = moving && !netStill && speed > 0.01f &&
-                                 speed < kTeleportSpeed;
+            directionalMoving_ = travelling;
             anim.Advance(dt);
         }
         ComputePose(dt);
@@ -600,19 +645,77 @@ public:
         footOffset += (targetFoot - footOffset) * step;
     }
 
-    // Crouch as a pose edit on top of whatever the clip produced. There is no
-    // crouch clip on either rig (idle, walk, run and jumps only -- the same gap
-    // EaseDownedRoll works around), so the pelvis drops, the legs fold with the
+    // AI-only crouch decision, rolled once per volley so a shooter is not
+    // flickering between standing and crouched on a per-shot coin flip.
+    // netCrouching is
+    // deliberately untouched: it is the player's own replicated stance
+    // (Multiplayer.h/NetSession.h), and this must never fight it or be fought
+    // by it. Called from Update every frame for an AI actor; a networked
+    // player body never reaches Update (main.cpp skips networkControlled
+    // actors before the AI loop), so the two crouch sources cannot collide,
+    // but the flag is guarded here too in case that ever changes.
+    //
+    // Firing only: the roll happens when a volley starts (firingTimer_ goes
+    // live, which TryFireAt holds across the gaps inside a burst) and the
+    // stance drops once the volley has been over for kCrouchLinger. Aiming,
+    // winding up or advancing without shooting never crouches. Keyed on the
+    // shot itself rather than awareness_, so marines -- which fire on bandits
+    // without going through the player-awareness states -- crouch too.
+    void UpdateAiCrouch(float dt) {
+        if (networkControlled || dead_) return;
+        // Covers the pause between a volley's last round and the next pose,
+        // so the body does not bob up and straight back down.
+        constexpr float kCrouchLinger = 0.4f;
+        if (firingTimer_ > 0.0f) {
+            if (!aiCrouchVolley_) {
+                aiCrouchVolley_ = true;
+                // 30-40%: enough to see a crouching shooter fairly often
+                // without every firefight looking the same way. Does not
+                // touch spread or damage -- TryFireAt's cone is unchanged --
+                // so a crouched shooter is exactly as dodgeable as a standing
+                // one, just posed differently.
+                const float chance = 0.30f +
+                    (float)std::rand() / RAND_MAX * 0.10f;
+                aiCrouching_ = std::rand() / (float)RAND_MAX < chance;
+            }
+            aiCrouchTimer_ = kCrouchLinger;
+        } else if (aiCrouchTimer_ > 0.0f) {
+            aiCrouchTimer_ -= dt;
+        } else {
+            aiCrouchVolley_ = false;
+            aiCrouching_ = false;
+        }
+        // Same ease rate UpdateNetworkedPose uses, so an AI actor's crouch
+        // reads at the same speed a replicated player's does.
+        const float crouchStep = (std::min)(1.0f, dt * 6.5f);
+        crouchBlend_ += ((aiCrouching_ ? 1.0f : 0.0f) - crouchBlend_) * crouchStep;
+        if (crouchBlend_ < 0.001f) crouchBlend_ = 0.0f;
+    }
+
+    // Crouch as a pose edit on top of whatever the clip produced. This is the
+    // fallback for the poses that have no authored crouch clip -- firing,
+    // reload, throw, run -- so the pelvis drops, the legs fold with the
     // two-bone solver the arms use to keep the feet where the clip planted
     // them, and the spine leans in over them. Runs before the gun IK, which
     // anchors on the shoulder bone, so the rifle comes down with the chest.
     //
+    // Skipped when the clip just played this frame is itself one of the
+    // authored crouch clips (see UpdateStandingPose/UpdateLocomotion): those
+    // already show a crouched pose, and folding this on top would double the
+    // pelvis drop and bury the knees.
+    //
     // Drop and lean together take the head down ~0.6 m against the owner's
     // 0.75 m eye drop; the pelvis cannot go further without the knees running
     // out of reach, and a deeper lean folds the chest onto the thighs.
+    // Disabled: the authored crouch clips carry the pose now. The procedural
+    // drop/lean layer made standing clips look half-squatted. crouchBlend_
+    // still drives the hitbox and muzzle height.
+    static constexpr bool kProceduralCrouch = false;
     void ApplyCrouch() {
         using namespace DirectX;
-        if (crouchBlend_ <= 0.0f || poseGlobals_.empty()) return;
+        if (!kProceduralCrouch) return;
+        if (crouchBlend_ <= 0.0f || poseGlobals_.empty() || playedCrouchClip_)
+            return;
         const Skeleton& skel = model.skeleton;
         const int pelvis = skel.Find("pelvis");
         const int spine = skel.Find("spine_01");
@@ -731,6 +834,13 @@ public:
         const AnimationClip* idle = model.FindClip("Idle");
         return anim.clip != idle;
     }
+
+    // The AI's own crouch-while-firing decision (see UpdateAiCrouch), for
+    // PublishHostEnemies to put on the wire. False for a networked body: its
+    // aiCrouching_ is never set, since Update -- the only writer -- is never
+    // called on one (main.cpp skips networkControlled actors before the AI
+    // loop runs).
+    bool AiCrouching() const { return aiCrouching_; }
 
     // Shared world matrix for both the skinned mesh and the skeleton overlay:
     // native (cm) space -> scaled to metres -> oriented (roll/pitch/yaw) ->
@@ -963,6 +1073,7 @@ public:
         // world and make the telegraph unreadable. Plant it for the wind-up.
         const bool rooted = !hasCoverTarget_ &&
             (preparingShot_ || laserCharge_ > 0.0f);
+        UpdateAiCrouch(dt);
         float speed = 0.0f;
         const bool movingToCover = hasCoverTarget_ && !inCover_;
         const float safeDistance = BackoffRange();
@@ -1047,6 +1158,11 @@ public:
             } else {
                 speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
             }
+            // Crouched but not rooted -- e.g. easing into or out of the aim-up
+            // window while still closing distance. Slow rather than snap back
+            // to standing speed, matching the crouch-walk clips picked in
+            // UpdateLocomotion (CrouchWalkClipName) below.
+            if (aiCrouching_) speed *= 0.5f;
 
             // Detour supplies corridor-safe steering. Near combat ring, query a
             // short tangent destination; farther away, path toward player.
@@ -2348,11 +2464,20 @@ private:
     // Unlike the reload this is not gated on standing: a bandit firing as it
     // advances should still shoulder the rifle, so the caller runs this ahead
     // of the stillness test and the pose plays over a moving body.
+    //
+    // There is no authored crouch-fire clip, and with the procedural
+    // pelvis-drop layer disabled (kProceduralCrouch) there is nothing left to
+    // bend the standing Fire clip into a crouch -- it would just play
+    // standing while crouchBlend_ silently lowered the muzzle, which reads as
+    // a floating gun. CrouchIdleAim is the nearer authored pose instead:
+    // still holding a weapon at the ready, just already crouched.
     bool UpdateFiringPose(float dt) {
         firingTimer_ = (std::max)(0.0f, firingTimer_ - dt);
         if (firingTimer_ <= 0.0f) return false;
         if (dead_ || held_ || rappelling_) return false;
-        const AnimationClip* fire = model.FindClip("Fire");
+        const AnimationClip* crouchIdle = crouchBlend_ > 0.5f
+            ? model.FindClip("CrouchIdleAim") : nullptr;
+        const AnimationClip* fire = crouchIdle ? crouchIdle : model.FindClip("Fire");
         if (!fire) return false;
         // Firing outranks a queued reload -- the magazine is not empty until
         // the volley actually stops -- but it must not eat it: the request
@@ -2363,6 +2488,7 @@ private:
         if (anim.clip != fire) anim.Play(fire);
         anim.loop = true;
         anim.Advance(dt);
+        playedCrouchClip_ = crouchIdle != nullptr;
         return true;
     }
 
@@ -2394,6 +2520,19 @@ private:
             return true;
         }
 
+        // Crouched and holding: the authored aiming-crouch pose beats both
+        // standing idles whenever it is actually loaded. Gated well past the
+        // ease-in (0.5, versus ApplyCrouch's own > 0) so a body only just
+        // starting to crouch does not pop straight to the crouched clip
+        // before the transition reads as one.
+        if (const AnimationClip* crouchIdle = model.FindClip("CrouchIdleAim");
+            crouchIdle && crouchBlend_ > 0.5f) {
+            if (anim.clip != crouchIdle) { anim.Play(crouchIdle); anim.loop = true; }
+            anim.Advance(dt);
+            playedCrouchClip_ = true;
+            return true;
+        }
+
         // Only the undetected stance is new behaviour; everything else keeps
         // playing the aim idle the gun overlay was built against.
         const bool detected = awareness_ != AwarenessState::Patrol;
@@ -2404,8 +2543,28 @@ private:
         return true;
     }
 
+    // Picks the crouch-walk clip for the dominant local-space travel
+    // direction, mirroring the forward/backward/left/right convention
+    // DirectionalLocomotion bakes the run blend space with. There is no
+    // crouch run and no blending between the four -- just four discrete
+    // cycles -- so the loudest axis wins outright rather than shading toward
+    // a diagonal.
+    static const char* CrouchWalkClipName(float localRight, float localForward) {
+        if (std::abs(localForward) >= std::abs(localRight))
+            return localForward >= 0.0f ? "CrouchWalkForward" : "CrouchWalkBackward";
+        return localRight >= 0.0f ? "CrouchWalkRight" : "CrouchWalkLeft";
+    }
+
     void UpdateLocomotion(float dt, const DirectX::XMFLOAT3& start,
                           float requestedSpeed, float fallbackPlaybackRate = 1.0f) {
+        // Cleared here rather than at the top of ComputePose: this function
+        // and everything it calls (UpdateFiringPose, UpdateStandingPose, and
+        // this function's own crouch-walk branch below) are the only places
+        // that can set it for an AI-driven or networked actor, and all of
+        // them run once per frame ahead of ComputePose, so clearing at this
+        // shared entry point cannot miss a frame the way clearing after the
+        // fact could.
+        playedCrouchClip_ = false;
         const float inverseDt = dt > 1e-5f ? 1.0f / dt : 0.0f;
         float vx = (position.x - start.x) * inverseDt;
         float vz = (position.z - start.z) * inverseDt;
@@ -2435,6 +2594,24 @@ private:
         if (UpdateFiringPose(dt)) return;
         if (still && UpdateStandingPose(dt)) return;
         if (reloadPlaying_) { reloadPlaying_ = false; anim.loop = true; }
+
+        // Crouch-walking: four discrete authored cycles rather than the
+        // directional blend space, so this is checked ahead of it. Only while
+        // actually moving -- a still crouched body already took the
+        // CrouchIdleAim branch in UpdateStandingPose above.
+        if (!still && crouchBlend_ > 0.5f) {
+            const float c = std::cos(yaw), s = std::sin(yaw);
+            const float localRight = vx * c - vz * s;
+            const float localForward = vx * s + vz * c;
+            if (const AnimationClip* crouchWalk =
+                    model.FindClip(CrouchWalkClipName(localRight, localForward))) {
+                if (anim.clip != crouchWalk) anim.Play(crouchWalk);
+                anim.loop = true;
+                anim.Advance(dt);
+                playedCrouchClip_ = true;
+                return;
+            }
+        }
 
         const float c = std::cos(yaw), s = std::sin(yaw);
         const AnimationClip* pose = (model.authoredDirectional || directionalLocomotionIK)
@@ -2677,6 +2854,19 @@ private:
         }
     }
 
+    // The upper body a crouched body should show: always the standing aim
+    // pose, per the user's decision -- Fire while a shot is still reading as
+    // fired (matches UpdateFiringPose's own gate), the shouldered aim Idle
+    // otherwise. Never the crouch clip's own arms: measured with
+    // InspectCrouchHands, the crouch clips are an unarmed/different pose
+    // (hand_r sits near the spine rather than out along a rifle barrel), so
+    // using their arms floated the gun and put the hands nowhere near it.
+    const AnimationClip* StandingAimOverlay() const {
+        if (firingTimer_ > 0.0f)
+            if (const AnimationClip* fire = model.FindClip("Fire")) return fire;
+        return model.FindClip("Idle");
+    }
+
     void ComputePose(float dt) {
         previousPoseGlobals_ = poseGlobals_;
         previousPoseWorld_ = poseWorld_;
@@ -2684,11 +2874,34 @@ private:
         if (model.valid) {
             DirectX::XMStoreFloat4x4(&previousMeshWorld_, MeshWorldMatrix());
         }
+        // Crouched: pelvis height/rotation and the legs come from whatever
+        // crouch clip anim is currently playing (playedCrouchClip_), but the
+        // torso, arms and head are always layered in from the standing aim
+        // pose -- never bent, leaned or replaced -- using the same
+        // upperBodyMask_/ComputeLayeredPalette the (non-authored-directional)
+        // gun layer already uses. upperBodyAnim_ is repurposed as that
+        // overlay's instance here; it is otherwise only read by the
+        // non-authoredDirectional branch below, so stealing it for one frame
+        // does not disturb that path.
+        const AnimationClip* crouchOverlay = (playedCrouchClip_ && crouchBlend_ > 0.0f)
+            ? StandingAimOverlay() : nullptr;
+        if (crouchOverlay) {
+            if (upperBodyAnim_.clip != crouchOverlay) upperBodyAnim_.Play(crouchOverlay);
+            upperBodyAnim_.loop = true;
+            upperBodyAnim_.Advance(dt);
+        }
         if (model.authoredDirectional) {
-            // These clips contain a complete rifle-running pose. Keep their
-            // torso motion instead of replacing it with the legacy idle layer.
-            anim.ComputePalette(model.skeleton, paletteCPU_);
-            anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            if (crouchOverlay) {
+                anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_,
+                                           upperBodyMask_, gunPoseOffsets_,
+                                           paletteCPU_, &poseGlobals_);
+            } else {
+                // These clips contain a complete rifle-running pose. Keep
+                // their torso motion instead of replacing it with the legacy
+                // idle layer.
+                anim.ComputePalette(model.skeleton, paletteCPU_);
+                anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            }
             ApplyCrouch();
             if (upperBodyGunLayer) ApplyGunIK(dt);
             else UpdateGunFromHandBone(model.skeleton.Find("hand_l"));
@@ -2714,8 +2927,14 @@ private:
 
     DirectX::XMFLOAT3 GunOriginWorld(float yawForGun) const {
         const float sx = std::sin(yawForGun), cz = std::cos(yawForGun);
+        // Matches ApplyCrouch's ~0.42m pelvis drop plus the spine lean, scaled
+        // by the same crouchBlend_ that drives the pose, so a crouched shooter
+        // (player-controlled or AI) fires from where it is actually aiming
+        // rather than from a standing eye height. Deliberately not tied to a
+        // separate hitbox height: shots are tested against the posed bones
+        // already, so this only has to match the muzzle, not add a new one.
         return { position.x + cz * 0.12f + sx * 0.10f,
-                 position.y + footOffset + 1.48f,
+                 position.y + footOffset + 1.48f - 0.42f * crouchBlend_,
                  position.z - sx * 0.12f + cz * 0.10f };
     }
 

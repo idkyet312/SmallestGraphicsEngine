@@ -81,6 +81,9 @@ struct RemoteEnemy {
     // death. The only thing a client can key a payout off.
     PlayerId killer = kInvalidPlayerId;
     bool marine = false;
+    // Mirrors HostEnemyState::crouching -- see there for why this has to be
+    // on the wire at all.
+    bool crouching = false;
 };
 
 // A demolition charge another player planted, and the order to fire one
@@ -169,6 +172,11 @@ struct HostEnemyState {
     bool dead = false;
     PlayerId killer = kInvalidPlayerId;
     bool marine = false;
+    // AI's own crouch-while-firing decision (SkinnedEnemy::aiCrouching_).
+    // Without this on the wire a client only ever sees enemies standing: the
+    // host runs the only AI, so a client that never learns the decision was
+    // made can never play CrouchIdleAim/CrouchWalk* for that body.
+    bool crouching = false;
 };
 
 // A client's squad, landed by the host where that client's transport set down.
@@ -2915,6 +2923,7 @@ private:
                 out.dead = source.dead ? 1 : 0;
                 out.killer = source.killer;
                 out.marine = source.marine ? 1 : 0;
+                out.crouching = source.crouching ? 1 : 0;
             }
             transport_->Send(peer, &message, sizeof(message),
                              Channel::Unreliable);
@@ -2974,6 +2983,7 @@ private:
             enemy.dead = incoming.dead != 0;
             enemy.killer = incoming.killer;
             enemy.marine = incoming.marine != 0;
+            enemy.crouching = incoming.crouching != 0;
             remoteEnemies_.push_back(enemy);
         }
     }

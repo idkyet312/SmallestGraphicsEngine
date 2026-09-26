@@ -18,6 +18,7 @@ by object id, so renaming the model carries the whole rig with it.
 Binary FBX only (Mixamo exports 7700); an ASCII file is rejected rather than
 silently copied.
 """
+import re
 import struct
 import sys
 
@@ -46,7 +47,10 @@ for side, tag in (('Left', 'l'), ('Right', 'r')):
 
 # The leaf markers Mixamo appends carry no animation curves and no skin
 # weights, and the engine never asks for them, so they keep their own names.
-PREFIX = 'mixamorig:'
+# A batch of several auto-rigs exported together gets a numeric suffix on the
+# prefix itself (`mixamorig12:` rather than plain `mixamorig:`), so the prefix
+# is matched with a pattern rather than a literal.
+PREFIX_RE = re.compile(r'^mixamorig[0-9]*:')
 
 
 def rename(raw):
@@ -55,13 +59,14 @@ def rename(raw):
     if sep == b'':
         return raw
     name = head.decode('utf8', 'replace')
-    if not name.startswith(PREFIX):
+    match = PREFIX_RE.match(name)
+    if not match:
         return raw
-    mapped = NAMES.get(name[len(PREFIX):])
+    mapped = NAMES.get(name[match.end():])
     if mapped is None:
         # An unmapped bone still loses the prefix: leaving one behind would let
         # a later `mixamorig:` check pass a file that is only half converted.
-        mapped = name[len(PREFIX):]
+        mapped = name[match.end():]
     return mapped.encode('utf8') + sep + tail
 
 

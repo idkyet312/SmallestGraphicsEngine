@@ -396,6 +396,11 @@ struct EnemySnapshot {
     // An allied marine rather than a bandit: the client picks the model, the
     // faction and the friendly marker from it. Claimed from the padding.
     uint8_t marine = 0;
+    // The AI's own crouch-while-firing decision (SkinnedEnemy::aiCrouching_).
+    // No spare padding byte left to claim this time, so the struct grows
+    // again rather than hiding it -- there is nothing static_assert-ed
+    // against this size, so that is the whole cost.
+    uint8_t crouching = 0;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // Radians, matching SkinnedEnemy. Both are sent because the upper body aims
     // independently of the legs, and a client that guessed one from the other

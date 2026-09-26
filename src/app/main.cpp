@@ -5270,6 +5270,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     mixamoDir + "Animations/RifleReload.fbx",
                     mixamoDir + "Animations/RifleFire.fbx",
                     mixamoDir + "Animations/TossGrenade.fbx",
+                    // Crouch set: one stationary aim pose plus the four
+                    // cardinal walk cycles, retargeted onto this rig's bone
+                    // names the same way the run cycles above were (see
+                    // scripts/mixamo-to-ue.py). Optional, named by position
+                    // below, same as Reload/Fire/ThrowGrenade.
+                    mixamoDir + "Animations/CrouchIdleAim.fbx",
+                    mixamoDir + "Animations/CrouchWalkForward.fbx",
+                    mixamoDir + "Animations/CrouchWalkBackward.fbx",
+                    mixamoDir + "Animations/CrouchWalkLeft.fbx",
+                    mixamoDir + "Animations/CrouchWalkRight.fbx",
                 };
                 SkinnedModel bm = SkinnedFBXImporter::Load(
                     mixamoDir + "SK_BanditMixamo.fbx", clips,
@@ -5310,7 +5320,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // motion. "ThrowGrenade" is a one-shot like the reload,
                     // played when a thrower commits to a grenade.
                     const char* const optionalClips[] = {
-                        "Reload", "Fire", "ThrowGrenade" };
+                        "Reload", "Fire", "ThrowGrenade",
+                        "CrouchIdleAim", "CrouchWalkForward",
+                        "CrouchWalkBackward", "CrouchWalkLeft",
+                        "CrouchWalkRight" };
                     for (size_t i = 0; i < std::size(optionalClips); ++i) {
                         const size_t slot = kIdleClip + 2 + i;
                         if (slot < bm.clips.size()) {
@@ -5328,6 +5341,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         std::cerr << "Bandit clip missing: " << optionalClips[i]
                                   << " (expected from " << clips[slot - 1]
                                   << "); the actor loads without it\n";
+                    }
+                    // One-time visibility into what actually registered, per
+                    // PlayClip's own pitfall: a name that silently failed to
+                    // resolve reads as a T-pose with no error anywhere else.
+                    {
+                        std::string loaded;
+                        for (const auto& c : bm.clips) loaded += c.name + " ";
+                        std::cout << "Bandit clips loaded: " << loaded << "\n";
                     }
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         authoredNames = {
@@ -5393,6 +5414,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     banditAnimDir + "RifleIdleRelaxed.fbx",
                     banditAnimDir + "RifleFire.fbx",
                     banditAnimDir + "TossGrenade.fbx",
+                    // Same crouch set as the bandit, from the same shared
+                    // Animations folder.
+                    banditAnimDir + "CrouchIdleAim.fbx",
+                    banditAnimDir + "CrouchWalkForward.fbx",
+                    banditAnimDir + "CrouchWalkBackward.fbx",
+                    banditAnimDir + "CrouchWalkLeft.fbx",
+                    banditAnimDir + "CrouchWalkRight.fbx",
                 };
                 SkinnedModel mm = SkinnedFBXImporter::Load(
                     marineMixamoDir + "SK_MarineMixamo.fbx", marineClips,
@@ -5414,7 +5442,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // The marine has no reload clip, so the throw lands one
                     // slot earlier here than it does on the bandit.
                     const char* const optionalMarineClips[] = {
-                        "Fire", "ThrowGrenade" };
+                        "Fire", "ThrowGrenade",
+                        "CrouchIdleAim", "CrouchWalkForward",
+                        "CrouchWalkBackward", "CrouchWalkLeft",
+                        "CrouchWalkRight" };
                     for (size_t i = 0; i < std::size(optionalMarineClips); ++i) {
                         const size_t slot = kIdleClip + 2 + i;
                         if (slot < mm.clips.size()) {
@@ -5425,6 +5456,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                   << optionalMarineClips[i]
                                   << " (expected from " << marineClips[slot - 1]
                                   << "); the actor loads without it\n";
+                    }
+                    // Same one-time visibility as the bandit block.
+                    {
+                        std::string loaded;
+                        for (const auto& c : mm.clips) loaded += c.name + " ";
+                        std::cout << "Marine clips loaded: " << loaded << "\n";
                     }
                     const std::vector<DirectionalLocomotion::AuthoredCycle>
                         marineAuthored = {
