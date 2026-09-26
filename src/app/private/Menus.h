@@ -729,6 +729,107 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::End();
 }
 
+// Squad wipe screen: shown when all players are downed in multiplayer.
+// Only shown after a 2-second delay so it doesn't flash on/off during rapid events.
+static void RenderSquadWipeScreen(HWND hwnd) {
+    if (!squadWipeCursorReleased) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        squadWipeCursorReleased = true;
+    }
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(30, 12, 9, 220));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(400.0f, 280.0f), ImGuiCond_Always);
+    ImGui::Begin("Squad Wipe Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse);
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    const char* wiped = "SQUAD WIPED";
+    const float panelWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (panelWidth - ImGui::CalcTextSize(wiped).x) * 0.5f);
+    ImGui::TextColored(ImVec4(1.0f, 0.24f, 0.18f, 1.0f), "%s", wiped);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    {
+        ImDrawList* wipeDraw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        constexpr float ruleWidth = 52.0f;
+        const float ruleX = cursor.x + (panelWidth - ruleWidth) * 0.5f;
+        wipeDraw->AddRectFilled(ImVec2(ruleX, cursor.y),
+                                ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
+                                IM_COL32(240, 80, 60, 240), 1.0f);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 20.0f));
+
+    // Host gets restart, clients get waiting message
+    const bool isHost = g_netSession.CurrentRole() == net::Role::Host;
+    if (isHost) {
+        if (UIPrimaryButton("RESTART LEVEL")) {
+            // Slots first: they own every player's health, and the clients
+            // need the restart order to reload a level whose name is unchanged.
+            g_netSession.RestartHostLevel();
+            RestartActiveLevel(hwnd);
+        }
+    } else {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (panelWidth - ImGui::CalcTextSize("Waiting for host...").x) * 0.5f);
+        ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "Waiting for host...");
+        ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    }
+
+    if (UIMenuButton("LEAVE TO MENU", 40.0f)) {
+        ShutdownMultiplayer();
+        OpenMainMenu();
+    }
+    ImGui::End();
+}
+
+// Multiplayer scoreboard overlay, shown when TAB is held during gameplay.
+// Lists all players: name/id, kills, deaths, revives.
+static void RenderScoreboard() {
+    if ((FocusedKeyState(VK_TAB) & 0x8000) == 0) return;
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (ImGui::Begin("Scoreboard", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+        ImGui::TextColored(UITheme::kTextDim, "SCOREBOARD");
+        ImGui::Separator();
+
+        // Display headers
+        ImGui::TextColored(UITheme::kTextDim, "%-16s %6s %6s %7s",
+                          "PLAYER", "KILLS", "DEATHS", "REVIVES");
+        ImGui::Separator();
+
+        static std::vector<net::ScoreboardEntry> entries;
+        g_netSession.GetScoreboard(entries);
+
+        if (entries.empty()) {
+            ImGui::TextColored(UITheme::kTextDim, "No session");
+        } else {
+            for (const auto& entry : entries) {
+                if (entry.id >= net::kMaxPlayers) continue;
+                char name[24];
+                std::snprintf(name, sizeof(name), "PLAYER-%d%s",
+                              static_cast<int>(entry.id) + 1,
+                              entry.id == g_netSession.LocalId() ? " (you)" : "");
+                ImGui::Text("%-16s %6u %6u %7u", name,
+                            entry.kills, entry.deaths, entry.revives);
+            }
+        }
+        ImGui::End();
+    }
+}
+
 // One product row. Returns true when the row was activated, which the caller
 // turns into a purchase and/or an equip.
 //
@@ -1335,9 +1436,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ImGui::TextWrapped(
                 "The aircraft begins its takeoff roll %d seconds after you are "
                 "on the ground, and it is clear of the map about %d seconds "
-                "after that. Once it is airborne there is nothing to shoot at "
-                "and the mission is a failure -- the clock is the objective as "
-                "much as the airframe is.",
+                "after that. It can still be brought down in the air, but the "
+                "moment it leaves the map the mission is a failure -- the "
+                "clock is the objective as much as the airframe is.",
                 static_cast<int>(kObjectivePlaneHoldSeconds),
                 static_cast<int>(kObjectivePlaneTakeoffSeconds));
             ImGui::Dummy(ImVec2(0.0f, 6.0f));
@@ -2309,7 +2410,59 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
-    const bool deployPressed = ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f));
+    // SGE_AUTO_DEPLOY=host|client|1 presses DEPLOY once, for that session role
+    // (1: any), so an unattended two-instance run can deploy one player and
+    // not the other -- which is how the aircraft countdown starting on the
+    // first deploy anywhere is checked.
+    static bool autoDeployed = false;
+    bool autoDeploy = false;
+    bool autoSquad = false;
+    char autoRole[16] = {};
+    if (!autoDeployed && weaponsReady && !g_deploymentZones.empty() &&
+        GetEnvironmentVariableA("SGE_AUTO_DEPLOY", autoRole,
+                                sizeof(autoRole)) > 0) {
+        const bool client = g_netSession.CurrentRole() == net::Role::Client;
+        autoDeploy = std::strcmp(autoRole, "1") == 0 ||
+            (std::strcmp(autoRole, "client") == 0 && client) ||
+            (std::strcmp(autoRole, "host") == 0 && !client);
+        // squad: the host presses DEPLOY SQUAD instead.
+        autoSquad = std::strcmp(autoRole, "squad") == 0 && !client &&
+                    MultiplayerActive();
+        if (autoDeploy || autoSquad) {
+            if (g_selectedDeploymentZone < 0) g_selectedDeploymentZone = 0;
+            autoDeployed = true;
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                std::string("Auto-deploy (") + autoRole + ")");
+        }
+    }
+    bool deployPressed =
+        ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f)) || autoDeploy;
+    // The host can take the whole squad in with it: every client still on
+    // this screen deploys at the same moment, in the same aircraft.
+    const bool hosting = MultiplayerActive() &&
+        g_netSession.CurrentRole() == net::Role::Host;
+    if (hosting) {
+        ImGui::SetCursorPosX(45.0f);
+        const bool squadPressed = ImGui::Button(
+            "DEPLOY SQUAD (CLIENTS RIDE WITH YOU)", ImVec2(340.0f, 40.0f));
+        if ((squadPressed || autoSquad) && g_selectedDeploymentZone >= 0) {
+            const XMFLOAT3& dropOff = g_deploymentZones[
+                static_cast<size_t>(g_selectedDeploymentZone)];
+            g_netSession.PublishSquadDeploy(
+                static_cast<uint8_t>(g_playerInsertionChoice),
+                static_cast<uint8_t>(g_insertionAirframe),
+                g_playerRidesLeftSeat, dropOff.x, dropOff.y, dropOff.z);
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                "Squad deploy ordered");
+            deployPressed = true;
+        }
+    }
+    // A client the host ordered in. Its insertion was set up when the order
+    // arrived (ApplySquadDeployOrder); this is the press.
+    if (g_squadDeployRequested && g_selectedDeploymentZone >= 0) {
+        g_squadDeployRequested = false;
+        deployPressed = true;
+    }
     ImGui::PopStyleColor(3);
     if (deployPressed) {
         // Pay for the squad. Charged here rather than on the slider because
@@ -2317,7 +2470,18 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // this press is the commitment. ArmoryPurchase re-checks the balance,
         // so a squad that became unaffordable between the pick and the press is
         // dropped to nothing rather than deploying for free.
-        if (g_deploymentMarineCount > 0) {
+        //
+        // SGE_AUTO_MARINES=N: an unattended run takes N marines without
+        // touching the career wallet, so the drop path can be tested on a save
+        // that cannot afford them.
+        char autoMarines[16] = {};
+        if (GetEnvironmentVariableA("SGE_AUTO_MARINES", autoMarines,
+                                    sizeof(autoMarines)) > 0) {
+            g_deploymentMarineCount = (std::clamp)(
+                std::atoi(autoMarines), 0, kMaxDeploymentMarines);
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Auto-marines: " + std::to_string(g_deploymentMarineCount));
+        } else if (g_deploymentMarineCount > 0) {
             const int squadPrice =
                 g_deploymentMarineCount * kDeploymentMarinePrice;
             if (ArmoryPurchase(squadPrice)) {
@@ -2410,8 +2574,9 @@ static void RenderWinScreen(HWND hwnd) {
     const MissionReport& report = g_game.mission.Report();
     const MissionLoadout& loadout = g_game.mission.Loadout();
     const MissionRunStats& stats = g_game.mission.Stats();
-    const bool primaryFailed = report.primaryObjectivePresent &&
-                               !report.primaryObjectiveComplete;
+    const bool missionFailed = !g_missionFailReason.empty();
+    const bool primaryFailed = missionFailed ||
+        (report.primaryObjectivePresent && !report.primaryObjectiveComplete);
 
     // ---- Backdrop ----------------------------------------------------------
     //
@@ -2514,8 +2679,11 @@ static void RenderWinScreen(HWND hwnd) {
     // ---- Header ------------------------------------------------------------
     {
         const float t = stage(0.05f);
-        const char* banner = primaryFailed ? "AFTER ACTION REPORT // FAILED"
-                                           : "AFTER ACTION REPORT";
+        const std::string failedBanner = "MISSION FAILED // " +
+            g_missionFailReason;
+        const char* banner = missionFailed ? failedBanner.c_str()
+            : primaryFailed ? "AFTER ACTION REPORT // FAILED"
+                            : "AFTER ACTION REPORT";
         // Letter-spaced by hand, the way the main menu sets its wordmark: at
         // this size the default tracking reads as a word rather than a stamp.
         ImDrawList* draw = ImGui::GetWindowDrawList();

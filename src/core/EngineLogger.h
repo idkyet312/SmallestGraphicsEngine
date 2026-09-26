@@ -81,6 +81,12 @@ public:
             }
             error.clear();
             std::filesystem::rename(currentPath_, backup, error);
+            // Another instance has it open (a host and a client on one
+            // machine): the rename fails, and truncating the file below wiped
+            // the other process's log mid-run. Take a file of our own.
+            if (error)
+                currentPath_ = directory / (application_ + "-" +
+                    std::to_string(GetCurrentProcessId()) + ".log");
         }
 
         file_.open(currentPath_, std::ios::out | std::ios::trunc);

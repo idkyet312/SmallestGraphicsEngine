@@ -84,7 +84,8 @@ static void UpdateEnemyHumvees(float dt) {
         HumveeGameplayState& state = g_humveeGameplay[index];
         state.aiDriving = false;
         const bool playerDriving =
-            g_drivingHumvee && g_activeHumveeIndex == index;
+            (g_drivingHumvee && g_activeHumveeIndex == index) ||
+            state.remoteDriven;
         if (playerDriving || !HumveeHasLiveGunner(index)) continue;
         XMFLOAT4X4 pose;
         XMFLOAT3 position, forward, velocity;
@@ -220,9 +221,32 @@ static void UpdateEnemyHumvees(float dt) {
 // host says it is, eased so it does not step at the net tick rate. The body is
 // moved rather than just the draw: the player collides with it, the gunner
 // mounts off it and the headlights follow it.
+//
+// Host-side, the same easing for a Humvee a remote player is driving: their
+// machine runs it, and the host's body follows their reports so the host's
+// player can see it, collide with it, and pass it on in the armor state.
 static void SyncEnemyHumveePoses(float dt) {
-    if (!ClientOwnedByHost() || IsEditorEditing()) return;
+    if (IsEditorEditing()) return;
     const float ease = 1.0f - std::exp(-14.0f * (std::max)(0.0f, dt));
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        for (size_t index = 0; index < g_humveeGameplay.size(); ++index) {
+            HumveeGameplayState& state = g_humveeGameplay[index];
+            if (!state.remoteDriven || !state.netPosed) continue;
+            state.turretYaw += std::atan2(
+                std::sin(state.netTurretYaw - state.turretYaw),
+                std::cos(state.netTurretYaw - state.turretYaw)) * ease;
+            XMStoreFloat3(&state.drawPosition, XMVectorLerp(
+                XMLoadFloat3(&state.drawPosition),
+                XMLoadFloat3(&state.netPosition), ease));
+            XMStoreFloat4(&state.drawRotation, XMQuaternionSlerp(
+                XMLoadFloat4(&state.drawRotation),
+                XMLoadFloat4(&state.netRotation), ease));
+            g_destruction.SetVehiclePose(index, state.drawPosition,
+                                         state.drawRotation);
+        }
+        return;
+    }
+    if (!ClientOwnedByHost()) return;
     for (size_t index = 0; index < g_humveeGameplay.size(); ++index) {
         HumveeGameplayState& state = g_humveeGameplay[index];
         const bool playerDriving =

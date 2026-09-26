@@ -66,6 +66,16 @@ static void UpdateRemoteInsertionVisuals(float deltaTime) {
     for (const auto& player : g_remoteInsertionPlayers) {
         const auto& helicopter = player.helicopter;
         if (!helicopter.visible || helicopter.airframe >= 2) continue;
+        // Riding the same aircraft (DEPLOY SQUAD): the other player's copy sits
+        // inside this one, a network tick behind. Drawing both doubles the
+        // airframe and flickers the pair against each other.
+        if (BlackHawkVisible() &&
+            helicopter.airframe == static_cast<uint8_t>(g_insertionAirframe)) {
+            const float dx = helicopter.x - g_blackHawkPosition.x;
+            const float dy = helicopter.y - g_blackHawkPosition.y;
+            const float dz = helicopter.z - g_blackHawkPosition.z;
+            if (dx * dx + dy * dy + dz * dz < 12.0f * 12.0f) continue;
+        }
         const size_t airframe = helicopter.airframe;
         const auto& model = g_blackHawkAirframeModel[airframe];
         if (!model) continue;

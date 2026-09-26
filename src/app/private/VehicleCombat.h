@@ -432,3 +432,274 @@ static void ResolveActorSeparation() {
         ResolveBanditPrefabCollisions(*actor);
     }
 }
+
+// ---- Captured tanks -------------------------------------------------------
+// Any living enemy tank, at any health, can be taken over with E from beside
+// its hull. W/S drive, A/D steer, the mouse lays the turret and the left
+// button fires the tank's own gun. Only the machine that simulates tanks can
+// board one: on a client they are poses from the host with no body to drive.
+
+// Metres from the hull box's surface at which E boards.
+static constexpr float kTankBoardReach = 2.5f;
+// A player-fired round flies faster than the AI's dodgeable one: nobody has
+// to be given a chance to sidestep the player's gun.
+static constexpr float kPlayerTankShellSpeed = 90.0f;
+static float g_playerTankReload = 0.0f;
+// SGE_TANK_BOARD_TEST's stand-in for the keys, read where the keys are, so the
+// scripted drive and the real one take the same single path to the solver.
+static bool g_tankTestInputActive = false;
+static float g_tankTestThrottle = 0.0f;
+static float g_tankTestTurn = 0.0f;
+
+static const PrefabCollider* TankHullCollider(const EnemyTankState& tank) {
+    for (const PrefabCollider& collider : g_prefabColliders)
+        if (collider.entityId == tank.entityId &&
+            collider.prefabId == tank.hullPrefabId) return &collider;
+    return nullptr;
+}
+
+static void ExitPlayerTank() {
+    EnemyTankState* tank = PlayerTank();
+    g_playerTankEntity = 0;
+    scene.playerArmored = false;
+    scene.gun.visible = g_savedGunVisible;
+    scene.camera.FPSMode = true;
+    scene.camera.VerticalVelocity = 0.0f;
+    if (!tank) return;
+    g_destruction.SetGroundVehicleInput(tank->physicsHandle, 0.0f, 0.0f, true);
+    // Out over the side, clear of the tracks, standing on the ground there.
+    const float halfWidth = tank->spec.chassisHalfExtents.z / 0.9f;
+    XMFLOAT3 exit;
+    XMStoreFloat3(&exit, XMVector3TransformCoord(XMVectorSet(
+        tank->boxCenterLocal.x, 0.0f,
+        tank->boxCenterLocal.z + halfWidth + 1.4f, 1.0f),
+        EnemyTankHullWorld(*tank)));
+    exit.y = GroundHeightAt(exit.x, exit.z) + scene.camera.PlayerHeight + 0.2f;
+    scene.camera.Position = exit;
+}
+
+// E: out of the tank being driven, or into the nearest one in reach. False
+// when this press is not about a tank, so the Humvee gets its turn.
+static bool ToggleTankDriving(bool anyDistance = false) {
+    if (g_playerTankEntity != 0) {
+        ExitPlayerTank();
+        return true;
+    }
+    if (g_drivingHumvee || ClientOwnedByHost() ||
+        scene.player.health <= 0.0f || scene.player.downed) return false;
+    EnemyTankState* best = nullptr;
+    float bestSurface = anyDistance ? FLT_MAX : kTankBoardReach;
+    for (EnemyTankState& tank : g_enemyTanks) {
+        if (tank.dead || tank.physicsHandle == 0) continue;
+        const PrefabCollider* collider = TankHullCollider(tank);
+        if (!collider) continue;
+        const XMFLOAT3 local =
+            PrefabColliderToLocal(*collider, scene.camera.Position);
+        const float outX = (std::max)(0.0f,
+            std::abs(local.x) - collider->halfExtents.x);
+        const float outY = (std::max)(0.0f,
+            std::abs(local.y) - collider->halfExtents.y);
+        const float outZ = (std::max)(0.0f,
+            std::abs(local.z) - collider->halfExtents.z);
+        const float surface =
+            std::sqrt(outX * outX + outY * outY + outZ * outZ);
+        if (surface >= bestSurface) continue;
+        bestSurface = surface;
+        best = &tank;
+    }
+    if (!best) return false;
+    best->captured = true;
+    best->reverseTime = 0.0f;
+    best->stuckTime = 0.0f;
+    g_playerTankEntity = best->entityId;
+    g_playerTankReload = 0.5f;
+    scene.playerArmored = true;
+    g_savedGunVisible = scene.gun.visible;
+    scene.gun.visible = false;
+    scene.camera.FPSMode = false;
+    scene.camera.VerticalVelocity = 0.0f;
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Player boarded tank " + best->hullPrefabId + " (" +
+        std::to_string(best->entityId) + "), health " +
+        std::to_string(best->health) + "/" + std::to_string(best->maxHealth));
+    return true;
+}
+
+// Throttle and turn in [-1, 1]; turn is positive to the left, as A is.
+// The steering sign comes from the AI's heading solve, which is measured: it
+// steers with +1 toward a heading on the side cross(forward, want) < 0 names.
+// A walks the camera along +cross(front, up), so the hull's left is
+// cross(forward, up) = (-fz, 0, fx), whose solve gives -1: left is negative.
+static void DrivePlayerTank(float throttle, float turn, bool brake) {
+    EnemyTankState* tank = PlayerTank();
+    if (!tank || tank->dead) return;
+    const float steering = (std::max)(-1.0f, (std::min)(1.0f, -turn));
+    g_destruction.SetGroundVehicleInput(tank->physicsHandle,
+        throttle * kEnemyTankThrottleSign, steering,
+        brake || throttle == 0.0f);
+}
+
+static void FirePlayerTankShell() {
+    EnemyTankState* tank = PlayerTank();
+    if (!tank || tank->dead || g_playerTankReload > 0.0f) return;
+    const XMMATRIX turretWorld =
+        EnemyTankTurretWorld(*tank, EnemyTankHullWorld(*tank));
+    XMFLOAT3 muzzle;
+    XMStoreFloat3(&muzzle, XMVector3TransformCoord(
+        XMLoadFloat3(&tank->muzzleLocal), turretWorld));
+    // The gun only traverses, so the round leaves along the barrel's heading
+    // and is pitched to meet the crosshair's range: firing mid-traverse
+    // misses where the barrel is still pointing, as it should.
+    const XMFLOAT3 aim = HumveeScreenCenterAimPoint();
+    XMFLOAT3 barrel;
+    XMStoreFloat3(&barrel, XMVector3TransformNormal(
+        XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), turretWorld));
+    const float barrelFlat =
+        std::sqrt(barrel.x * barrel.x + barrel.z * barrel.z);
+    if (barrelFlat < 1e-4f) return;
+    const float ax = aim.x - muzzle.x, az = aim.z - muzzle.z;
+    const float range = (std::max)(1.0f, std::sqrt(ax * ax + az * az));
+    XMFLOAT3 shotDirection;
+    XMStoreFloat3(&shotDirection, XMVector3Normalize(XMVectorSet(
+        barrel.x / barrelFlat * range, aim.y - muzzle.y,
+        barrel.z / barrelFlat * range, 0.0f)));
+    const XMFLOAT3 start = EnemyTankShellStart(*tank, muzzle, shotDirection);
+    SpawnEnemyTankShell(muzzle, start, shotDirection, kPlayerTankShellSpeed,
+                        tank->fireRange * 1.6f / kPlayerTankShellSpeed,
+                        tank->shellDamage, /*hostReplica=*/false,
+                        /*playerOwned=*/true);
+    scene.camera.AddFireTrauma(0.12f);
+    g_playerTankReload = tank->reloadSeconds;
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Player tank fired from " + std::to_string(muzzle.x) + ", " +
+        std::to_string(muzzle.y) + ", " + std::to_string(muzzle.z) +
+        " at " + std::to_string(aim.x) + ", " + std::to_string(aim.y) +
+        ", " + std::to_string(aim.z));
+}
+
+// SGE_TANK_BOARD_TEST=1: once a tank is placed, board the nearest one from
+// anywhere and run a fixed drive -- straight, then A, then D, firing on
+// reload -- logging heading and position, so the steering and throttle signs
+// and the gun can be checked without anyone at the keyboard.
+static void RunTankBoardTest(float dt) {
+    static const bool enabled =
+        GetEnvironmentVariableA("SGE_TANK_BOARD_TEST", nullptr, 0) > 0;
+    if (!enabled || g_enemyTanks.empty() || g_game.loading.Active()) return;
+    static float clock = -1.0f;
+    static float logTimer = 0.0f;
+    if (clock < 0.0f) {
+        if (!ToggleTankDriving(/*anyDistance=*/true)) return;
+        clock = 0.0f;
+    }
+    clock += dt;
+    EnemyTankState* tank = PlayerTank();
+    if (!tank) return;
+    // SGE_TANK_BOARD_TEST_STRAIGHT=1: full throttle dead ahead for 20 s, to
+    // drive onto or into whatever is placed in front of the hull.
+    static const bool straight =
+        GetEnvironmentVariableA("SGE_TANK_BOARD_TEST_STRAIGHT", nullptr, 0) > 0;
+    const float throttle = clock < (straight ? 20.0f : 12.0f) ? 1.0f : 0.0f;
+    const float turn = straight ? 0.0f
+        : (clock < 4.0f ? 0.0f : (clock < 8.0f ? 1.0f : -1.0f));
+    g_tankTestInputActive = true;
+    g_tankTestThrottle = throttle;
+    g_tankTestTurn = turn;
+    // Look at the nearest other live tank, as a player would, so the turret
+    // lays on it and the rounds show whether the gun hurts armour.
+    const EnemyTankState* mark = nullptr;
+    float markSq = FLT_MAX;
+    for (const EnemyTankState& other : g_enemyTanks) {
+        if (&other == tank || other.dead) continue;
+        const float dx = other.position.x - tank->position.x;
+        const float dz = other.position.z - tank->position.z;
+        if (dx * dx + dz * dz < markSq) { markSq = dx * dx + dz * dz; mark = &other; }
+    }
+    if (mark) {
+        XMStoreFloat3(&scene.camera.Front, XMVector3Normalize(
+            XMLoadFloat3(&mark->position) - XMLoadFloat3(&scene.camera.Position)));
+        FirePlayerTankShell();
+    }
+    logTimer -= dt;
+    if (logTimer > 0.0f) return;
+    logTimer = 1.0f;
+    XMFLOAT3 forward;
+    XMStoreFloat3(&forward, XMVector3Rotate(
+        XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), XMLoadFloat4(&tank->rotation)));
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "TankBoardTest t " + std::to_string(clock) + " turn " +
+        std::to_string(turn) + " pos " + std::to_string(tank->position.x) +
+        ", " + std::to_string(tank->position.y) + ", " +
+        std::to_string(tank->position.z) + " terrain " +
+        std::to_string(GroundHeightAt(tank->position.x, tank->position.z)) +
+        " heading " +
+        std::to_string(std::atan2(forward.z, forward.x)) + " turret " +
+        std::to_string(tank->turretYaw) + " health " +
+        std::to_string(tank->health) + " playerHealth " +
+        std::to_string(scene.player.health));
+}
+
+// Chase camera, turret laying and the tank's end: run every frame after the
+// physics sync. A tank that is wrecked with the player aboard throws them out
+// hurt; one that is gone (the prefab rebuild restarts every tank) or no longer
+// captured just lets them out.
+static void UpdatePlayerTank(float dt) {
+    RunTankBoardTest(dt);
+    if (g_playerTankEntity == 0) return;
+    EnemyTankState* tank = PlayerTank();
+    if (!tank || !tank->captured || tank->dead) {
+        const bool destroyed = tank && tank->dead;
+        ExitPlayerTank();
+        if (destroyed) {
+            scene.DamagePlayer(45.0f);
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Player's tank destroyed; thrown clear at health " +
+                std::to_string(scene.player.health));
+        }
+        return;
+    }
+    g_playerTankReload = (std::max)(0.0f, g_playerTankReload - dt);
+    const XMMATRIX hullWorld = EnemyTankHullWorld(*tank);
+
+    // Orbit like the Humvee's chase camera, further out for the bigger hull,
+    // looking over the turret roof.
+    XMFLOAT3 roof = tank->boxCenterLocal;
+    roof.y = tank->boxCenterLocal.y * 2.0f + 0.6f;
+    const XMVECTOR target =
+        XMVector3TransformCoord(XMLoadFloat3(&roof), hullWorld);
+    const float distance = tank->spec.chassisHalfExtents.x * 2.0f + 4.5f;
+    const XMVECTOR orbitView =
+        XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+    XMFLOAT3 desired;
+    XMStoreFloat3(&desired, target - orbitView * distance);
+    desired.y = (std::max)(desired.y,
+        GroundHeightAt(desired.x, desired.z) + 0.6f);
+    const float follow = 1.0f - std::exp(-8.0f * (std::max)(0.0f, dt));
+    const XMVECTOR cameraPosition = XMVectorLerp(
+        XMLoadFloat3(&scene.camera.Position), XMLoadFloat3(&desired), follow);
+    XMStoreFloat3(&scene.camera.Position, cameraPosition);
+    XMStoreFloat3(&scene.camera.Front,
+        XMVector3Normalize(target - cameraPosition));
+    scene.camera.Up = { 0.0f, 1.0f, 0.0f };
+
+    // Turret onto the crosshair, in the hull's frame, faster than the AI's
+    // warning-paced traverse.
+    const XMFLOAT3 aim = HumveeScreenCenterAimPoint();
+    XMFLOAT3 pivot;
+    XMStoreFloat3(&pivot, XMVector3TransformCoord(
+        XMLoadFloat3(&tank->turretPivot), hullWorld));
+    const XMMATRIX orientation =
+        XMMatrixRotationQuaternion(XMLoadFloat4(&tank->rotation));
+    const XMVECTOR local = XMVector3TransformNormal(
+        XMVectorSet(aim.x - pivot.x, 0.0f, aim.z - pivot.z, 0.0f),
+        XMMatrixTranspose(orientation));
+    if (XMVectorGetX(XMVector3LengthSq(local)) > 0.01f) {
+        const float desiredYaw =
+            std::atan2(-XMVectorGetZ(local), XMVectorGetX(local));
+        const float error = std::atan2(
+            std::sin(desiredYaw - tank->turretYaw),
+            std::cos(desiredYaw - tank->turretYaw));
+        const float step =
+            (std::max)(1.2f, tank->turretRate * 2.0f) * (std::max)(0.0f, dt);
+        tank->turretYaw += (std::max)(-step, (std::min)(step, error));
+    }
+}

@@ -266,6 +266,7 @@ static void BeginEditorPlaytest(HWND hwnd) {
     // stale mission-planning flag to take camera ownership or block input.
     CancelDeploymentPlanning();
     g_game.world.Prefabs().ResetGameplayState();
+    ReleaseAmmoPickupBodies();
     scene.ResetLevelRuntimeState();
     SynchronizeEditorRuntime(true);
     scene.player.godMode = true;
@@ -294,6 +295,7 @@ static void StopEditorPlaytest() {
     g_heldBandit = nullptr;
     g_bandits.clear();
     g_game.world.Prefabs().ResetGameplayState();
+    ReleaseAmmoPickupBodies();
     scene.ResetLevelRuntimeState();
     g_game.commands.Set(GameCommand::ResetLevelRuntime, false);
     g_game.commands.Set(GameCommand::RespawnTurretGunner, false);

@@ -73,6 +73,33 @@ static void UpdateNetPlayerNotices(float deltaTime) {
     }
 }
 
+// Medic callouts: displayed for ~4 seconds each.
+struct MedicCallout {
+    net::PlayerId callerId = net::kInvalidPlayerId;
+    float remaining = 0.0f;
+};
+static std::vector<MedicCallout> g_medicCallouts;
+static constexpr float kMedicCalloutSeconds = 4.0f;
+static float g_medicCallCooldown = 0.0f;
+static constexpr float kMedicCallCooldownSeconds = 3.0f;
+
+static void ResetMedicCallouts() {
+    g_medicCallouts.clear();
+    g_medicCallCooldown = 0.0f;
+}
+
+static void UpdateMedicCallouts(float deltaTime) {
+    for (MedicCallout& callout : g_medicCallouts)
+        callout.remaining -= deltaTime;
+    g_medicCallouts.erase(
+        std::remove_if(g_medicCallouts.begin(), g_medicCallouts.end(),
+                       [](const MedicCallout& callout) {
+                           return callout.remaining <= 0.0f;
+                       }),
+        g_medicCallouts.end());
+    g_medicCallCooldown -= deltaTime;
+}
+
 // Drawn under the top edge, stacked downwards, newest last. Uses the foreground
 // list so it survives whatever the HUD is doing beneath it.
 static void DrawNetPlayerNotices() {
@@ -147,13 +174,35 @@ static std::filesystem::path FindNetworkLevelFile(const std::string& file) {
     return {};
 }
 
+// SGE_AUTO_HOST_LEVEL=<path>: the host starts that level once, as soon as a
+// client has joined. Loading with --level at boot instead starves the host's
+// poll during the load and the client's connect never completes.
+static void AutoStartHostLevel(HWND hwnd) {
+    static bool started = false;
+    if (started || !MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Host ||
+        g_game.loading.Active()) return;
+    char path[260] = {};
+    if (GetEnvironmentVariableA("SGE_AUTO_HOST_LEVEL", path, sizeof(path)) == 0)
+        return;
+    g_netSession.GetRemotePlayers(g_netRemoteScratch);
+    if (g_netRemoteScratch.empty()) return;
+    started = true;
+    SGE_LOG("LogNet", EngineLog::Level::Display,
+        std::string("auto-starting host level ") + path);
+    StartCustomLevel(hwnd, std::filesystem::path(path));
+}
+
 static void FollowHostLevel(HWND hwnd) {
     if (!MultiplayerActive() ||
         g_netSession.CurrentRole() != net::Role::Client) return;
     net::LevelKind kind = net::LevelKind::None;
     std::string file;
     if (!g_netSession.TakePendingLevel(kind, file)) return;
-    if (kind == g_activeLevelKind && file == g_activeLevelFile) return;
+    // The host restarting the level it is on names the same level again.
+    const bool restart = g_netSession.LevelRestartPending();
+    if (!restart && kind == g_activeLevelKind && file == g_activeLevelFile)
+        return;
     // A host sitting in its own menus is not a reason to tear this player's
     // level down. It will name one shortly, and being dropped to the menu in
     // between is worse than arriving a moment late.
@@ -164,6 +213,7 @@ static void FollowHostLevel(HWND hwnd) {
         g_netSession.RequeuePendingLevel();
         return;
     }
+    g_netSession.ClearLevelRestart();
     switch (kind) {
     case net::LevelKind::Level1:
         StartLevelOne(hwnd, true);
@@ -641,6 +691,69 @@ static void ApplyNetworkEnemyHelicopters() {
 static std::vector<net::EnemyTankSnapshot> g_hostTankScratch;
 static std::vector<net::AATurretSnapshot> g_hostTurretScratch;
 static std::vector<net::EnemyHumveeSnapshot> g_hostHumveeScratch;
+static std::vector<net::ObjectivePlaneSnapshot> g_hostPlaneScratch;
+
+// Whether anyone in the session has deployed -- this machine's player, or on
+// the host any remote one. The objective aircraft's countdown starts on it.
+static bool AnyPlayerDeployed() {
+    if (PlayerHasDeployed()) return true;
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Host) return false;
+    static std::vector<net::RemotePlayer> remotes;
+    g_netSession.GetRemotePlayers(remotes);
+    return std::any_of(remotes.begin(), remotes.end(),
+        [](const net::RemotePlayer& remote) {
+            return remote.helicopter.deployed != 0;
+        });
+}
+
+// Client-side: the host pressed DEPLOY SQUAD. A player still planning takes
+// the host's insertion, the other door and the host's drop-off, and the
+// deployment screen deploys them on its next frame. One already on the ground
+// is left alone -- the order is for whoever has not gone in yet. An order that
+// lands while this machine is still loading the level waits for the planning
+// screen rather than being lost.
+static void ApplySquadDeployOrder() {
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() != net::Role::Client) return;
+    static bool havePending = false;
+    static net::SquadDeployOrder order;
+    net::SquadDeployOrder incoming;
+    if (g_netSession.TakeSquadDeploy(incoming)) {
+        order = incoming;
+        havePending = true;
+    }
+    if (!havePending) return;
+    if (PlayerHasDeployed()) {
+        havePending = false;
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "Squad deploy order ignored: already deployed");
+        return;
+    }
+    if (!g_insertionChoicePending || g_game.loading.Active() ||
+        g_deploymentZones.empty()) return;
+    havePending = false;
+    g_playerInsertionChoice = static_cast<LevelInsertionMode>(
+        order.insertionMode);
+    ApplyInsertionAirframe(static_cast<InsertionAirframe>(order.airframe));
+    g_playerRidesLeftSeat = !order.hostLeftSeat;
+    size_t nearest = 0;
+    float nearestSq = FLT_MAX;
+    for (size_t i = 0; i < g_deploymentZones.size(); ++i) {
+        const float dx = g_deploymentZones[i].x - order.x;
+        const float dz = g_deploymentZones[i].z - order.z;
+        if (dx * dx + dz * dz < nearestSq) {
+            nearestSq = dx * dx + dz * dz;
+            nearest = i;
+        }
+    }
+    g_selectedDeploymentZone = static_cast<int>(nearest);
+    g_squadDeployRequested = true;
+    SGE_LOG("LogNet", EngineLog::Level::Display,
+        "Squad deploy: riding the host's insertion from zone " +
+        std::to_string(nearest) + " (" + std::to_string(std::sqrt(nearestSq)) +
+        " m from the host's drop-off)");
+}
 
 static void PublishHostArmor() {
     if (!MultiplayerActive() ||
@@ -687,7 +800,8 @@ static void PublishHostArmor() {
             XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
         net::EnemyHumveeSnapshot out;
         out.index = static_cast<uint8_t>(index);
-        out.hostDriven = g_humveeGameplay[index].aiEverDriven ? 1 : 0;
+        out.hostDriven = g_humveeGameplay[index].aiEverDriven ||
+                         g_humveeGameplay[index].playerEverDriven ? 1 : 0;
         out.x = position.x;
         out.y = position.y;
         out.z = position.z;
@@ -698,12 +812,37 @@ static void PublishHostArmor() {
         out.turretYaw = g_humveeGameplay[index].turretYaw;
         g_hostHumveeScratch.push_back(out);
     }
+    g_hostPlaneScratch.clear();
+    for (const ObjectivePlaneState& plane : g_objectivePlanes) {
+        net::ObjectivePlaneSnapshot out;
+        out.entityId = plane.entityId;
+        out.flags = static_cast<uint8_t>(
+            (plane.rolling ? net::kPlaneRolling : 0) |
+            (plane.escaped ? net::kPlaneEscaped : 0) |
+            (plane.destroyed ? net::kPlaneDestroyed : 0) |
+            (plane.crashing ? net::kPlaneCrashing : 0) |
+            (plane.crashed ? net::kPlaneCrashed : 0));
+        out.holdTimer = plane.holdTimer;
+        out.takeoffTimer = plane.takeoffTimer;
+        out.crashX = plane.crashPosition.x;
+        out.crashY = plane.crashPosition.y;
+        out.crashZ = plane.crashPosition.z;
+        out.crashVX = plane.crashVelocity.x;
+        out.crashVY = plane.crashVelocity.y;
+        out.crashVZ = plane.crashVelocity.z;
+        out.crashPitch = plane.crashPitch;
+        out.crashRoll = plane.crashRoll;
+        out.crashYaw = plane.crashYaw;
+        g_hostPlaneScratch.push_back(out);
+    }
     g_netSession.PublishArmor(g_hostTankScratch.data(),
                               g_hostTankScratch.size(),
                               g_hostTurretScratch.data(),
                               g_hostTurretScratch.size(),
                               g_hostHumveeScratch.data(),
-                              g_hostHumveeScratch.size());
+                              g_hostHumveeScratch.size(),
+                              g_hostPlaneScratch.data(),
+                              g_hostPlaneScratch.size());
 }
 
 // Client-side. Writes the host's tanks and guns over the local ones; the
@@ -749,6 +888,47 @@ static void ApplyNetworkArmor() {
                 }
             }
             tank.netSeen = true;
+            break;
+        }
+    }
+
+    // Objective aircraft: the host's timers and crash replace this machine's,
+    // so the takeoff, the crash and the escape happen at the same moment for
+    // everyone. A kill the host saw and this machine did not is applied
+    // through the normal damage path, so the mission tally and the crash start
+    // here exactly as they would have from a local hit.
+    // Timers and crash state are taken once per armor tick. The last message
+    // is re-read every frame, and re-applying it pinned the plane to the last
+    // tick's pose between packets instead of letting it fly on.
+    static uint32_t planeTickApplied = 0;
+    const bool freshPlanes = armor->tick != planeTickApplied;
+    planeTickApplied = armor->tick;
+    for (uint8_t i = 0; i < armor->planeCount; ++i) {
+        const net::ObjectivePlaneSnapshot& in = armor->planes[i];
+        for (ObjectivePlaneState& plane : g_objectivePlanes) {
+            if (plane.entityId != in.entityId) continue;
+            if ((in.flags & net::kPlaneDestroyed) && !plane.destroyed)
+                DamagePrefabEntity(plane.entityId, 1000000.0f,
+                                   ObjectivePlaneLivePosition(plane),
+                                   /*fromRemoteCharge=*/false,
+                                   /*fromPlayer=*/true, /*localShot=*/false);
+            if (freshPlanes) {
+                plane.holdTimer = in.holdTimer;
+                plane.takeoffTimer = in.takeoffTimer;
+                plane.rolling = (in.flags & net::kPlaneRolling) != 0;
+            }
+            if (freshPlanes &&
+                (in.flags & (net::kPlaneCrashing | net::kPlaneCrashed))) {
+                plane.destroyed = true;
+                plane.crashing = (in.flags & net::kPlaneCrashing) != 0;
+                plane.crashed = (in.flags & net::kPlaneCrashed) != 0;
+                plane.crashPosition = { in.crashX, in.crashY, in.crashZ };
+                plane.crashVelocity = { in.crashVX, in.crashVY, in.crashVZ };
+                plane.crashPitch = in.crashPitch;
+                plane.crashRoll = in.crashRoll;
+                plane.crashYaw = in.crashYaw;
+            }
+            if (in.flags & net::kPlaneEscaped) EscapeObjectivePlane(plane);
             break;
         }
     }
@@ -817,6 +997,135 @@ static void ApplyNetworkArmor() {
     }
 }
 
+// One infantry shot: the flash, smoke, tracer and report a firefight is read
+// by, and the rounds themselves. Shared by the actor that fired it and, in a
+// session, by each client flying a bandit's shot the host broadcast
+// (`hostReplica`) -- that client's own copy is what can hit its player, which
+// is the same way tank and AA rounds reach them. Clients run no AI, so before
+// this no enemy soldier could hurt anyone but the host.
+static void FireInfantryShot(const XMFLOAT3& shotOrigin,
+                             const XMFLOAT3& shotDirection,
+                             net::InfantryWeapon weapon, bool bandit,
+                             bool hostReplica) {
+    const bool shotgun = weapon == net::InfantryWeapon::Shotgun;
+    const bool sniper = weapon == net::InfantryWeapon::Sniper;
+    // Presentation for a shot fired somewhere out in the world. Enemy fire had
+    // none of this: the only sign a bandit was shooting was the report and
+    // whatever the round hit, so a firefight gave the player no way to see
+    // where it was coming from. The shotgun's flash is bigger and the sniper's
+    // leaner, matching what each gun sounds like.
+    //
+    // Flash and tracer only -- no dynamic light, so a night firefight does not
+    // light the level up, and no explosion FX, which would shake the camera
+    // and fire the explosion audio on every round.
+    const float flashScale = shotgun ? 1.7f : sniper ? 1.3f : 1.0f;
+    // AimRayOrigin is where the round and the LOS test start, which is not
+    // necessarily where the barrel ends on a given rig. Nudge the flash and its
+    // smoke onto the aim basis so the sliders can seat them on the weapon
+    // without moving the shot itself. Right is built against world up; a shot
+    // straight up or down would degenerate it, so fall back to world +X rather
+    // than normalising a zero vector.
+    XMFLOAT3 flashOrigin = shotOrigin;
+    {
+        const XMVECTOR forward = XMVector3Normalize(
+            XMLoadFloat3(&shotDirection));
+        const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        XMVECTOR right = XMVector3Cross(worldUp, forward);
+        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        right = XMVector3Normalize(right);
+        const XMVECTOR up = XMVector3Normalize(XMVector3Cross(forward, right));
+        const XMVECTOR offset =
+            forward * g_enemyFlashOffsetForward +
+            right   * g_enemyFlashOffsetRight +
+            up      * g_enemyFlashOffsetUp;
+        XMStoreFloat3(&flashOrigin, XMLoadFloat3(&shotOrigin) + offset);
+    }
+    scene.SpawnWorldMuzzleFlash(flashOrigin, shotDirection, flashScale);
+    scene.SpawnWeaponSmoke(flashOrigin, shotDirection, 0.55f * flashScale);
+    // The streak that says "someone is shooting, and that way". Same
+    // visual-speed tracer the networked players use, which is drawn far slower
+    // than the round actually travels so the eye can follow it out. Red for a
+    // bandit, orange for an ally marine -- the squad shares this code path, and
+    // friendly fire streaking past must not read as incoming. Stopped at the
+    // first thing its line hits, so a shot from behind a ridge or inside a
+    // hangar does not streak out through the geometry and advertise a firing
+    // position on the wrong side of the cover.
+    scene.SpawnRemoteTracer(shotOrigin, shotDirection, bandit,
+                            ResolveRemoteTracerRange(shotOrigin, shotDirection));
+
+    // A replica's rounds start a metre down the barrel. This machine's copy of
+    // the shooter is an interpolated snapshot, up to a tick behind the host's,
+    // and a round leaving from inside that lagging body would be stopped by it
+    // before it ever left the muzzle.
+    XMFLOAT3 roundOrigin = shotOrigin;
+    if (hostReplica) {
+        XMStoreFloat3(&roundOrigin, XMLoadFloat3(&shotOrigin) +
+            XMVector3Normalize(XMLoadFloat3(&shotDirection)) * 1.0f);
+    }
+    const auto spawnHostile = [&](const XMFLOAT3& direction,
+                                  float damageMultiplier,
+                                  float speedMultiplier) {
+        scene.SpawnHostileProjectile(roundOrigin, direction, damageMultiplier,
+                                     speedMultiplier);
+        scene.projectiles.back().netHostRound = hostReplica;
+    };
+    if (!bandit) {
+        // Marine rifle shot: behaves like a player shot for hit-testing --
+        // damages bandits only, never the player.
+        scene.SpawnPlayerProjectile(roundOrigin, shotDirection);
+    } else if (shotgun) {
+        // Cone of individually weak pellets. Overlapping hits at point-blank
+        // are what make it lethal; at range the cone is wide enough that most
+        // pellets miss entirely. A replica rolls its own cone: the spread is
+        // the gun's, the exact pellets never mattered.
+        const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&shotDirection));
+        XMVECTOR up = std::fabs(XMVectorGetY(forward)) > 0.95f
+            ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
+            : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, forward));
+        up = XMVector3Cross(forward, right);
+        for (int pellet = 0; pellet < kBanditShotgunPellets; ++pellet) {
+            const float spreadRight =
+                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
+            const float spreadUp =
+                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
+            XMFLOAT3 pelletDirection;
+            XMStoreFloat3(&pelletDirection, XMVector3Normalize(
+                forward + right * spreadRight + up * spreadUp));
+            spawnHostile(pelletDirection, 1.6f, 1.0f);
+        }
+    } else if (sniper) {
+        // One heavy, fast round. Damage is high because the five second laser
+        // gave the player every chance to not be standing there.
+        spawnHostile(shotDirection, 18.0f, 2.2f);
+    } else {
+        spawnHostile(shotDirection, 1.0f, 1.0f);
+    }
+
+    // Positional: an enemy shooting from the left is heard on the left. The
+    // distance falloff that used to be computed here by hand now comes from
+    // the emitter's rolloff curve.
+    //
+    // Half volume: several enemies firing at once stacked into a wall of sound
+    // that buried the player's own weapon and the voice cues. Quieter enemy
+    // fire keeps a firefight legible.
+    const float pitch = 0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
+    g_gunAudio.PlayAt(shotOrigin.x, shotOrigin.y, shotOrigin.z,
+                      0.29f, pitch, 70.0f);
+
+    // Everyone else flies their own copy. Bandits only: a marine's round
+    // cannot hurt a player, so it would be traffic for a tracer.
+    if (bandit && !hostReplica && MultiplayerActive() &&
+        g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.PublishEnemyFire(
+            net::EnemyFireKind::InfantryShot,
+            shotOrigin.x, shotOrigin.y, shotOrigin.z,
+            shotDirection.x, shotDirection.y, shotDirection.z,
+            0.0f, 0.0f, 1.0f, weapon);
+    }
+}
+
 // Client-side: fly the rounds the host's tanks and guns fired. Each is a live
 // hostile projectile here, so it can hit this machine's player -- which is how
 // it reaches them at all, since the host never simulates anyone's body but
@@ -837,6 +1146,9 @@ static void PresentEnemyFire() {
             SpawnEnemyTankShell(muzzle, muzzle, direction, fire.speed,
                                 (std::min)(fire.lifetime, 30.0f),
                                 fire.damageScale, /*hostReplica=*/true);
+        } else if (fire.kind == net::EnemyFireKind::InfantryShot) {
+            FireInfantryShot(muzzle, direction, fire.weapon, /*bandit=*/true,
+                             /*hostReplica=*/true);
         } else {
             SpawnAATurretRound(muzzle, direction, /*hostReplica=*/true);
         }
@@ -902,7 +1214,7 @@ static void ReportNetworkPlayerHit(net::PlayerId target, bool headshot,
 // reason: the prompt and the key handler read this one function, so they can
 // never disagree about who is being revived.
 static SkinnedEnemy* NearbyDownedPlayer(net::PlayerId* outId = nullptr) {
-    if (!MultiplayerActive() || g_drivingHumvee) return nullptr;
+    if (!MultiplayerActive() || PlayerInVehicle()) return nullptr;
     // You cannot pick anyone up while you are on the floor yourself.
     if (scene.player.downed) return nullptr;
     if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
@@ -976,6 +1288,67 @@ static void DrawRevivePrompt(DirectX::CXMMATRIX view,
         IM_COL32(120, 230, 150, 240), 2.0f);
 }
 
+// "PLAYER-N NEEDS A MEDIC" callout over a teammate who called for help.
+// Displayed for ~4 seconds per callout. Projects the caller's position to screen
+// and draws a marker, similar to the revive prompt.
+static void DrawMedicCallout(DirectX::CXMMATRIX view,
+                             DirectX::CXMMATRIX projection,
+                             net::PlayerId callerId, float displayTime) {
+    if (callerId >= net::kMaxPlayers) return;
+    if (displayTime <= 0.0f) return;
+
+    // Find the caller's position from the remote players or local player.
+    XMFLOAT3 callerPos;
+    if (callerId == g_netSession.LocalId()) {
+        // Camera is eye height; drop to the feet the remote snapshot uses.
+        callerPos = { scene.camera.Position.x, scene.camera.Position.y - 1.6f,
+                      scene.camera.Position.z };
+    } else {
+        // Remote player position from the snapshot.
+        g_netSession.GetRemotePlayers(g_netRemoteScratch);
+        bool found = false;
+        for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+            if (remote.id == callerId) {
+                callerPos = XMFLOAT3(remote.x, remote.y, remote.z);
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+    }
+
+    // Project to screen space.
+    const XMFLOAT3 anchor{ callerPos.x, callerPos.y + 1.5f, callerPos.z };
+    const XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&anchor),
+                                             view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    char label[64];
+    std::snprintf(label, sizeof(label), "PLAYER-%d NEEDS A MEDIC",
+                  static_cast<int>(callerId) + 1);
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+
+    // Fade out near the end of display time.
+    uint8_t alpha = 245;
+    if (displayTime < 0.5f) {
+        alpha = static_cast<uint8_t>(245.0f * (displayTime / 0.5f));
+    }
+
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
+        ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
+        IM_COL32(255, 100, 100, 200), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y),
+                  IM_COL32(255, 255, 255, alpha), label);
+}
+
 // Next id to hand out. Monotonic and never reused within a session: an id that
 // came back after its body was gone would let a late hit report land on a
 // different enemy entirely.
@@ -1017,6 +1390,7 @@ static void PublishHostEnemies() {
         state.killer = actor->netKiller == SkinnedEnemy::kLocalPlayerKiller
             ? g_netSession.LocalId()
             : actor->netKiller;
+        state.marine = actor->faction == Faction::Marine;
         g_hostEnemyScratch.push_back(state);
     }
     g_netSession.PublishEnemies(g_hostEnemyScratch);
@@ -1068,7 +1442,28 @@ static void ApplyReportedEnemyHits() {
         // Stamped after the damage so it only names a shooter who actually
         // finished the body, and published from here rather than from the kill
         // itself because only the session knows the reporter's id.
-        if (enemy->Dead()) enemy->netKiller = hit.shooter;
+        if (enemy->Dead()) {
+            enemy->netKiller = hit.shooter;
+            g_netSession.IncrementPlayerKill(hit.shooter);
+        }
+    }
+}
+
+// Host-side: land the marines a client's transport brought in. Spawned here so
+// their AI runs on the one machine that runs AI; they reach every client,
+// their owner included, through the enemy snapshot. Staggered because under
+// DEPLOY SQUAD the client set down at the host's own drop-off, where the host's
+// squad is already standing.
+static void LandClientMarineDrops() {
+    static std::vector<net::MarineDropRequest> drops;
+    g_netSession.DrainMarineDrops(drops);
+    for (const net::MarineDropRequest& drop : drops) {
+        const int landed = DropMarineSquad({ drop.x, drop.y, drop.z },
+                                           drop.count, /*staggered=*/true,
+                                           drop.requester);
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "Landed " + std::to_string(landed) + " marines for player " +
+                std::to_string(static_cast<int>(drop.requester) + 1));
     }
 }
 
@@ -1079,10 +1474,29 @@ static void UpdateClientEnemies(float frameDelta) {
         SkinnedEnemy* body = FindEnemyByNetId(remote.id);
         if (!body) {
             if (remote.dead) continue;   // do not spawn a corpse
-            if (!g_banditModel.valid) continue;
+            // Marines in their own model and faction: built as bandits, an
+            // allied squad wore the enemy's kit and drew no friendly marker.
+            const SkinnedModel& model =
+                remote.marine ? g_marineModel : g_banditModel;
+            if (!model.valid) continue;
             auto spawned = std::make_unique<SkinnedEnemy>();
-            if (!spawned->Init(g_banditModel)) continue;
-            spawned->faction = Faction::Bandit;
+            if (!spawned->Init(model)) continue;
+            spawned->faction =
+                remote.marine ? Faction::Marine : Faction::Bandit;
+            if (remote.marine) {
+                int squadNumber = 1;
+                for (const auto& existing : g_bandits)
+                    if (existing && !existing->networkControlled &&
+                        existing->faction == Faction::Marine)
+                        ++squadNumber;
+                char callsign[32];
+                std::snprintf(callsign, sizeof(callsign), "Bravo-%d",
+                              squadNumber);
+                spawned->callsign = callsign;
+                SGE_LOG("LogNet", EngineLog::Level::Display,
+                    std::string("client: marine replica ") + callsign +
+                        " (host id " + std::to_string(remote.id) + ")");
+            }
             spawned->netEnemyId = remote.id;
             spawned->leftArmReach = g_banditLeftArmReach;
             // The host owns this actor's life. Local damage must not touch it
@@ -1222,6 +1636,74 @@ static void ApplyNetworkTerrainDeforms() {
     }
 }
 
+// Explosive barrels and client blasts, in both directions.
+//
+// On the host: plays what clients asked for. A detonation request carries
+// where the barrel is on the asker, because a barrel a client threw has only
+// flown on that client -- the host's copy is still standing where it started,
+// and blowing it up there would miss everything the throw was aimed at. A
+// barrel the host already lost is announced again, so an asker that missed the
+// first broadcast still clears its copy. Then the rockets: applied to the
+// host's soldiers, which is the part of a client's blast nobody else ran.
+//
+// On a client: plays what the host decided, one barrel at a time.
+static std::vector<net::BarrelEventRecord> g_netBarrelEvents;
+static std::vector<net::BlastRecord> g_netRequestedBlasts;
+
+static void ApplyNetworkBarrelsAndBlasts() {
+    if (!MultiplayerActive()) return;
+    const net::Role role = g_netSession.CurrentRole();
+    if (role == net::Role::Host) {
+        g_netSession.DrainRequestedBarrelEvents(g_netBarrelEvents);
+        for (const net::BarrelEventRecord& request : g_netBarrelEvents) {
+            if (request.barrel >= scene.explosiveBarrels.size()) continue;
+            ExplosiveBarrel& barrel = scene.explosiveBarrels[request.barrel];
+            if (request.event == net::BarrelEvent::Ignite) {
+                IgniteBarrel(request.barrel);
+                continue;
+            }
+            if (!barrel.active) {
+                g_netSession.PublishBarrelEvent(request.barrel,
+                    net::BarrelEvent::Detonate,
+                    barrel.position.x, barrel.position.y, barrel.position.z);
+                continue;
+            }
+            // A barrel the host is holding stays where the host holds it.
+            if (g_heldBarrelIndex != request.barrel)
+                barrel.position = { request.x, request.y, request.z };
+            DetonateBarrel(request.barrel, /*fromPlayer=*/false);
+        }
+        g_netSession.DrainRequestedBlasts(g_netRequestedBlasts);
+        if (!g_banditLoaded || g_netRequestedBlasts.empty()) return;
+        for (const net::BlastRecord& blast : g_netRequestedBlasts) {
+            const XMFLOAT3 center{ blast.x, blast.y, blast.z };
+            for (auto& bandit : g_bandits) {
+                if (bandit) bandit->ApplyExplosion(
+                    center, blast.radius, blast.damage, blast.push,
+                    /*fromPlayer=*/false);
+            }
+            if (scene.useDestruction && g_destruction.IsInitialized())
+                g_destruction.ApplyRagdollExplosion(
+                    center, blast.radius, blast.ragdollImpulse);
+        }
+        PlayBanditDeathEvents();
+        return;
+    }
+    if (role != net::Role::Client) return;
+    g_netSession.DrainBarrelEvents(g_netBarrelEvents);
+    for (const net::BarrelEventRecord& event : g_netBarrelEvents) {
+        if (event.barrel >= scene.explosiveBarrels.size()) continue;
+        ExplosiveBarrel& barrel = scene.explosiveBarrels[event.barrel];
+        if (event.event == net::BarrelEvent::Ignite) {
+            IgniteBarrel(event.barrel, /*fromNetwork=*/true);
+            continue;
+        }
+        if (!barrel.active) continue;
+        barrel.position = { event.x, event.y, event.z };
+        DetonateBarrel(event.barrel, barrel.litByPlayer, /*fromNetwork=*/true);
+    }
+}
+
 static net::GrenadeKind NetworkGrenadeKind(const Projectile& p) {
     return p.molotov ? net::GrenadeKind::Molotov
          : p.vortex ? net::GrenadeKind::Vortex : net::GrenadeKind::Frag;
@@ -1271,12 +1753,13 @@ static void UpdateNetworkGrenades() {
         p.hostile = spawn.hostile;
         p.active = true;
         p.fuse = (std::max)(0.0f, spawn.fuse);
-        // An AI throw starts inside its own thrower, and a hostile grenade
-        // collides with the player body the moment its grace runs out. Without
-        // the same grace the local throw used, a replicated bandit frag
-        // detonates on the arm that threw it.
-        if (spawn.owner == net::kInvalidPlayerId)
-            p.grenadeCollisionGrace = 0.18f;
+        // Every throw starts inside its own thrower -- an AI's body, or a
+        // player's, whose remote body sits in g_bandits and blocks projectiles
+        // like any other. Without the grace the local throw used, the copy
+        // bounced off the thrower's own chest on its first frame and dropped at
+        // their feet; the host's detonation then pulled the thrower's grenade
+        // back there too, which on the client read as a throw that never left.
+        p.grenadeCollisionGrace = 0.18f;
         p.netGrenadeId = spawn.grenadeId;
         p.netClientToken = spawn.clientToken;
         p.netAuthoritative = g_netSession.CurrentRole() == net::Role::Host;
@@ -1358,6 +1841,24 @@ static void UpdateNetworkGrenades() {
                 (std::max)(0.0f, p.fuse));
         }
     }
+}
+
+// Check if all players (local and remote) are downed in a multiplayer session.
+// Returns true if the squad is wiped, false if at least one player is still up.
+static bool AreAllPlayersDowned() {
+    if (!MultiplayerActive()) return false;
+
+    // Check local player first
+    if (!scene.player.downed) return false;
+
+    // Check all remote players
+    g_netSession.GetRemotePlayers(g_netRemoteScratch);
+    for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+        if (!remote.downed) return false;
+    }
+
+    // All active players are downed
+    return true;
 }
 
 static void ShutdownMultiplayer() {
@@ -1556,6 +2057,30 @@ static void UpdateMultiplayerSession(float frameDelta,
     // and sending the eye would sink every other player waist-deep in terrain.
     local.y = scene.camera.Position.y - scene.camera.PlayerHeight;
     local.z = scene.camera.Position.z;
+    // The Humvee this machine is driving: its solver is the one with the
+    // input, so its pose is the one everyone else is shown.
+    if (g_drivingHumvee && g_activeHumveeIndex < g_humveeGameplay.size() &&
+        g_activeHumveeIndex < net::kMaxReplicatedHumvees) {
+        XMFLOAT4X4 pose;
+        XMFLOAT3 position;
+        if (g_destruction.GetVehicleTransform(g_activeHumveeIndex, pose,
+                                              &position)) {
+            XMFLOAT4 rotation;
+            XMStoreFloat4(&rotation, XMQuaternionNormalize(
+                XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
+            auto& vehicle = local.vehicle;
+            vehicle.kind = net::DrivenVehicleKind::Humvee;
+            vehicle.index = static_cast<uint8_t>(g_activeHumveeIndex);
+            vehicle.x = position.x;
+            vehicle.y = position.y;
+            vehicle.z = position.z;
+            vehicle.qx = rotation.x;
+            vehicle.qy = rotation.y;
+            vehicle.qz = rotation.z;
+            vehicle.qw = rotation.w;
+            vehicle.turretYaw = g_humveeGameplay[g_activeHumveeIndex].turretYaw;
+        }
+    }
     if (IsGameplayScreen() && !g_game.loading.Active() &&
         !g_insertionChoicePending && !g_baseMode && BlackHawkVisible()) {
         auto& helicopter = local.helicopter;
@@ -1571,7 +2096,25 @@ static void UpdateMultiplayerSession(float frameDelta,
         helicopter.minY = g_blackHawkModelMinY;
         helicopter.centerZ = g_blackHawkModelCenter.z;
         helicopter.scale = g_blackHawkModelScale;
+        // SGE_INSERTION_TRACE=1: this machine's insertion aircraft once a
+        // second, so a squad ride can be checked for the two copies agreeing.
+        static const bool trace =
+            GetEnvironmentVariableA("SGE_INSERTION_TRACE", nullptr, 0) > 0;
+        static float traceTimer = 0.0f;
+        traceTimer -= frameDelta;
+        if (trace && traceTimer <= 0.0f) {
+            traceTimer = 1.0f;
+            SGE_LOG("LogNet", EngineLog::Level::Display,
+                std::string("InsertionTrace[") +
+                (g_netSession.CurrentRole() == net::Role::Host ? "host"
+                                                               : "client") +
+                "] " + std::to_string(g_blackHawkPosition.x) + ", " +
+                std::to_string(g_blackHawkPosition.y) + ", " +
+                std::to_string(g_blackHawkPosition.z) + " seat " +
+                (g_playerRidesLeftSeat ? "left" : "right"));
+        }
     }
+    local.helicopter.deployed = PlayerHasDeployed() ? 1 : 0;
     if (g_insertionChoicePending) {
         local.x = g_deploymentNetworkPosition.x;
         local.y = g_deploymentNetworkPosition.y;
@@ -1706,8 +2249,20 @@ static void UpdateMultiplayerBodies(float frameDelta) {
         // nobody else can see.
         body->netDowned = remote.downed;
         body->netHealth = remote.health;
+        body->netDeployed = remote.helicopter.deployed != 0;
+        // A driver's reported position is their chase camera, metres behind
+        // and above the chassis, which stood their body in mid-air behind the
+        // Humvee. They are in the seat: hide the body and keep it at the
+        // vehicle, so enemy aim goes where the driver actually is.
+        const bool driving =
+            remote.vehicle.kind != net::DrivenVehicleKind::None;
+        body->visible = !driving;
+        if (driving) {
+            body->position = { remote.vehicle.x, remote.vehicle.y,
+                               remote.vehicle.z };
+        }
         body->UpdateNetworkedPose(frameDelta, remote.moving, remote.sprinting,
-                                  remote.aiming);
+                                  remote.aiming, remote.crouching);
     }
 
     // Drop bodies for players that are no longer in the session. Erases in one
@@ -1723,10 +2278,50 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                        });
 
     if (g_netSession.CurrentRole() == net::Role::Host) {
+        // Humvees other players are driving. Their machine simulates the
+        // chassis; the host takes the pose off their input, eases its own body
+        // there in SyncEnemyHumveePoses, and hands it on in the armor state
+        // below. Before that publish, so it carries this frame's pose. The
+        // host's own player keeps a wheel they already hold.
+        for (HumveeGameplayState& state : g_humveeGameplay)
+            state.remoteDriven = false;
+        for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+            const net::DrivenVehicleState& vehicle = remote.vehicle;
+            if (vehicle.kind != net::DrivenVehicleKind::Humvee ||
+                vehicle.index >= g_humveeGameplay.size()) continue;
+            if (g_drivingHumvee && g_activeHumveeIndex == vehicle.index)
+                continue;
+            HumveeGameplayState& state = g_humveeGameplay[vehicle.index];
+            state.remoteDriven = true;
+            state.playerEverDriven = true;
+            state.netPosition = { vehicle.x, vehicle.y, vehicle.z };
+            XMStoreFloat4(&state.netRotation, XMQuaternionNormalize(
+                XMVectorSet(vehicle.qx, vehicle.qy, vehicle.qz, vehicle.qw)));
+            state.netTurretYaw = vehicle.turretYaw;
+            if (!state.netPosed) {
+                // Start easing from where the body actually is.
+                XMFLOAT4X4 pose;
+                XMFLOAT3 position;
+                if (g_destruction.GetVehicleTransform(vehicle.index, pose,
+                                                      &position)) {
+                    state.drawPosition = position;
+                    XMStoreFloat4(&state.drawRotation, XMQuaternionNormalize(
+                        XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
+                } else {
+                    state.drawPosition = state.netPosition;
+                    state.drawRotation = state.netRotation;
+                }
+                state.turretYaw = state.netTurretYaw;
+                state.netPosed = true;
+            }
+        }
         // Apply what clients reported hitting, then publish the result. Both
         // after the player bodies above, so a hit reported this frame lands on
         // the positions the snapshot is about to carry.
         ApplyReportedEnemyHits();
+        // Before the publish, so a squad landed this frame gets its ids and
+        // goes out in the same tick.
+        LandClientMarineDrops();
         PublishHostEnemies();
         // After the hits: a gunship brought down by a client's report this
         // frame goes out already dead rather than flying for one more tick.
@@ -1735,6 +2330,7 @@ static void UpdateMultiplayerBodies(float frameDelta) {
     } else {
         UpdateClientEnemies(frameDelta);
         ApplyNetworkArmor();
+        ApplySquadDeployOrder();
         PresentEnemyFire();
     }
 }

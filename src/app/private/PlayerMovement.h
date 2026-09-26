@@ -2,6 +2,21 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+// Whether another player in the session is at this Humvee's wheel. Read off the
+// player snapshot, which says who is in which seat; without it two players
+// could both drive one Humvee and each fight the other's solver for the body.
+static std::vector<net::RemotePlayer> g_humveeSeatScratch;
+
+static bool HumveeTakenByRemotePlayer(size_t index) {
+    if (!g_netSession.Active()) return false;
+    g_netSession.GetRemotePlayers(g_humveeSeatScratch);
+    for (const net::RemotePlayer& remote : g_humveeSeatScratch) {
+        if (remote.vehicle.kind == net::DrivenVehicleKind::Humvee &&
+            remote.vehicle.index == index) return true;
+    }
+    return false;
+}
+
 static void ToggleHumveeDriving() {
     XMFLOAT4X4 pose;
     XMFLOAT3 position, forward;
@@ -10,6 +25,7 @@ static void ToggleHumveeDriving() {
         float nearestDistanceSq = 25.0f;
         size_t nearestIndex = kNoHumvee;
         for (size_t index = 0; index < g_destruction.VehicleCount(); ++index) {
+            if (HumveeTakenByRemotePlayer(index)) continue;
             XMFLOAT3 candidatePosition;
             if (!g_destruction.GetVehicleTransform(
                     index, pose, &candidatePosition, &forward)) continue;
@@ -24,6 +40,8 @@ static void ToggleHumveeDriving() {
         if (nearestIndex == kNoHumvee) return;
         g_activeHumveeIndex = nearestIndex;
         g_drivingHumvee = true;
+        if (nearestIndex < g_humveeGameplay.size())
+            g_humveeGameplay[nearestIndex].playerEverDriven = true;
         g_savedGunVisible = scene.gun.visible;
         scene.gun.visible = false;
         scene.camera.FPSMode = false;

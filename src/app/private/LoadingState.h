@@ -57,6 +57,8 @@ static bool IsGameplayScreen() {
     return g_game.session.Screen() == GameScreen::Level1 || IsEditorPlaying();
 }
 static bool  deathCursorReleased = false;
+static bool  squadWipeCursorReleased = false;
+static float squadWipeScreenAge = 0.0f;
 void RequestLiveDXRDDGIRebuild() {
     g_game.commands.Request(GameCommand::RebuildDDGI);
 }

@@ -51,6 +51,9 @@ inline constexpr float kRegenPerSecond = kMaxPlayerHealth / 2.0f;
 // Where a remote player is, already interpolated and ready to drive a body.
 struct RemotePlayer {
     InsertionHelicopterState helicopter;
+    // Newest snapshot's, not interpolated: the seat is a state, and the pose it
+    // carries is only read by the host, which gets it straight off the input.
+    DrivenVehicleState vehicle;
     PlayerId id = kInvalidPlayerId;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float yaw = 0.0f, pitch = 0.0f;
@@ -77,6 +80,7 @@ struct RemoteEnemy {
     // Who the host says killed it, or kInvalidPlayerId for an AI or hazard
     // death. The only thing a client can key a payout off.
     PlayerId killer = kInvalidPlayerId;
+    bool marine = false;
 };
 
 // A demolition charge another player planted, and the order to fire one
@@ -105,13 +109,36 @@ struct RemoteShot {
 // hostile projectile. Unlike RemoteShot this one does damage -- but only to
 // the receiving machine's own player, through the same local hostile-hit path
 // a bandit round takes, which the host already trusts a client to report.
+// The host's DEPLOY SQUAD order, as a client receives it.
+struct SquadDeployOrder {
+    uint8_t insertionMode = 0;
+    uint8_t airframe = 0;
+    bool hostLeftSeat = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+
 struct RemoteEnemyFire {
     EnemyFireKind kind = EnemyFireKind::TankShell;
+    InfantryWeapon weapon = InfantryWeapon::Rifle;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
     float speed = 0.0f;
     float lifetime = 0.0f;
     float damageScale = 1.0f;
+};
+
+struct BarrelEventRecord {
+    uint16_t barrel = 0;
+    BarrelEvent event = BarrelEvent::Detonate;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+
+struct BlastRecord {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float radius = 0.0f;
+    float damage = 0.0f;
+    float push = 0.0f;
+    float ragdollImpulse = 0.0f;
 };
 
 // One enemy gunship as the gameplay layer sees it. Used in both directions: the
@@ -136,6 +163,14 @@ struct HostEnemyState {
     bool moving = false;
     bool dead = false;
     PlayerId killer = kInvalidPlayerId;
+    bool marine = false;
+};
+
+// A client's squad, landed by the host where that client's transport set down.
+struct MarineDropRequest {
+    PlayerId requester = kInvalidPlayerId;
+    uint8_t count = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
 // A hit a client reported on one of the host's enemies, drained by the host and
@@ -245,6 +280,7 @@ struct TerrainDeformEvent {
 // What the local player is doing this frame, handed to the session.
 struct LocalPlayerState {
     InsertionHelicopterState helicopter;
+    DrivenVehicleState vehicle;
     PlayerInput input;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // This machine's god mode toggle. Only the host's is read: it becomes the
@@ -342,6 +378,9 @@ public:
         peerToPlayer_.clear();
         stateChanges_.clear();
         chatLines_.clear();
+        medicCalls_.clear();
+        marineDrops_.clear();
+        scoreboard_.clear();
         sessionGodMode_ = false;
         sessionGodModeKnown_ = false;
         hostEnemies_.clear();
@@ -363,6 +402,7 @@ public:
         remoteArmorTick_ = 0;
         hasHostArmor_ = false;
         hasRemoteArmor_ = false;
+        squadDeployPending_ = false;
         enemyFire_.clear();
         enemyHits_.clear();
         worldImpacts_.clear();
@@ -381,12 +421,17 @@ public:
         terrainDeformEvents_.clear();
         requestedTerrainDeforms_.clear();
         receivedTerrainDeforms_.clear();
+        barrelEvents_.clear();
+        requestedBarrelEvents_.clear();
+        requestedBlasts_.clear();
         nextGrenadeId_ = 1;
         nextImpactId_ = 1;
         nextDeformId_ = 1;
         levelKind_ = LevelKind::None;
         levelFile_.clear();
         hasPendingLevel_ = false;
+        levelRestartPending_ = false;
+        levelRestartSerial_ = 0;
         serverAddress_.clear();
         port_ = 0;
         overSteam_ = false;
@@ -462,6 +507,8 @@ public:
             slot.current.y = local.y;
             slot.current.z = local.z;
             slot.current.helicopter = local.helicopter;
+            slot.current.vehicle = ValidDrivenVehicle(local.vehicle)
+                ? local.vehicle : DrivenVehicleState{};
             slot.current.yaw = local.input.yaw;
             slot.current.pitch = local.input.pitch;
             slot.current.moving = local.input.Moving() ? 1 : 0;
@@ -496,6 +543,7 @@ public:
                 SendEnemySnapshots();
                 SendVehicleState();
                 SendArmorState();
+                SendScoreboard();
             } else {
                 SendInput(local);
             }
@@ -540,6 +588,7 @@ public:
             remote.yaw = LerpAngle(previous->yaw, current->yaw, alpha);
             remote.pitch = Lerp(previous->pitch, current->pitch, alpha);
             remote.helicopter = slot.current.helicopter;
+            remote.vehicle = slot.current.vehicle;
             const auto& previousHelicopter = previous->helicopter;
             const auto& currentHelicopter = current->helicopter;
             if (remote.helicopter.visible && previousHelicopter.visible &&
@@ -613,6 +662,39 @@ public:
         terrainDeforms_.clear();
         SendLevelTo(kInvalidPeer); // everyone
     }
+
+    // Host-side: the squad restarts the level it is already on. Everyone is put
+    // back on their feet at full health -- the slots are the authority, so a
+    // local reset alone would be overwritten by the next status pull -- and
+    // clients are told to reload even though the level name has not changed.
+    void RestartHostLevel() {
+        if (role_ != Role::Host) return;
+        ++levelRestartSerial_;
+        terrainDeforms_.clear();
+        for (PlayerSlot& slot : players_) {
+            if (!slot.active) continue;
+            const bool wasDowned = slot.downed;
+            slot.downed = false;
+            slot.health = kMaxPlayerHealth;
+            slot.reviver = kInvalidPlayerId;
+            slot.reviveProgress = 0.0f;
+            slot.downedTimer = 0.0f;
+            if (!wasDowned) continue;
+            PlayerStateChange change;
+            change.id = slot.id;
+            change.event = PlayerStateEvent::Revived;
+            change.instigator = kInvalidPlayerId;
+            change.health = kMaxPlayerHealth;
+            PublishStateChange(change);
+        }
+        SendLevelTo(kInvalidPeer);
+    }
+
+    // Client-side: the pending level is a restart of the current one. Cleared
+    // by the caller once the reload has actually started, so a request put
+    // back behind a load in progress stays a restart.
+    bool LevelRestartPending() const { return levelRestartPending_; }
+    void ClearLevelRestart() { levelRestartPending_ = false; }
 
     LevelKind HostLevelKind() const { return levelKind_; }
     const std::string& HostLevelFile() const { return levelFile_; }
@@ -933,6 +1015,62 @@ public:
         out.clear(); out.swap(requestedTerrainDeforms_);
     }
 
+    // ---- Explosive barrels ------------------------------------------------
+    //
+    // Host-owned, like the ground. A client asks; the host decides and
+    // broadcasts; every client plays the broadcast. See BarrelEventMessage.
+    void ReportBarrelEvent(uint16_t barrel, BarrelEvent barrelEvent,
+                           float x, float y, float z) {
+        if (role_ != Role::Client || !transport_ ||
+            serverPeer_ == kInvalidPeer || !Finite3(x, y, z)) return;
+        BarrelEventMessage message;
+        message.header.type = MessageType::ClientBarrelEvent;
+        message.barrel = barrel;
+        message.event = barrelEvent;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    void PublishBarrelEvent(uint16_t barrel, BarrelEvent barrelEvent,
+                            float x, float y, float z) {
+        if (role_ != Role::Host || !transport_ || !Finite3(x, y, z)) return;
+        BarrelEventMessage message;
+        message.header.type = MessageType::ServerBarrelEvent;
+        message.barrel = barrel;
+        message.event = barrelEvent;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+    }
+
+    // Host-side: what clients asked for. Client-side: what the host decided.
+    void DrainRequestedBarrelEvents(std::vector<BarrelEventRecord>& out) {
+        out.clear(); out.swap(requestedBarrelEvents_);
+    }
+    void DrainBarrelEvents(std::vector<BarrelEventRecord>& out) {
+        out.clear(); out.swap(barrelEvents_);
+    }
+
+    // Client-side: a rocket of this machine's went off. The host applies it to
+    // its soldiers; nothing here touches anything locally.
+    void ReportBlast(float x, float y, float z, float radius, float damage,
+                     float push, float ragdollImpulse) {
+        if (role_ != Role::Client || !transport_ ||
+            serverPeer_ == kInvalidPeer || !Finite3(x, y, z)) return;
+        ClientBlastMessage message;
+        message.x = x; message.y = y; message.z = z;
+        message.radius = radius;
+        message.damage = damage;
+        message.push = push;
+        message.ragdollImpulse = ragdollImpulse;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    void DrainRequestedBlasts(std::vector<BlastRecord>& out) {
+        out.clear(); out.swap(requestedBlasts_);
+    }
+
     // ---- PvP ----------------------------------------------------------
     //
     // Hits are shooter-authoritative: whoever fired ran the geometry test
@@ -997,6 +1135,8 @@ public:
         slot.downedTimer = 0.0f;
         slot.reviver = kInvalidPlayerId;
         slot.reviveProgress = 0.0f;
+        slot.deaths++;
+        slot.scoreboardDirty = true;
         PlayerStateChange change;
         change.id = target;
         change.event = PlayerStateEvent::Downed;
@@ -1101,6 +1241,94 @@ public:
     void DrainChat(std::vector<ChatLine>& out) {
         out.clear();
         out.swap(chatLines_);
+    }
+
+    // Current standings, read every frame the scoreboard is open. Not drained:
+    // the host sends only on change, so a drained copy would be gone the frame
+    // after it arrived. The host builds it from its own slots.
+    void GetScoreboard(std::vector<ScoreboardEntry>& out) const {
+        out.clear();
+        if (role_ != Role::Host) {
+            out = scoreboard_;
+            return;
+        }
+        for (const PlayerSlot& slot : players_) {
+            if (!slot.active) continue;
+            ScoreboardEntry entry;
+            entry.id = slot.id;
+            entry.kills = slot.kills;
+            entry.deaths = slot.deaths;
+            entry.revives = slot.revives;
+            out.push_back(entry);
+        }
+    }
+
+    void SendMedicCall() {
+        if (!Active() || localId_ == kInvalidPlayerId) return;
+
+        if (role_ == Role::Host) {
+            ServerMedicCallMessage message;
+            message.callerId = localId_;
+            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+            // Host queues its own call directly.
+            medicCalls_.push_back(localId_);
+            return;
+        }
+        if (serverPeer_ == kInvalidPeer) return;
+        ClientMedicCallMessage message;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    void DrainMedicCalls(std::vector<PlayerId>& out) {
+        out.clear();
+        out.swap(medicCalls_);
+    }
+
+    // Client-side: this player's transport set down with `count` marines
+    // aboard. The host lands them; a client cannot run their AI.
+    void SendMarineDrop(uint8_t count, float x, float y, float z) {
+        if (role_ != Role::Client || !transport_ ||
+            serverPeer_ == kInvalidPeer || count == 0 || !Finite3(x, y, z))
+            return;
+        ClientMarineDropMessage message;
+        message.count = count;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Send(serverPeer_, &message, sizeof(message),
+                         Channel::Reliable);
+    }
+
+    // Host-side: the client squads to land this frame, moved out so each is
+    // landed exactly once.
+    void DrainMarineDrops(std::vector<MarineDropRequest>& out) {
+        out.clear();
+        out.swap(marineDrops_);
+    }
+
+    // Host-only: track kills, deaths, and revives for scoreboard. Called when
+    // stats change; marked dirty and broadcast on next SendScoreboard.
+    void IncrementPlayerKill(PlayerId player) {
+        if (role_ != Role::Host || player >= kMaxPlayers) return;
+        PlayerSlot& slot = players_[player];
+        if (!slot.active) return;
+        slot.kills++;
+        slot.scoreboardDirty = true;
+    }
+
+    void IncrementPlayerDeath(PlayerId player) {
+        if (role_ != Role::Host || player >= kMaxPlayers) return;
+        PlayerSlot& slot = players_[player];
+        if (!slot.active) return;
+        slot.deaths++;
+        slot.scoreboardDirty = true;
+    }
+
+    void IncrementPlayerRevive(PlayerId player) {
+        if (role_ != Role::Host || player >= kMaxPlayers) return;
+        PlayerSlot& slot = players_[player];
+        if (!slot.active) return;
+        slot.revives++;
+        slot.scoreboardDirty = true;
     }
 
     // Any player's life state, not just the local one. Used by the HUD to show
@@ -1246,7 +1474,9 @@ public:
     // on the net tick, like the gunships. Counts past the wire caps are cut.
     void PublishArmor(const EnemyTankSnapshot* tanks, size_t tankCount,
                       const AATurretSnapshot* turrets, size_t turretCount,
-                      const EnemyHumveeSnapshot* humvees, size_t humveeCount) {
+                      const EnemyHumveeSnapshot* humvees, size_t humveeCount,
+                      const ObjectivePlaneSnapshot* planes = nullptr,
+                      size_t planeCount = 0) {
         if (role_ != Role::Host) return;
         hostArmor_ = ServerArmorStateMessage{};
         hostArmor_.tankCount = static_cast<uint8_t>(
@@ -1263,6 +1493,11 @@ public:
             hostArmor_.turrets[i] = turrets[i];
         for (uint8_t i = 0; i < hostArmor_.humveeCount; ++i)
             hostArmor_.humvees[i] = humvees[i];
+        hostArmor_.planeCount = static_cast<uint8_t>(
+            planeCount < kMaxReplicatedPlanes ? planeCount
+                                              : kMaxReplicatedPlanes);
+        for (uint8_t i = 0; i < hostArmor_.planeCount; ++i)
+            hostArmor_.planes[i] = planes[i];
         hasHostArmor_ = true;
     }
 
@@ -1279,20 +1514,47 @@ public:
     void PublishEnemyFire(EnemyFireKind kind, float x, float y, float z,
                           float dirX, float dirY, float dirZ,
                           float speed = 0.0f, float lifetime = 0.0f,
-                          float damageScale = 1.0f) {
+                          float damageScale = 1.0f,
+                          InfantryWeapon weapon = InfantryWeapon::Rifle) {
         if (role_ != Role::Host || !transport_ || !Finite3(x, y, z) ||
             !Finite3(dirX, dirY, dirZ) || !std::isfinite(speed) ||
             !std::isfinite(lifetime) || !std::isfinite(damageScale)) return;
         ServerEnemyFireMessage message;
         message.kind = kind;
+        message.weapon = weapon;
         message.x = x; message.y = y; message.z = z;
         message.dirX = dirX; message.dirY = dirY; message.dirZ = dirZ;
         message.speed = speed;
         message.lifetime = lifetime;
         message.damageScale = damageScale;
+        // A sniper round is rare and nearly lethal, like a tank shell; rifle
+        // and shotgun fire is a stream where a resent round arrives late.
+        const bool reliable = kind == EnemyFireKind::TankShell ||
+            (kind == EnemyFireKind::InfantryShot &&
+             weapon == InfantryWeapon::Sniper);
         transport_->Broadcast(&message, sizeof(message),
-                              kind == EnemyFireKind::TankShell
-                                  ? Channel::Reliable : Channel::Unreliable);
+                              reliable ? Channel::Reliable : Channel::Unreliable);
+    }
+
+    // Host-side: DEPLOY SQUAD. Reliable -- a lost order leaves a player on the
+    // planning map while the rest of the squad flies off without them.
+    void PublishSquadDeploy(uint8_t insertionMode, uint8_t airframe,
+                            bool hostLeftSeat, float x, float y, float z) {
+        if (role_ != Role::Host || !transport_ || !Finite3(x, y, z)) return;
+        ServerSquadDeployMessage message;
+        message.insertionMode = insertionMode;
+        message.airframe = airframe;
+        message.hostLeftSeat = hostLeftSeat ? 1 : 0;
+        message.x = x; message.y = y; message.z = z;
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+    }
+
+    // Client-side: the squad order, once. False when none is waiting.
+    bool TakeSquadDeploy(SquadDeployOrder& out) {
+        if (!squadDeployPending_) return false;
+        squadDeployPending_ = false;
+        out = squadDeploy_;
+        return true;
     }
 
     // Client-side: the host's rounds to spawn this frame, moved out so each is
@@ -1359,6 +1621,18 @@ private:
     }
     static bool Finite3(float x, float y, float z) {
         return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+    }
+    // The pose goes straight into a physics body on the host, so a NaN or a
+    // zero quaternion here would not fail loudly -- it would fling the chassis.
+    static bool ValidDrivenVehicle(const DrivenVehicleState& v) {
+        if (v.kind == DrivenVehicleKind::None) return true;
+        if (v.kind != DrivenVehicleKind::Humvee || v.index >= kMaxReplicatedHumvees)
+            return false;
+        if (!Finite3(v.x, v.y, v.z) || !Finite3(v.qx, v.qy, v.qz) ||
+            !std::isfinite(v.qw) || !std::isfinite(v.turretYaw)) return false;
+        const float lengthSq = v.qx * v.qx + v.qy * v.qy + v.qz * v.qz +
+                               v.qw * v.qw;
+        return lengthSq > 0.25f && lengthSq < 4.0f;
     }
     static bool ValidGrenade(GrenadeKind kind) {
         return kind == GrenadeKind::Frag || kind == GrenadeKind::Molotov ||
@@ -1437,6 +1711,11 @@ private:
         // Throttles the "revive denied" diagnostic to roughly one line a second
         // so a 30 Hz rejection does not bury the log it is meant to explain.
         float diagnosticTimer = 0.0f;
+        // Scoreboard stats. Host-only and replicated on change.
+        uint32_t kills = 0;
+        uint32_t deaths = 0;  // times downed
+        uint32_t revives = 0;
+        bool scoreboardDirty = false;  // triggers broadcast on next SendScoreboard
     };
 
     static float Clamp01(float value) {
@@ -1594,6 +1873,10 @@ private:
             slot.downedTimer = 0.0f;
             const PlayerId reviver = slot.reviver;
             slot.reviver = kInvalidPlayerId;
+            if (reviver < kMaxPlayers && players_[reviver].active) {
+                players_[reviver].revives++;
+                players_[reviver].scoreboardDirty = true;
+            }
             PlayerStateChange change;
             change.id = target;
             change.event = PlayerStateEvent::Revived;
@@ -1682,6 +1965,9 @@ private:
         case MessageType::ServerEnemyFire:
             if (role_ == Role::Client) HandleEnemyFire(event);
             break;
+        case MessageType::ServerSquadDeploy:
+            if (role_ == Role::Client) HandleSquadDeploy(event);
+            break;
         case MessageType::ClientChargeStuck:
             if (role_ == Role::Host) HandleClientChargeStuck(event);
             break;
@@ -1736,9 +2022,73 @@ private:
         case MessageType::ClientGrenadeDetonation:
             if (role_ == Role::Host) HandleGrenadeDetonationReport(event);
             break;
+        case MessageType::ClientBarrelEvent:
+            if (role_ == Role::Host) HandleBarrelEvent(event, /*fromServer=*/false);
+            break;
+        case MessageType::ServerBarrelEvent:
+            if (role_ == Role::Client) HandleBarrelEvent(event, /*fromServer=*/true);
+            break;
+        case MessageType::ClientBlast:
+            if (role_ == Role::Host) HandleClientBlast(event);
+            break;
+        case MessageType::ClientMedicCall:
+            if (role_ == Role::Host) HandleClientMedicCall(event);
+            break;
+        case MessageType::ServerMedicCall:
+            if (role_ == Role::Client) HandleServerMedicCall(event);
+            break;
+        case MessageType::ClientMarineDrop:
+            if (role_ == Role::Host) HandleClientMarineDrop(event);
+            break;
+        case MessageType::ServerScoreboard:
+            if (role_ == Role::Client) HandleServerScoreboard(event);
+            break;
         default:
             break;
         }
+    }
+
+    void HandleBarrelEvent(Event& event, bool fromServer) {
+        if (event.payload.size() < sizeof(BarrelEventMessage)) return;
+        if (fromServer) {
+            if (event.peer != serverPeer_) return;
+        } else if (peerToPlayer_.find(event.peer) == peerToPlayer_.end()) {
+            return;
+        }
+        BarrelEventMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.event != BarrelEvent::Ignite &&
+            message.event != BarrelEvent::Detonate) return;
+        if (!Finite3(message.x, message.y, message.z)) return;
+        // Bounded like the enemy-fire queue: a machine sitting on a loading
+        // screen is not draining, and a chain of a whole yard is a few dozen.
+        std::vector<BarrelEventRecord>& queue =
+            fromServer ? barrelEvents_ : requestedBarrelEvents_;
+        if (queue.size() >= 256) return;
+        queue.push_back({ message.barrel, message.event,
+                          message.x, message.y, message.z });
+    }
+
+    void HandleClientBlast(Event& event) {
+        if (event.payload.size() < sizeof(ClientBlastMessage)) return;
+        if (peerToPlayer_.find(event.peer) == peerToPlayer_.end()) return;
+        ClientBlastMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (!Finite3(message.x, message.y, message.z) ||
+            !Finite3(message.radius, message.damage, message.push) ||
+            !std::isfinite(message.ragdollImpulse)) return;
+        // Clamped rather than trusted, for the same reason player damage is:
+        // so a bug cannot wipe the map, not to stop a cheater. The ceilings sit
+        // well above a missile-scaled rocket.
+        BlastRecord blast;
+        blast.x = message.x; blast.y = message.y; blast.z = message.z;
+        blast.radius = (std::max)(0.0f, (std::min)(message.radius, 40.0f));
+        blast.damage = (std::max)(0.0f, (std::min)(message.damage, 2000.0f));
+        blast.push = (std::max)(0.0f, (std::min)(message.push, 60.0f));
+        blast.ragdollImpulse =
+            (std::max)(0.0f, (std::min)(message.ragdollImpulse, 400.0f));
+        if (blast.radius <= 0.0f || requestedBlasts_.size() >= 64) return;
+        requestedBlasts_.push_back(blast);
     }
 
     void HandleHitReport(Event& event) {
@@ -1864,6 +2214,7 @@ private:
         if (role_ != Role::Host || !transport_) return;
         ServerLevelMessage message;
         message.kind = levelKind_;
+        message.restartSerial = levelRestartSerial_;
         // Bounded copy into a fixed field: the name came from a filesystem path
         // and nothing upstream promises it is short.
         const size_t length =
@@ -1900,7 +2251,12 @@ private:
                 "ignoring level '" + file + "': not a bare file name");
             return;
         }
-        if (message.kind == levelKind_ && file == levelFile_) return;
+        const bool sameLevel = message.kind == levelKind_ && file == levelFile_;
+        if (sameLevel && message.restartSerial == levelRestartSerial_) return;
+        // Only a restart when this machine already knew the level: a joining
+        // player's first message carries whatever serial the host is on.
+        if (sameLevel) levelRestartPending_ = true;
+        levelRestartSerial_ = message.restartSerial;
         levelKind_ = message.kind;
         levelFile_ = file;
         hasPendingLevel_ = true;
@@ -1948,6 +2304,8 @@ private:
         slot.lastInput = message.input;
         slot.current.helicopter = ValidInsertionHelicopter(message.helicopter)
             ? message.helicopter : InsertionHelicopterState{};
+        slot.current.vehicle = ValidDrivenVehicle(message.vehicle)
+            ? message.vehicle : DrivenVehicleState{};
         slot.hasInput = true;
         slot.current.yaw = message.input.yaw;
         slot.current.pitch = message.input.pitch;
@@ -1993,6 +2351,8 @@ private:
             slot.current = incoming;
             if (!ValidInsertionHelicopter(slot.current.helicopter))
                 slot.current.helicopter = {};
+            if (!ValidDrivenVehicle(slot.current.vehicle))
+                slot.current.vehicle = {};
             slot.currentTime = interpolationTime_;
             // Visibility/airframe changes mark a new insertion, not a path
             // through the old flight. Equal-time packets replace the newest
@@ -2187,6 +2547,58 @@ private:
         QueueChat(message.speaker, message.text);
     }
 
+    void HandleClientMedicCall(Event& event) {
+        if (event.payload.size() < sizeof(ClientMedicCallMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        PlayerId callerId = it->second;
+
+        ServerMedicCallMessage out;
+        out.callerId = callerId;
+        transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+        // Host queues its own call directly.
+        medicCalls_.push_back(callerId);
+    }
+
+    void HandleClientMarineDrop(Event& event) {
+        if (event.payload.size() < sizeof(ClientMarineDropMessage)) return;
+        const auto it = peerToPlayer_.find(event.peer);
+        if (it == peerToPlayer_.end()) return;
+        ClientMarineDropMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.count == 0 || !Finite3(message.x, message.y, message.z))
+            return;
+        MarineDropRequest request;
+        request.requester = it->second;
+        request.count = message.count;
+        request.x = message.x; request.y = message.y; request.z = message.z;
+        marineDrops_.push_back(request);
+    }
+
+    void HandleServerMedicCall(Event& event) {
+        if (event.payload.size() < sizeof(ServerMedicCallMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerMedicCallMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.callerId >= kMaxPlayers) return;
+        medicCalls_.push_back(message.callerId);
+    }
+
+    void HandleServerScoreboard(Event& event) {
+        if (event.payload.size() < sizeof(ServerScoreboardMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerScoreboardMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        const uint8_t count = message.playerCount < kMaxPlayers
+            ? message.playerCount : kMaxPlayers;
+        scoreboard_.clear();
+        scoreboard_.reserve(count);
+        for (uint8_t i = 0; i < count; ++i) {
+            if (message.entries[i].id >= kMaxPlayers) continue;
+            scoreboard_.push_back(message.entries[i]);
+        }
+    }
+
     void HandleServerChargeDetonate(Event& event) {
         if (event.payload.size() < sizeof(ServerChargeDetonateMessage)) return;
         if (event.peer != serverPeer_) return;
@@ -2276,7 +2688,8 @@ private:
             static_cast<int32_t>(message.tick - remoteArmorTick_) <= 0) return;
         if (message.tankCount > kMaxReplicatedTanks ||
             message.turretCount > kMaxReplicatedAATurrets ||
-            message.humveeCount > kMaxReplicatedHumvees) return;
+            message.humveeCount > kMaxReplicatedHumvees ||
+            message.planeCount > kMaxReplicatedPlanes) return;
         // Unreliable, so a corrupt packet must not hand the pose code a NaN.
         for (uint8_t i = 0; i < message.tankCount; ++i) {
             const EnemyTankSnapshot& tank = message.tanks[i];
@@ -2296,9 +2709,33 @@ private:
                 !Finite3(humvee.qx, humvee.qy, humvee.qz) ||
                 !Finite3(humvee.qw, humvee.turretYaw, 0.0f)) return;
         }
+        for (uint8_t i = 0; i < message.planeCount; ++i) {
+            const ObjectivePlaneSnapshot& plane = message.planes[i];
+            if (!Finite3(plane.holdTimer, plane.takeoffTimer, 0.0f) ||
+                !Finite3(plane.crashX, plane.crashY, plane.crashZ) ||
+                !Finite3(plane.crashVX, plane.crashVY, plane.crashVZ) ||
+                !Finite3(plane.crashPitch, plane.crashRoll, plane.crashYaw))
+                return;
+        }
         remoteArmor_ = message;
         remoteArmorTick_ = message.tick;
         hasRemoteArmor_ = true;
+    }
+
+    void HandleSquadDeploy(Event& event) {
+        if (event.payload.size() < sizeof(ServerSquadDeployMessage)) return;
+        if (event.peer != serverPeer_) return;
+        ServerSquadDeployMessage message{};
+        std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.insertionMode > 2 || message.airframe > 1 ||
+            !Finite3(message.x, message.y, message.z)) return;
+        squadDeploy_.insertionMode = message.insertionMode;
+        squadDeploy_.airframe = message.airframe;
+        squadDeploy_.hostLeftSeat = message.hostLeftSeat != 0;
+        squadDeploy_.x = message.x;
+        squadDeploy_.y = message.y;
+        squadDeploy_.z = message.z;
+        squadDeployPending_ = true;
     }
 
     void HandleEnemyFire(Event& event) {
@@ -2307,7 +2744,12 @@ private:
         ServerEnemyFireMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
         if (message.kind != EnemyFireKind::TankShell &&
-            message.kind != EnemyFireKind::AAShell) return;
+            message.kind != EnemyFireKind::AAShell &&
+            message.kind != EnemyFireKind::InfantryShot) return;
+        if (message.kind == EnemyFireKind::InfantryShot &&
+            message.weapon != InfantryWeapon::Rifle &&
+            message.weapon != InfantryWeapon::Shotgun &&
+            message.weapon != InfantryWeapon::Sniper) return;
         if (!Finite3(message.x, message.y, message.z) ||
             !Finite3(message.dirX, message.dirY, message.dirZ) ||
             !std::isfinite(message.speed) ||
@@ -2318,6 +2760,7 @@ private:
         if (enemyFire_.size() >= 256) return;
         RemoteEnemyFire fire;
         fire.kind = message.kind;
+        fire.weapon = message.weapon;
         fire.x = message.x; fire.y = message.y; fire.z = message.z;
         fire.dirX = message.dirX; fire.dirY = message.dirY;
         fire.dirZ = message.dirZ;
@@ -2373,10 +2816,35 @@ private:
                 out.moving = source.moving ? 1 : 0;
                 out.dead = source.dead ? 1 : 0;
                 out.killer = source.killer;
+                out.marine = source.marine ? 1 : 0;
             }
             transport_->Send(peer, &message, sizeof(message),
                              Channel::Unreliable);
         }
+    }
+
+    void SendScoreboard() {
+        if (role_ != Role::Host || !transport_) return;
+        bool anyDirty = false;
+        for (uint8_t i = 0; i < kMaxPlayers; ++i) {
+            if (players_[i].scoreboardDirty) {
+                anyDirty = true;
+                players_[i].scoreboardDirty = false;
+            }
+        }
+        if (!anyDirty) return;
+        ServerScoreboardMessage message;
+        message.playerCount = 0;
+        for (uint8_t i = 0; i < kMaxPlayers; ++i) {
+            const PlayerSlot& slot = players_[i];
+            if (!slot.active) continue;
+            message.entries[message.playerCount].id = slot.id;
+            message.entries[message.playerCount].kills = slot.kills;
+            message.entries[message.playerCount].deaths = slot.deaths;
+            message.entries[message.playerCount].revives = slot.revives;
+            message.playerCount++;
+        }
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
     }
 
     void HandleEnemySnapshot(Event& event) {
@@ -2407,6 +2875,7 @@ private:
             enemy.moving = incoming.moving != 0;
             enemy.dead = incoming.dead != 0;
             enemy.killer = incoming.killer;
+            enemy.marine = incoming.marine != 0;
             remoteEnemies_.push_back(enemy);
         }
     }
@@ -2635,6 +3104,7 @@ private:
         message.y = local.y;
         message.z = local.z;
         message.helicopter = local.helicopter;
+        message.vehicle = local.vehicle;
         message.input.sequence = ++inputSequence_;
         transport_->Send(serverPeer_, &message, sizeof(message),
                          Channel::Unreliable);
@@ -2647,6 +3117,9 @@ private:
             players_[i].id = i;
             players_[i].active = true;
             players_[i].peer = peer;
+            // A scoreboard only goes out on change; flag one so the newcomer
+            // gets the standings now and everyone else gets the new row.
+            players_[i].scoreboardDirty = true;
             peerToPlayer_[peer] = i;
             return i;
         }
@@ -2683,6 +3156,11 @@ private:
     // Life-state edges waiting to be drained by the game this frame.
     std::vector<PlayerStateChange> stateChanges_;
     std::vector<ChatLine> chatLines_;
+    // Medic callouts from teammates, waiting to be drained.
+    std::vector<PlayerId> medicCalls_;
+    std::vector<MarineDropRequest> marineDrops_;
+    // Scoreboard entries, the host publishes when stats change.
+    std::vector<ScoreboardEntry> scoreboard_;
     // The host's god mode toggle. Written by the host from its own local state
     // every Update, and by a client from each snapshot.
     bool sessionGodMode_ = false;
@@ -2712,6 +3190,8 @@ private:
     bool hasHostArmor_ = false;
     bool hasRemoteArmor_ = false;
     std::vector<RemoteEnemyFire> enemyFire_;
+    SquadDeployOrder squadDeploy_;
+    bool squadDeployPending_ = false;
     std::vector<EnemyHitRequest> enemyHits_;
     std::vector<WorldImpactRequest> worldImpacts_;
     std::vector<WorldBreakEvent> worldBreaks_;
@@ -2741,6 +3221,9 @@ private:
     // Host only: cuts clients have asked for, waiting to be applied and then
     // published back out as the host's own.
     std::vector<TerrainDeform> requestedTerrainDeforms_;
+    std::vector<BarrelEventRecord> barrelEvents_;
+    std::vector<BarrelEventRecord> requestedBarrelEvents_;
+    std::vector<BlastRecord> requestedBlasts_;
     uint32_t nextGrenadeId_ = 1;
     uint32_t nextImpactId_ = 1;
     uint32_t nextDeformId_ = 1;
@@ -2750,6 +3233,8 @@ private:
     LevelKind levelKind_ = LevelKind::None;
     std::string levelFile_;
     bool hasPendingLevel_ = false;
+    bool levelRestartPending_ = false;
+    uint8_t levelRestartSerial_ = 0;
     std::string serverAddress_;
     uint16_t port_ = 0;
     // Whether this session is riding Steam's relay rather than a UDP port.

@@ -658,7 +658,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     gameTimer.Start();
     float lastTime = 0.0f;
 
-    std::cout << "Controls: WASD, Mouse, TAB=UI, F11=Fullscreen, ESC=Exit\n";
+    std::cout << "Controls: WASD, Mouse, F3=UI, TAB=Scoreboard, F11=Fullscreen, ESC=Exit\n";
 
     const std::filesystem::path startupLevel = StartupLevelPath(commandLine);
     if (!startupLevel.empty()) StartCustomLevel(hwnd, startupLevel);
@@ -1032,6 +1032,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // told to load is almost always sitting in the menu when it hears it.
         PublishHostLevel();
         FollowHostLevel(hwnd);
+        AutoStartHostLevel(hwnd);
 
         if (g_game.commands.Consume(GameCommand::EditorStopPlay)) {
             StopEditorPlaytest();
@@ -1115,6 +1116,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // roster changes while a player sits in the menu, and the notices have
         // to clear themselves when the session ends from any screen.
         UpdateNetPlayerNotices(deltaTime);
+        UpdateMedicCallouts(deltaTime);
+        // Squad wipe timer: incremented every frame so the screen appears after
+        // ~2 seconds if all players are downed. Resets if any player revives.
+        if (AreAllPlayersDowned()) {
+            squadWipeScreenAge += deltaTime;
+        } else {
+            squadWipeScreenAge = 0.0f;
+            squadWipeCursorReleased = false;
+        }
         // Same placement and reason: chat lines arrive and the log has to clear
         // itself when a session ends, whatever screen the player is on.
         UpdateChat(deltaTime);
@@ -1143,13 +1153,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // presentation -- keeps the real delta on purpose: none of it is world
         // state, and freezing it would stall the menus and the network too.
 
-        // Dying or going down while paused clears it. The pause screen is not
-        // drawn in either state, so leaving the flag set would freeze the
-        // world behind a death screen with nothing on screen able to unfreeze
-        // it -- the player's only way out would be to quit.
-        if (g_gamePaused &&
-            (scene.player.downed ||
-             (!scene.player.godMode && scene.player.health <= 0.0f))) {
+        // Dying while paused clears it. The pause screen is not drawn over the
+        // death screen, so leaving the flag set would freeze the world behind
+        // it with nothing on screen able to unfreeze it. Downed keeps the
+        // pause: that screen is drawn then, and a session never freezes.
+        if (g_gamePaused && !scene.player.downed &&
+            !scene.player.godMode && scene.player.health <= 0.0f) {
             g_gamePaused = false;
             g_showPauseSettings = false;
         }
@@ -1243,7 +1252,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // player dry regardless of where they are, so the surface is parked
         // out of reach in those cases rather than special-cased in the camera.
         if (!g_emptyLevelMode && !ridingBlackHawk && !deploymentPlanning &&
-            !g_game.vehicles.insertionBoatCarryingPlayer && !g_drivingHumvee) {
+            !g_game.vehicles.insertionBoatCarryingPlayer && !PlayerInVehicle()) {
             scene.camera.WaterSurfaceY =
                 g_ocean.GetSurfaceY() +
                 g_ocean.WaveHeightAt(scene.camera.Position.x,
@@ -1381,7 +1390,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // player taking a step. The tracker measures raw camera displacement;
         // left enabled, either motion reads as a sprint in the viewmodel.
         const bool nonLocomotionCameraMotion = g_insertionChoicePending ||
-            g_drivingHumvee || g_game.vehicles.blackHawkCarryingPlayer;
+            PlayerInVehicle() || g_game.vehicles.blackHawkCarryingPlayer;
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime,
             !nonLocomotionCameraMotion);
@@ -1748,7 +1757,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const bool insertionVehicleOccupied =
                 OccupiedInsertionVehicleTarget(insertionVehicleTarget);
             for (const auto& b : g_bandits) {
-                if (!b || b->Dead()) continue;
+                if (!b || b->Dead() || HiddenFromEnemies(*b)) continue;
                 // Torso, not feet. position.y is the ground the actor stands
                 // on, and the LOS raycast starts at the shooter's chest -- a
                 // ray from chest height down to ground level dives into the
@@ -1780,7 +1789,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (bandit->ConsumeBurnSpreadEvent())
                         scene.SpawnCarriedFire(bandit->position);
                 }
-                if (bandit->Dead()) continue;
+                if (bandit->Dead()) {
+                    // Drop the gun, carrying ammo, on death. The seed (from enemy
+                    // ID in multiplayer) varies the toss per enemy.
+                    if (!bandit->ammoPickupSpawned) {
+                        uint32_t seed = 0;
+                        if (bandit->netEnemyId != 0xFFFF) {
+                            // Multiplayer: use stable network ID.
+                            seed = bandit->netEnemyId * 2654435761u;
+                        } else {
+                            // Single-player: use pointer address hash.
+                            seed = static_cast<uint32_t>(
+                                reinterpret_cast<uintptr_t>(bandit.get())) * 2654435761u;
+                        }
+                        SpawnDroppedEnemyGun(*bandit, seed);
+                        bandit->ammoPickupSpawned = true;
+                    }
+                    continue;
+                }
                 // Pushed before the held/turret early-outs below so every live
                 // actor picks up live slider edits, not just the ones that
                 // reach the general movement path.
@@ -1822,12 +1848,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // toward the player, which both aims the marine at the wrong
                 // thing and keeps its vision cone off the bandit, so a leashed
                 // marine could never hold an aim long enough to fire.
+                //
+                // A client's marines follow that client's body, not the host.
+                // Its owner gone (left, or the level reset its body) and they
+                // fall back to the host rather than standing where they landed.
                 if (bandit->faction == Faction::Marine) {
                     if (bandit->Awareness() ==
-                        SkinnedEnemy::AwarenessState::Combat)
+                        SkinnedEnemy::AwarenessState::Combat) {
                         bandit->leashPosition.reset();
-                    else
-                        bandit->leashPosition = scene.camera.Position;
+                    } else {
+                        const SkinnedEnemy* owner =
+                            bandit->leashOwner != net::kInvalidPlayerId
+                                ? FindNetworkPlayerBody(bandit->leashOwner)
+                                : nullptr;
+                        bandit->leashPosition = owner
+                            ? owner->position : scene.camera.Position;
+                    }
                 }
                 // Shooting at the insertion craft needs the same perception a
                 // shot at anything else does: close enough to make it out, and
@@ -2311,99 +2347,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
-                    // Presentation for a shot fired somewhere out in the world.
-                    // Enemy fire had none of this: the only sign a bandit was
-                    // shooting was the report and whatever the round hit, so a
-                    // firefight gave the player no way to see where it was
-                    // coming from. The shotgun's flash is bigger and the
-                    // sniper's leaner, matching what each gun sounds like.
-                    //
-                    // Flash and tracer only -- no dynamic light, so a night
-                    // firefight does not light the level up, and no explosion
-                    // FX, which would shake the camera and fire the explosion
-                    // audio on every round.
-                    const float flashScale = bandit->IsShotgunner() ? 1.7f
-                                           : bandit->IsSniper()     ? 1.3f
-                                                                    : 1.0f;
-                    // AimRayOrigin is where the round and the LOS test start,
-                    // which is not necessarily where the barrel ends on a given
-                    // rig. Nudge the flash and its smoke onto the aim basis so
-                    // the sliders can seat them on the weapon without moving
-                    // the shot itself. Right is built against world up; a shot
-                    // straight up or down would degenerate it, so fall back to
-                    // world +X rather than normalising a zero vector.
-                    XMFLOAT3 flashOrigin = shotOrigin;
-                    {
-                        const XMVECTOR forward = XMVector3Normalize(
-                            XMLoadFloat3(&shotDirection));
-                        const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-                        XMVECTOR right = XMVector3Cross(worldUp, forward);
-                        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
-                            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
-                        right = XMVector3Normalize(right);
-                        const XMVECTOR up =
-                            XMVector3Normalize(XMVector3Cross(forward, right));
-                        const XMVECTOR offset =
-                            forward * g_enemyFlashOffsetForward +
-                            right   * g_enemyFlashOffsetRight +
-                            up      * g_enemyFlashOffsetUp;
-                        XMStoreFloat3(&flashOrigin,
-                                      XMLoadFloat3(&shotOrigin) + offset);
-                    }
-                    scene.SpawnWorldMuzzleFlash(flashOrigin, shotDirection,
-                                                flashScale);
-                    scene.SpawnWeaponSmoke(flashOrigin, shotDirection,
-                                           0.55f * flashScale);
-                    // The streak that says "someone is shooting, and that way".
-                    // Same visual-speed tracer the networked players use, which
-                    // is drawn far slower than the round actually travels so
-                    // the eye can follow it out. Red for a bandit, orange for
-                    // an ally marine -- the squad shares this code path, and
-                    // friendly fire streaking past must not read as incoming.
-                    // Stopped at the first thing its line hits, so a shot from
-                    // behind a ridge or inside a hangar does not streak out
-                    // through the geometry and advertise a firing position on
-                    // the wrong side of the cover.
-                    scene.SpawnRemoteTracer(
-                        shotOrigin, shotDirection,
-                        bandit->faction == Faction::Bandit,
-                        ResolveRemoteTracerRange(shotOrigin, shotDirection));
-                    if (bandit->IsShotgunner()) {
-                        // Cone of individually weak pellets. Overlapping hits at
-                        // point-blank are what make it lethal; at range the cone
-                        // is wide enough that most pellets miss entirely.
-                        const XMVECTOR forward =
-                            XMVector3Normalize(XMLoadFloat3(&shotDirection));
-                        XMVECTOR up = std::fabs(XMVectorGetY(forward)) > 0.95f
-                            ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
-                            : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-                        const XMVECTOR right =
-                            XMVector3Normalize(XMVector3Cross(up, forward));
-                        up = XMVector3Cross(forward, right);
-                        for (int pellet = 0; pellet < kBanditShotgunPellets; ++pellet) {
-                            const float spreadRight =
-                                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
-                            const float spreadUp =
-                                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
-                            XMFLOAT3 pelletDirection;
-                            XMStoreFloat3(&pelletDirection, XMVector3Normalize(
-                                forward + right * spreadRight + up * spreadUp));
-                            scene.SpawnHostileProjectile(
-                                shotOrigin, pelletDirection, 1.6f);
-                        }
-                    } else if (bandit->IsSniper()) {
-                        // One heavy, fast round. Damage is high because the five
-                        // second laser gave the player every chance to not be
-                        // standing there.
-                        scene.SpawnHostileProjectile(
-                            shotOrigin, shotDirection, 18.0f, 2.2f);
-                    } else if (bandit->faction == Faction::Bandit) {
-                        scene.SpawnHostileProjectile(shotOrigin, shotDirection);
-                    } else {
-                        // Marine rifle shot: behaves like a player shot for
-                        // hit-testing -- damages bandits only, never the player.
-                        scene.SpawnPlayerProjectile(shotOrigin, shotDirection);
-                    }
+                    const net::InfantryWeapon weapon =
+                        bandit->IsShotgunner() ? net::InfantryWeapon::Shotgun
+                        : bandit->IsSniper()   ? net::InfantryWeapon::Sniper
+                                               : net::InfantryWeapon::Rifle;
+                    FireInfantryShot(shotOrigin, shotDirection, weapon,
+                                     bandit->faction == Faction::Bandit,
+                                     /*hostReplica=*/false);
                     // Any actor's gunfire is audible to the AI, not just the
                     // player's. Without this a marine could only ever notice a
                     // bandit inside its 160-degree vision cone -- and a
@@ -2412,17 +2362,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // when a firefight starts nearby.
                     g_enemyNoiseEvents.push_back(
                         { shotOrigin, SkinnedEnemy::GunshotHearingRadius() });
-                    // Positional: an enemy shooting from the left is heard on
-                    // the left. The distance falloff that used to be computed
-                    // here by hand now comes from the emitter's rolloff curve.
-                    //
-                    // Half volume: several enemies firing at once stacked into a
-                    // wall of sound that buried the player's own weapon and the
-                    // voice cues. Quieter enemy fire keeps a firefight legible.
-                    const float pitch =
-                        0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    g_gunAudio.PlayAt(shotOrigin.x, shotOrigin.y, shotOrigin.z,
-                                      0.29f, pitch, 70.0f);
                 }
             }
             // After every actor has moved, so a pair is separated once from
@@ -2566,6 +2505,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Before the frame's physics and draws so a client stands on the same
         // ground the host does this frame, rather than a frame behind it.
         ApplyNetworkTerrainDeforms();
+        ApplyNetworkBarrelsAndBlasts();
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this
@@ -2573,6 +2513,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             SyncGrenadePhysicsBodies(false);
             {
                 ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
+                SyncPrefabMeshPhysics();
                 g_game.physicsClock.Accumulate(deltaTime);
                 float physicsStep = 0.0f;
                 // physicsClock hands out up to 4 steps after a long frame, and
@@ -2615,7 +2556,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 UpdateHumveeImpacts(deltaTime);
                 UpdateHumveeChaseCamera(deltaTime);
                 UpdateHumveeTurretAim(deltaTime);
+                UpdatePlayerTank(deltaTime);
                 UpdateWeaponPickups(deltaTime);
+                UpdateAmmoPickups(deltaTime);
+                CollectNearbyAmmoPickup();   // walk-over, no key
                 UpdateFootsteps(deltaTime);
                 // Ongoing bombardment, armed on the deploy board. Gated on a
                 // run actually being under way: the mission clock is what
@@ -2958,17 +2902,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (projectile.molotov) {
                             scene.SpawnMolotovFire(center);
                             if (!g_emptyLevelMode) {
-                                for (ExplosiveBarrel& barrel :
-                                     scene.explosiveBarrels) {
+                                for (size_t bi = 0;
+                                     bi < scene.explosiveBarrels.size(); ++bi) {
+                                    const ExplosiveBarrel& barrel =
+                                        scene.explosiveBarrels[bi];
                                     if (!barrel.active || barrel.burning) continue;
                                     const float dx = barrel.position.x - center.x;
                                     const float dy = barrel.position.y - center.y;
                                     const float dz = barrel.position.z - center.z;
                                     if (dx * dx + dy * dy + dz * dz > 2.4f * 2.4f)
                                         continue;
-                                    barrel.burning = true;
-                                    barrel.fuse = 3.0f;
-                                    barrel.fireFxCooldown = 0.0f;
+                                    IgniteBarrel(bi);
                                 }
                             }
                             projectile.active = false;
@@ -3067,6 +3011,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     projectile.playerOwned);
                             }
                             PlayBanditDeathEvents();
+                        } else if (projectile.rocket && !projectile.hostile &&
+                                   !projectile.netHostRound) {
+                            // This client's own rocket, or the shell of a tank
+                            // it drives. Neither reaches the host as a
+                            // projectile, and the soldiers are the host's, so
+                            // the blast is handed over to be applied there.
+                            // Grenades and C4 need none of this: the host
+                            // already runs those blasts itself.
+                            g_netSession.ReportBlast(
+                                center.x, center.y, center.z, enemyRadius,
+                                enemyDamage, enemyPush,
+                                scene.grenadeEnemyImpulse);
                         }
                         if (!g_helicopterDead && g_helicopterModel) {
                             const float dx = g_helicopterPosition.x - center.x;
@@ -3164,7 +3120,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 center, enemyRadius, c4Blast,
                                 projectile.rocket, projectile.missile,
                                 enemyDamage, projectile.playerOwned,
-                                projectile.netGrenadeId != 0);
+                                projectile.netGrenadeId != 0,
+                                projectile.blastDamageScale);
+                        else if (projectile.rocket)
+                            DamagePlayerTankFromBlast(
+                                center, enemyRadius,
+                                projectile.blastDamageScale);
                         // Grenades hurt the player too. Previously only enemies
                         // took blast damage, because every grenade in the game
                         // was thrown BY the player -- enemy grenades made the
@@ -3806,17 +3767,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // the barrel, and the detonation arrives three seconds later
                     // with nothing left to ask.
                     if (projectile.playerOwned) barrel.litByPlayer = true;
-                    if (projectile.flame && !barrel.burning) {
-                        barrel.burning = true;
-                        barrel.fuse = 3.0f;
-                        barrel.fireFxCooldown = 0.0f;
-                    }
+                    if (projectile.flame) IgniteBarrel(barrelIndex);
                     if (barrel.hits >= 4) {
                         DetonateBarrel(barrelIndex, projectile.playerOwned);
-                    } else if (barrel.hits == 2 && !barrel.burning) {
-                        barrel.burning = true;
-                        barrel.fuse = 3.0f;
-                        barrel.fireFxCooldown = 0.0f;
+                    } else if (barrel.hits == 2) {
+                        IgniteBarrel(barrelIndex);
                     }
                     stopProjectileAt(barrelHit);
                     continue;
@@ -6745,6 +6700,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawRevivePrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                // Draw all active medic callouts.
+                for (const MedicCallout& callout : g_medicCallouts) {
+                    DrawMedicCallout(
+                        scene.GetViewMatrix(), scene.GetProjectionMatrix(),
+                        callout.callerId, callout.remaining);
+                }
                 DrawArmoryShopPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 RenderArmoryShopPanel(hwnd);
@@ -6781,13 +6742,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawDXRDDGIProbeDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
-            // Above the downed and death branches: those are states the player
-            // cannot pause out of, and a pause screen layered over a death
-            // screen would leave two panels fighting for the same clicks. A
-            // player who goes down while paused gets the downed overlay, which
-            // is the screen that actually matters then.
-            if (g_gamePaused && !scene.player.downed &&
-                (scene.player.godMode || scene.player.health > 0.0f)) {
+            // Squad wipe first: it is the one screen with a way forward once
+            // nobody is left standing, so a pause left open must not hide it.
+            // Pause is above the downed overlay -- a downed player waiting on a
+            // teammate can still reach settings or leave -- but not above the
+            // single-player death screen, which has its own buttons and would
+            // fight the pause panel for the same clicks.
+            if (MultiplayerActive() && squadWipeScreenAge >= 2.0f) {
+                RenderSquadWipeScreen(hwnd);
+            } else if (g_gamePaused &&
+                (scene.player.downed || scene.player.godMode ||
+                 scene.player.health > 0.0f)) {
                 RenderPauseMenu(hwnd);
             } else if (scene.player.downed) {
                 // Not the death screen: the world behind this is still running
@@ -6796,6 +6761,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // same reason.
                 RenderDownedOverlay();
                 if (showUI) RenderUI(scene, visBuffer);
+                RenderScoreboard();
             } else if (!scene.player.godMode && scene.player.health <= 0.0f) {
                 RenderDeathScreen(hwnd);
             } else if (DeploymentPlanningVisible()) {
@@ -6811,6 +6777,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawDestructionDebug(scene);
                 DrawRagdollPhysicsDebug(scene);
                 DrawVirtualShadowPageDebug(scene);
+                RenderScoreboard();
             }
         }
         ImGui::Render();
@@ -7310,7 +7277,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const bool closed = !g_travelScreenOpen;
                 const bool boardReleased = !g_travelCursorReleased;
                 const bool swapped = g_activeLevelFile ==
-                    (travelSmokeAirfield ? "BigIslandv33.json"
+                    (travelSmokeAirfield ? "BigIslandv34.json"
                                          : "Islandv10.json");
                 const bool passed = closed && boardReleased && swapped;
                 SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display

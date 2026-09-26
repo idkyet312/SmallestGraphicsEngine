@@ -108,6 +108,9 @@ struct EnemyTankState {
     // a wreck in the first one is laid down silently: it died before this
     // machine joined, and the explosion belongs to that moment, not this one.
     bool netSeen = false;
+    // Taken over by the player. The AI never drives or fires it again: once
+    // the player climbs out it sits where it was left, braked.
+    bool captured = false;
 };
 static std::vector<EnemyTankState> g_enemyTanks;
 
@@ -125,6 +128,23 @@ struct PendingEnemyTank {
     XMFLOAT3 boundsMaximum{};
 };
 static std::vector<PendingEnemyTank> g_pendingEnemyTanks;
+
+// The tank the local player is driving, by level entity id; 0 on foot. Only
+// the machine that simulates tanks (single player or the host) can drive one:
+// a client has no physics body under its tanks.
+static uint64_t g_playerTankEntity = 0;
+
+static EnemyTankState* PlayerTank() {
+    if (g_playerTankEntity == 0) return nullptr;
+    for (EnemyTankState& tank : g_enemyTanks)
+        if (tank.entityId == g_playerTankEntity) return &tank;
+    return nullptr;
+}
+
+// In any vehicle the player drives: the Humvee or a captured tank.
+static bool PlayerInVehicle() {
+    return g_drivingHumvee || g_playerTankEntity != 0;
+}
 
 static void ReleaseEnemyTanks() {
     for (const EnemyTankState& tank : g_enemyTanks)
@@ -375,9 +395,14 @@ static void RouteEnemyTankDamage(EnemyTankState& tank, float damage,
 static void DamageEnemyTanksFromBlast(const XMFLOAT3& center, float reach,
                                       bool remoteCharge, bool rocket,
                                       bool missile, float fragDamage,
-                                      bool fromPlayer, bool hostAuthored) {
+                                      bool fromPlayer, bool hostAuthored,
+                                      float damageScale = 1.0f) {
     for (EnemyTankState& tank : g_enemyTanks) {
         if (tank.dead) continue;
+        // The player's own gun and rockets do not hurt the tank they sit in:
+        // a shell bursting on a wall beside the hull would otherwise cost it.
+        if (fromPlayer && !hostAuthored && tank.entityId == g_playerTankEntity)
+            continue;
         const auto collider = std::find_if(g_prefabColliders.begin(),
             g_prefabColliders.end(), [&](const PrefabCollider& value) {
                 return value.entityId == tank.entityId &&
@@ -408,6 +433,8 @@ static void DamageEnemyTanksFromBlast(const XMFLOAT3& center, float reach,
             // strategy.
             damage = fragDamage * 0.2f * falloff;
         }
+        // A captured tank's gun hits as hard as its shells were authored to.
+        damage *= damageScale;
         RouteEnemyTankDamage(tank, damage, center, fromPlayer, hostAuthored);
     }
 }
@@ -511,7 +538,8 @@ static void ApplyReportedEnemyTankDamage(uint64_t entityId, float damage,
 // that lined up perfectly would otherwise pass through and burst behind them.
 static bool HostileShellHitsPlayer(const XMFLOAT3& start, const XMFLOAT3& end,
                                    float radius, XMFLOAT3& hit) {
-    if (scene.player.health <= 0.0f) return false;
+    // Inside a tank the player's body is the hull: the shell meets its box.
+    if (scene.player.health <= 0.0f || g_playerTankEntity != 0) return false;
     const XMFLOAT3 eye = scene.camera.Position;
     const XMVECTOR top = XMVectorSet(eye.x, eye.y, eye.z, 0.0f);
     const XMVECTOR bottom = XMVectorSet(
@@ -553,7 +581,7 @@ static bool HostileShellHitsPlayer(const XMFLOAT3& start, const XMFLOAT3& end,
 static void SpawnEnemyTankShell(const XMFLOAT3& muzzle, const XMFLOAT3& start,
                                 const XMFLOAT3& direction, float speed,
                                 float lifetime, float damageScale,
-                                bool hostReplica) {
+                                bool hostReplica, bool playerOwned = false) {
     Projectile shell = {};
     shell.position = shell.previousPosition = start;
     shell.direction = direction;
@@ -561,7 +589,8 @@ static void SpawnEnemyTankShell(const XMFLOAT3& muzzle, const XMFLOAT3& start,
     shell.lifetime = lifetime;
     shell.active = true;
     shell.rocket = true;
-    shell.hostile = true;
+    shell.hostile = !playerOwned;
+    shell.playerOwned = playerOwned;
     shell.netHostRound = hostReplica;
     shell.blastDamageScale = damageScale;
     scene.projectiles.push_back(shell);
@@ -628,7 +657,15 @@ static bool NearestEnemyTankTarget(const XMFLOAT3& from, float range,
         !scene.player.downed && !g_insertionChoicePending &&
         !g_game.vehicles.blackHawkCarryingPlayer;
     if (localTargetable) {
-        const XMFLOAT3 p = scene.camera.Position;
+        XMFLOAT3 p = scene.camera.Position;
+        // Driving a tank, the camera is metres behind it: aim at the hull.
+        // The caller aims PlayerHeight * 0.4 under the eye, so that much is
+        // added back to land on the box centre.
+        if (const EnemyTankState* own = PlayerTank()) {
+            XMStoreFloat3(&p, XMVector3TransformCoord(
+                XMLoadFloat3(&own->boxCenterLocal), EnemyTankHullWorld(*own)));
+            p.y += scene.camera.PlayerHeight * 0.4f;
+        }
         const float dx = p.x - from.x, dz = p.z - from.z;
         const float dSq = dx * dx + dz * dz;
         if (dSq <= bestSq) { bestSq = dSq; eye = p; found = true; }
@@ -637,7 +674,7 @@ static bool NearestEnemyTankTarget(const XMFLOAT3& from, float range,
         g_netSession.CurrentRole() != net::Role::Host) return found;
     for (const auto& actor : g_bandits) {
         if (!actor || !actor->networkControlled || actor->netDowned ||
-            actor->netHealth <= 0.0f) continue;
+            actor->netHealth <= 0.0f || HiddenFromEnemies(*actor)) continue;
         const XMFLOAT3 feet = actor->position;
         // Well clear of the ground is a player still riding their insertion
         // in, the remote equivalent of blackHawkCarryingPlayer above.
@@ -690,6 +727,35 @@ static void FireEnemyTankShell(EnemyTankState& tank, const XMMATRIX& turretWorld
         std::to_string(muzzle.y) + ", " + std::to_string(muzzle.z) +
         " at " + std::to_string(target.x) + ", " + std::to_string(target.y) +
         ", " + std::to_string(target.z));
+}
+
+// A hostile shell bursting by the tank the player drives. Enemy explosives
+// are otherwise kept off tanks (one column does not shell itself), so this is
+// the only way enemy fire reaches a captured hull. Scaled like the player's
+// rocket against an enemy tank, times the shell's own damage scale.
+static void DamagePlayerTankFromBlast(const XMFLOAT3& center, float reach,
+                                      float damageScale) {
+    EnemyTankState* tank = PlayerTank();
+    if (!tank || tank->dead || damageScale <= 0.0f) return;
+    const auto collider = std::find_if(g_prefabColliders.begin(),
+        g_prefabColliders.end(), [&](const PrefabCollider& value) {
+            return value.entityId == tank->entityId &&
+                   value.prefabId == tank->hullPrefabId;
+        });
+    if (collider == g_prefabColliders.end()) return;
+    const XMFLOAT3 local = PrefabColliderToLocal(*collider, center);
+    const float outX = (std::max)(0.0f,
+        std::abs(local.x) - collider->halfExtents.x);
+    const float outY = (std::max)(0.0f,
+        std::abs(local.y) - collider->halfExtents.y);
+    const float outZ = (std::max)(0.0f,
+        std::abs(local.z) - collider->halfExtents.z);
+    const float surface = std::sqrt(outX * outX + outY * outY + outZ * outZ);
+    if (surface >= reach) return;
+    const float falloff = surface < 1.0f ? 1.0f : 1.0f - surface / reach;
+    DamageEnemyTank(*tank, kEnemyTankRocketDamage * damageScale * falloff,
+                    center, /*fromPlayer=*/false, net::kInvalidPlayerId);
+    scene.camera.AddHitTrauma(0.2f + 0.3f * falloff);
 }
 
 // SGE_TANK_TRACE=1: each tank's pose, speed, turret and intent once a second.
@@ -776,6 +842,13 @@ static void UpdateEnemyTanks(float dt) {
             continue;
         }
         if (hostOwned) continue;
+        // Captured: driven from the player's input, or parked once they left.
+        if (tank.captured) {
+            if (tank.entityId != g_playerTankEntity)
+                g_destruction.SetGroundVehicleInput(
+                    tank.physicsHandle, 0.0f, 0.0f, true);
+            continue;
+        }
 
         const XMMATRIX orientation =
             XMMatrixRotationQuaternion(XMLoadFloat4(&tank.rotation));

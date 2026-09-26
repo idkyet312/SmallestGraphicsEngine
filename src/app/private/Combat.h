@@ -816,11 +816,106 @@ static void SpawnBarrelExplosionFX(const XMFLOAT3& center) {
         { center.x, center.y + 1.1f, center.z }, 5.5f);
 }
 
+// Lights a barrel's three-second fuse. In a session the host owns barrels (see
+// BarrelEventMessage): the host tells everyone, and a client tells the host,
+// lighting its own copy straight away so the fire shows without a round trip.
+// `fromNetwork` is the host's broadcast arriving, which is not re-reported.
+static void IgniteBarrel(size_t index, bool fromNetwork = false) {
+    if (index >= scene.explosiveBarrels.size()) return;
+    ExplosiveBarrel& barrel = scene.explosiveBarrels[index];
+    if (!barrel.active || barrel.burning) return;
+    barrel.burning = true;
+    barrel.fuse = 3.0f;
+    barrel.fireFxCooldown = 0.0f;
+    const net::Role role = g_netSession.CurrentRole();
+    if (role == net::Role::Host) {
+        g_netSession.PublishBarrelEvent(static_cast<uint16_t>(index),
+            net::BarrelEvent::Ignite,
+            barrel.position.x, barrel.position.y, barrel.position.z);
+    } else if (role == net::Role::Client && !fromNetwork) {
+        g_netSession.ReportBarrelEvent(static_cast<uint16_t>(index),
+            net::BarrelEvent::Ignite,
+            barrel.position.x, barrel.position.y, barrel.position.z);
+    }
+}
+
+// The part of a barrel blast that lands on things the host owns: soldiers,
+// gunships and the AA gun. Split out so a client playing the host's
+// detonation can skip it -- the host has already applied it.
+static void ApplyBarrelBlastToHostTargets(const XMFLOAT3& center,
+                                          bool fromPlayer) {
+    for (auto& bandit : g_bandits) {
+        if (bandit)
+            bandit->ApplyExplosion(center, 6.5f, 500.0f, 12.0f, fromPlayer);
+    }
+    PlayBanditDeathEvents();
+    if (!g_helicopterDead && g_helicopterModel) {
+        const float hx = g_helicopterPosition.x - center.x;
+        const float hy = g_helicopterPosition.y - center.y;
+        const float hz = g_helicopterPosition.z - center.z;
+        const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
+        // Hull hit-sphere is ~5 m, so a barrel bursting on the hull
+        // registers as a near-full-strength hit.
+        const float reach = 11.5f;
+        if (distance < reach)
+            ReportBarrelHelicopterDamage(
+                0, 120.0f * (1.0f - distance / reach),
+                g_helicopterPosition);
+    }
+    if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead &&
+        g_helicopterModel) {
+        const float hx = g_secondaryHelicopterPosition.x - center.x;
+        const float hy = g_secondaryHelicopterPosition.y - center.y;
+        const float hz = g_secondaryHelicopterPosition.z - center.z;
+        const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
+        const float reach = 11.5f;
+        if (distance < reach)
+            ReportBarrelHelicopterDamage(
+                1, 120.0f * (1.0f - distance / reach),
+                g_secondaryHelicopterPosition);
+    }
+    // Blast takes the emplacement too, so C4 or a rocket is a valid answer
+    // to it rather than the gun being immune to everything but bullets.
+    for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i) {
+        if (!g_game.vehicles.aaTurrets[i].Active()) continue;
+        const XMFLOAT3 turret = g_game.vehicles.aaTurrets[i].position;
+        const float hx = turret.x - center.x;
+        const float hy = turret.y - center.y;
+        const float hz = turret.z - center.z;
+        const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
+        const float reach = 9.0f;
+        if (distance < reach)
+            DamageAATurret(i, 320.0f * (1.0f - distance / reach), turret,
+                           fromPlayer);
+    }
+}
+
 // `fromPlayer` credits the whole chain, not just the barrel that was hit: the
 // player lined up the row, so the barrels it takes with it are their doing.
-static void DetonateBarrel(size_t firstBarrel, bool fromPlayer) {
+//
+// In a session only the host sets barrels off. A client asks instead and
+// returns; the host's broadcast comes back as `fromNetwork`, one call per
+// barrel, since the host already worked out the chain. A client playing that
+// broadcast draws the blast and takes its own share of it, but leaves the
+// soldiers, gunships and the AA gun to the host, which owns all of them.
+static void DetonateBarrel(size_t firstBarrel, bool fromPlayer,
+                           bool fromNetwork = false) {
     if (firstBarrel >= scene.explosiveBarrels.size() ||
         !scene.explosiveBarrels[firstBarrel].active) return;
+
+    const net::Role role = g_netSession.CurrentRole();
+    const bool host = role == net::Role::Host;
+    const bool replica = role == net::Role::Client;
+    if (replica && !fromNetwork) {
+        ExplosiveBarrel& barrel = scene.explosiveBarrels[firstBarrel];
+        if (!barrel.netDetonationRequested) {
+            barrel.netDetonationRequested = true;
+            g_netSession.ReportBarrelEvent(static_cast<uint16_t>(firstBarrel),
+                net::BarrelEvent::Detonate,
+                barrel.position.x, barrel.position.y, barrel.position.z);
+        }
+        return;
+    }
 
     fromPlayer = fromPlayer || scene.explosiveBarrels[firstBarrel].litByPlayer;
     if (g_heldBarrelIndex == firstBarrel) g_heldBarrelIndex = SIZE_MAX;
@@ -835,51 +930,14 @@ static void DetonateBarrel(size_t firstBarrel, bool fromPlayer) {
         // No terrain crater: a barrel is a surface fuel burst, not a buried
         // charge, so it scorches and shoves but leaves the ground intact.
         SpawnBarrelExplosionFX(center);
-
-        for (auto& bandit : g_bandits) {
-            if (bandit)
-                bandit->ApplyExplosion(center, 6.5f, 500.0f, 12.0f, fromPlayer);
+        // Every barrel of the chain goes out on its own, so a client plays
+        // exactly the host's chain rather than working out its own.
+        if (host) {
+            g_netSession.PublishBarrelEvent(
+                static_cast<uint16_t>(pending[cursor]),
+                net::BarrelEvent::Detonate, center.x, center.y, center.z);
         }
-        PlayBanditDeathEvents();
-        if (!g_helicopterDead && g_helicopterModel) {
-            const float hx = g_helicopterPosition.x - center.x;
-            const float hy = g_helicopterPosition.y - center.y;
-            const float hz = g_helicopterPosition.z - center.z;
-            const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
-            // Hull hit-sphere is ~5 m, so a barrel bursting on the hull
-            // registers as a near-full-strength hit.
-            const float reach = 11.5f;
-            if (distance < reach)
-                ReportBarrelHelicopterDamage(
-                    0, 120.0f * (1.0f - distance / reach),
-                    g_helicopterPosition);
-        }
-        if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead &&
-            g_helicopterModel) {
-            const float hx = g_secondaryHelicopterPosition.x - center.x;
-            const float hy = g_secondaryHelicopterPosition.y - center.y;
-            const float hz = g_secondaryHelicopterPosition.z - center.z;
-            const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
-            const float reach = 11.5f;
-            if (distance < reach)
-                ReportBarrelHelicopterDamage(
-                    1, 120.0f * (1.0f - distance / reach),
-                    g_secondaryHelicopterPosition);
-        }
-        // Blast takes the emplacement too, so C4 or a rocket is a valid answer
-        // to it rather than the gun being immune to everything but bullets.
-        for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i) {
-            if (!g_game.vehicles.aaTurrets[i].Active()) continue;
-            const XMFLOAT3 turret = g_game.vehicles.aaTurrets[i].position;
-            const float hx = turret.x - center.x;
-            const float hy = turret.y - center.y;
-            const float hz = turret.z - center.z;
-            const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
-            const float reach = 9.0f;
-            if (distance < reach)
-                DamageAATurret(i, 320.0f * (1.0f - distance / reach), turret,
-                               fromPlayer);
-        }
+        if (!replica) ApplyBarrelBlastToHostTargets(center, fromPlayer);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             if (fromPlayer) CreditPlayerDestruction();
             g_destruction.ApplyExplosion(center, 5.0f, 3.0f, 180.0f);
@@ -894,7 +952,8 @@ static void DetonateBarrel(size_t firstBarrel, bool fromPlayer) {
             scene.DamagePlayer(85.0f * (1.0f - playerDistance / 6.0f));
 
         // Nearby barrels chain-react. Mark on enqueue to prevent duplicates.
-        for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
+        // Not on a client: the host's chain arrives barrel by barrel.
+        for (size_t i = 0; !replica && i < scene.explosiveBarrels.size(); ++i) {
             ExplosiveBarrel& other = scene.explosiveBarrels[i];
             if (!other.active) continue;
             const float dx = other.position.x - center.x;
@@ -1247,15 +1306,14 @@ static void UpdateMolotovFireDamage() {
                     collider.entityId, flamePosition,
                     (std::min)(2.1f, 1.15f + fire.radius * 0.55f));
             }
-            for (ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
+                const ExplosiveBarrel& barrel = scene.explosiveBarrels[i];
                 if (!barrel.active || barrel.burning) continue;
                 const float dx = barrel.position.x - fire.position.x;
                 const float dz = barrel.position.z - fire.position.z;
                 const float barrelReach = reach + 0.5f;
                 if (dx * dx + dz * dz > barrelReach * barrelReach) continue;
-                barrel.burning = true;
-                barrel.fuse = 3.0f;
-                barrel.fireFxCooldown = 0.0f;
+                IgniteBarrel(i);
             }
         }
     }

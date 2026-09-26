@@ -130,6 +130,7 @@ static void UpdateChat(float dt) {
     const bool inSession = MultiplayerActive();
     if (inSession != wasInSession) {
         g_chatLog.clear();
+        ResetMedicCallouts();
         wasInSession = inSession;
     }
     // The level can end, or the run be abandoned, while the prompt is open.
@@ -146,6 +147,14 @@ static void UpdateChat(float dt) {
                           static_cast<int>(line.speaker) + 1);
             AppendChatLog(std::string(label) + ": " + line.text,
                           line.fromLocalPlayer);
+        }
+        // Drain medic callouts and queue them for display.
+        static std::vector<net::PlayerId> g_medicCallScratch;
+        g_netSession.DrainMedicCalls(g_medicCallScratch);
+        for (net::PlayerId callerId : g_medicCallScratch) {
+            if (callerId < net::kMaxPlayers) {
+                g_medicCallouts.push_back({ callerId, kMedicCalloutSeconds });
+            }
         }
     }
 

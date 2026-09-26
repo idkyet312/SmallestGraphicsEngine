@@ -117,13 +117,17 @@ $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 $connected = $false
 while ((Get-Date) -lt $deadline) {
     if ($clientProcess.HasExited) { throw "Client exited during startup (code $($clientProcess.ExitCode))." }
-    if (Test-Path $log) {
-        # -Raw: both processes append to this file, so the lines interleave and
-        # a per-line read can split a message. The marker is the client being
-        # given a player id, which is the point the session is actually usable.
-        $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
-        if ($text -and $text -match 'welcome received; we are player') { $connected = $true; break }
+    # The client logs to GraphicEngine-<pid>.log: the host holds
+    # GraphicEngine.log open, so the second instance takes a file of its own.
+    # The marker is the client being given a player id, which is the point the
+    # session is actually usable.
+    $clientLog = Join-Path $logDir "GraphicEngine-$($clientProcess.Id).log"
+    foreach ($candidate in @($clientLog, $log)) {
+        if (-not (Test-Path $candidate)) { continue }
+        $text = Get-Content $candidate -Raw -ErrorAction SilentlyContinue
+        if ($text -and $text -match 'welcome received; we are player') { $connected = $true; $log = $candidate; break }
     }
+    if ($connected) { break }
     Start-Sleep -Milliseconds 1500
 }
 

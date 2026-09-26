@@ -26,6 +26,12 @@ Textures are 27 x 4096^2, ~2.4 GB of VRAM uncooked; they are cut to 2048 on
 the large painted surfaces and 1024 elsewhere. The desert-tan paint is tinted
 green through baseColorFactor, which both importers and the cook preserve.
 
+The renderer decodes the texture to linear (pow 2.2) and multiplies the factor
+there, so the factor is solved in linear space: each painted material's factor
+is PAINT_GREEN over its own measured texture mean. A factor picked as if it
+multiplied sRGB values left the paint at ~(0.52, 0.60, 0.28): olive-yellow.
+Unpainted (grey) metal keeps its authored colour.
+
 Usage: py scripts/split-antiair.py
 """
 import sys
@@ -43,9 +49,11 @@ AXIS_Z = -1.335              # traverse axis, shared by Main/Rotater/Barrel
 TRUNNION_Y = 6.08            # "Barrel" node origin
 SCALE = MOUNT_HEIGHT / (TRUNNION_Y - GROUND_Y)
 
-# Multiplies the tan paint (mean ~0.76, 0.68, 0.37) to ~(0.27, 0.42, 0.16),
-# a clear military green; the grey metal parts come out dark green-grey.
-GREEN_TINT = [0.36, 0.62, 0.42, 1.0]
+# Where the tan paint's mean lands, in sRGB: a clear military green.
+PAINT_GREEN = (0.24, 0.38, 0.16)
+# A material is paint when its texture's mean blue is under this fraction of
+# its red: the tan measures ~0.5, the grey metal ~1.0.
+PAINT_BLUE_TO_RED = 0.7
 
 PARTS = {
     "AntiAir_Base.glb": ["Support", "Cloth", "Hinge", "pipe"],
@@ -60,16 +68,50 @@ def image_size(image):
     return 2048 if any(part in name for part in LARGE_TEXTURES) else 1024
 
 
-def tint(material):
-    pbr = material.setdefault("pbrMetallicRoughness", {})
-    pbr["baseColorFactor"] = GREEN_TINT
+def paint_factors(doc, binary):
+    """baseColorFactor by material name, for the painted materials only."""
+    import io
+    from PIL import Image
+    factors = {}
+    for material in doc["materials"]:
+        texture = material.get("pbrMetallicRoughness", {}).get(
+            "baseColorTexture")
+        if not texture:
+            continue
+        image = doc["images"][doc["textures"][texture["index"]]["source"]]
+        view = doc["bufferViews"][image["bufferView"]]
+        start = view.get("byteOffset", 0)
+        pixels = Image.open(io.BytesIO(
+            binary[start:start + view["byteLength"]])).convert("RGB")
+        pixels = pixels.resize((256, 256))
+        data = pixels.tobytes()
+        count = len(data) // 3
+        mean = [sum((value / 255.0) ** 2.2 for value in data[channel::3])
+                / count for channel in range(3)]
+        if mean[2] >= mean[0] * PAINT_BLUE_TO_RED:
+            continue
+        factors[material["name"]] = [
+            min(1.0, target ** 2.2 / max(value, 1e-4))
+            for target, value in zip(PAINT_GREEN, mean)] + [1.0]
+    return factors
+
+
+def make_tint(factors):
+    def tint(material):
+        factor = factors.get(material.get("name"))
+        pbr = material.setdefault("pbrMetallicRoughness", {})
+        if factor:
+            pbr["baseColorFactor"] = factor
+        else:
+            pbr.pop("baseColorFactor", None)
+    return tint
 
 
 def root_translation(pivot_y):
     return [0.0, -pivot_y * SCALE, -AXIS_Z * SCALE]
 
 
-def write_part(doc, binary, names, pivot_y, out_path, cache):
+def write_part(doc, binary, names, pivot_y, out_path, cache, tint):
     by_name = {node.get("name"): index
                for index, node in enumerate(doc["nodes"])}
     missing = [name for name in names if name not in by_name]
@@ -92,13 +134,18 @@ def write_part(doc, binary, names, pivot_y, out_path, cache):
 def main():
     doc, binary = read_glb(SOURCE)
     cache = {}
+    factors = paint_factors(doc, binary)
+    for name, factor in sorted(factors.items()):
+        print(f"paint {name:10} baseColorFactor "
+              f"[{factor[0]:.3f}, {factor[1]:.3f}, {factor[2]:.3f}]")
+    tint = make_tint(factors)
     everything = []
     for file_name, names in PARTS.items():
         pivot = GROUND_Y if file_name == "AntiAir_Base.glb" else TRUNNION_Y
-        write_part(doc, binary, names, pivot, FOLDER / file_name, cache)
+        write_part(doc, binary, names, pivot, FOLDER / file_name, cache, tint)
         everything += names
     write_part(doc, binary, everything, GROUND_Y, FOLDER / "AntiAir.glb",
-               cache)
+               cache, tint)
     barrel_tip_z = 15.37     # far end of "Muzzle"
     print(f"scale {SCALE:.5f}; barrel length trunnion->muzzle "
           f"{(barrel_tip_z - AXIS_Z) * SCALE:.3f} m")

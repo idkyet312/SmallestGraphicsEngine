@@ -251,8 +251,11 @@ static void ConfigureBlackHawkBounds() {
     // 27.2 m is the original 34 m brought down by a fifth. A third (22.78 m)
     // was tried first and read as too small, so this is the shallower cut that
     // keeps the cabin comfortably walkable.
-    const float targetLength =
-        g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 27.2f : 20.0f;
+    //
+    // Both then trimmed by 0.5% (27.2 -> 27.064 m, 20 -> 19.9 m).
+    constexpr float kInsertionAirframeTrim = 0.995f;
+    const float targetLength = kInsertionAirframeTrim *
+        (g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 27.2f : 20.0f);
     g_blackHawkModelScale = targetLength / horizontalLength;
 }
 

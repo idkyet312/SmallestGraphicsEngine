@@ -77,7 +77,23 @@ namespace net {
 //     message grows by 8 x 36 bytes, still inside one datagram.
 // 22: ServerEnemyFire carries damageScale, so a light gun's shells hurt a
 //     client's player as little as they hurt the host's.
-inline constexpr uint32_t kProtocolVersion = 22;
+// 23: ServerArmorState carries the objective aircraft (planeCount takes the
+//     padding byte; 4 x 56 bytes), so every player sees the same takeoff and
+//     the host's escape fails the mission for everyone. The insertion
+//     helicopter state says whether that player has deployed, which is what
+//     starts the aircraft's countdown. ServerSquadDeploy lets the host drop
+//     the clients still planning in with its own insertion.
+// 24: ServerEnemyFire carries bandit infantry shots (InfantryShot, weapon
+//     byte from the padding), so enemy soldiers can hurt clients. Explosive
+//     barrels are host-owned (Client/ServerBarrelEvent), a client's rocket
+//     blast reaches the host's soldiers (ClientBlast), and PlayerSnapshot and
+//     ClientInput carry the vehicle a player is driving (DrivenVehicleState).
+// 25: ServerScoreboard (per-player kills/deaths/downs) and Client/ServerMedicCall.
+// 26: a client's bought marines are the host's. ClientMarineDrop asks the host
+//     to land them where the client's transport set down, and EnemySnapshot
+//     says which bodies are marines (a padding byte after `killer`, so the
+//     struct keeps its 36 bytes) -- a client built every replica as a bandit.
+inline constexpr uint32_t kProtocolVersion = 26;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -131,6 +147,14 @@ enum class MessageType : uint8_t {
     ServerChatMessage,        // host -> clients, reliable
     ServerArmorState,         // host -> clients, unreliable, every net tick
     ServerEnemyFire,          // host -> clients, reliable (tank) / unreliable (AA)
+    ServerSquadDeploy,        // host -> clients, reliable
+    ClientBarrelEvent,        // client -> host, reliable
+    ServerBarrelEvent,        // host -> clients, reliable
+    ClientBlast,              // client -> host, reliable
+    ServerScoreboard,         // host -> clients, reliable (on change)
+    ClientMedicCall,          // client -> host, reliable
+    ServerMedicCall,          // host -> clients, reliable
+    ClientMarineDrop,         // client -> host, reliable
 };
 
 // One-shot transitions in a player's life state. Carried by a reliable message
@@ -178,7 +202,12 @@ struct ServerReject {
 struct InsertionHelicopterState {
     uint8_t visible = 0;
     uint8_t airframe = 0;
-    uint8_t padding[2] = {};
+    // This player has pressed DEPLOY and their mission clock is running. Rides
+    // here because every player already sends this struct every tick; the host
+    // starts the objective aircraft's countdown on the first player to deploy,
+    // not on its own deploy. Claimed from the padding, so the size holds.
+    uint8_t deployed = 0;
+    uint8_t padding = 0;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // Degrees, matching player-angle interpolation.
     float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
@@ -186,11 +215,35 @@ struct InsertionHelicopterState {
     float scale = 1.0f;
 };
 
+enum class DrivenVehicleKind : uint8_t {
+    None = 0,
+    Humvee,
+};
+
+// The vehicle a player is at the wheel of. A driven vehicle is simulated by
+// its driver -- that machine has the input, so its solver is the one that
+// feels right -- and this is how everyone else learns where it went. The host
+// puts its copy of the body there, and from then on it rides the armor state
+// like any Humvee the host moved itself. In the player snapshot it tells every
+// machine who is in which seat, which is what stops two players taking the
+// same wheel and what hides a driver's body out at the chase camera.
+struct DrivenVehicleState {
+    DrivenVehicleKind kind = DrivenVehicleKind::None;
+    uint8_t index = 0;   // level Humvee spawn index (EnemyHumveeSnapshot::index)
+    uint8_t padding[2] = {};
+    // Chassis body centre and orientation, as the driver's solver has them.
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    // Radians, HumveeGameplayState::turretYaw: the driver aims it too.
+    float turretYaw = 0.0f;
+};
+
 struct ClientInputMessage {
     MessageHeader header{ MessageType::ClientInput, {} };
     PlayerInput input;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     InsertionHelicopterState helicopter;
+    DrivenVehicleState vehicle;
 };
 
 // One player's replicated state. Weapons and ammo are still local-only; health
@@ -241,6 +294,7 @@ struct PlayerSnapshot {
     // Lands on a 4-byte boundary: the padding above closes out `reviver`.
     float reviveProgress = 0.0f;
     InsertionHelicopterState helicopter;
+    DrivenVehicleState vehicle;
 };
 
 struct ServerSnapshotMessage {
@@ -336,6 +390,9 @@ struct EnemySnapshot {
     // to claim. The struct goes 32 -> 36 bytes. Sized against the datagram in
     // the changelog above rather than left to be discovered later.
     PlayerId killer = kInvalidPlayerId;
+    // An allied marine rather than a bandit: the client picks the model, the
+    // faction and the friendly marker from it. Claimed from the padding.
+    uint8_t marine = 0;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // Radians, matching SkinnedEnemy. Both are sent because the upper body aims
     // independently of the legs, and a client that guessed one from the other
@@ -427,9 +484,10 @@ struct AATurretSnapshot {
 };
 
 // One level Humvee. Keyed by its spawn index: both machines build the Humvees
-// from the same level file in the same order. `hostDriven` says the host's AI
-// has driven it this level, so the client should show the host's pose rather
-// than its own parked body; the turret yaw applies either way.
+// from the same level file in the same order. `hostDriven` says it has moved
+// this level -- the host's AI drove it, or a player did -- so the client should
+// show the host's pose rather than its own parked body; the turret yaw applies
+// either way.
 struct EnemyHumveeSnapshot {
     uint8_t index = 0;
     uint8_t hostDriven = 0;
@@ -439,6 +497,30 @@ struct EnemyHumveeSnapshot {
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
     float turretYaw = 0.0f;
 };
+
+// One objective aircraft. Its flight is a pure function of these timers and
+// the crash state, so they are what is sent: the client re-derives the pose
+// and keeps flying it between armor states, and the host alone decides when it
+// escaped -- which is what fails the mission. Keyed by level entity id, like a
+// tank.
+struct ObjectivePlaneSnapshot {
+    uint64_t entityId = 0;
+    // kPlaneRolling | kPlaneEscaped | kPlaneDestroyed | kPlaneCrashing |
+    // kPlaneCrashed.
+    uint8_t flags = 0;
+    uint8_t padding[3] = {};
+    float holdTimer = 0.0f;
+    float takeoffTimer = 0.0f;
+    float crashX = 0.0f, crashY = 0.0f, crashZ = 0.0f;
+    float crashVX = 0.0f, crashVY = 0.0f, crashVZ = 0.0f;
+    float crashPitch = 0.0f, crashRoll = 0.0f, crashYaw = 0.0f;
+};
+inline constexpr uint8_t kPlaneRolling = 1u << 0;
+inline constexpr uint8_t kPlaneEscaped = 1u << 1;
+inline constexpr uint8_t kPlaneDestroyed = 1u << 2;
+inline constexpr uint8_t kPlaneCrashing = 1u << 3;
+inline constexpr uint8_t kPlaneCrashed = 1u << 4;
+inline constexpr uint8_t kMaxReplicatedPlanes = 4;
 
 inline constexpr uint8_t kMaxReplicatedTanks = 8;
 inline constexpr uint8_t kMaxReplicatedHumvees = 8;
@@ -455,15 +537,27 @@ struct ServerArmorStateMessage {
     uint8_t tankCount = 0;
     uint8_t turretCount = 0;
     uint8_t humveeCount = 0;
-    uint8_t padding = 0;
+    uint8_t planeCount = 0;
     EnemyTankSnapshot tanks[kMaxReplicatedTanks];
     AATurretSnapshot turrets[kMaxReplicatedAATurrets];
     EnemyHumveeSnapshot humvees[kMaxReplicatedHumvees];
+    ObjectivePlaneSnapshot planes[kMaxReplicatedPlanes];
 };
 
 enum class EnemyFireKind : uint8_t {
     TankShell = 0,
     AAShell,
+    // A bandit's rifle, shotgun or sniper shot (see InfantryWeapon). Clients
+    // run no AI, so without this no enemy soldier could ever hurt them.
+    InfantryShot,
+};
+
+// Which gun an InfantryShot came from. Picks the flash, the pellet cone and the
+// round's damage and speed on the client, which are the host's constants.
+enum class InfantryWeapon : uint8_t {
+    Rifle = 0,
+    Shotgun,
+    Sniper,
 };
 
 // A round leaving a tank's gun or an AA emplacement on the host. Every client
@@ -475,7 +569,9 @@ enum class EnemyFireKind : uint8_t {
 struct ServerEnemyFireMessage {
     MessageHeader header{ MessageType::ServerEnemyFire, {} };
     EnemyFireKind kind = EnemyFireKind::TankShell;
-    uint8_t padding[3] = {};
+    // InfantryShot only; claimed from the padding, so the size holds.
+    InfantryWeapon weapon = InfantryWeapon::Rifle;
+    uint8_t padding[2] = {};
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float dirX = 0.0f, dirY = 0.0f, dirZ = 0.0f;
     // Tank shells carry their tank's authored ballistics; AA rounds use the
@@ -485,6 +581,20 @@ struct ServerEnemyFireMessage {
     // Tank shells: the blast's scale on the player and the crater (1 = main
     // gun). AA rounds leave it at 1.
     float damageScale = 1.0f;
+};
+
+// The host pressed DEPLOY SQUAD: every client still on the planning screen
+// deploys now, in the same insertion, from the same drop-off. The run is a
+// pure function of these (the craft always flies in toward the island centre),
+// so each machine flying its own copy from the same moment puts the whole
+// squad in one aircraft. The client takes the other door.
+struct ServerSquadDeployMessage {
+    MessageHeader header{ MessageType::ServerSquadDeploy, {} };
+    uint8_t insertionMode = 0;   // LevelInsertionMode
+    uint8_t airframe = 0;        // InsertionAirframe
+    uint8_t hostLeftSeat = 0;
+    uint8_t padding = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;   // the host's drop-off
 };
 
 // One round leaving a player's muzzle. Carried purely so everyone else can see
@@ -724,7 +834,10 @@ inline constexpr uint8_t kMaxLevelFileName = 96;
 struct ServerLevelMessage {
     MessageHeader header{ MessageType::ServerLevel, {} };
     LevelKind kind = LevelKind::None;
-    uint8_t padding[3] = {};
+    // Bumped by the host on a restart of the same level, which a kind/file
+    // compare alone would read as "already there". Claimed from the padding.
+    uint8_t restartSerial = 0;
+    uint8_t padding[2] = {};
     char file[kMaxLevelFileName] = {};
 };
 
@@ -785,6 +898,85 @@ struct ClientTerrainDeformMessage {
 // includes, so the number is repeated rather than shared. Keeping the two equal
 // is what stops the backlog replaying a cut the host itself has already evicted.
 inline constexpr size_t kMaxReplicatedTerrainDeforms = 1024;
+
+// Explosive barrels are host-owned. They used to run their whole life on every
+// machine at once -- hits, fuse, chain reaction -- so each player blew up their
+// own copy and only the host's could hurt an enemy. A client now asks (its
+// shots, its fuse, its thrown barrel landing), the host decides, and the
+// broadcast is what every machine plays. Barrels are identified by their index
+// in the level's barrel list, which every machine builds from the same level
+// plan in the same order.
+enum class BarrelEvent : uint8_t {
+    Ignite = 1,   // lit: burning, three-second fuse
+    Detonate,     // gone: blast here, at x/y/z
+};
+
+// One message for both directions; the header says which. x/y/z is where the
+// barrel is on the sender, because a thrown barrel is flown by whoever threw
+// it and the other machines still have it standing where it started.
+struct BarrelEventMessage {
+    MessageHeader header{ MessageType::ClientBarrelEvent, {} };
+    uint16_t barrel = 0;
+    BarrelEvent event = BarrelEvent::Detonate;
+    uint8_t padding = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+
+// A client's rocket (or captured-tank shell) went off. Clients run no enemy
+// damage -- the host owns every soldier -- so without this a client's rocket
+// could hurt nothing but the ground. The host applies it to its actors as an
+// explosion here, with the numbers the client's blast used.
+struct ClientBlastMessage {
+    MessageHeader header{ MessageType::ClientBlast, {} };
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float radius = 0.0f;
+    float damage = 0.0f;
+    float push = 0.0f;
+    float ragdollImpulse = 0.0f;
+};
+
+// A player requesting a medic callout. Client sends to host, host broadcasts
+// to all clients with the calling player's ID. Carries a cooldown to prevent spam.
+struct ClientMedicCallMessage {
+    MessageHeader header{ MessageType::ClientMedicCall, {} };
+};
+
+// Host broadcasts a medic callout from a player to all clients. The calling
+// player's ID is in the header or carried here so remote players know who needs help.
+struct ServerMedicCallMessage {
+    MessageHeader header{ MessageType::ServerMedicCall, {} };
+    PlayerId callerId = kInvalidPlayerId;
+    uint8_t padding[3] = {};
+};
+
+// A client's transport delivered it along with the marines it paid for. The
+// host lands them, because no AI runs on a client: a squad spawned there never
+// moved and was retired as a stray the next frame. Reliable -- a lost one is a
+// squad paid for and never seen.
+struct ClientMarineDropMessage {
+    MessageHeader header{ MessageType::ClientMarineDrop, {} };
+    uint8_t count = 0;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;   // where the transport set down
+};
+
+// One player's scoreboard stats: kills on enemies, times downed, revives given.
+struct ScoreboardEntry {
+    PlayerId id = kInvalidPlayerId;
+    uint8_t padding[3] = {};
+    uint32_t kills = 0;
+    uint32_t deaths = 0;  // times downed
+    uint32_t revives = 0;
+};
+
+// Host broadcasts whenever any player's stats change. Clients store and draw it.
+struct ServerScoreboardMessage {
+    MessageHeader header{ MessageType::ServerScoreboard, {} };
+    uint8_t playerCount = 0;
+    uint8_t padding[3] = {};
+    ScoreboardEntry entries[kMaxPlayers];
+    static_assert(sizeof(ScoreboardEntry) == 16, "ScoreboardEntry must be 16 bytes");
+};
 
 } // namespace net
 

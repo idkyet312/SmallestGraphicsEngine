@@ -3093,6 +3093,50 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
+    // Guns dropped by killed enemies, drawn at their rigid-body pose. The body
+    // sits at the mesh bounds' centre, so the mesh is shifted onto it first.
+    if (!g_emptyLevelMode && GunModel::Loaded()) {
+        for (const AmmoPickup& pickup : scene.ammoPickups) {
+            if (!pickup.active || pickup.collected ||
+                pickup.physicsHandle == 0) continue;
+            const XMMATRIX gunTransform =
+                XMMatrixScaling(pickup.meshScale, pickup.meshScale,
+                                pickup.meshScale) *
+                XMMatrixTranslation(pickup.meshCenterOffset.x,
+                                    pickup.meshCenterOffset.y,
+                                    pickup.meshCenterOffset.z) *
+                XMMatrixRotationQuaternion(XMLoadFloat4(&pickup.rotation)) *
+                XMMatrixTranslation(pickup.position.x, pickup.position.y,
+                                    pickup.position.z);
+            DrawMeshAt(GunModel::Mesh(), shader, gunTransform, view, proj,
+                       lightSpace, false, visibilityExtensionsOnly);
+        }
+        shader.Use(scene.wireframeMode);
+    }
+
+    // Ammo that could not get a gun body (no physics world or gun pose):
+    // small hovering glowing boxes.
+    if (!g_emptyLevelMode) {
+        for (const AmmoPickup& pickup : scene.ammoPickups) {
+            if (!pickup.active || pickup.collected ||
+                pickup.physicsHandle != 0) continue;
+
+            const float bob = std::sin(pickup.bobPhase * 1.9f) * 0.08f;
+            const float spin = pickup.bobPhase * 1.1f;
+            const XMMATRIX ammoTransform =
+                XMMatrixScaling(0.15f, 0.15f, 0.15f) *
+                XMMatrixRotationY(spin) *
+                XMMatrixTranslation(pickup.position.x,
+                                    pickup.position.y + bob,
+                                    pickup.position.z);
+            shader.SetMatrices(ammoTransform, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(1.0f, 1.0f, 0.3f), 2.5f);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
+        shader.Use(scene.wireframeMode);
+    }
+
     // Sustained laser beam. Two additive layers make a cyan heat halo around a
     // white-hot core; depth testing keeps the beam clipped by its impact point.
     if (scene.laserBeam.life > 0.0f) {

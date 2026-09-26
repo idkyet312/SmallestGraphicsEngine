@@ -101,7 +101,21 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 22, "protocol version was not bumped");
+    Check(kProtocolVersion == 26, "protocol version was not bumped");
+    static_assert(std::is_trivially_copyable<ScoreboardEntry>::value,
+                  "scoreboard entries are memcpy'd");
+    static_assert(std::is_trivially_copyable<ServerScoreboardMessage>::value,
+                  "scoreboard messages are memcpy'd");
+    static_assert(std::is_trivially_copyable<BarrelEventMessage>::value,
+                  "barrel events are memcpy'd");
+    static_assert(std::is_trivially_copyable<ClientBlastMessage>::value,
+                  "blasts are memcpy'd");
+    static_assert(offsetof(BarrelEventMessage, header) == 0, "header must lead");
+    static_assert(offsetof(ClientBlastMessage, header) == 0, "header must lead");
+    // The weapon byte was claimed from the padding; the shell fields after it
+    // must not have moved.
+    static_assert(offsetof(ServerEnemyFireMessage, x) == 8,
+                  "enemy fire layout moved");
 
     // The whole armor set rides in one datagram; pinned so growing the caps or
     // a snapshot is a deliberate decision about packet size.
@@ -111,6 +125,8 @@ int main() {
                   "EnemyHumveeSnapshot size changed unexpectedly");
     static_assert(sizeof(AATurretSnapshot) == 28,
                   "AATurretSnapshot size changed unexpectedly");
+    static_assert(sizeof(ObjectivePlaneSnapshot) == 56,
+                  "ObjectivePlaneSnapshot size changed unexpectedly");
     static_assert(sizeof(ServerArmorStateMessage) <= 1200,
                   "ServerArmorStateMessage no longer fits one datagram");
     static_assert(std::is_trivially_copyable<ServerArmorStateMessage>::value,
@@ -142,6 +158,14 @@ int main() {
                   "EnemySnapshot layout changed unexpectedly");
     static_assert(sizeof(EnemySnapshot) == 36,
                   "EnemySnapshot size changed unexpectedly");
+    // `marine` rides in the padding `killer` left, so it costs nothing.
+    static_assert(offsetof(EnemySnapshot, marine) == 5,
+                  "marine must sit in the padding after killer");
+    static_assert(std::is_trivially_copyable<ClientMarineDropMessage>::value,
+                  "marine drop is memcpy'd");
+    Check(ClientMarineDropMessage{}.header.type ==
+              MessageType::ClientMarineDrop,
+          "ClientMarineDropMessage has the wrong default type");
 
     // Default-constructed messages must already carry their own type, or a
     // sender that forgets to set it produces a message that reads as something
@@ -168,6 +192,8 @@ int main() {
     Check(ClientReviveProgressMessage{}.header.type ==
               MessageType::ClientReviveProgress,
           "ClientReviveProgressMessage has the wrong default type");
+    Check(ServerScoreboardMessage{}.header.type == MessageType::ServerScoreboard,
+          "ServerScoreboardMessage has the wrong default type");
 
     // The hello carries the magic and version by default: a peer that sends a
     // default-constructed hello must be accepted by a matching build.

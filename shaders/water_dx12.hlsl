@@ -125,6 +125,32 @@ bool WaterBathymetryUV(float2 worldXZ, out float2 uv)
 // Ultra ignores it and always refracts fully.
 bool WaterUltraQuality() { return ultraSimulation.w > 0.5; }
 
+// One Gerstner train, scaled by `weight` so two fields can be crossfaded.
+void AccumulateGerstner(float2 direction, float k, float phase,
+                        float amplitude, float steepness, float weight,
+                        inout float3 position, inout float3 tangentX,
+                        inout float3 tangentZ, inout float compression)
+{
+    const float sine = sin(phase);
+    const float cosine = cos(phase);
+    const float weightedAmplitude = amplitude * weight;
+    const float horizontal = steepness * weightedAmplitude;
+
+    position.xz += direction * horizontal * cosine;
+    position.y += weightedAmplitude * sine;
+
+    const float common = horizontal * k * sine;
+    tangentX += float3(
+        -direction.x * direction.x * common,
+         direction.x * weightedAmplitude * k * cosine,
+        -direction.x * direction.y * common);
+    tangentZ += float3(
+        -direction.x * direction.y * common,
+         direction.y * weightedAmplitude * k * cosine,
+        -direction.y * direction.y * common);
+    compression += common;
+}
+
 void EvaluateOcean(float2 baseXZ, float time, out float3 position,
                    out float3 normal, out float crest)
 {
@@ -212,6 +238,19 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
         ? WavePhaseNoise(baseXZ) : 0.0;
     float breakingEnergy = 0.0;
 
+    // The CPU bed stops at 24 m (ShoreDistanceToBed), about 99 m offshore.
+    // Trains longer than 48 m still feel the bed at that depth, so shoaling and
+    // refraction were cut off along that contour -- a visible ring around the
+    // island. Retire the bed's influence over a wide band well before the
+    // clamp, and toward the edges of the bathymetry field, so nothing is still
+    // bent or shoaled where the data goes flat or ends.
+    float bedFade = 0.0;
+    if (haveBathymetry) {
+        const float2 edge = min(bathymetryUV, 1.0 - bathymetryUV);
+        bedFade = (1.0 - smoothstep(8.0, 21.0, restDepth)) *
+                  smoothstep(0.0, 0.08, min(edge.x, edge.y));
+    }
+
     [unroll]
     for (uint i = 0; i < OceanWaveCount; ++i) {
         const float2 authored = normalize(waves[i].xy);
@@ -235,7 +274,7 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
         // One ramp, two weights off it, so both halves fade in at the same
         // depths for a given train and cannot drift out of step.
         const float bedInfluence = haveBathymetry
-            ? 1.0 - smoothstep(0.0, feelDepth, restDepth) : 0.0;
+            ? (1.0 - smoothstep(0.0, feelDepth, restDepth)) * bedFade : 0.0;
         const float refractMix = bedInfluence * refractStrength;
         const float flattenMix = bedInfluence * flattenStrength;
 
@@ -251,8 +290,12 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
         const float fanSide = (i & 1) ? -1.0 : 1.0;
         const float spread = fanSide * lerp(0.95, 0.18, periodMix);
         const float2 shoreDirection = normalize(shoreward + alongShore * spread);
+        // Ultra turns its single field by refractMix. High instead builds the
+        // fully turned bearing here and crossfades to it below, so this turn
+        // uses the slider alone rather than the depth-scaled mix.
+        const float turnAmount = ultraWaveModel ? refractMix : refractStrength;
         float2 direction = authored;
-        if (refractMix > 0.001) {
+        if (turnAmount > 0.001 && bedInfluence > 0.001) {
             // Rotate along the shortest arc, not a vector lerp. Lerping two
             // near-opposed unit vectors passes through the degenerate midpoint
             // and sends the train the long way round -- measured swings of
@@ -276,7 +319,7 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
             // should.
             const float maxTurn = 1.57079632679;
             delta = clamp(delta, -maxTurn, maxTurn);
-            const float turned = authoredAngle + delta * refractMix;
+            const float turned = authoredAngle + delta * turnAmount;
             direction = float2(cos(turned), sin(turned));
         }
 
@@ -344,7 +387,6 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
         // noise terms so successive fronts are not identical arcs. High takes
         // the classic projection onto the authored bearing: parallel crests
         // sweeping across the world, travelling with the wave direction.
-        float phase;
         if (ultraWaveModel) {
             const float wander = wavelength * 0.85 *
                 sin(bearing * (2.0 + float(i)) + authored.x * 3.1);
@@ -353,41 +395,41 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
             // length. Scaled by wavelength so the long swell bends over
             // hundreds of metres while the chop breaks up over a few.
             const float noiseOffset = phaseNoise * wavelength * 0.42;
-            phase = k * (travelDistance + wander * spread * 3.0 +
-                         noiseOffset) + omega * time;
+            const float phase = k * (travelDistance + wander * spread * 3.0 +
+                                     noiseOffset) + omega * time;
+            AccumulateGerstner(direction, k, phase, amplitude, steepness, 1.0,
+                               position, tangentX, tangentZ, compression);
         } else {
-            // Travelling along the refracted bearing, so as `direction` turns
-            // shoreward the crests advance inward rather than being pushed back
-            // out to sea. `shoreward` is the uphill bed gradient and the bed is
-            // negative in water, so +direction is genuinely toward the beach.
+            // High crossfades two whole fields instead of bending one. The
+            // phase is k * dot(direction, worldXZ); turning `direction` or
+            // shortening k a little at a time multiplies that small change by
+            // the full world position -- ~100 m out at the island -- so the
+            // crests piled into one sharp contour where the bed first took
+            // hold: a visible ring. Each field below keeps a phase that is
+            // smooth on its own, and the depth ramp only fades between them.
             //
-            // The noise offset is what keeps this from reading as concentric
-            // rings: it displaces the crest line by a fraction of a wavelength
-            // along its length, so successive fronts arrive slightly ragged and
-            // out of step instead of as clean arcs. Scaled by wavelength, and by
-            // refractMix so the offshore swell stays clean and only the shoaling
-            // near-shore trains break up.
-            const float irregular =
-                phaseNoise * wavelength * 0.30 * refractMix;
-            phase = k * (dot(direction, baseXZ) + irregular) - omega * time;
+            // Offshore field: authored bearing, deep-water wavenumber.
+            const float deepPhase =
+                deepK * dot(authored, baseXZ) - omega * time;
+            AccumulateGerstner(authored, deepK, deepPhase, amplitude,
+                               steepness, 1.0 - bedInfluence,
+                               position, tangentX, tangentZ, compression);
+            if (bedInfluence > 0.001) {
+                // Shore field: fully refracted bearing and shoaled wavelength.
+                // `shoreward` is the uphill bed gradient and the bed is
+                // negative in water, so +direction is toward the beach. The
+                // noise offset displaces the crest line by a fraction of a
+                // wavelength so the bent fronts arrive ragged rather than as
+                // clean concentric arcs.
+                const float irregular =
+                    phaseNoise * wavelength * 0.30 * refractStrength;
+                const float shorePhase =
+                    k * (dot(direction, baseXZ) + irregular) - omega * time;
+                AccumulateGerstner(direction, k, shorePhase, amplitude,
+                                   steepness, bedInfluence,
+                                   position, tangentX, tangentZ, compression);
+            }
         }
-        float sine = sin(phase);
-        float cosine = cos(phase);
-        float horizontal = steepness * amplitude;
-
-        position.xz += direction * horizontal * cosine;
-        position.y += amplitude * sine;
-
-        float common = horizontal * k * sine;
-        tangentX += float3(
-            -direction.x * direction.x * common,
-             direction.x * amplitude * k * cosine,
-            -direction.x * direction.y * common);
-        tangentZ += float3(
-            -direction.x * direction.y * common,
-             direction.y * amplitude * k * cosine,
-            -direction.y * direction.y * common);
-        compression += common;
     }
 
     normal = normalize(cross(tangentZ, tangentX));

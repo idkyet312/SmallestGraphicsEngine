@@ -462,10 +462,13 @@ static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
         best.isPlayer = isPlayer;
         best.valid = true;
     };
-    if (scene.player.health > 0.0f && !scene.player.downed)
+    // Not while planning: the gun is already held off then, and turning to
+    // face the parked body would still give the undeployed player away.
+    if (scene.player.health > 0.0f && !scene.player.downed &&
+        !g_insertionChoicePending)
         consider(scene.camera.Position, true);
     for (const auto& actor : g_bandits) {
-        if (!actor || actor->Dead()) continue;
+        if (!actor || actor->Dead() || HiddenFromEnemies(*actor)) continue;
         if (actor->faction != Faction::Marine) continue;
         // Torso rather than feet, matching the infantry sight tests: a ray
         // aimed at ground level dives into the terrain over any real distance.

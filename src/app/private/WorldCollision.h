@@ -994,3 +994,51 @@ static bool QueryBanditCover(const SkinnedEnemy& bandit,
     }
     return found;
 }
+
+// Hands the prefab mesh colliders to the physics world, so vehicles, debris
+// and ragdolls meet the same geometry the player walks on. Cheap every frame:
+// the set is re-sent only when its signature (who, which mesh, where) moves,
+// and DestructionDX12 keeps unchanged instances' bodies across a re-send.
+static void SyncPrefabMeshPhysics() {
+    static uint64_t lastSignature = 0;
+    static bool sent = false;
+    uint64_t signature = 1469598103934665603ull;
+    const auto mix = [&signature](const void* data, size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < bytes; ++i)
+            signature = (signature ^ p[i]) * 1099511628211ull;
+    };
+    const size_t count = g_prefabMeshColliders.size();
+    mix(&count, sizeof(count));
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        mix(&instance.entityId, sizeof(instance.entityId));
+        mix(&instance.mesh, sizeof(instance.mesh));
+        mix(&instance.worldTransform, sizeof(instance.worldTransform));
+    }
+    if (sent && signature == lastSignature) return;
+    sent = true;
+    lastSignature = signature;
+
+    const auto begin = std::chrono::steady_clock::now();
+    std::vector<DestructionDX12::StaticMeshColliderDesc> colliders;
+    colliders.reserve(count);
+    size_t triangles = 0;
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        if (!instance.mesh || instance.mesh->triangles.empty()) continue;
+        DestructionDX12::StaticMeshColliderDesc desc;
+        desc.key = instance.entityId;
+        desc.source = instance.mesh;
+        desc.triangles = instance.mesh->triangles.data();
+        desc.triangleCount = instance.mesh->triangles.size() / 9;
+        desc.world = instance.worldTransform;
+        triangles += desc.triangleCount;
+        colliders.push_back(desc);
+    }
+    g_destruction.SetStaticMeshColliders(colliders);
+    SGE_LOG("LogPhysics", EngineLog::Level::Display,
+        "Static mesh colliders: " + std::to_string(colliders.size()) +
+        " instances, " + std::to_string(triangles) + " triangles, " +
+        std::to_string(g_destruction.StaticMeshColliderBodyCount()) +
+        " bodies, " + std::to_string(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count()) + " ms");
+}

@@ -10,11 +10,108 @@ static void UpdateWeaponPickups(float dt) {
     }
 }
 
+// Death hides the enemy's held gun; this puts the same mesh back into the world
+// as a rigid body at the pose it last drew at, fitted with a box hull to the
+// mesh's own bounds, so it falls out of his hand instead of vanishing.
+static void SpawnDroppedEnemyGun(const SkinnedEnemy& enemy, uint32_t seed) {
+    AmmoPickup pickup;
+    pickup.life = pickup.maxLife;
+    pickup.active = true;
+
+    XMMATRIX gunWorld;
+    XMFLOAT3 boundsMin = { FLT_MAX, FLT_MAX, FLT_MAX };
+    XMFLOAT3 boundsMax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    if (GunModel::Loaded()) {
+        for (const MeshPrimitive& prim : GunModel::Mesh()->primitives) {
+            if (!prim.boundsValid) continue;
+            boundsMin.x = (std::min)(boundsMin.x, prim.boundsMin.x);
+            boundsMin.y = (std::min)(boundsMin.y, prim.boundsMin.y);
+            boundsMin.z = (std::min)(boundsMin.z, prim.boundsMin.z);
+            boundsMax.x = (std::max)(boundsMax.x, prim.boundsMax.x);
+            boundsMax.y = (std::max)(boundsMax.y, prim.boundsMax.y);
+            boundsMax.z = (std::max)(boundsMax.z, prim.boundsMax.z);
+        }
+    }
+    XMVECTOR scale, rotation, translation;
+    if (boundsMin.x <= boundsMax.x && enemy.LastGunWorldMatrix(gunWorld) &&
+        XMMatrixDecompose(&scale, &rotation, &translation, gunWorld)) {
+        // The gun transform is uniform scale * rotation * translation (see
+        // SkinnedEnemy::UpdateGunFromHand*), so one scale factor covers it.
+        const float s = XMVectorGetX(scale);
+        const XMVECTOR centerLocal =
+            (XMLoadFloat3(&boundsMin) + XMLoadFloat3(&boundsMax)) * 0.5f;
+        XMFLOAT3 halfExtents;
+        XMStoreFloat3(&halfExtents,
+            (XMLoadFloat3(&boundsMax) - XMLoadFloat3(&boundsMin)) * (0.5f * s));
+        // Box3D rejects a flat hull; a thin receiver still gets some depth.
+        halfExtents.x = (std::max)(halfExtents.x, 0.015f);
+        halfExtents.y = (std::max)(halfExtents.y, 0.015f);
+        halfExtents.z = (std::max)(halfExtents.z, 0.015f);
+        XMFLOAT3 bodyPosition;
+        XMStoreFloat3(&bodyPosition, XMVector3Transform(centerLocal, gunWorld));
+        XMFLOAT4 bodyRotation;
+        XMStoreFloat4(&bodyRotation, rotation);
+
+        // Slips out of the hand: a small forward flick plus a seeded sideways
+        // push and tumble, so every drop is different but repeatable.
+        const float side = ((seed >> 8) & 0xFF) / 255.0f * 2.0f - 1.0f;
+        const float spin = ((seed >> 16) & 0xFF) / 255.0f * 2.0f - 1.0f;
+        const float fwdX = std::sin(enemy.yaw), fwdZ = std::cos(enemy.yaw);
+        const XMFLOAT3 linearVelocity = {
+            fwdX * 0.8f + fwdZ * side * 0.6f, 1.0f,
+            fwdZ * 0.8f - fwdX * side * 0.6f };
+        const XMFLOAT3 angularVelocity = { spin * 4.0f, side * 2.0f, 3.0f };
+        // A rifle is ~3.5 kg whatever its bounds measure.
+        const float volume =
+            8.0f * halfExtents.x * halfExtents.y * halfExtents.z;
+        const float density = 3.5f / volume;
+
+        pickup.physicsHandle = g_destruction.CreateDroppedItemBody(
+            bodyPosition, bodyRotation, halfExtents,
+            linearVelocity, angularVelocity, density);
+        if (pickup.physicsHandle != 0) {
+            pickup.position = bodyPosition;
+            pickup.rotation = bodyRotation;
+            pickup.meshScale = s;
+            XMStoreFloat3(&pickup.meshCenterOffset, -centerLocal * s);
+        }
+    }
+    if (pickup.physicsHandle == 0) {
+        pickup.position = enemy.position;
+        pickup.position.y += 0.3f;
+    }
+    scene.ammoPickups.push_back(pickup);
+}
+
+static void UpdateAmmoPickups(float dt) {
+    scene.ammoPickupGainTimer = (std::max)(0.0f, scene.ammoPickupGainTimer - dt);
+    if (scene.ammoPickups.empty()) return;
+    for (auto it = scene.ammoPickups.begin(); it != scene.ammoPickups.end(); ) {
+        it->life -= dt;
+        if (!it->active || it->collected || it->life <= 0.0f) {
+            g_destruction.DestroyPropBody(it->physicsHandle);
+            it = scene.ammoPickups.erase(it);
+            continue;
+        }
+        // A sleeping box keeps its last pose. A failed read (the world was
+        // rebuilt under it) leaves it where it last landed.
+        DestructionBodyPose pose;
+        if (it->physicsHandle != 0 &&
+            g_destruction.IsPropBodyAwake(it->physicsHandle) &&
+            g_destruction.GetPropBodyPose(it->physicsHandle, pose)) {
+            it->position = pose.position;
+            it->rotation = pose.rotation;
+        }
+        it->bobPhase += dt;
+        ++it;
+    }
+}
+
 // The pickup the player is standing close enough to take, or null. Nearest wins
 // when two overlap, so the prompt and the E handler can never disagree about
 // which one is being offered.
 static WeaponPickup* NearbyWeaponPickup() {
-    if (scene.weaponPickups.empty() || g_drivingHumvee) return nullptr;
+    if (scene.weaponPickups.empty() || PlayerInVehicle()) return nullptr;
     if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
         return nullptr;
 
@@ -94,6 +191,72 @@ static bool CollectNearbyWeaponPickup() {
     return true;
 }
 
+static AmmoPickup* NearbyAmmoPickup() {
+    if (scene.ammoPickups.empty() || PlayerInVehicle()) return nullptr;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return nullptr;
+
+    const XMFLOAT3& camera = scene.camera.Position;
+    AmmoPickup* best = nullptr;
+    float bestDistanceSq = FLT_MAX;
+    for (AmmoPickup& pickup : scene.ammoPickups) {
+        if (!pickup.active || pickup.collected) continue;
+
+        const float dx = camera.x - pickup.position.x;
+        const float dz = camera.z - pickup.position.z;
+        const float dy = camera.y - pickup.position.y;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq > pickup.radius * pickup.radius) continue;
+        if (std::abs(dy) > pickup.verticalRange) continue;
+        if (distanceSq >= bestDistanceSq) continue;
+        bestDistanceSq = distanceSq;
+        best = &pickup;
+    }
+    return best;
+}
+
+// Walk-over ammo: called every frame, takes the dropped gun the player is
+// standing on and tops up both carried weapons. Returns false when there is
+// nothing in reach or nothing to add -- a gun left while full stays on the
+// ground to come back for.
+static bool CollectNearbyAmmoPickup() {
+    AmmoPickup* pickup = NearbyAmmoPickup();
+    if (!pickup) return false;
+
+    PlayerState& player = scene.player;
+    auto& carried = GunModel::LoadoutWeapons();
+    const int held = GunModel::SelectedWeapon();
+    int ammoAdded = 0;
+    int heldAdded = 0;
+
+    for (size_t i = 0; i < carried.size(); ++i) {
+        const int weaponId = carried[i];
+        SGE::WeaponInstance* weapon = player.Weapon(weaponId);
+        if (!weapon) continue;
+
+        // One full magazine, clamped to what the weapon can carry.
+        const int toAdd = (std::min)(player.MagazineSize(weaponId),
+                                     player.MaxReserve(weaponId) - weapon->reserve);
+        if (toAdd > 0) {
+            weapon->reserve += toAdd;
+            ammoAdded += toAdd;
+            if (weaponId == held) heldAdded += toAdd;
+        }
+    }
+
+    if (ammoAdded > 0) {
+        pickup->collected = true;
+        // The HUD shows the reserve of the weapon in hand, so the popup reports
+        // that weapon's gain; only a held weapon already full falls back to
+        // the total so the pickup never reads as "+0".
+        scene.ammoPickupGain = heldAdded > 0 ? heldAdded : ammoAdded;
+        scene.ammoPickupGainTimer = Scene::kAmmoPickupGainDuration;
+        g_reloadAudio.Play(0.85f, 0.80f);
+        return true;
+    }
+    return false;
+}
+
 // ---- Armory shop ----------------------------------------------------------
 // A placed armory counter opens a storefront in the middle of a mission. It
 // sells the same catalogue the deploy screen does and charges through the same
@@ -113,7 +276,7 @@ static int g_armoryShopSlot = 0;
 // The counter the player is standing at, or null. Nearest wins, so the prompt
 // and the E handler can never disagree about which one is being offered.
 static const PrefabArmoryShop* NearbyArmoryShop(size_t* outIndex = nullptr) {
-    if (g_prefabArmoryShops.empty() || g_drivingHumvee) return nullptr;
+    if (g_prefabArmoryShops.empty() || PlayerInVehicle()) return nullptr;
     if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
         return nullptr;
 
@@ -473,10 +636,10 @@ static const std::array<TravelDestination, 2> kTravelDestinations = { {
         "build/Content/Levels/Islandv10.json" },
       "Content/Levels/Islandv10/preview.png" },
     { "MILITARY AIRFIELD", "Strike - aircraft on the ground",
-      { "Content/Levels/BigIslandv33.json",
-        "levels/BigIslandv33.json",
-        "build/Content/Levels/BigIslandv33.json" },
-      "Content/Levels/BigIslandv33/preview.png" },
+      { "Content/Levels/BigIslandv34.json",
+        "levels/BigIslandv34.json",
+        "build/Content/Levels/BigIslandv34.json" },
+      "Content/Levels/BigIslandv34/preview.png" },
 } };
 
 
@@ -502,7 +665,7 @@ static XMFLOAT3 g_travelReturnPosition{};
 // The boarding point the player is standing at, or null. Nearest wins, so the
 // prompt and the E handler can never disagree about which one is on offer.
 static const PrefabTravelPoint* NearbyTravelPoint(size_t* outIndex = nullptr) {
-    if (g_prefabTravelPoints.empty() || g_drivingHumvee) return nullptr;
+    if (g_prefabTravelPoints.empty() || PlayerInVehicle()) return nullptr;
     if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
         return nullptr;
 

@@ -343,7 +343,10 @@ static void UpdateSteam() {
     switch (g_game.session.Screen()) {
     case GameScreen::Level1: screen = "In a mission"; break;
     case GameScreen::LevelEditor: screen = "In the level editor"; break;
-    case GameScreen::WinScreen: screen = "Mission complete"; break;
+    case GameScreen::WinScreen:
+        screen = g_missionFailReason.empty() ? "Mission complete"
+                                             : "Mission failed";
+        break;
     default: break;
     }
     // Multiplayer is worth saying out loud: it is the one state where a friend

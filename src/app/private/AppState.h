@@ -265,8 +265,13 @@ static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
 static constexpr const char* kObjectivePlanePrefabId = "props/objective_plane";
 // Time from level start until the aircraft begins its roll.
 static constexpr float kObjectivePlaneHoldSeconds = 120.0f;
-// How long the roll/rotate/climb takes once started. After this it is gone.
+// Roughly how long the roll/rotate/climb takes to clear a typical map; the
+// briefing quotes it. The escape itself is the airframe leaving the map
+// (kObjectivePlaneEscapeMargin past the play area), with
+// kObjectivePlaneMaxFlightSeconds as a backstop.
 static constexpr float kObjectivePlaneTakeoffSeconds = 14.0f;
+static constexpr float kObjectivePlaneEscapeMargin = 40.0f;
+static constexpr float kObjectivePlaneMaxFlightSeconds = 90.0f;
 static constexpr float kObjectivePlaneTaxiSpeed = 34.0f;   // m/s at rotation
 static constexpr float kObjectivePlaneClimbRate = 11.0f;   // m/s once airborne
 // Crash-out, matching the Black Hawk's numbers so a downed aircraft reads the
@@ -332,10 +337,25 @@ struct ObjectivePlaneState {
     // and the plane shrugged off a demolition charge planted directly on it.
     float blastReachHorizontal = 7.0f;
     float blastReachVertical = 4.0f;
+    // The prefab box collider's centre in the airframe's own space. The box
+    // is built at the authored placement and never moved on its own, so once
+    // the plane rolled, rounds and rockets kept stopping on (and damaging it
+    // through) the empty apron. It is carried with the airframe instead.
+    DirectX::XMFLOAT3 colliderLocal{};
+    bool colliderLocalValid = false;
 };
 static std::vector<ObjectivePlaneState> g_objectivePlanes;
 // Set when an aircraft clears the map, so the mission can report the failure.
 static bool g_objectivePlaneEscaped = false;
+// A client has been ordered in with the host's insertion (DEPLOY SQUAD); the
+// deployment screen presses DEPLOY for it on its next frame.
+static bool g_squadDeployRequested = false;
+// The aircraft's countdown has been started for this level. In a session the
+// first player to deploy starts it; later deploys must not restart it.
+static bool g_objectivePlanesArmed = false;
+// Why the run ended in failure, shown on the after-action report; empty on a
+// run that ended by extraction.
+static std::string g_missionFailReason;
 
 // One prefab placement that simulates as a rigid body instead of standing
 // still, created for any prefab carrying a "rigidBody" component.
@@ -1040,6 +1060,14 @@ struct HumveeGameplayState {
     // the gunner dies and the Humvee stops wherever it was.
     bool aiDriving = false;
     bool aiEverDriven = false;
+    // A player has driven it this level -- this machine's, or on the host a
+    // remote one. Latches like aiEverDriven, and for the same reason: the
+    // Humvee stays wherever they left it, which the others must see.
+    bool playerEverDriven = false;
+    // Host-side, this frame: a remote player is at the wheel. Their machine
+    // simulates it; the host only places its body where they say, and keeps
+    // its own AI off it.
+    bool remoteDriven = false;
     float aiStuckTime = 0.0f;
     float aiReverseTime = 0.0f;
     float aiReverseSteer = 1.0f;

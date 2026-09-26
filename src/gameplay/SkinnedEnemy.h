@@ -225,15 +225,26 @@ public:
     // already hold it and should not reach back into the session.
     bool              netDowned = false;
     float             netHealth = 100.0f;
+    // The owner has pressed DEPLOY. Until then the body is parked at the
+    // insertion point while its player plans, and no enemy may see it. Starts
+    // false so a body is hidden until a snapshot says otherwise.
+    bool              netDeployed = false;
     // Replicated aim state. Written by UpdateNetworkedPose and read by the gun
     // layer to pick the raised hold; meaningless on an AI actor, which decides
     // that from its own awareness.
     bool              netAiming = false;
+    // Replicated stance, same shape as netAiming. Drives the pose edit in
+    // ApplyCrouch, which is also what lowers the hitbox: shots are tested
+    // against the posed bones, so a crouched player behind cover is behind it.
+    bool              netCrouching = false;
     // Last position this body was placed at by a snapshot, for measuring how
     // fast it is travelling. Only meaningful for a networked body: an AI actor
     // moves itself and already knows its own speed.
     DirectX::XMFLOAT3 netPreviousPosition_{};
     bool              netHasPreviousPosition_ = false;
+    // 0 standing .. 1 fully crouched, eased toward netCrouching. Zero on every
+    // AI actor, which leaves ApplyCrouch a no-op for them.
+    float             crouchBlend_ = 0.0f;
     // Stable network identity for an AI actor, assigned at spawn and never
     // reused within a session. Deliberately not the index in g_bandits: that
     // vector is compacted when bodies are removed, which would renumber every
@@ -246,6 +257,11 @@ public:
     // near the player instead of near wherever it was placed. Left unset
     // (nullopt) for bandits, who should keep wandering their own spawn point.
     std::optional<DirectX::XMFLOAT3> leashPosition;
+    // The player a marine follows, on the host: 0xFF is this machine's own
+    // player, anything else the net player whose transport brought it in.
+    uint8_t           leashOwner = 0xFF;
+    // True after ammo pickup has been spawned on death, prevents duplicate drops.
+    bool              ammoPickupSpawned = false;
 
     // Sniper telegraph: how long the laser paints the player before the shot.
     // Long on purpose -- the beam IS the warning, so the player needs time to
@@ -474,8 +490,15 @@ public:
     // is what normally drives the clip and the skinning pose -- without this a
     // remote player would slide around frozen in its bind pose.
     void UpdateNetworkedPose(float dt, bool moving, bool sprinting,
-                             bool aiming = false) {
+                             bool aiming = false, bool crouching = false) {
         netAiming = aiming;
+        netCrouching = crouching && !netDowned;
+        // About the pace the owner's own eye drops at (CameraDX12 SetCrouching
+        // moves 0.75 m at 5 m/s), so the body and the view it stands for
+        // arrive together.
+        const float crouchStep = (std::min)(1.0f, dt * 6.5f);
+        crouchBlend_ += ((netCrouching ? 1.0f : 0.0f) - crouchBlend_) * crouchStep;
+        if (crouchBlend_ < 0.001f) crouchBlend_ = 0.0f;
         // Kept on the signature for the callers, but not read: the blend space
         // picks walk or run from the speed measured below, which is what the
         // legs have to match. A sprint flag held against a wall would otherwise
@@ -575,6 +598,78 @@ public:
         const float targetFoot = down ? kDownedFootOffset : kStandingFootOffset;
         rootRoll += (targetRoll - rootRoll) * step;
         footOffset += (targetFoot - footOffset) * step;
+    }
+
+    // Crouch as a pose edit on top of whatever the clip produced. There is no
+    // crouch clip on either rig (idle, walk, run and jumps only -- the same gap
+    // EaseDownedRoll works around), so the pelvis drops, the legs fold with the
+    // two-bone solver the arms use to keep the feet where the clip planted
+    // them, and the spine leans in over them. Runs before the gun IK, which
+    // anchors on the shoulder bone, so the rifle comes down with the chest.
+    //
+    // Drop and lean together take the head down ~0.6 m against the owner's
+    // 0.75 m eye drop; the pelvis cannot go further without the knees running
+    // out of reach, and a deeper lean folds the chest onto the thighs.
+    void ApplyCrouch() {
+        using namespace DirectX;
+        if (crouchBlend_ <= 0.0f || poseGlobals_.empty()) return;
+        const Skeleton& skel = model.skeleton;
+        const int pelvis = skel.Find("pelvis");
+        const int spine = skel.Find("spine_01");
+        const int thighs[2] = { skel.Find("thigh_l"), skel.Find("thigh_r") };
+        const int calves[2] = { skel.Find("calf_l"), skel.Find("calf_r") };
+        const int feet[2] = { skel.Find("foot_l"), skel.Find("foot_r") };
+        if (pelvis < 0) return;
+        for (int leg = 0; leg < 2; ++leg)
+            if (thighs[leg] < 0 || calves[leg] < 0 || feet[leg] < 0) return;
+
+        constexpr float kPelvisDrop = 0.42f;
+        constexpr float kSpineLean = 0.38f;   // radians, forward
+        // World down taken into the pose's space rather than assumed: the rig
+        // is axis-converted, so its local "down" is not -Y.
+        const XMMATRIX world = MeshWorldMatrix();
+        const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, world);
+        const XMVECTOR dropModel = XMVector3TransformNormal(
+            XMVectorSet(0.0f, -kPelvisDrop * crouchBlend_, 0.0f, 0.0f),
+            inverseWorld);
+
+        XMMATRIX footBefore[2];
+        for (int leg = 0; leg < 2; ++leg)
+            footBefore[leg] = XMLoadFloat4x4(&poseGlobals_[feet[leg]]);
+
+        const XMMATRIX lower = XMMatrixTranslationFromVector(dropModel);
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            if (!IsDescendant(static_cast<int>(bone), pelvis)) continue;
+            XMStoreFloat4x4(&poseGlobals_[bone],
+                XMLoadFloat4x4(&poseGlobals_[bone]) * lower);
+        }
+        for (int leg = 0; leg < 2; ++leg) {
+            SolveArmIK(thighs[leg], calves[leg], feet[leg], footBefore[leg].r[3]);
+            // The solver swings the foot with the shin. Put it back exactly as
+            // the clip had it -- same place, flat on the same ground.
+            const XMMATRIX restore = XMMatrixInverse(nullptr,
+                XMLoadFloat4x4(&poseGlobals_[feet[leg]])) * footBefore[leg];
+            for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+                if (!IsDescendant(static_cast<int>(bone), feet[leg])) continue;
+                XMStoreFloat4x4(&poseGlobals_[bone],
+                    XMLoadFloat4x4(&poseGlobals_[bone]) * restore);
+            }
+        }
+        if (spine >= 0) {
+            // Body right, the same axis ComputeGripTargets uses; a positive
+            // turn about it tips the chest toward the facing direction.
+            const XMVECTOR right =
+                XMVectorSet(std::cos(yaw), 0.0f, -std::sin(yaw), 0.0f);
+            RotateBranchWorld(spine, XMLoadFloat4x4(&poseGlobals_[spine]).r[3],
+                XMMatrixRotationAxis(right, kSpineLean * crouchBlend_));
+        }
+        // The IK path rebuilds the palette again after this; the paths without
+        // it draw straight from this one.
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            const XMMATRIX skin = XMLoadFloat4x4(&skel.offset[bone]) *
+                                  XMLoadFloat4x4(&poseGlobals_[bone]);
+            XMStoreFloat4x4(&paletteCPU_[bone], XMMatrixTranspose(skin));
+        }
     }
 
     void PlayClip(const std::string& name) {
@@ -1602,6 +1697,17 @@ public:
         return XMLoadFloat4x4(&gunWorld_);
     }
 
+    // Where the gun was on the last frame it drew. Death hides the held gun
+    // (HasGunPose needs !dead_) without touching gunWorld_, so this is the pose
+    // to drop it from. False when the gun was never posed.
+    bool LastGunWorldMatrix(DirectX::XMMATRIX& out) const {
+        if (handBone_ < 0 ||
+            static_cast<size_t>(handBone_) >= poseGlobals_.size())
+            return false;
+        out = DirectX::XMLoadFloat4x4(&gunWorld_);
+        return true;
+    }
+
     void SyncRagdoll() {
         using namespace DirectX;
         if (!dead_ || ragdollId_ == UINT32_MAX || deathGlobals_.empty()) return;
@@ -2583,15 +2689,18 @@ private:
             // torso motion instead of replacing it with the legacy idle layer.
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            ApplyCrouch();
             if (upperBodyGunLayer) ApplyGunIK(dt);
             else UpdateGunFromHandBone(model.skeleton.Find("hand_l"));
         } else if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);
+            ApplyCrouch();
             ApplyGunIK(dt);
         } else {
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+            ApplyCrouch();
             // No IK to hang the weapon off, so parent it to the hand instead
             // of leaving the actor empty-handed.
             UpdateGunFromHandBone(model.skeleton.Find("hand_l"));

@@ -935,6 +935,26 @@ inline void RenderPlayerHUD(const Scene& scene) {
             hudText(ImVec2(spareX, magY + magHeight * 0.44f),
                     IM_COL32(160, 172, 178, 235), spareText);
 
+            // "+N" over the reserve after walking over a dropped gun: drifts
+            // up and fades across the pickup timer.
+            if (scene.ammoPickupGainTimer > 0.0f && scene.ammoPickupGain > 0) {
+                constexpr float kGainDuration = Scene::kAmmoPickupGainDuration;
+                const float age = 1.0f -
+                    scene.ammoPickupGainTimer / kGainDuration;
+                const float alpha = (std::min)(1.0f,
+                    scene.ammoPickupGainTimer / (kGainDuration * 0.4f));
+                char gainText[24];
+                snprintf(gainText, sizeof(gainText), "+%d",
+                         scene.ammoPickupGain);
+                const ImVec2 gainSize = hudTextSize(gainText);
+                hudText(ImVec2(right - gainSize.x,
+                               magY + magHeight * 0.44f - gainSize.y - 4.0f -
+                                   age * 10.0f),
+                        IM_COL32(120, 235, 120,
+                                 static_cast<int>(245.0f * alpha)),
+                        gainText);
+            }
+
             // Reload sweeps a rule directly under the figures. Kept off the
             // numbers themselves so the counts never disappear mid-reload.
             if (scene.Reloading()) {
@@ -2189,7 +2209,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Separator();
 
     ImGui::Text("Controls:");
-    ImGui::BulletText("TAB: Toggle UI");
+    ImGui::BulletText("F3: Toggle UI");
+    ImGui::BulletText("TAB (hold): Scoreboard");
     ImGui::BulletText("C: Lock/Unlock Camera");
     ImGui::BulletText("F: Grab / throw enemy");
     ImGui::BulletText("E: Enter / exit Humvee");

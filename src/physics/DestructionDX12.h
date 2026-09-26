@@ -245,6 +245,28 @@ public:
                                bool brake);
     bool GetGroundVehiclePose(uint32_t handle, DestructionBodyPose& pose) const;
     void DestroyGroundVehicle(uint32_t handle);
+
+    // Static triangle-mesh colliders: the prefabs with "mesh" collision (the
+    // airport, car park, helipad, buildings). Without them the physics world
+    // holds only the terrain, so tanks, the Humvee, debris and ragdolls went
+    // straight through every building the player collides with.
+    //
+    // The set replaces the previous one; instances are matched by key, so an
+    // unchanged instance keeps its body. It outlives Initialize/Reset: each
+    // new world gets every body re-created, which is what lets the level-start
+    // prefab rebuild register them before the world exists. Instances with the
+    // same `source` share one Box3D mesh. `triangles` (9 floats per triangle,
+    // model space) is read during the call only.
+    struct StaticMeshColliderDesc {
+        uint64_t key = 0;
+        const void* source = nullptr;
+        const float* triangles = nullptr;
+        size_t triangleCount = 0;
+        DirectX::XMFLOAT4X4 world{};
+    };
+    void SetStaticMeshColliders(
+        const std::vector<StaticMeshColliderDesc>& colliders);
+    size_t StaticMeshColliderBodyCount() const;
     void SetEnemyTarget(const DirectX::XMFLOAT3& target);
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
@@ -367,6 +389,16 @@ public:
                             const DirectX::XMFLOAT3& halfExtents,
                             float yawRadians, float density);
     bool GetPropBodyPose(uint32_t handle, DestructionBodyPose& pose) const;
+    // A loose hand-held item (an enemy's dropped gun): a prop body with a full
+    // spawn rotation and initial velocity. It skips ragdolls, because it spawns
+    // inside the dying enemy's hand and depenetration would fling it. Read and
+    // destroyed through the prop calls above/below.
+    uint32_t CreateDroppedItemBody(const DirectX::XMFLOAT3& worldPosition,
+                                   const DirectX::XMFLOAT4& rotation,
+                                   const DirectX::XMFLOAT3& halfExtents,
+                                   const DirectX::XMFLOAT3& linearVelocity,
+                                   const DirectX::XMFLOAT3& angularVelocity,
+                                   float density);
     // True while the body is still moving. A sleeping prop can keep its last
     // pose instead of being re-read and re-uploaded every frame.
     bool IsPropBodyAwake(uint32_t handle) const;
@@ -483,6 +515,11 @@ private:
                                 DirectX::XMFLOAT3& hitPosition,
                                 uint32_t ignoredHarpoonId,
                                 bool skipFencePieces) const;
+    // Declared before `m`: members are destroyed in reverse order, so the
+    // world (and every shape referencing these meshes) goes first.
+    struct StaticMeshRegistry;
+    std::unique_ptr<StaticMeshRegistry> staticMeshes_;
+    void CreateStaticMeshBodies();
     struct Impl;
     std::unique_ptr<Impl> m;
 };

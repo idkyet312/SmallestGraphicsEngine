@@ -19,6 +19,7 @@
 #include <box3d/box3d.h>
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <cfloat>
@@ -541,7 +542,6 @@ struct DestructionDX12::Impl {
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
     std::vector<PropRuntime> propBodies;
-    uint32_t nextPropHandle = 1;
     std::vector<GrenadeRuntime> grenadeBodies;
     std::vector<uint32_t> grenadeContactEvents;
     uint32_t nextGrenadeHandle = 1;
@@ -2273,6 +2273,7 @@ struct DestructionDX12::Impl {
         world = b3CreateWorld(&worldDef);
         if (B3_IS_NULL(world)) return false;
         BuildGround();
+        owner->CreateStaticMeshBodies();
         // A level with no destructible geometry still needs the world and the
         // ground collider: explosive barrels, grenades, vehicles and ragdolls
         // all live here and are unrelated to Blast chunks. Only the root
@@ -3934,6 +3935,180 @@ struct DestructionDX12::Impl {
 };
 
 DestructionDX12::DestructionDX12() : m(std::make_unique<Impl>()) { m->owner = this; }
+struct DestructionDX12::StaticMeshRegistry {
+    struct Shared {
+        const void* source = nullptr;
+        size_t triangleCount = 0;
+        // First and last vertex, so a freed mesh whose address is reused by a
+        // different one is not mistaken for it.
+        float probe[6] = {};
+        b3MeshData* mesh = nullptr;
+        int users = 0;
+    };
+    struct Instance {
+        uint64_t key = 0;
+        const void* source = nullptr;
+        XMFLOAT4X4 world{};
+        b3MeshData* mesh = nullptr;
+        b3BodyId body = b3_nullBodyId;
+    };
+    std::vector<Shared> shared;
+    std::vector<Instance> instances;
+
+    ~StaticMeshRegistry() {
+        for (Shared& entry : shared)
+            if (entry.mesh) b3DestroyMesh(entry.mesh);
+    }
+
+    static void Probe(const StaticMeshColliderDesc& desc, float out[6]) {
+        const float* last = desc.triangles + (desc.triangleCount * 9 - 3);
+        for (int i = 0; i < 3; ++i) {
+            out[i] = desc.triangles[i];
+            out[3 + i] = last[i];
+        }
+    }
+
+    b3MeshData* Acquire(const StaticMeshColliderDesc& desc) {
+        float probe[6];
+        Probe(desc, probe);
+        for (Shared& entry : shared) {
+            if (entry.source == desc.source &&
+                entry.triangleCount == desc.triangleCount &&
+                std::memcmp(entry.probe, probe, sizeof(probe)) == 0) {
+                ++entry.users;
+                return entry.mesh;
+            }
+        }
+        std::vector<b3Vec3> vertices(desc.triangleCount * 3);
+        std::vector<int32_t> indices(desc.triangleCount * 3);
+        for (size_t i = 0; i < vertices.size(); ++i) {
+            vertices[i] = { desc.triangles[i * 3 + 0], desc.triangles[i * 3 + 1],
+                            desc.triangles[i * 3 + 2] };
+            indices[i] = static_cast<int32_t>(i);
+        }
+        b3MeshDef def = {};
+        def.vertices = vertices.data();
+        def.indices = indices.data();
+        def.vertexCount = static_cast<int>(vertices.size());
+        def.triangleCount = static_cast<int>(desc.triangleCount);
+        // The collision soup is unindexed; welding restores the shared edges
+        // that edge identification needs, so wheels roll across the seams
+        // between triangles instead of catching on them.
+        def.weldVertices = true;
+        def.weldTolerance = 0.001f;
+        def.identifyEdges = true;
+        b3MeshData* mesh = b3CreateMesh(&def, nullptr, 0);
+        if (!mesh) return nullptr;
+        Shared entry;
+        entry.source = desc.source;
+        entry.triangleCount = desc.triangleCount;
+        std::memcpy(entry.probe, probe, sizeof(probe));
+        entry.mesh = mesh;
+        entry.users = 1;
+        shared.push_back(entry);
+        return mesh;
+    }
+
+    void Release(b3MeshData* mesh) {
+        for (Shared& entry : shared)
+            if (entry.mesh == mesh) --entry.users;
+    }
+
+    void DropUnused() {
+        for (size_t i = shared.size(); i-- > 0;) {
+            if (shared[i].users > 0) continue;
+            if (shared[i].mesh) b3DestroyMesh(shared[i].mesh);
+            shared.erase(shared.begin() + i);
+        }
+    }
+
+    static void CreateBody(b3WorldId world, Instance& instance) {
+        if (B3_IS_NULL(world) || !instance.mesh ||
+            !B3_IS_NULL(instance.body)) return;
+        XMVECTOR scale, rotation, translation;
+        if (!XMMatrixDecompose(&scale, &rotation, &translation,
+                               XMLoadFloat4x4(&instance.world))) return;
+        XMFLOAT3 s, t;
+        XMFLOAT4 q;
+        XMStoreFloat3(&s, scale);
+        XMStoreFloat4(&q, rotation);
+        XMStoreFloat3(&t, translation);
+        if (!(std::abs(s.x) > 1e-5f) || !(std::abs(s.y) > 1e-5f) ||
+            !(std::abs(s.z) > 1e-5f)) return;
+        b3BodyDef bodyDef = b3DefaultBodyDef();
+        bodyDef.position = { t.x, t.y, t.z };
+        bodyDef.rotation = { { q.x, q.y, q.z }, q.w };
+        instance.body = b3CreateBody(world, &bodyDef);
+        // Same surface as the terrain. No hit events: debris landing on a
+        // building must not fracture whichever cell happens to be nearest.
+        b3ShapeDef shapeDef = b3DefaultShapeDef();
+        shapeDef.baseMaterial.friction = 1.15f;
+        b3CreateMeshShape(instance.body, &shapeDef, instance.mesh,
+                          { s.x, s.y, s.z });
+    }
+};
+
+void DestructionDX12::CreateStaticMeshBodies() {
+    if (!staticMeshes_ || !m || B3_IS_NULL(m->world)) return;
+    for (StaticMeshRegistry::Instance& instance : staticMeshes_->instances)
+        StaticMeshRegistry::CreateBody(m->world, instance);
+}
+
+void DestructionDX12::SetStaticMeshColliders(
+        const std::vector<StaticMeshColliderDesc>& colliders) {
+    if (!staticMeshes_) staticMeshes_ = std::make_unique<StaticMeshRegistry>();
+    StaticMeshRegistry& registry = *staticMeshes_;
+    const bool haveWorld = m && !B3_IS_NULL(m->world);
+    const auto matches = [](const StaticMeshRegistry::Instance& instance,
+                            const StaticMeshColliderDesc& desc) {
+        return instance.key == desc.key && instance.source == desc.source &&
+               std::memcmp(&instance.world, &desc.world,
+                           sizeof(XMFLOAT4X4)) == 0;
+    };
+    // Keep what is unchanged; retire the rest.
+    std::vector<StaticMeshRegistry::Instance> kept;
+    kept.reserve(colliders.size());
+    for (StaticMeshRegistry::Instance& instance : registry.instances) {
+        const bool stays = std::any_of(colliders.begin(), colliders.end(),
+            [&](const StaticMeshColliderDesc& desc) {
+                return matches(instance, desc);
+            });
+        if (stays) {
+            kept.push_back(instance);
+            continue;
+        }
+        if (haveWorld && !B3_IS_NULL(instance.body))
+            b3DestroyBody(instance.body);
+        registry.Release(instance.mesh);
+    }
+    for (const StaticMeshColliderDesc& desc : colliders) {
+        if (!desc.triangles || desc.triangleCount == 0) continue;
+        const bool present = std::any_of(kept.begin(), kept.end(),
+            [&](const StaticMeshRegistry::Instance& instance) {
+                return matches(instance, desc);
+            });
+        if (present) continue;
+        StaticMeshRegistry::Instance instance;
+        instance.key = desc.key;
+        instance.source = desc.source;
+        instance.world = desc.world;
+        instance.mesh = registry.Acquire(desc);
+        if (!instance.mesh) continue;
+        if (haveWorld) StaticMeshRegistry::CreateBody(m->world, instance);
+        kept.push_back(instance);
+    }
+    registry.instances.swap(kept);
+    registry.DropUnused();
+}
+
+size_t DestructionDX12::StaticMeshColliderBodyCount() const {
+    if (!staticMeshes_) return 0;
+    size_t count = 0;
+    for (const StaticMeshRegistry::Instance& instance : staticMeshes_->instances)
+        if (!B3_IS_NULL(instance.body)) ++count;
+    return count;
+}
+
 DestructionDX12::~DestructionDX12() { Shutdown(); }
 
 bool DestructionDX12::Initialize(const std::shared_ptr<SceneNode>& mergedModel,
@@ -4011,6 +4186,11 @@ void DestructionDX12::Shutdown() {
     }
     if (!B3_IS_NULL(m->world)) b3DestroyWorld(m->world);
     m->world = b3_nullWorldId;
+    // The world took the static mesh bodies with it; the meshes and the
+    // registry stay, for the next world to rebuild from.
+    if (staticMeshes_)
+        for (auto& instance : staticMeshes_->instances)
+            instance.body = b3_nullBodyId;
     m->vehicles.clear();
     m->groundVehicles.clear();
     if (m->terrainHeightField) {
@@ -5640,6 +5820,14 @@ std::vector<uint32_t> DestructionDX12::DrainExplosiveBarrelImpactEvents() {
     return events;
 }
 
+// Prop handles are numbered across worlds, not per Impl: Initialize rebuilds
+// Impl, and a caller still holding a handle from the old world (a dropped gun
+// outliving a reset) must miss, not alias a new prefab's body.
+static std::atomic<uint32_t>& NextPropHandle() {
+    static std::atomic<uint32_t> next{ 1 };
+    return next;
+}
+
 // A prefab prop simulated as a rigid body. The hull is the placement's own
 // measured half extents, so the simulated box is the same box the static
 // collider used and the prop does not change size the moment it wakes up.
@@ -5686,8 +5874,56 @@ uint32_t DestructionDX12::CreatePropBody(
     b3BoxHull hull = b3MakeBoxHull(halfX, halfY, halfZ);
     b3CreateHullShape(body, &shapeDef, &hull.base);
 
-    uint32_t handle = m->nextPropHandle++;
-    if (handle == 0) handle = m->nextPropHandle++;
+    std::atomic<uint32_t>& nextHandle = NextPropHandle();
+    uint32_t handle = nextHandle++;
+    if (handle == 0) handle = nextHandle++;
+    m->propBodies.push_back({ handle, body });
+    return handle;
+}
+
+uint32_t DestructionDX12::CreateDroppedItemBody(
+    const XMFLOAT3& worldPosition, const XMFLOAT4& rotation,
+    const XMFLOAT3& halfExtents, const XMFLOAT3& linearVelocity,
+    const XMFLOAT3& angularVelocity, float density) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
+    const float halfX = halfExtents.x, halfY = halfExtents.y,
+                halfZ = halfExtents.z;
+    if (!(halfX > 1e-3f) || !(halfY > 1e-3f) || !(halfZ > 1e-3f) ||
+        !std::isfinite(halfX) || !std::isfinite(halfY) ||
+        !std::isfinite(halfZ) || !(density > 0.0f) || !std::isfinite(density))
+        return 0;
+    const float qLength = std::sqrt(
+        rotation.x * rotation.x + rotation.y * rotation.y +
+        rotation.z * rotation.z + rotation.w * rotation.w);
+    if (!(qLength > 1e-4f) || !std::isfinite(qLength)) return 0;
+
+    b3BodyDef bodyDef = b3DefaultBodyDef();
+    bodyDef.type = b3_dynamicBody;
+    bodyDef.position = { worldPosition.x, worldPosition.y, worldPosition.z };
+    bodyDef.rotation = { { rotation.x / qLength, rotation.y / qLength,
+                           rotation.z / qLength }, rotation.w / qLength };
+    bodyDef.linearVelocity =
+        { linearVelocity.x, linearVelocity.y, linearVelocity.z };
+    bodyDef.angularVelocity =
+        { angularVelocity.x, angularVelocity.y, angularVelocity.z };
+    bodyDef.linearDamping = 0.10f;
+    bodyDef.angularDamping = 0.40f;
+    bodyDef.sleepThreshold = 0.08f;
+    bodyDef.allowFastRotation = true;
+    const b3BodyId body = b3CreateBody(m->world, &bodyDef);
+
+    b3ShapeDef shapeDef = b3DefaultShapeDef();
+    shapeDef.density = density;
+    shapeDef.baseMaterial.friction = 0.60f;
+    shapeDef.baseMaterial.restitution = 0.10f;
+    shapeDef.filter.categoryBits = CollisionCategoryProp;
+    shapeDef.filter.maskBits = B3_DEFAULT_MASK_BITS & ~CollisionCategoryRagdoll;
+    b3BoxHull hull = b3MakeBoxHull(halfX, halfY, halfZ);
+    b3CreateHullShape(body, &shapeDef, &hull.base);
+
+    std::atomic<uint32_t>& nextHandle = NextPropHandle();
+    uint32_t handle = nextHandle++;
+    if (handle == 0) handle = nextHandle++;
     m->propBodies.push_back({ handle, body });
     return handle;
 }

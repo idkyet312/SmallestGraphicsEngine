@@ -547,6 +547,15 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
     return false;
 }
 
+// Another player's body whose owner has not pressed DEPLOY yet. It wears
+// Faction::Marine, so without this every enemy target list would pick up a
+// teammate still on the planning screen -- parked at the insertion point and
+// unable to fight back. The local player's equivalent is g_insertionChoicePending,
+// which already freezes or disarms each hostile on this machine.
+static bool HiddenFromEnemies(const SkinnedEnemy& actor) {
+    return actor.networkControlled && !actor.netDeployed;
+}
+
 // Player settings, loaded once at startup and rewritten whenever the player
 // changes one. Whether the settings panel is currently open is UI state rather
 // than a setting, so it is not persisted.

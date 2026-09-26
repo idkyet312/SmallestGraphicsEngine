@@ -105,7 +105,9 @@ static void OpenMainMenu() {
     g_game.world.Prefabs().ClearDerived();
     g_meshCollisionEntities.clear();
     g_objectivePlanes.clear();
+    g_objectivePlanesArmed = false;
     g_objectivePlaneEscaped = false;
+    g_missionFailReason.clear();
     g_game.world.Prefabs().ResetGameplayState();
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
@@ -148,7 +150,7 @@ static void OpenMainMenu() {
 // Re-centring on resume is not optional. The camera turns on the delta between
 // the cursor and the window centre, so handing control back with the pointer
 // wherever the player last left it feeds one enormous delta into the first
-// frame and snaps the view -- the same reason the TAB overlay and level start
+// frame and snaps the view -- the same reason the debug overlay and level start
 // both re-centre before capturing.
 static void TogglePauseMenu(HWND hwnd) {
     g_gamePaused = !g_gamePaused;
@@ -161,7 +163,7 @@ static void TogglePauseMenu(HWND hwnd) {
     // Always back to the pause screen's root, so opening it again does not
     // land on the settings panel the player was in last time.
     g_showPauseSettings = false;
-    // A player who paused with the TAB overlay up keeps it, cursor and all;
+    // A player who paused with the debug overlay (F3) up keeps it, cursor and all;
     // capturing here would take the pointer away from the UI they left open.
     if (showUI) return;
     cameraLocked = false;
@@ -369,13 +371,16 @@ static void OpenWinScreen() {
     // The range is practice and pays nothing, extraction included -- the same
     // rule AwardCombatEvent applies to every kill on it. The score is still
     // computed and still shown; it just does not turn into money or rank.
-    g_winScreenMissionBonus = g_trainingRangeMode
+    // A failed run (the aircraft got away) is graded and shown, but the
+    // completion bonus is for completing: it pays nothing.
+    const bool failed = !g_missionFailReason.empty();
+    g_winScreenMissionBonus = g_trainingRangeMode || failed
         ? 0 : g_game.money.AwardMissionBonus(report.totalScore);
     g_winScreenPayout = static_cast<int64_t>(g_game.money.SessionEarned());
     // And the same grade in experience. The rank readout is snapshotted here
     // too: the run's promotions are drained off the queue by the HUD the frame
     // they happen, so the win screen cannot go looking for them afterwards.
-    g_winScreenXpBonus = g_trainingRangeMode
+    g_winScreenXpBonus = g_trainingRangeMode || failed
         ? 0 : g_game.rank.AwardMissionBonus(report.totalScore);
     g_winScreenXpEarned = g_game.rank.SessionXp();
     g_winScreenLevelAfter = g_game.rank.Level();
@@ -392,7 +397,7 @@ static void OpenWinScreen() {
     SaveCareer();
     g_game.session.StopTimer();
     g_game.session.SetScreen(GameScreen::WinScreen);
-    g_greatJobAudio.Play(2.0f);
+    if (!failed) g_greatJobAudio.Play(2.0f);
     showUI = false;
     cameraLocked = true;
     ReleaseCapture();
@@ -579,6 +584,14 @@ static void EnsureSceneRenderAssets() {
     }
 }
 
+// Scene::ResetLevelRuntimeState drops the ammo list but cannot reach the
+// physics world, so the thrown boxes' bodies would stay behind as invisible
+// colliders. Every caller of it runs this first.
+static void ReleaseAmmoPickupBodies() {
+    for (const AmmoPickup& pickup : scene.ammoPickups)
+        g_destruction.DestroyPropBody(pickup.physicsHandle);
+}
+
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
@@ -690,6 +703,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.RestorePlayerHealth();
     ResetSprintStamina();
     g_game.world.Prefabs().ResetGameplayState();
+    ReleaseAmmoPickupBodies();
     scene.ResetLevelRuntimeState();
     // A tower rigged last run must not start the next one already demolishable.
     g_commTowersRiggedForDemolition.clear();
@@ -757,6 +771,8 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_gamePaused = false;
     g_showPauseSettings = false;
     deathCursorReleased = false;
+    squadWipeCursorReleased = false;
+    squadWipeScreenAge = 0.0f;
     // The cursor is re-grabbed for mouse-look below, so the next prompt has to
     // release it again rather than assuming it is already free.
     g_insertionChoiceCursorReleased = false;

@@ -2,6 +2,21 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+// Defined later in the include order (LevelSession.h, Multiplayer.h).
+static void OpenWinScreen();
+static float CurrentPhysicsTerrainExtent();
+static void PublishHostArmor();
+static bool AnyPlayerDeployed();
+static bool MultiplayerActive();
+
+// This machine's player has pressed DEPLOY: in a live level, off the planning
+// map, with the mission clock running.
+static bool PlayerHasDeployed() {
+    return IsGameplayScreen() && !g_game.loading.Active() &&
+           !g_insertionChoicePending && !g_baseMode &&
+           g_game.session.TimerRunning();
+}
+
 // Base position and height of a comm-tower entity, or false when the id is not
 // one. Height comes from the prefab's authored targetSize; the level transform
 // carries the base, since LoadPrefabModel grounds the mesh at local Y=0.
@@ -615,7 +630,14 @@ static uint64_t HitObjectivePlaneSegment(const XMFLOAT3& start,
 // entirely, so without the second call an authored aircraft would sit inert and
 // a designer could never see the takeoff they placed it for.
 static void ArmObjectivePlanes() {
+    // In a session the countdown is the session's: the first player to deploy
+    // started it (on the host, via AnyPlayerDeployed), and a later deploy --
+    // the host's own included -- joins the run already under way.
+    const bool keepCountdown = g_objectivePlanesArmed && MultiplayerActive();
+    g_objectivePlanesArmed = true;
+    if (!keepCountdown) {
     g_objectivePlaneEscaped = false;
+    g_missionFailReason.clear();
     for (ObjectivePlaneState& plane : g_objectivePlanes) {
         plane.holdTimer = 0.0f;
         plane.takeoffTimer = 0.0f;
@@ -628,6 +650,7 @@ static void ArmObjectivePlanes() {
         plane.crashPitch = 0.0f;
         plane.crashRoll = 0.0f;
         plane.crashYaw = 0.0f;
+    }
     }
     // An aircraft flies its own wreck down, so it has to survive its own death:
     // a destructible is normally disabled the moment it dies, and the next
@@ -646,7 +669,7 @@ static void ArmObjectivePlanes() {
 //
 // The batch is rebuilt whenever a prefab changes, so the entity has to be
 // re-found by id each frame rather than caching an index into `transforms`.
-static void WriteObjectivePlaneTransform(const ObjectivePlaneState& plane,
+static void WriteObjectivePlaneTransform(ObjectivePlaneState& plane,
                                          const XMMATRIX& world) {
     for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
         if (batch.prefabId != kObjectivePlanePrefabId) continue;
@@ -655,11 +678,67 @@ static void WriteObjectivePlaneTransform(const ObjectivePlaneState& plane,
                 i < batch.transforms.size())
                 batch.transforms[i] = world;
     }
+    // The box collider goes with it, yaw-only like every prefab collider. A
+    // prefab rebuild puts it back on the apron; the next write moves it again.
+    XMFLOAT3 axis;
+    XMStoreFloat3(&axis, XMVector3TransformNormal(
+        XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), world));
+    for (PrefabCollider& collider : g_prefabColliders) {
+        if (collider.entityId != plane.entityId) continue;
+        if (!plane.colliderLocalValid) {
+            // Measured against the authored placement, which is where the
+            // collider is built -- the first write has not moved it yet.
+            XMStoreFloat3(&plane.colliderLocal, XMVector3TransformCoord(
+                XMLoadFloat3(&collider.center), XMMatrixInverse(nullptr,
+                    XMLoadFloat4x4(&plane.baseTransform))));
+            plane.colliderLocalValid = true;
+        }
+        XMStoreFloat3(&collider.center, XMVector3TransformCoord(
+            XMLoadFloat3(&plane.colliderLocal), world));
+        collider.yawRadians = std::atan2(axis.z, axis.x);
+    }
+}
+
+// An aircraft that has left: nothing of it may stay behind to be shot. A
+// prefab rebuild recreates the collider on the apron, so this runs every frame.
+static void RemoveObjectivePlaneCollider(const ObjectivePlaneState& plane) {
+    g_prefabColliders.erase(std::remove_if(g_prefabColliders.begin(),
+        g_prefabColliders.end(), [&](const PrefabCollider& collider) {
+            return collider.entityId == plane.entityId;
+        }), g_prefabColliders.end());
+}
+
+// The aircraft got away: the objective is lost and the run ends on the
+// after-action report, marked failed. Reached on the machine that decides
+// (single player or the host) from the flight, and on a client from the
+// host's armor state -- never from a client's own clock.
+static void EscapeObjectivePlane(ObjectivePlaneState& plane) {
+    if (plane.escaped) return;
+    plane.escaped = true;
+    RemoveObjectivePlaneCollider(plane);
+    g_objectivePlaneEscaped = true;
+    g_game.mission.RecordObjectivePlaneEscaped();
+    SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+        "Objective aircraft escaped -- mission failed");
+    // An escape resolves the aircraft too. Big Island withholds its exfil on
+    // this failed outcome; destroying the plane calls it in.
+    OnObjectivePlaneResolved(false);
+    // Measured: the host stops refreshing its armor state once it leaves the
+    // level for the report, so the escape has to go into the state being
+    // broadcast before the screen changes, or clients never hear of it.
+    PublishHostArmor();
+    if (g_game.session.Screen() == GameScreen::Level1 &&
+        g_missionFailReason.empty()) {
+        g_missionFailReason = "PLANE ESCAPED";
+        OpenWinScreen();
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Mission failed screen opened: " + g_missionFailReason);
+    }
 }
 
 // Composes the tumbling wreck pose: authored scale/orientation, then the crash
 // rotation, then the falling position.
-static void WriteObjectivePlaneCrashTransform(const ObjectivePlaneState& plane) {
+static void WriteObjectivePlaneCrashTransform(ObjectivePlaneState& plane) {
     const XMMATRIX fall =
         XMMatrixRotationRollPitchYaw(plane.crashPitch, plane.crashYaw,
                                      plane.crashRoll) *
@@ -785,15 +864,32 @@ static void UpdatePrefabRigidBodies() {
 // the aircraft started -- shooting it is a ranged objective, not a dogfight.
 static void UpdateObjectivePlanes(float dt) {
     if (g_objectivePlanes.empty() || dt <= 0.0f) return;
-    // Only while a run is actually live. The mission timer covers the normal
-    // game (it is stopped during deployment planning and after the mission
-    // ends), but an editor playtest deliberately runs with the timer stopped --
-    // gating on the timer alone left the aircraft inert in exactly the mode a
-    // designer would use to check it.
-    if (!g_game.session.TimerRunning() && !IsEditorPlaying()) return;
+    // Only the machine that simulates the world decides the aircraft got
+    // away. A client flies its copy between armor states but takes the escape
+    // from the host, or two clocks a tick apart would disagree about failure.
+    const bool decidesEscape = !ClientOwnedByHost();
+    // Only while a run is actually live. An editor playtest deliberately runs
+    // with the timer stopped, so it is let through on its own. Otherwise the
+    // countdown starts the moment anyone deploys: in a session a client that
+    // drops in while the host is still planning starts the clock for all of
+    // them, so the deciding machine arms on the first deploy it sees. A client
+    // flies whatever timers the host sends as soon as it is in the level.
+    if (!IsEditorPlaying()) {
+        if (decidesEscape) {
+            if (!AnyPlayerDeployed()) return;
+            if (!g_objectivePlanesArmed) ArmObjectivePlanes();
+        } else if (!IsGameplayScreen() || g_game.loading.Active()) {
+            return;
+        }
+    }
+    const float mapEdge =
+        CurrentPhysicsTerrainExtent() + kObjectivePlaneEscapeMargin;
 
     for (ObjectivePlaneState& plane : g_objectivePlanes) {
-        if (plane.escaped) continue;
+        if (plane.escaped) {
+            RemoveObjectivePlaneCollider(plane);
+            continue;
+        }
 
         // Shot down: fall on the last pose it was flying, tumbling, until it
         // meets the terrain. Runs ahead of the escape/takeoff logic and skips
@@ -849,8 +945,17 @@ static void UpdateObjectivePlanes(float dt) {
         if (plane.destroyed) continue;
 
         if (!plane.rolling) {
+            // SGE_PLANE_HOLD_SECONDS=<s> shortens the wait, so the takeoff,
+            // the moving collider and the escape can be checked unattended.
+            static const float holdSeconds = [] {
+                char value[32] = {};
+                return GetEnvironmentVariableA("SGE_PLANE_HOLD_SECONDS", value,
+                                               sizeof(value)) > 0
+                    ? static_cast<float>(std::atof(value))
+                    : kObjectivePlaneHoldSeconds;
+            }();
             plane.holdTimer += dt;
-            if (plane.holdTimer < kObjectivePlaneHoldSeconds) continue;
+            if (plane.holdTimer < holdSeconds) continue;
             plane.rolling = true;
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft beginning takeoff run");
@@ -893,16 +998,38 @@ static void UpdateObjectivePlanes(float dt) {
         const XMMATRIX world = oriented * flight;
         WriteObjectivePlaneTransform(plane, world);
 
-        if (t >= kObjectivePlaneTakeoffSeconds) {
-            plane.escaped = true;
-            g_objectivePlaneEscaped = true;
-            g_game.mission.RecordObjectivePlaneEscaped();
-            SGE_LOG("LogGameplay", EngineLog::Level::Warning,
-                "Objective aircraft escaped");
-            // An escape resolves the aircraft too. Big Island withholds its
-            // exfil on this failed outcome; destroying the plane calls it in.
-            OnObjectivePlaneResolved(false);
+        // Gone once it is past the edge of the play area; it can be shot down
+        // right up to that point.
+        const XMFLOAT3 live = ObjectivePlaneLivePosition(plane);
+        const bool offMap = (std::max)(std::abs(live.x), std::abs(live.z)) >
+                            mapEdge;
+        // SGE_PLANE_TRACE=1: once a second, where the airframe is and where
+        // its collider is, against the map edge it escapes past.
+        static const bool trace =
+            GetEnvironmentVariableA("SGE_PLANE_TRACE", nullptr, 0) > 0;
+        static float traceTimer = 0.0f;
+        traceTimer -= dt;
+        if (trace && traceTimer <= 0.0f) {
+            traceTimer = 1.0f;
+            std::string collider = "none";
+            for (const PrefabCollider& box : g_prefabColliders)
+                if (box.entityId == plane.entityId)
+                    collider = std::to_string(box.center.x) + ", " +
+                               std::to_string(box.center.y) + ", " +
+                               std::to_string(box.center.z);
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                std::string(decidesEscape ? "PlaneTrace[sim]" : "PlaneTrace[client]") +
+                " t " + std::to_string(t) + " live " +
+                std::to_string(live.x) + ", " + std::to_string(live.y) +
+                ", " + std::to_string(live.z) + " collider " + collider +
+                " edge " + std::to_string(mapEdge));
         }
+        // Never before the takeoff time the briefing quotes: on a compact map
+        // the edge is only ~200 m out, which would halve the window to shoot.
+        if (decidesEscape &&
+            ((offMap && t >= kObjectivePlaneTakeoffSeconds) ||
+             t >= kObjectivePlaneMaxFlightSeconds))
+            EscapeObjectivePlane(plane);
     }
 }
 

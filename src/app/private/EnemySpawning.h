@@ -388,16 +388,18 @@ static void SpawnMarinesFromLevel() {
 // Placed on a ring around the drop point rather than at it: the player is
 // standing there, and stacking eight actors on the same metre leaves them
 // shoving each other apart for the first few seconds of the run.
-static void DropDeploymentMarines() {
-    if (!g_marineDropPending) return;
-    g_marineDropPending = false;
-    const int requested = (std::min)(g_deploymentMarineCount,
-                                     kMaxDeploymentMarines);
-    if (requested <= 0) return;
+//
+// `staggered` is a squad landing on top of another one -- a client's marines
+// off the host's own DEPLOY SQUAD aircraft. It sits half a ring out and half a
+// slot round, between the first squad's marines rather than inside them.
+static int DropMarineSquad(const XMFLOAT3& origin, int requested,
+                           bool staggered, uint8_t owner = 0xFF) {
+    requested = (std::min)(requested, kMaxDeploymentMarines);
+    if (requested <= 0) return 0;
     if (!g_marineModel.valid) {
         SGE_LOG("LogGameplay", EngineLog::Level::Warning,
             "Marine drop skipped: ally model unavailable");
-        return;
+        return 0;
     }
 
     // Wide enough that the ring clears the transport's own hull, tight enough
@@ -417,31 +419,58 @@ static void DropDeploymentMarines() {
     int dropped = 0;
     int index = 0;
     int ring = 0;
+    const float ringOffset = staggered ? kRingSpacing * 0.5f : 0.0f;
+    const float slotPhase = staggered ? 0.5f : 0.0f;
     while (index < requested) {
-        const float radius = kRingRadius + kRingSpacing * static_cast<float>(ring);
+        const float radius = kRingRadius + ringOffset +
+                             kRingSpacing * static_cast<float>(ring);
         // How many fit on this ring at the spacing above, and never fewer than
         // one, so the loop cannot stall on a degenerate radius.
         const int ringCapacity = (std::max)(1,
             static_cast<int>((XM_2PI * radius) / kPerMarineArc));
         const int ringCount = (std::min)(ringCapacity, requested - index);
         for (int slot = 0; slot < ringCount; ++slot, ++index) {
-            const float angle = XM_2PI * static_cast<float>(slot) /
+            const float angle = XM_2PI * (static_cast<float>(slot) + slotPhase) /
                                 static_cast<float>(ringCount);
-            const float x = g_marineDropOrigin.x + std::sin(angle) * radius;
-            const float z = g_marineDropOrigin.z + std::cos(angle) * radius;
+            const float x = origin.x + std::sin(angle) * radius;
+            const float z = origin.z + std::cos(angle) * radius;
             // Sampled per marine rather than reusing the drop-off height: the
             // ring can straddle a slope or a shoreline, where one shared Y
             // buries half the squad and leaves the rest hanging.
             const XMFLOAT3 stand{ x, GroundHeightAt(x, z), z };
             // Facing outward, away from the player and into whatever the
             // landing zone is surrounded by.
-            if (SpawnMarine(stand, angle)) ++dropped;
+            if (!SpawnMarine(stand, angle)) continue;
+            g_bandits.back()->leashOwner = owner;
+            ++dropped;
         }
         ++ring;
     }
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Deployment marines landed: " + std::to_string(dropped) + " of " +
             std::to_string(requested) + " requested");
+    return dropped;
+}
+
+static void DropDeploymentMarines() {
+    if (!g_marineDropPending) return;
+    g_marineDropPending = false;
+    const int requested = (std::min)(g_deploymentMarineCount,
+                                     kMaxDeploymentMarines);
+    if (requested <= 0) return;
+    // A client runs no AI, and anything it spawns without a host id is retired
+    // as a stray (UpdateClientEnemies). The host lands this squad instead and
+    // it comes back by enemy snapshot, the same way the host's own does.
+    if (ClientOwnedByHost()) {
+        g_netSession.SendMarineDrop(static_cast<uint8_t>(requested),
+                                    g_marineDropOrigin.x, g_marineDropOrigin.y,
+                                    g_marineDropOrigin.z);
+        SGE_LOG("LogNet", EngineLog::Level::Display,
+            "Marine drop: asked the host to land " +
+                std::to_string(requested) + " marines");
+        return;
+    }
+    DropMarineSquad(g_marineDropOrigin, requested, /*staggered=*/false);
 }
 
 // Test mode: relocates every live bandit to a random walkable point on the

@@ -296,6 +296,10 @@ struct ExplosiveBarrel {
     bool litByPlayer = false;
     float fuse = 0.0f;
     float fireFxCooldown = 0.0f;
+    // Client in a session: this machine has asked the host to set the barrel
+    // off and is waiting for the broadcast. Latched so a fuse sitting at zero,
+    // or every further round into it, does not send the request again.
+    bool netDetonationRequested = false;
 };
 
 // A weapon lying in the world, collected by walking over it. The pickup swaps
@@ -314,6 +318,30 @@ struct WeaponPickup {
     float verticalRange = 3.0f; // vertical tolerance, so a pickup is not
                                 // collectable from a rooftop directly above it
     float bobPhase = 0.0f;      // drives the idle hover/spin so it reads as loot
+    bool active = false;
+    bool collected = false;
+};
+
+// A killed enemy's gun. Drops from his hand as a Box3D prop body fitted to the
+// gun mesh's bounds; position/rotation are the body's centre and are read back
+// each frame. Running over it tops up reserve ammo for the carried weapons.
+// Despawns after ~45s.
+//
+// physicsHandle 0 means no body could be made (no physics world, no gun pose):
+// the drop then falls back to a hovering glowing box.
+struct AmmoPickup {
+    XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT4 rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    // Gun mesh -> body frame: uniform scale, then the mesh-space bounds centre
+    // (already scaled) moved to the body origin.
+    float meshScale = 1.0f;
+    XMFLOAT3 meshCenterOffset = { 0.0f, 0.0f, 0.0f };
+    uint32_t physicsHandle = 0;
+    float life = 0.0f;          // time remaining in seconds
+    float maxLife = 45.0f;      // despawn time
+    float bobPhase = 0.0f;      // drives idle hover/spin
+    float radius = 1.5f;        // horizontal collection distance, metres
+    float verticalRange = 2.0f; // vertical tolerance
     bool active = false;
     bool collected = false;
 };
@@ -548,6 +576,12 @@ struct Scene {
     std::function<void(float)> playerDamageNetworkSink;
     std::vector<ExplosiveBarrel> explosiveBarrels;
     std::vector<WeaponPickup> weaponPickups;      // walk-over weapon crates
+    std::vector<AmmoPickup> ammoPickups;          // dropped from killed enemies
+    // "+N" beside the reserve count after an ammo pickup; the HUD fades it out
+    // as the timer runs down.
+    static constexpr float kAmmoPickupGainDuration = 1.6f;
+    int ammoPickupGain = 0;
+    float ammoPickupGainTimer = 0.0f;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
@@ -564,6 +598,14 @@ struct Scene {
     bool c4DetonateHeld = false;
     float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
+    // The launcher's own kick, 1 at the shot and falling linearly to 0 over
+    // kLauncherRecoilSeconds. The rifle channels above return in ~0.1 s, which
+    // on a single rocket shot is six frames: the tube looked like it never
+    // moved. Squared on use, so it slams back and eases home.
+    float launcherRecoil     = 0.0f;
+    static constexpr float kLauncherRecoilSeconds = 0.6f;
+    static constexpr float kLauncherRecoilBack    = 0.24f;  // metres
+    static constexpr float kLauncherRecoilKick    = 10.0f;  // degrees
     // Weapon sway: the gun lags behind the camera when the player turns, then
     // settles back to centre. Degrees of trailing rotation, signed against the
     // turn direction. Previous angles are the only way to recover turn rate --
@@ -806,6 +848,9 @@ struct Scene {
     // damage against the player. 1.0 is the balance the levels were tuned at.
     // Applied through DamagePlayerFromEnemy, never to self-inflicted damage.
     float enemyDamageMultiplier = 1.0f;
+    // Inside a tank: the hull takes the hits, so nothing reaches the player's
+    // health until they climb out (or the tank is destroyed under them).
+    bool playerArmored = false;
     float molotovMaterialDamagePerSecond = 34.0f;
     float molotovDamageCooldown = 0.0f;
     float vortexRadius = 7.5f;
@@ -1310,12 +1355,16 @@ struct Scene {
         // whatever pickups the map authors, and keeping stale ones here would
         // leave a collected rocket floating on a map that never had one.
         weaponPickups.clear();
+        ammoPickups.clear();
+        ammoPickupGain = 0;
+        ammoPickupGainTimer = 0.0f;
         fireCooldown = 0.0f;
         muzzleFlashTime = 0.0f;
         muzzleFlashScale = 1.0f;
         muzzleFlashRotation = 0.0f;
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
+        launcherRecoil = 0.0f;
         opticDotRecoil = 0.0f;
         gunSwayYaw = gunSwayPitch = 0.0f;
         gunJumpPitch = gunJumpVelocity = 0.0f;
@@ -1346,7 +1395,8 @@ struct Scene {
     }
 
     void DamagePlayer(float damage) {
-        if (player.godMode || damage <= 0.0f || player.health <= 0.0f) return;
+        if (player.godMode || playerArmored || damage <= 0.0f ||
+            player.health <= 0.0f) return;
         player.health = (std::max)(0.0f, player.health - damage);
 
         // Severity drives every hit reaction, on a curve rather than a ratio.
@@ -1394,7 +1444,8 @@ struct Scene {
     // Damage with a known origin: records the direction so the HUD can show
     // where it came from. Everything else is identical to DamagePlayer.
     void DamagePlayerFrom(float damage, const XMFLOAT3& source) {
-        if (player.godMode || damage <= 0.0f || player.health <= 0.0f) return;
+        if (player.godMode || playerArmored || damage <= 0.0f ||
+            player.health <= 0.0f) return;
         const float dx = source.x - camera.Position.x;
         const float dz = source.z - camera.Position.z;
         const float lengthSq = dx * dx + dz * dz;
@@ -1537,6 +1588,8 @@ struct Scene {
             if (opticDotRecoil < 0.0005f) opticDotRecoil = 0.0f;
         }
         gunRecoilKick = (std::max)(0.0f, gunRecoilKick - 95.0f * dt);
+        launcherRecoil = (std::max)(0.0f,
+            launcherRecoil - (std::max)(0.0f, dt) / kLauncherRecoilSeconds);
 
         // Weapon sway. Turning the camera leaves the gun behind for a moment,
         // then it eases back to centre -- weight, not a wobble. The offset is
@@ -2682,25 +2735,33 @@ struct Scene {
     }
 
     void ShootRocket() {
-        camera.ApplyRecoil(recoilPitch * 4.0f *
-            SGE::WeaponCustomizationSystem::kGlobalRecoilScale, 0.0f);
-        // Launcher backblast: the hardest shove of any weapon here, and the one
-        // shot where a real jolt is expected. Still under the firing ceiling --
-        // the rocket's own detonation supplies the big shake a moment later.
-        camera.AddFireTrauma(0.19f);
-        gunRecoilBack = (std::min)(0.20f, gunRecoilBack + 0.16f);
-        gunRecoilKick = (std::min)(14.0f, gunRecoilKick + 9.0f);
+        // The rocket leaves first, from where the tube and the crosshair are
+        // at the trigger pull. Recoil used to be applied before these were
+        // read, so the round came out of the kicked-up tube along a view that
+        // had already climbed 4.4 degrees: it fired after the recoil, high.
+        const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
+        const XMFLOAT3 aim = camera.GetAimFront();
         TriggerMuzzleFlash(1.8f, 1.75f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(), 2.4f);
+        SpawnWeaponSmoke(muzzle, aim, 2.4f);
 
         Projectile p = {};
-        p.position = p.previousPosition = GetMuzzleWorldPosition();
-        p.direction = camera.GetAimFront();
+        p.position = p.previousPosition = muzzle;
+        p.direction = aim;
         p.speed = 42.0f;
         p.lifetime = 6.0f;
         p.active = true;
         p.rocket = true;
         projectiles.push_back(p);
+
+        // Then the kick. The tube's own recoil (launcherRecoil) is the big,
+        // visible one and returns to rest; the view keeps only a small climb,
+        // so the next shot is not pointing into the sky.
+        camera.ApplyRecoil(1.2f, 0.0f);
+        // Launcher backblast: the hardest shove of any weapon here, and the one
+        // shot where a real jolt is expected. Still under the firing ceiling --
+        // the rocket's own detonation supplies the big shake a moment later.
+        camera.AddFireTrauma(0.19f);
+        launcherRecoil = 1.0f;
     }
 
     // Build matrices
@@ -2972,9 +3033,14 @@ struct Scene {
         const float offsetY = gun.offset.y + (adsOffsetY - gun.offset.y) * hipToSights;
         const float offsetZ = gun.offset.z + (adsOffsetZ - gun.offset.z) * hipToSights;
 
-        const XMVECTOR gp = camPos + camFront * (offsetZ - gunRecoilBack)
+        const float launcher = launcherRecoil * launcherRecoil;
+        const float recoilBack =
+            gunRecoilBack + launcher * kLauncherRecoilBack;
+        const float recoilKick =
+            gunRecoilKick + launcher * kLauncherRecoilKick;
+        const XMVECTOR gp = camPos + camFront * (offsetZ - recoilBack)
                                    + camRight * offsetX
-                                   + camUp    * (offsetY + gunRecoilBack * 0.18f);
+                                   + camUp    * (offsetY + recoilBack * 0.18f);
 
         // Orthonormal basis: rows right/up/front, translation at the gun spot.
         XMMATRIX basis = XMMatrixIdentity();
@@ -2996,7 +3062,7 @@ struct Scene {
         // directly above, so a positive spring value reads as barrel-up.
         const float jumpVisible = gunJumpPitch * (1.0f - 0.75f * hipToSights);
         return XMMatrixRotationX(
-                   XMConvertToRadians(-gunRecoilKick - jumpVisible)) *
+                   XMConvertToRadians(-recoilKick - jumpVisible)) *
                sway * basis;
     }
 

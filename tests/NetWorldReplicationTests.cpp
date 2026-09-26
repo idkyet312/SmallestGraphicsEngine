@@ -323,11 +323,16 @@ int main() {
     const size_t vehicleStart = wire.size();
     host.PublishVehicles(helicopters, boat);
     host.Update(NetSession::kNetTickSeconds, local);
-    Check(wire.size() > vehicleStart &&
-          wire.back().bytes.size() == sizeof(ServerVehicleStateMessage),
-          "host must transmit published vehicle state");
+    // Searched for rather than read off the back: the same tick can also carry
+    // the scoreboard, which goes out on the first tick after a join.
+    const WireMessage* vehicleWire = nullptr;
+    for (size_t i = vehicleStart; i < wire.size(); ++i)
+        if (wire[i].bytes.size() == sizeof(ServerVehicleStateMessage) &&
+            wire[i].bytes[0] == uint8_t(MessageType::ServerVehicleState))
+            vehicleWire = &wire[i];
+    Check(vehicleWire != nullptr, "host must transmit published vehicle state");
     ServerVehicleStateMessage vehicleMessage;
-    std::memcpy(&vehicleMessage, wire.back().bytes.data(),
+    std::memcpy(&vehicleMessage, vehicleWire->bytes.data(),
                 sizeof(vehicleMessage));
     Check(vehicleMessage.escapeBoat.active == 1 &&
           vehicleMessage.escapeBoat.x == boat.x &&
@@ -380,6 +385,50 @@ int main() {
     client.Update(0.0f, local);
     Check(client.RemoteEscapeBoat()->active == 0,
           "nonfinite boat packet must be rejected");
+
+    // A client's bought marines: the client asks, the host lands them. The
+    // request must arrive intact from a known peer and nowhere else.
+    const size_t marineDropIndex = wire.size();
+    client.SendMarineDrop(5, 10.0f, 2.0f, -4.0f);
+    Check(wire.size() == marineDropIndex + 1 &&
+          wire.back().channel == Channel::Reliable &&
+          wire.back().bytes.size() == sizeof(ClientMarineDropMessage),
+          "marine drop must be sent reliably");
+    ClientMarineDropMessage marineDrop;
+    std::memcpy(&marineDrop, wire.back().bytes.data(), sizeof(marineDrop));
+    Receive(7, marineDrop);
+    Receive(999, marineDrop);
+    host.Update(0.0f, local);
+    std::vector<MarineDropRequest> marineDrops;
+    host.DrainMarineDrops(marineDrops);
+    Check(marineDrops.size() == 1 && marineDrops[0].requester == 1 &&
+          marineDrops[0].count == 5 && marineDrops[0].x == 10.0f &&
+          marineDrops[0].z == -4.0f,
+          "host must queue one marine drop, from the known peer only");
+    host.DrainMarineDrops(marineDrops);
+    Check(marineDrops.empty(), "a marine drop must be landed once");
+    const size_t emptyDropIndex = wire.size();
+    client.SendMarineDrop(0, 0.0f, 0.0f, 0.0f);
+    client.SendMarineDrop(3, std::numeric_limits<float>::quiet_NaN(),
+                          0.0f, 0.0f);
+    Check(wire.size() == emptyDropIndex,
+          "empty or nonfinite marine drops must not be sent");
+
+    // The marine flag has to survive the enemy snapshot, or the client builds
+    // the squad as bandits.
+    ServerEnemySnapshotMessage enemies;
+    enemies.tick = 1;
+    enemies.enemyCount = 2;
+    enemies.enemies[0].id = 10;
+    enemies.enemies[0].marine = 1;
+    enemies.enemies[1].id = 11;
+    Receive(3, enemies);
+    client.Update(0.0f, local);
+    Check(client.RemoteEnemies().size() == 2 &&
+          client.RemoteEnemies()[0].marine &&
+          !client.RemoteEnemies()[1].marine,
+          "enemy snapshot must carry the marine flag");
+
     client.Shutdown();
     Check(client.RemoteEscapeBoat() == nullptr,
           "stopping a client must clear remote boat state");

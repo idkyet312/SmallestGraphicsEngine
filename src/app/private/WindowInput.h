@@ -42,7 +42,7 @@ static void ApplyVirtualInput() {
 
 static void ProcessInput(HWND) {
     scene.camera.UpdateBodycamAim(deltaTime,
-        IsGameplayScreen() && !g_insertionChoicePending && !g_drivingHumvee &&
+        IsGameplayScreen() && !g_insertionChoicePending && !PlayerInVehicle() &&
         !scene.ejected && scene.player.health > 0.0f);
     scene.weaponAdsFOV = scene.player.ResolveWeaponStats(
         GunModel::SelectedWeapon()).adsFovDegrees;
@@ -58,7 +58,7 @@ static void ProcessInput(HWND) {
     const bool rightMouseHeld =
         (FocusedKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool c4DetonateRequested = IsGameplayScreen() &&
-        scene.player.health > 0.0f && !g_drivingHumvee &&
+        scene.player.health > 0.0f && !PlayerInVehicle() &&
         !cameraLocked && !ImGui::GetIO().WantCaptureMouse &&
         GunModel::C4Selected() && rightMouseHeld;
     if (c4DetonateRequested && !scene.c4DetonateHeld) {
@@ -85,7 +85,7 @@ static void ProcessInput(HWND) {
     // raise the sights -- otherwise every step forward would be taken aiming.
     const bool aimRequested = IsGameplayScreen() &&
         scene.player.health > 0.0f &&
-        !g_drivingHumvee && !cameraLocked && !g_mouseWalkTestMode &&
+        !PlayerInVehicle() && !cameraLocked && !g_mouseWalkTestMode &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         !GunModel::C4Selected() && rightMouseHeld;
     const bool scopeRequested = aimRequested && GunModel::R700Selected();
@@ -96,9 +96,18 @@ static void ProcessInput(HWND) {
     scene.UpdateAimDownSights(aimRequested, deltaTime);
     // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
     // must not suppress the input those widgets produced on the previous frame.
-    if (!g_drivingHumvee) ApplyVirtualInput();
+    if (!PlayerInVehicle()) ApplyVirtualInput();
 
-    if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
+    if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) {
+        // A tank keeps the last input it was given: with the keys unread it
+        // would roll on under a released W, so it brakes -- unless the
+        // unattended drive test is steering it, which has no captured cursor.
+        if (g_playerTankEntity != 0)
+            DrivePlayerTank(g_tankTestInputActive ? g_tankTestThrottle : 0.0f,
+                            g_tankTestInputActive ? g_tankTestTurn : 0.0f,
+                            !g_tankTestInputActive);
+        return;
+    }
 
     // Ejected (F8): the camera flies free while the player body -- and with it
     // the weapon and arms -- stays parked where it was. Shift accelerates,
@@ -116,6 +125,24 @@ static void ProcessInput(HWND) {
         return;
     }
 
+    if (g_playerTankEntity != 0) {
+        float throttle =
+            ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
+        float turn =
+            ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f);
+        if (g_tankTestInputActive) {
+            throttle = g_tankTestThrottle;
+            turn = g_tankTestTurn;
+        }
+        DrivePlayerTank(throttle, turn,
+                        (FocusedKeyState(VK_SPACE) & 0x8000) != 0);
+        if ((FocusedKeyState(VK_LBUTTON) & 0x8000) &&
+            !ImGui::GetIO().WantCaptureMouse)
+            FirePlayerTankShell();
+        return;
+    }
     if (g_drivingHumvee) {
         if (g_activeHumveeIndex >= g_humveeGameplay.size()) {
             g_drivingHumvee = false;
@@ -296,8 +323,28 @@ static void ProcessInput(HWND) {
 
     // Grenade: press G to lob one. Cooldown debounces the held key.
     scene.grenadeCooldown -= deltaTime;
-    if ((FocusedKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f &&
-        !scene.player.downed) {
+    // SGE_AUTO_GRENADE=host|client|1 throws one every 6 s on foot in a level,
+    // for that session role, so an unattended two-instance run can exercise
+    // the client throw path without anyone at the keyboard.
+    bool autoGrenade = false;
+    {
+        static float autoGrenadeTimer = 0.0f;
+        char role[16] = {};
+        if (IsGameplayScreen() && !PlayerInVehicle() && !scene.ejected &&
+            GetEnvironmentVariableA("SGE_AUTO_GRENADE", role, sizeof(role)) > 0) {
+            const bool client = g_netSession.CurrentRole() == net::Role::Client;
+            const bool roleMatches = std::strcmp(role, "1") == 0 ||
+                (std::strcmp(role, "client") == 0 && client) ||
+                (std::strcmp(role, "host") == 0 && !client);
+            autoGrenadeTimer += deltaTime;
+            if (roleMatches && autoGrenadeTimer >= 6.0f) {
+                autoGrenadeTimer = 0.0f;
+                autoGrenade = true;
+            }
+        }
+    }
+    if (((FocusedKeyState('G') & 0x8000) || autoGrenade) &&
+        scene.grenadeCooldown <= 0.0f && !scene.player.downed) {
         const size_t projectileStart = scene.projectiles.size();
         scene.ThrowGrenade();
         for (size_t index = projectileStart; index < scene.projectiles.size(); ++index)
@@ -488,7 +535,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // aim or swap weapons mid-sentence.
         if (ChatPromptOpen()) return 0;
         if (!ImGui::GetIO().WantCaptureMouse) {
-            if (g_drivingHumvee) {
+            if (g_playerTankEntity != 0) {
+                FirePlayerTankShell();
+                return 0;
+            } else if (g_drivingHumvee) {
                 FireHumveeTurret();
                 return 0;
             } else if (HeldBarrel()) {
@@ -564,6 +614,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OpenChatPrompt();
             return 0;
         }
+        // X calls for a medic. Respects chat focus and cooldown.
+        if (wParam == 'X' && !IsEditorEditing() &&
+            !g_gamePaused && MultiplayerActive() && !(lParam & 0x40000000) &&
+            !(showUI && ImGui::GetIO().WantCaptureKeyboard) &&
+            g_medicCallCooldown <= 0.0f) {
+            g_netSession.SendMedicCall();
+            g_medicCallCooldown = kMedicCallCooldownSeconds;
+            return 0;
+        }
         if (wParam == VK_ESCAPE) {
             if (IsEditorPlaying())
                 g_game.commands.Request(GameCommand::EditorStopPlay);
@@ -585,7 +644,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!(FocusedKeyState(VK_RBUTTON) & 0x8000))
                 g_levelEditor.OnKeyDown(static_cast<unsigned>(wParam), controlDown);
         }
-        else if (wParam == VK_TAB) {
+        // F3 toggles the debug UI; TAB belongs to the scoreboard.
+        else if (wParam == VK_F3 && !(lParam & 0x40000000)) {
             showUI = !showUI;
             if (showUI) {
                 cameraLocked = true;
@@ -692,7 +752,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 !g_game.vehicles.BailOutOfInsertionBoat() &&
                 !CollectNearbyWeaponPickup() &&
                 !OpenNearbyArmoryShop() &&
-                !OpenNearbyTravelScreen())
+                !OpenNearbyTravelScreen() &&
+                !ToggleTankDriving())
                 ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
