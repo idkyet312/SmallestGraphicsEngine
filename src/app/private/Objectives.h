@@ -510,6 +510,7 @@ static std::unordered_set<uint64_t> g_commTowersRiggedForDemolition;
 
 static void MarkCommTowersRiggedForDemolition() {
     for (const RemoteCharge& charge : scene.remoteCharges) {
+        if (charge.anchorPart != SGE::ChargeAnchorPart::World) continue;
         const uint64_t tower = CommTowerEntityAt(charge.position);
         if (tower != 0) g_commTowersRiggedForDemolition.insert(tower);
     }

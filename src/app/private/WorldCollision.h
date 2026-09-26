@@ -631,10 +631,19 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      float radius, XMFLOAT3& hit,
                                      uint64_t* hitEntityId,
                                      XMFLOAT3* hitNormal,
-                                     bool fencePanelsTransparent) {
+                                     bool fencePanelsTransparent,
+                                     bool ignoreAATurretColliders) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
+    const auto isTurretEntity = [&](uint64_t entityId) {
+        if (!ignoreAATurretColliders || entityId == 0) return false;
+        for (const auto& turret : g_game.vehicles.aaTurrets)
+            if (turret.Active() && turret.prefabEntityId == entityId)
+                return true;
+        return false;
+    };
     for (const PrefabCollider& collider : g_prefabColliders) {
+        if (isTurretEntity(collider.entityId)) continue;
         // A fence panel's coarse box is what the player sweep and the AI walk
         // into, so it stays in the list. What it must not do is stop a trace
         // that chain-link would not: a projectile has to reach the destructible
@@ -665,6 +674,7 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         }
     }
     for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        if (isTurretEntity(instance.entityId)) continue;
         CollisionMeshRayHit meshHit;
         if (!CollisionMeshInstanceRaycast(instance, start, end, radius, meshHit))
             continue;

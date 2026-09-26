@@ -8,6 +8,7 @@
 #include "MissionSystem.h"
 #include "Weather.h"
 #include "TimeOfDay.h"
+#include "ChargeAnchor.h"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -67,6 +68,10 @@ struct Projectile {
     bool     rocket = false;
     bool     laser = false;
     bool     remoteCharge = false;
+    // Who planted a charge blast (RemoteCharge::owner). The host detonates
+    // every player's charges, so this -- not playerOwned, which only means
+    // "this machine's player" -- is who the objective damage belongs to.
+    uint8_t  chargeOwner = 0xFF;
     bool     flame = false;
     bool     harpoon = false;
     bool     harpoonExpired = false;
@@ -211,6 +216,16 @@ struct PinnedHarpoonFX {
 struct RemoteCharge {
     XMFLOAT3 position = {};
     XMFLOAT3 normal = { 0.0f, 1.0f, 0.0f };
+    XMFLOAT4 orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    SGE::ChargeAnchorPart anchorPart = SGE::ChargeAnchorPart::World;
+    uint64_t turretEntityId = 0;
+    uint32_t turretOrdinal = 0;
+    XMFLOAT3 turretBase = {};
+    XMFLOAT3 localPosition = {};
+    XMFLOAT3 localNormal = { 0.0f, 1.0f, 0.0f };
+    uint32_t networkId = 0;
+    bool attachmentResolved = false;
+    bool attachmentFrozen = false;
     // Who planted it. A detonator only fires its owner's charges, so two
     // players can rig separate targets and blow them independently. 0xFF is
     // "this machine's own", which is what an offline game plants.
@@ -2521,16 +2536,16 @@ struct Scene {
         gunRecoilBack = (std::min)(0.08f, gunRecoilBack + 0.035f);
     }
 
-    void StickRemoteCharge(const XMFLOAT3& position, const XMFLOAT3& normal,
-                           uint8_t owner = 0xFF) {
+    void StickRemoteCharge(RemoteCharge charge) {
+        if (charge.networkId != 0) {
+            for (const RemoteCharge& existing : remoteCharges)
+                if (existing.networkId == charge.networkId) return;
+        }
         if (remoteCharges.size() >= 12) remoteCharges.erase(remoteCharges.begin());
-        RemoteCharge charge;
         charge.position = {
-            position.x + normal.x * 0.035f,
-            position.y + normal.y * 0.035f,
-            position.z + normal.z * 0.035f };
-        charge.normal = normal;
-        charge.owner = owner;
+            charge.position.x + charge.normal.x * 0.035f,
+            charge.position.y + charge.normal.y * 0.035f,
+            charge.position.z + charge.normal.z * 0.035f };
         remoteCharges.push_back(charge);
     }
 
@@ -2540,7 +2555,12 @@ struct Scene {
     // authoritative machine may queue it. Everyone else drops the charges and
     // shows the burst, and receives the damage through the same world-break
     // path every other explosion already uses.
-    void DetonateRemoteChargesFor(uint8_t owner, bool spawnBlast) {
+    //
+    // `ownedHere` marks the blast playerOwned when the planter is this
+    // machine's player. Left false, every charge blast failed the objective
+    // aircraft's player-only gate and C4 never touched the plane.
+    void DetonateRemoteChargesFor(uint8_t owner, bool spawnBlast,
+                                  bool ownedHere = true) {
         for (const RemoteCharge& charge : remoteCharges) {
             if (charge.owner != owner) continue;
             if (spawnBlast) {
@@ -2548,6 +2568,8 @@ struct Scene {
                 blast.position = blast.previousPosition = charge.position;
                 blast.grenade = true;
                 blast.remoteCharge = true;
+                blast.playerOwned = ownedHere;
+                blast.chargeOwner = owner;
                 blast.detonate = true;
                 blast.active = false;
                 projectiles.push_back(blast);

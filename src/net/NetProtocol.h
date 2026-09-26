@@ -2,6 +2,7 @@
 #define NET_PROTOCOL_H
 
 #include "PlayerInput.h"
+#include "ChargeAnchor.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -93,7 +94,8 @@ namespace net {
 //     to land them where the client's transport set down, and EnemySnapshot
 //     says which bodies are marines (a padding byte after `killer`, so the
 //     struct keeps its 36 bytes) -- a client built every replica as a bandit.
-inline constexpr uint32_t kProtocolVersion = 26;
+// 27: C4 carries a turret attachment and a host charge id for late-join replay.
+inline constexpr uint32_t kProtocolVersion = 27;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -619,18 +621,31 @@ struct ServerShotFiredMessage {
 // A demolition charge has stuck to something. Reliable: a charge is placed once
 // and then sits there, so a dropped packet would leave it invisible on one
 // machine and standing on the wall on every other.
-struct ClientChargeStuckMessage {
-    MessageHeader header{ MessageType::ClientChargeStuck, {} };
+struct ChargeStickData {
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+    SGE::ChargeAnchorPart part = SGE::ChargeAnchorPart::World;
+    uint8_t frozen = 0;
+    uint8_t padding[2] = {};
+    uint64_t turretEntityId = 0;
+    uint32_t turretOrdinal = 0;
+    float turretX = 0.0f, turretY = 0.0f, turretZ = 0.0f;
+    float localX = 0.0f, localY = 0.0f, localZ = 0.0f;
+    float localNx = 0.0f, localNy = 1.0f, localNz = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+};
+
+struct ClientChargeStuckMessage {
+    MessageHeader header{ MessageType::ClientChargeStuck, {} };
+    ChargeStickData charge;
 };
 
 struct ServerChargeStuckMessage {
     MessageHeader header{ MessageType::ServerChargeStuck, {} };
     PlayerId owner = kInvalidPlayerId;
     uint8_t padding[3] = {};
-    float x = 0.0f, y = 0.0f, z = 0.0f;
-    float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+    uint32_t chargeId = 0;
+    ChargeStickData charge;
 };
 
 // The detonator. Carries no position -- it fires every charge its owner has

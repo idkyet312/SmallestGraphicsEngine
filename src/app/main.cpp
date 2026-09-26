@@ -98,6 +98,7 @@
 #include "CombatSystem.h"
 #include "EnemySystem.h"
 #include "VehicleSystem.h"
+#include "AATurretCharge.h"
 #include "RopeSwing.h"
 #include "DeploymentPlanner.h"
 #include "ArmoryCatalog.h"
@@ -2500,6 +2501,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Remote bodies only: the session itself is driven every frame from
         // outside this gameplay gate, so a handshake can complete at the menu.
         UpdateMultiplayerBodies(deltaTime);
+        RefreshAATurretChargeAttachments();
         UpdateNetworkWorldImpacts();
         UpdateNetworkGrenades();
         // Before the frame's physics and draws so a client stands on the same
@@ -2773,6 +2775,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (!struck && HitSecondaryHelicopterSegment(
                             projectile.previousPosition, projectile.position,
                             radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                        hostileTargetStruck = true;
+                    }
+                    // The AA gun stops a rocket on its mount. Without this it
+                    // flew through the gun and burst on whatever lay behind,
+                    // so a dead-on shot only ever splashed it.
+                    size_t rocketTurretIndex = 0;
+                    if (!struck && !projectile.hostile && HitAATurretSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate, rocketTurretIndex)) {
                         impact = candidate;
                         struck = true;
                         hostileTargetStruck = true;
@@ -3073,9 +3086,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // planted charge is a valid answer to it rather than
                         // grinding its 900 HP down with rifle fire. Only the
                         // barrel chain reaction used to reach it; a charge stuck
-                        // to the gun itself did nothing. C4 is a demolition and
-                        // one is enough, while a frag still only chips the
-                        // mount -- same split the comm tower uses below.
+                        // to the gun itself did nothing. C4 and rockets are
+                        // demolitions and one is enough, while a frag still only
+                        // chips the mount -- same split the comm tower uses below.
                         for (size_t ti = 0;
                              ti < g_game.vehicles.aaTurrets.size(); ++ti) {
                             if (!g_game.vehicles.aaTurrets[ti].Active()) continue;
@@ -3093,23 +3106,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 VehicleSystem::AATurretMountHeight;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
-                                // A charge planted on the gun kills outright:
-                                // full health with no falloff, since falloff
-                                // measured from the mount origin would leave a
-                                // charge stuck to the barrel ~18% short of the
-                                // 900 HP it needs. Past that the blast still
-                                // reaches, but only as scaled splash.
-                                const bool planted =
-                                    c4Blast && distance <
-                                        VehicleSystem::AATurretBarrelLength;
-                                const float damage = planted
+                                // C4 or a friendly rocket on or beside the gun
+                                // kills outright: full health with no falloff.
+                                // Falloff measured from the mount origin left a
+                                // charge on the barrel ~18% short of 900 HP, and
+                                // a rocket's 500 never got there at all. The
+                                // zone covers the whole gun -- mount height
+                                // plus barrel, so a charge on the tip of a
+                                // raised barrel counts -- and a rocket stopped
+                                // on the 2 m hit sphere (~3.1 m out) lands well
+                                // inside it. Past that it is scaled splash.
+                                const bool demolition = c4Blast ||
+                                    (projectile.rocket && !projectile.hostile);
+                                const bool direct = demolition && distance <
+                                    VehicleSystem::AATurretMountHeight +
+                                    VehicleSystem::AATurretBarrelLength + 0.5f;
+                                const float damage = direct
                                     ? VehicleSystem::AATurretMaxHealth
-                                    : (c4Blast
+                                    : (demolition
                                            ? VehicleSystem::AATurretMaxHealth
                                            : enemyDamage) * falloff;
                                 DamageAATurret(ti, damage, turret,
-                                               projectile.playerOwned,
-                                               projectile.netGrenadeId != 0);
+                                               projectile.playerOwned || c4Blast,
+                                               projectile.netGrenadeId != 0,
+                                               c4Blast ? projectile.chargeOwner
+                                                       : net::kInvalidPlayerId);
                             }
                         }
                         // Enemy tanks answer to explosives only, measured to
@@ -3235,46 +3256,84 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bool stuck = false;
                     uint64_t ignoredEntity = 0;
                     size_t ignoredBarrel = 0;
+                    const auto considerWorldHit = [&](const XMFLOAT3& candidate) {
+                        if (!stuck || SGE::AATurretChargeIsNearer(
+                                projectile.previousPosition, candidate, chargeHit)) {
+                            chargeHit = candidate;
+                            stuck = true;
+                        }
+                    };
+                    XMFLOAT3 candidate;
                     if (g_destruction.HitTestSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit)) {
-                        stuck = true;
-                    } else if (HitPrefabColliderSegment(
+                            chargeRadius, candidate))
+                        considerWorldHit(candidate);
+                    if (HitPrefabColliderSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit, &ignoredEntity)) {
-                        stuck = true;
-                    } else if (HitHelicopterSegment(
+                            chargeRadius, candidate, &ignoredEntity, nullptr,
+                            /*fencePanelsTransparent=*/false,
+                            /*ignoreAATurretColliders=*/true))
+                        considerWorldHit(candidate);
+                    if (HitHelicopterSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit) ||
-                               HitSecondaryHelicopterSegment(
+                            chargeRadius, candidate))
+                        considerWorldHit(candidate);
+                    if (HitSecondaryHelicopterSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit) ||
-                               HitBoatSegment(
+                            chargeRadius, candidate))
+                        considerWorldHit(candidate);
+                    if (HitBoatSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit) ||
-                               HitExplosiveBarrelSegment(
+                            chargeRadius, candidate))
+                        considerWorldHit(candidate);
+                    if (HitExplosiveBarrelSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, ignoredBarrel, chargeHit)) {
-                        stuck = true;
-                    } else if (!g_emptyLevelMode && g_trees.BlocksSegment(
+                            chargeRadius, ignoredBarrel, candidate))
+                        considerWorldHit(candidate);
+                    if (!g_emptyLevelMode && g_trees.BlocksSegment(
                             projectile.previousPosition, projectile.position,
                             chargeRadius)) {
-                        chargeHit = projectile.position;
-                        stuck = true;
-                    } else if (HitTerrainSegment(
+                        considerWorldHit(projectile.position);
+                    }
+                    if (HitTerrainSegment(
                             projectile.previousPosition, projectile.position,
-                            chargeRadius, chargeHit)) {
-                        stuck = true;
-                    } else if (!scene.useMeshTerrain &&
+                            chargeRadius, candidate))
+                        considerWorldHit(candidate);
+                    if (!scene.useMeshTerrain &&
                                projectile.position.y <= scene.grenadeGroundY) {
-                        chargeHit.y = scene.grenadeGroundY;
-                        stuck = true;
+                        candidate = projectile.position;
+                        candidate.y = scene.grenadeGroundY;
+                        considerWorldHit(candidate);
+                    }
+                    SGE::AATurretChargeHit turretHit;
+                    const VehicleSystem::AATurret* hitTurret = nullptr;
+                    for (const auto& turret : g_game.vehicles.aaTurrets) {
+                        SGE::AATurretChargeHit candidate;
+                        if (SGE::HitAATurretChargeSegment(turret,
+                                projectile.previousPosition, projectile.position,
+                                chargeRadius, candidate) &&
+                            candidate.fraction < turretHit.fraction) {
+                            turretHit = candidate;
+                            hitTurret = &turret;
+                        }
+                    }
+                    if (hitTurret) {
+                        if (!stuck || SGE::AATurretChargeIsNearer(
+                                projectile.previousPosition,
+                                turretHit.position, chargeHit)) {
+                            chargeHit = turretHit.position;
+                            stuck = true;
+                        } else {
+                            hitTurret = nullptr;
+                        }
                     }
                     if (stuck) {
-                        const XMFLOAT3 normal{
+                        const XMFLOAT3 fallbackNormal{
                             -projectile.direction.x,
                             -projectile.direction.y,
                             -projectile.direction.z };
+                        const XMFLOAT3 normal = hitTurret
+                            ? turretHit.normal : fallbackNormal;
                         // Owned by whoever planted it, so a detonator fires
                         // only its own player's charges. Placed locally right
                         // away rather than waiting for the round trip -- the
@@ -3283,11 +3342,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         const uint8_t chargeOwner = MultiplayerActive()
                             ? static_cast<uint8_t>(g_netSession.LocalId())
                             : uint8_t{ 0xFF };
-                        scene.StickRemoteCharge(chargeHit, normal, chargeOwner);
+                        net::ChargeStickData data;
+                        data.x = chargeHit.x; data.y = chargeHit.y;
+                        data.z = chargeHit.z;
+                        data.nx = normal.x; data.ny = normal.y;
+                        data.nz = normal.z;
+                        if (hitTurret) {
+                            data.part = turretHit.part;
+                            data.turretEntityId = hitTurret->prefabEntityId;
+                            data.turretOrdinal = hitTurret->prefabOrdinal;
+                            data.turretX = hitTurret->position.x;
+                            data.turretY = hitTurret->position.y;
+                            data.turretZ = hitTurret->position.z;
+                            data.localX = turretHit.localPosition.x;
+                            data.localY = turretHit.localPosition.y;
+                            data.localZ = turretHit.localPosition.z;
+                            data.localNx = turretHit.localNormal.x;
+                            data.localNy = turretHit.localNormal.y;
+                            data.localNz = turretHit.localNormal.z;
+                        }
+                        scene.StickRemoteCharge(MakeRemoteCharge(
+                            { chargeOwner, 0, data }));
                         if (MultiplayerActive())
-                            g_netSession.ReportChargeStuck(
-                                chargeHit.x, chargeHit.y, chargeHit.z,
-                                normal.x, normal.y, normal.z);
+                            g_netSession.ReportChargeStuck(data);
                         projectile.active = false;
                     }
                     continue;

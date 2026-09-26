@@ -430,7 +430,101 @@ static void UpdateNetworkWorldImpacts() {
 
 static std::vector<net::RemoteShot> g_netRemoteShots;
 static std::vector<net::RemoteChargeStuck> g_netChargeSticks;
+static std::vector<net::ChargeStickRequest> g_netChargeStickRequests;
 static std::vector<net::RemoteChargeDetonate> g_netChargeDetonations;
+
+static const VehicleSystem::AATurret* FindChargeTurret(
+        uint64_t entityId, uint32_t ordinal, const XMFLOAT3& base,
+        bool liveOnly = false) {
+    for (const VehicleSystem::AATurret& turret : g_game.vehicles.aaTurrets) {
+        if (turret.prefabEntityId != entityId ||
+            turret.prefabOrdinal != ordinal ||
+            (liveOnly && !turret.Active())) continue;
+        const float dx = turret.position.x - base.x;
+        const float dy = turret.position.y - base.y;
+        const float dz = turret.position.z - base.z;
+        if (dx * dx + dy * dy + dz * dz <= 3.0f * 3.0f)
+            return &turret;
+    }
+    return nullptr;
+}
+
+static void RefreshAATurretChargeAttachments() {
+    for (RemoteCharge& charge : scene.remoteCharges) {
+        if (charge.anchorPart != SGE::ChargeAnchorPart::World &&
+            !charge.attachmentFrozen) {
+            const auto* turret = FindChargeTurret(charge.turretEntityId,
+                charge.turretOrdinal, charge.turretBase);
+            if (turret) {
+                XMFLOAT3 position, normal;
+                SGE::ResolveAATurretCharge(*turret, charge.anchorPart,
+                    charge.localPosition, charge.localNormal, position, normal);
+                charge.position = { position.x + normal.x * 0.035f,
+                                    position.y + normal.y * 0.035f,
+                                    position.z + normal.z * 0.035f };
+                charge.normal = normal;
+                XMStoreFloat4(&charge.orientation, XMQuaternionRotationMatrix(
+                    SGE::AATurretChargeMatrix(*turret, charge.anchorPart)));
+                charge.attachmentResolved = true;
+                if (!turret->Active()) charge.attachmentFrozen = true;
+            } else if (charge.attachmentResolved) {
+                charge.attachmentFrozen = true;
+            }
+        }
+        if (g_netSession.CurrentRole() == net::Role::Host &&
+            charge.networkId != 0) {
+            g_netSession.UpdateActiveChargePose(charge.networkId,
+                charge.position.x - charge.normal.x * 0.035f,
+                charge.position.y - charge.normal.y * 0.035f,
+                charge.position.z - charge.normal.z * 0.035f,
+                charge.normal.x, charge.normal.y, charge.normal.z,
+                charge.orientation.x, charge.orientation.y,
+                charge.orientation.z, charge.orientation.w,
+                charge.attachmentFrozen);
+        }
+    }
+}
+
+static bool ValidateChargeTurretAttachment(net::ChargeStickData& charge) {
+    charge.frozen = 0;
+    if (charge.part == SGE::ChargeAnchorPart::World) return true;
+    const XMFLOAT3 base{ charge.turretX, charge.turretY, charge.turretZ };
+    const auto* turret = FindChargeTurret(charge.turretEntityId,
+        charge.turretOrdinal, base, /*liveOnly=*/true);
+    if (turret) {
+        XMFLOAT3 position, normal;
+        SGE::ResolveAATurretCharge(*turret, charge.part,
+            { charge.localX, charge.localY, charge.localZ },
+            { charge.localNx, charge.localNy, charge.localNz },
+            position, normal);
+        const float dx = position.x - charge.x;
+        const float dy = position.y - charge.y;
+        const float dz = position.z - charge.z;
+        if (dx * dx + dy * dy + dz * dz <= 3.0f * 3.0f) return true;
+    }
+    // The host could not confirm the moving target. Keep the charge at the
+    // reported impact rather than letting an invalid reference follow a gun.
+    charge.part = SGE::ChargeAnchorPart::World;
+    return true;
+}
+
+static RemoteCharge MakeRemoteCharge(const net::RemoteChargeStuck& stuck) {
+    const net::ChargeStickData& data = stuck.charge;
+    RemoteCharge charge;
+    charge.owner = static_cast<uint8_t>(stuck.owner);
+    charge.networkId = stuck.chargeId;
+    charge.position = { data.x, data.y, data.z };
+    charge.normal = { data.nx, data.ny, data.nz };
+    charge.anchorPart = data.part;
+    charge.turretEntityId = data.turretEntityId;
+    charge.turretOrdinal = data.turretOrdinal;
+    charge.turretBase = { data.turretX, data.turretY, data.turretZ };
+    charge.localPosition = { data.localX, data.localY, data.localZ };
+    charge.localNormal = { data.localNx, data.localNy, data.localNz };
+    charge.orientation = { data.qx, data.qy, data.qz, data.qw };
+    charge.attachmentFrozen = data.frozen != 0;
+    return charge;
+}
 // Last shot count this machine has already put on the wire. Compared rather
 // than hooked, so Scene stays unaware that a session exists.
 static uint32_t g_netLastReportedShot = 0;
@@ -557,20 +651,52 @@ static void PresentRemoteShots(float deltaTime) {
 // it happens.
 static void UpdateNetworkCharges() {
     if (!MultiplayerActive()) return;
-    g_netSession.DrainChargeSticks(g_netChargeSticks);
-    for (const net::RemoteChargeStuck& stuck : g_netChargeSticks) {
-        // The planter placed its own the moment the charge landed; this is
-        // everyone else catching up.
-        if (stuck.owner == g_netSession.LocalId()) continue;
-        scene.StickRemoteCharge({ stuck.x, stuck.y, stuck.z },
-                                { stuck.nx, stuck.ny, stuck.nz },
-                                static_cast<uint8_t>(stuck.owner));
+    const bool levelReady = IsGameplayScreen() && !g_game.loading.Active() &&
+        g_activeLevelKind == g_netSession.HostLevelKind() &&
+        !g_netSession.LevelRestartPending();
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.DrainChargeStickRequests(g_netChargeStickRequests);
+        if (levelReady) {
+            for (const net::ChargeStickRequest& request :
+                 g_netChargeStickRequests) {
+                net::ChargeStickData data = request.charge;
+                if (ValidateChargeTurretAttachment(data))
+                    g_netSession.CommitChargeStuck(request.owner, data);
+            }
+        }
+    }
+    if (levelReady) {
+        g_netSession.DrainChargeSticks(g_netChargeSticks);
+        for (const net::RemoteChargeStuck& stuck : g_netChargeSticks) {
+            // Replace the planter's prediction with the host's validated pose
+            // and ID. Replays have no prediction and use the same path.
+            if (stuck.owner == g_netSession.LocalId()) {
+                const auto& at = stuck.charge;
+                auto predicted = std::find_if(scene.remoteCharges.begin(),
+                    scene.remoteCharges.end(), [&](const RemoteCharge& charge) {
+                    if (charge.owner != stuck.owner || charge.networkId != 0)
+                        return false;
+                    const float dx = charge.position.x - at.x;
+                    const float dy = charge.position.y - at.y;
+                    const float dz = charge.position.z - at.z;
+                    return dx * dx + dy * dy + dz * dz < 3.0f * 3.0f;
+                });
+                if (predicted != scene.remoteCharges.end())
+                    scene.remoteCharges.erase(predicted);
+            }
+            scene.StickRemoteCharge(MakeRemoteCharge(stuck));
+        }
+        RefreshAATurretChargeAttachments();
     }
 
     const bool authoritative =
         g_netSession.CurrentRole() == net::Role::Host;
     g_netSession.DrainChargeDetonations(g_netChargeDetonations);
     for (const net::RemoteChargeDetonate& fired : g_netChargeDetonations) {
+        if (!levelReady) {
+            g_netSession.DiscardPendingChargeSticksFor(fired.owner);
+            continue;
+        }
         // Rigged towers are recorded before the charges are cleared, for the
         // same reason the local detonator does it: the blast is not resolved
         // until the projectile pass later this frame, by which point the charge
@@ -584,9 +710,11 @@ static void UpdateNetworkCharges() {
         // client rejecting the host's own answer -- charges went off at the
         // foot of the tower and it stayed standing, on the screen of the player
         // who had just blown it.
+        RefreshAATurretChargeAttachments();
         MarkCommTowersRiggedForDemolition();
         scene.DetonateRemoteChargesFor(static_cast<uint8_t>(fired.owner),
-                                       authoritative);
+                                       authoritative,
+                                       fired.owner == g_netSession.LocalId());
     }
 }
 
@@ -987,6 +1115,7 @@ static void ApplyNetworkArmor() {
         if (in.dead && !match->dead) {
             match->dead = true;
             match->shotsLeftInBurst = 0;
+            HideAATurretVisual(static_cast<size_t>(match - turrets.data()));
             if (match->netSeen)
                 WreckAATurret(match->position,
                               in.killer != net::kInvalidPlayerId &&

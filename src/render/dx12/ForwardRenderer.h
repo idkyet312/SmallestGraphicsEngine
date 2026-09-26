@@ -3373,12 +3373,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // Authored brick where it loaded, procedural box where it did not, so a
         // missing asset still leaves a visible, defusable charge.
         if (g_c4Model) {
-            model = XMMatrixTranslation(charge.position.x, charge.position.y,
+            model = XMMatrixRotationQuaternion(XMLoadFloat4(&charge.orientation)) *
+                    XMMatrixTranslation(charge.position.x, charge.position.y,
                                         charge.position.z);
             DrawSceneNode(g_c4Model, shader, model, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);
         } else {
             model = XMMatrixScaling(0.30f, 0.08f, 0.42f) *
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&charge.orientation)) *
                     XMMatrixTranslation(charge.position.x, charge.position.y,
                                         charge.position.z);
             shader.SetMatrices(model, view, proj, lightSpace);
@@ -3393,8 +3395,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // its own panel, so the extra glowing cube just floats above it.
         if (!g_c4Model) {
             model = XMMatrixScaling(0.055f, 0.055f, 0.055f) *
-                    XMMatrixTranslation(charge.position.x,
-                                        charge.position.y + 0.07f,
+                    XMMatrixTranslation(0.0f, 0.07f, 0.0f) *
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&charge.orientation)) *
+                    XMMatrixTranslation(charge.position.x, charge.position.y,
                                         charge.position.z);
             shader.UseAdditive();
             shader.SetMatrices(model, view, proj, lightSpace);

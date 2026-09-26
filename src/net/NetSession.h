@@ -88,8 +88,13 @@ struct RemoteEnemy {
 // sits, and the detonator fires whatever its owner has out.
 struct RemoteChargeStuck {
     PlayerId owner = kInvalidPlayerId;
-    float x = 0.0f, y = 0.0f, z = 0.0f;
-    float nx = 0.0f, ny = 1.0f, nz = 0.0f;
+    uint32_t chargeId = 0;
+    ChargeStickData charge;
+};
+
+struct ChargeStickRequest {
+    PlayerId owner = kInvalidPlayerId;
+    ChargeStickData charge;
 };
 
 struct RemoteChargeDetonate {
@@ -387,7 +392,11 @@ public:
         remoteEnemies_.clear();
         remoteShots_.clear();
         chargeSticks_.clear();
+        chargeStickRequests_.clear();
         chargeDetonations_.clear();
+        activeCharges_.clear();
+        receivedChargeIds_.clear();
+        nextChargeId_ = 1;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             hostHelicopters_[i] = EnemyHelicopterState{};
             remoteHelicopters_[i] = EnemyHelicopterState{};
@@ -660,6 +669,9 @@ public:
         // next player who joins would cut the new level's ground at the old
         // one's coordinates.
         terrainDeforms_.clear();
+        activeCharges_.clear();
+        chargeSticks_.clear();
+        chargeStickRequests_.clear();
         SendLevelTo(kInvalidPeer); // everyone
     }
 
@@ -671,6 +683,9 @@ public:
         if (role_ != Role::Host) return;
         ++levelRestartSerial_;
         terrainDeforms_.clear();
+        activeCharges_.clear();
+        chargeSticks_.clear();
+        chargeStickRequests_.clear();
         for (PlayerSlot& slot : players_) {
             if (!slot.active) continue;
             const bool wasDowned = slot.downed;
@@ -1412,31 +1427,63 @@ public:
     // it and tells everyone; a client asks the host to. Either way the charge
     // appears on every machine from the one committed event, so nobody is
     // holding a charge the others cannot see.
-    void ReportChargeStuck(float x, float y, float z,
-                           float nx, float ny, float nz) {
+    void ReportChargeStuck(const ChargeStickData& charge) {
         if (!Active() || !transport_ || localId_ == kInvalidPlayerId ||
-            !Finite3(x, y, z) || !Finite3(nx, ny, nz)) return;
+            !ValidChargeStick(charge)) return;
         if (role_ == Role::Host) {
-            chargeSticks_.push_back({ localId_, x, y, z, nx, ny, nz });
-            ServerChargeStuckMessage message;
-            message.owner = localId_;
-            message.x = x; message.y = y; message.z = z;
-            message.nx = nx; message.ny = ny; message.nz = nz;
-            transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+            CommitChargeStuck(localId_, charge);
             return;
         }
         if (serverPeer_ == kInvalidPeer) return;
         ClientChargeStuckMessage message;
-        message.x = x; message.y = y; message.z = z;
-        message.nx = nx; message.ny = ny; message.nz = nz;
+        message.charge = charge;
         transport_->Send(serverPeer_, &message, sizeof(message),
                          Channel::Reliable);
+    }
+
+    void DrainChargeStickRequests(std::vector<ChargeStickRequest>& out) {
+        out.clear();
+        out.swap(chargeStickRequests_);
+    }
+
+    void CommitChargeStuck(PlayerId owner, const ChargeStickData& charge) {
+        if (role_ != Role::Host || !transport_ || owner >= kMaxPlayers ||
+            !players_[owner].active || !ValidChargeStick(charge)) return;
+        ServerChargeStuckMessage message;
+        message.owner = owner;
+        message.chargeId = nextChargeId_++;
+        if (message.chargeId == 0) message.chargeId = nextChargeId_++;
+        message.charge = charge;
+        if (activeCharges_.size() >= 12) activeCharges_.erase(activeCharges_.begin());
+        activeCharges_.push_back(message);
+        chargeSticks_.push_back({ owner, message.chargeId, charge });
+        transport_->Broadcast(&message, sizeof(message), Channel::Reliable);
+    }
+
+    // Keep the replay fallback at the host's last drawn pose. If the turret
+    // disappears, late joiners receive a fixed charge at that pose.
+    void UpdateActiveChargePose(uint32_t id, float x, float y, float z,
+                                float nx, float ny, float nz,
+                                float qx, float qy, float qz, float qw,
+                                bool frozen) {
+        if (role_ != Role::Host || id == 0) return;
+        for (ServerChargeStuckMessage& stored : activeCharges_) {
+            if (stored.chargeId != id) continue;
+            stored.charge.x = x; stored.charge.y = y; stored.charge.z = z;
+            stored.charge.nx = nx; stored.charge.ny = ny;
+            stored.charge.nz = nz;
+            stored.charge.qx = qx; stored.charge.qy = qy;
+            stored.charge.qz = qz; stored.charge.qw = qw;
+            if (frozen) stored.charge.frozen = 1;
+            return;
+        }
     }
 
     // This machine's player pressed the detonator.
     void ReportChargeDetonate() {
         if (!Active() || !transport_ || localId_ == kInvalidPlayerId) return;
         if (role_ == Role::Host) {
+            RemoveActiveChargesFor(localId_);
             chargeDetonations_.push_back({ localId_ });
             ServerChargeDetonateMessage message;
             message.owner = localId_;
@@ -1452,6 +1499,13 @@ public:
     void DrainChargeSticks(std::vector<RemoteChargeStuck>& out) {
         out.clear();
         out.swap(chargeSticks_);
+    }
+
+    void DiscardPendingChargeSticksFor(PlayerId owner) {
+        chargeSticks_.erase(std::remove_if(chargeSticks_.begin(),
+            chargeSticks_.end(), [owner](const RemoteChargeStuck& charge) {
+                return charge.owner == owner;
+            }), chargeSticks_.end());
     }
 
     void DrainChargeDetonations(std::vector<RemoteChargeDetonate>& out) {
@@ -1613,6 +1667,37 @@ public:
     }
 
 private:
+    static bool ValidChargeStick(const ChargeStickData& charge) {
+        if (!Finite3(charge.x, charge.y, charge.z) ||
+            !Finite3(charge.nx, charge.ny, charge.nz) ||
+            !Finite3(charge.qx, charge.qy, charge.qz) ||
+            !std::isfinite(charge.qw) || charge.frozen > 1 ||
+            !SGE::ValidChargeAnchorPart(charge.part)) return false;
+        if (charge.part == SGE::ChargeAnchorPart::World) return true;
+        if (!Finite3(charge.turretX, charge.turretY, charge.turretZ) ||
+            !Finite3(charge.localX, charge.localY, charge.localZ) ||
+            !Finite3(charge.localNx, charge.localNy, charge.localNz)) return false;
+        const float dx = charge.x - charge.turretX;
+        const float dy = charge.y - charge.turretY;
+        const float dz = charge.z - charge.turretZ;
+        const float offsetSq = charge.localX * charge.localX +
+                               charge.localY * charge.localY +
+                               charge.localZ * charge.localZ;
+        const float normalSq = charge.localNx * charge.localNx +
+                               charge.localNy * charge.localNy +
+                               charge.localNz * charge.localNz;
+        return dx * dx + dy * dy + dz * dz <= 7.0f * 7.0f &&
+               offsetSq <= 6.0f * 6.0f && normalSq > 0.25f &&
+               normalSq < 2.25f;
+    }
+
+    void RemoveActiveChargesFor(PlayerId owner) {
+        activeCharges_.erase(std::remove_if(activeCharges_.begin(),
+            activeCharges_.end(), [owner](const ServerChargeStuckMessage& charge) {
+                return charge.owner == owner;
+            }), activeCharges_.end());
+    }
+
     static bool ValidInsertionHelicopter(const InsertionHelicopterState& h) {
         return h.visible <= 1 && h.airframe < 2 &&
             Finite3(h.x, h.y, h.z) && Finite3(h.yaw, h.pitch, h.roll) &&
@@ -2193,6 +2278,13 @@ private:
         // in progress walks onto pristine terrain while everyone else is taking
         // cover in craters that, to them, are not there.
         SendTerrainDeformsTo(event.peer);
+        SendActiveChargesTo(event.peer);
+    }
+
+    void SendActiveChargesTo(PeerId peer) {
+        if (role_ != Role::Host || !transport_ || peer == kInvalidPeer) return;
+        for (const ServerChargeStuckMessage& charge : activeCharges_)
+            transport_->Send(peer, &charge, sizeof(charge), Channel::Reliable);
     }
 
     // Replays the cuts made so far to one joining peer. One message per stamp
@@ -2259,6 +2351,9 @@ private:
         levelRestartSerial_ = message.restartSerial;
         levelKind_ = message.kind;
         levelFile_ = file;
+        chargeSticks_.clear();
+        chargeDetonations_.clear();
+        receivedChargeIds_.clear();
         hasPendingLevel_ = true;
         SGE_LOG("LogNet", EngineLog::Level::Display,
             "host is on level " + std::to_string(int(levelKind_)) +
@@ -2451,15 +2546,8 @@ private:
         if (it == peerToPlayer_.end()) return;
         ClientChargeStuckMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
-        if (!Finite3(message.x, message.y, message.z) ||
-            !Finite3(message.nx, message.ny, message.nz)) return;
-        chargeSticks_.push_back({ it->second, message.x, message.y, message.z,
-                                  message.nx, message.ny, message.nz });
-        ServerChargeStuckMessage out;
-        out.owner = it->second;
-        out.x = message.x; out.y = message.y; out.z = message.z;
-        out.nx = message.nx; out.ny = message.ny; out.nz = message.nz;
-        transport_->Broadcast(&out, sizeof(out), Channel::Reliable);
+        if (!ValidChargeStick(message.charge)) return;
+        chargeStickRequests_.push_back({ it->second, message.charge });
     }
 
     void HandleServerChargeStuck(Event& event) {
@@ -2467,19 +2555,18 @@ private:
         if (event.peer != serverPeer_) return;
         ServerChargeStuckMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
-        // The planter already stuck its own charge when it landed.
-        if (message.owner == localId_) return;
-        if (!Finite3(message.x, message.y, message.z) ||
-            !Finite3(message.nx, message.ny, message.nz)) return;
-        chargeSticks_.push_back({ message.owner, message.x, message.y,
-                                  message.z, message.nx, message.ny,
-                                  message.nz });
+        if (message.owner >= kMaxPlayers || message.chargeId == 0 ||
+            !ValidChargeStick(message.charge) ||
+            !receivedChargeIds_.insert(message.chargeId).second) return;
+        chargeSticks_.push_back({ message.owner, message.chargeId,
+                                  message.charge });
     }
 
     void HandleClientChargeDetonate(Event& event) {
         if (event.payload.size() < sizeof(ClientChargeDetonateMessage)) return;
         const auto it = peerToPlayer_.find(event.peer);
         if (it == peerToPlayer_.end()) return;
+        RemoveActiveChargesFor(it->second);
         chargeDetonations_.push_back({ it->second });
         ServerChargeDetonateMessage out;
         out.owner = it->second;
@@ -3147,6 +3234,7 @@ private:
             }
         }
         if (role_ == Role::Host) {
+            RemoveActiveChargesFor(id);
             PlayerLeftMessage left;
             left.id = id;
             transport_->Broadcast(&left, sizeof(left), Channel::Reliable);
@@ -3175,7 +3263,11 @@ private:
     std::vector<RemoteEnemy> remoteEnemies_;
     std::vector<RemoteShot> remoteShots_;
     std::vector<RemoteChargeStuck> chargeSticks_;
+    std::vector<ChargeStickRequest> chargeStickRequests_;
     std::vector<RemoteChargeDetonate> chargeDetonations_;
+    std::vector<ServerChargeStuckMessage> activeCharges_;
+    std::unordered_set<uint32_t> receivedChargeIds_;
+    uint32_t nextChargeId_ = 1;
     EnemyHelicopterState hostHelicopters_[kEnemyHelicopterCount]{};
     EnemyHelicopterState remoteHelicopters_[kEnemyHelicopterCount]{};
     EscapeBoatSnapshot hostEscapeBoat_{};

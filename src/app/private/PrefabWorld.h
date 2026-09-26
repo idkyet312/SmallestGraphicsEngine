@@ -883,6 +883,7 @@ static void RebuildPrefabRenderBatches() {
             for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i) {
                 const VehicleSystem::AATurret& turret =
                     g_game.vehicles.aaTurrets[i];
+                if (!turret.Active()) continue;
                 const std::shared_ptr<SceneNode>& instance =
                     g_aaTurretModelInstances[i];
                 if (!instance) continue;

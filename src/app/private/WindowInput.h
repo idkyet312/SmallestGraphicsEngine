@@ -75,6 +75,7 @@ static void ProcessInput(HWND) {
         if (MultiplayerActive()) {
             g_netSession.ReportChargeDetonate();
         } else {
+            RefreshAATurretChargeAttachments();
             MarkCommTowersRiggedForDemolition();
             scene.DetonateRemoteCharges();
         }

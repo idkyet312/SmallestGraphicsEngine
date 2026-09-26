@@ -152,6 +152,19 @@ static void WreckAATurret(const XMFLOAT3& base, bool localKill,
     SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
 }
 
+static void HideAATurretVisual(size_t turretIndex) {
+    const std::string batchId = "__aa_turret_" + std::to_string(turretIndex);
+    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        if (batch.prefabId != batchId) continue;
+        // Render and shadow paths both consume these transforms. The turret
+        // stays in VehicleSystem for its death state and network snapshots.
+        batch.transforms.clear();
+        batch.baseTransforms.clear();
+        batch.entityIds.clear();
+        break;
+    }
+}
+
 // Authoritative damage: offline, or on the host. `killer` is the player id the
 // host credits in a session.
 static void ApplyAATurretDamage(size_t turretIndex, float damage,
@@ -162,7 +175,14 @@ static void ApplyAATurretDamage(size_t turretIndex, float damage,
     if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
     if (!result.destroyed) return;
+    if (g_netSession.Active()) {
+        if (killer != net::kInvalidPlayerId)
+            g_netSession.IncrementPlayerKill(killer);
+    } else if (fromPlayer) {
+        ++g_singlePlayerScore.kills;
+    }
     g_game.vehicles.aaTurrets[turretIndex].netKiller = killer;
+    HideAATurretVisual(turretIndex);
     WreckAATurret(result.position, fromPlayer, /*hostAuthored=*/false);
 }
 
@@ -172,15 +192,18 @@ static void ApplyAATurretDamage(size_t turretIndex, float damage,
 // those itself. The host applies directly.
 static void DamageAATurret(size_t turretIndex, float damage,
                            const XMFLOAT3& hit, bool fromPlayer,
-                           bool hostAuthored = false) {
+                           bool hostAuthored = false,
+                           net::PlayerId creditedShooter = net::kInvalidPlayerId) {
     if (!g_netSession.Active()) {
         ApplyAATurretDamage(turretIndex, damage, hit, fromPlayer, 0xFF);
         return;
     }
     if (g_netSession.CurrentRole() == net::Role::Host) {
-        ApplyAATurretDamage(turretIndex, damage, hit, fromPlayer,
-                            fromPlayer ? g_netSession.LocalId()
-                                       : net::kInvalidPlayerId);
+        const net::PlayerId killer = creditedShooter != net::kInvalidPlayerId
+            ? creditedShooter
+            : (fromPlayer ? g_netSession.LocalId() : net::kInvalidPlayerId);
+        ApplyAATurretDamage(turretIndex, damage, hit,
+                            killer == g_netSession.LocalId(), killer);
         return;
     }
     if (!fromPlayer || hostAuthored || damage <= 0.0f ||

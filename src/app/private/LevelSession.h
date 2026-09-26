@@ -101,6 +101,7 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
+    scene.remoteCharges.clear();
     ReleasePrefabRigidBodies();
     g_game.world.Prefabs().ClearDerived();
     g_meshCollisionEntities.clear();

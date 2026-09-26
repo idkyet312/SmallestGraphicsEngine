@@ -200,7 +200,8 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start,
                                      XMFLOAT3& hit,
                                      uint64_t* hitEntityId = nullptr,
                                      XMFLOAT3* hitNormal = nullptr,
-                                     bool fencePanelsTransparent = false);
+                                     bool fencePanelsTransparent = false,
+                                     bool ignoreAATurretColliders = false);
 
 static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
                                  const XMFLOAT3& target) {

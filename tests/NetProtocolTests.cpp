@@ -101,7 +101,38 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 26, "protocol version was not bumped");
+    Check(kProtocolVersion == 27, "protocol version was not bumped");
+    static_assert(std::is_trivially_copyable<ChargeStickData>::value,
+                  "charge attachment must be memcpy-able");
+    static_assert(std::is_trivially_copyable<ClientChargeStuckMessage>::value,
+                  "client charge message must be memcpy-able");
+    static_assert(std::is_trivially_copyable<ServerChargeStuckMessage>::value,
+                  "server charge message must be memcpy-able");
+    static_assert(offsetof(ClientChargeStuckMessage, header) == 0,
+                  "charge header must lead");
+    static_assert(offsetof(ServerChargeStuckMessage, header) == 0,
+                  "charge header must lead");
+    ServerChargeStuckMessage planted;
+    planted.owner = 2;
+    planted.chargeId = 42;
+    planted.charge.part = SGE::ChargeAnchorPart::AATurretElevation;
+    planted.charge.turretEntityId = 1234567;
+    planted.charge.turretOrdinal = 3;
+    planted.charge.localX = -0.2f;
+    planted.charge.localY = 0.15f;
+    planted.charge.localZ = 2.7f;
+    planted.charge.qy = 0.5f;
+    ServerChargeStuckMessage roundTrip{};
+    std::memcpy(&roundTrip, &planted, sizeof(planted));
+    Check(roundTrip.owner == 2 && roundTrip.chargeId == 42 &&
+          roundTrip.charge.part == SGE::ChargeAnchorPart::AATurretElevation &&
+          roundTrip.charge.turretEntityId == 1234567 &&
+          roundTrip.charge.turretOrdinal == 3 &&
+          roundTrip.charge.localX == -0.2f &&
+          roundTrip.charge.localY == 0.15f &&
+          roundTrip.charge.localZ == 2.7f &&
+          roundTrip.charge.qy == 0.5f,
+          "charge attachment lost fields in wire round trip");
     static_assert(std::is_trivially_copyable<ScoreboardEntry>::value,
                   "scoreboard entries are memcpy'd");
     static_assert(std::is_trivially_copyable<ServerScoreboardMessage>::value,
