@@ -180,6 +180,37 @@ bool ObjectivePlaneStatus(XMFLOAT3& position, float& health, float& maxHealth,
     return false;
 }
 
+// Seconds from arming until the aircraft starts its roll.
+// SGE_PLANE_HOLD_SECONDS=<s> shortens the wait, so the takeoff, the moving
+// collider and the escape can be checked unattended.
+static float ObjectivePlaneHoldSeconds() {
+    static const float holdSeconds = [] {
+        char value[32] = {};
+        return GetEnvironmentVariableA("SGE_PLANE_HOLD_SECONDS", value,
+                                       sizeof(value)) > 0
+            ? static_cast<float>(std::atof(value))
+            : kObjectivePlaneHoldSeconds;
+    }();
+    return holdSeconds;
+}
+
+// Time left before the first still-parked aircraft starts its roll, for the
+// HUD countdown. False once every aircraft is rolling, down or gone.
+bool ObjectivePlaneTakeoffCountdown(float& secondsRemaining) {
+    bool any = false;
+    secondsRemaining = 0.0f;
+    for (const ObjectivePlaneState& plane : g_objectivePlanes) {
+        if (plane.rolling || plane.escaped || plane.destroyed ||
+            plane.crashing || plane.crashed) continue;
+        const float remaining =
+            (std::max)(0.0f, ObjectivePlaneHoldSeconds() - plane.holdTimer);
+        secondsRemaining = any ? (std::min)(secondsRemaining, remaining)
+                               : remaining;
+        any = true;
+    }
+    return any;
+}
+
 // Comm towers standing on the level right now. The deployment briefing reads it
 // to state the objective, and the run arms the mission counter from it -- so a
 // map that authors two towers grades against two without anything being hardcoded.
@@ -945,17 +976,8 @@ static void UpdateObjectivePlanes(float dt) {
         if (plane.destroyed) continue;
 
         if (!plane.rolling) {
-            // SGE_PLANE_HOLD_SECONDS=<s> shortens the wait, so the takeoff,
-            // the moving collider and the escape can be checked unattended.
-            static const float holdSeconds = [] {
-                char value[32] = {};
-                return GetEnvironmentVariableA("SGE_PLANE_HOLD_SECONDS", value,
-                                               sizeof(value)) > 0
-                    ? static_cast<float>(std::atof(value))
-                    : kObjectivePlaneHoldSeconds;
-            }();
             plane.holdTimer += dt;
-            if (plane.holdTimer < holdSeconds) continue;
+            if (plane.holdTimer < ObjectivePlaneHoldSeconds()) continue;
             plane.rolling = true;
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft beginning takeoff run");

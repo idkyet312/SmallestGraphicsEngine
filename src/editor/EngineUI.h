@@ -97,6 +97,10 @@ RankSystem& PlayerRank();
 bool ObjectivePlaneStatus(DirectX::XMFLOAT3& position, float& health,
                           float& maxHealth, bool& down);
 
+// Seconds until the aircraft objective starts its takeoff roll. False when no
+// aircraft is still parked. Defined in main.cpp.
+bool ObjectivePlaneTakeoffCountdown(float& secondsRemaining);
+
 // On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
     virtualInput.moveX = virtualInput.moveY = 0.0f;
@@ -445,6 +449,27 @@ inline void RenderPlayerHUD(const Scene& scene) {
             const ImVec2 labelSize = ImGui::CalcTextSize(label);
             draw->AddText(ImVec2(at.x - labelSize.x * 0.5f, barMax.y + 3.0f),
                           colour, label);
+        }
+
+        // Takeoff clock, centred under the compass in the task-line slot. Drops
+        // below the tower's task and gauge on a level that carries both.
+        float secondsLeft = 0.0f;
+        if (ObjectivePlaneTakeoffCountdown(secondsLeft)) {
+            float towerHealth = 0.0f, towerMaxHealth = 0.0f;
+            const float countdownY =
+                CommTowerObjectiveStatus(towerHealth, towerMaxHealth)
+                    ? 90.0f : 62.0f;
+            const int whole = static_cast<int>(std::ceil(secondsLeft));
+            char countdown[48];
+            snprintf(countdown, sizeof(countdown), "AIRCRAFT TAKEOFF IN %d:%02d",
+                     whole / 60, whole % 60);
+            const ImVec2 size = ImGui::CalcTextSize(countdown);
+            // Amber like the aircraft marker; red for the last ten seconds.
+            const ImU32 tint = secondsLeft <= 10.0f
+                ? IM_COL32(255, 90, 70, 250)
+                : IM_COL32(255, 196, 78, 245);
+            draw->AddText(ImVec2((io.DisplaySize.x - size.x) * 0.5f, countdownY),
+                          tint, countdown);
         }
     }
 
