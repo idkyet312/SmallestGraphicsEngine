@@ -2413,7 +2413,13 @@ struct Scene {
         ++localShotCounter;
     }
 
-    void ShootProjectile(const SGE::ResolvedWeaponStats& stats) {
+    // kickAfterShot: the round leaves along the aim as it was when the trigger
+    // broke, and only then does the camera climb -- the same order the R700
+    // uses. Without it the shot's own kick is applied first, so every round
+    // lands above the sight picture. The Garand opts in; the automatics keep
+    // the original order, where each round rides its own kick.
+    void ShootProjectile(const SGE::ResolvedWeaponStats& stats,
+                         bool kickAfterShot = false) {
         // Bullets leave inside the cone the reticle is showing, so sights
         // tighten grouping in two ways: the bloom itself collapses under ADS,
         // and the kick halves. Sighted fire is steadier but still climbs -- the
@@ -2423,6 +2429,8 @@ struct Scene {
         const float authoredYawScale = stats.recoilYawDegrees / 0.22f;
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * authoredYawScale * recoilScale;
+        const XMFLOAT3 preKickAim = camera.GetAimFront();
+        const XMFLOAT3 preKickMuzzle = GetMuzzleWorldPosition();
         camera.ApplyRecoil(recoilPitch * authoredPitchScale * recoilScale,
                            randomYaw);
         // Carbine tap. Scaled by the same recoilScale the aim kick uses, so
@@ -2430,18 +2438,20 @@ struct Scene {
         camera.AddFireTrauma(0.045f * recoilScale);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
+        const XMFLOAT3 shotAim = kickAfterShot ? preKickAim : camera.GetAimFront();
+        const XMFLOAT3 shotMuzzle = kickAfterShot ? preKickMuzzle
+                                                  : GetMuzzleWorldPosition();
         TriggerMuzzleFlash(stats.muzzleFlashDurationMultiplier,
                            stats.muzzleFlashSizeMultiplier);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.GetAimFront(),
-                         stats.smokeMultiplier);
-        RecordLocalShot(GetMuzzleWorldPosition(), camera.GetAimFront());
+        SpawnWeaponSmoke(shotMuzzle, shotAim, stats.smokeMultiplier);
+        RecordLocalShot(shotMuzzle, shotAim);
 
         Projectile p;
-        p.position  = GetMuzzleWorldPosition();
+        p.position  = shotMuzzle;
         p.previousPosition = p.position;
         const float spreadMultiplier = stats.hipSpreadMultiplier +
             (stats.adsSpreadMultiplier - stats.hipSpreadMultiplier) * adsBlend;
-        p.direction = ApplyShotSpread(camera.GetAimFront(), spreadMultiplier);
+        p.direction = ApplyShotSpread(shotAim, spreadMultiplier);
         // projectileSpeed remains live-tunable in the engine UI; the immutable
         // definition records the authored baseline without stealing that knob.
         p.speed     = projectileSpeed;

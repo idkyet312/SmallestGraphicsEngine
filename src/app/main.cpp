@@ -292,6 +292,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_shotgunAudio.Initialize("Content/Audio/PlayerGuns/Shotgun/shotgun.mp3");
     g_ak74Audio.Initialize("Content/Audio/PlayerGuns/ak74/ak74.mp3");
     g_krissAudio.Initialize("Content/Audio/PlayerGuns/Kriss/freesound_community-smgshoot2-35768.wav");
+    g_garandAudio.Initialize("Content/Audio/PlayerGuns/m1garand/m1garand_shot.mp3");
+    g_garandClipEjectAudio.Initialize(
+        "Content/Audio/PlayerGuns/m1garand/m1garand_clip_eject.mp3");
     g_rpgFireAudio.Initialize("Content/Audio/rpg_fire.wav");
     // Lives under build/Sounds like the RPG explosion above, not models/audio --
     // that tree is CMake-synced from source, this one ships in the build dir.
@@ -1603,6 +1606,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_shotgunAudio.Update();
         g_ak74Audio.Update();
         g_krissAudio.Update();
+        g_garandAudio.Update();
+        g_garandClipEjectAudio.Update();
         g_rpgFireAudio.Update();
         for (GunAudio& step : g_footstepAudio) step.Update();
         g_breathingAudio.Update();
@@ -7605,6 +7610,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     for (GunAudio& step : g_footstepAudio) step.Shutdown();
     g_breathingAudio.Shutdown();
     g_krissAudio.Shutdown();
+    g_garandAudio.Shutdown();
+    g_garandClipEjectAudio.Shutdown();
     g_ak74Audio.Shutdown();
     g_shotgunAudio.Shutdown();
     g_r700Audio.Shutdown();

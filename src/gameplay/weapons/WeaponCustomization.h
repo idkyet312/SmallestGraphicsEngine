@@ -124,7 +124,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 13;
+    static constexpr int kWeaponCount = 14;
     static constexpr size_t kAttachmentCount = 3;
     // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
     // twice the climb per shot. Scales the camera recoil -- the part that
@@ -208,6 +208,20 @@ public:
               280.0f, 0.30f, 0.14f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 1.2f, false,
               "Content/Models/MainPlayer/Guns/Kriss/KRISS+VECTOR.glb", "" },
+            // .30-06 battle rifle, 8-round en-bloc clip. Semi-automatic like the
+            // M9 (final `true`), so the cadence is the player's trigger finger
+            // with fireIntervalSeconds as the floor between shots -- set to
+            // roughly a rifleman's fastest aimed follow-up. Damage sits between
+            // the full-auto rifles (AK/AK-74 2.0, M4A1 1.8) and the bolt-action
+            // R700 (5.0): a harder-hitting semi-auto, not a one-shot sniper.
+            // Recoil climb is the sharpest of any automatic-cycling weapon here,
+            // ahead of the AK, to sell the heavier cartridge. Reload sits
+            // between the rifles and the R700: an en-bloc clip is fast to
+            // insert but the reload also covers racking a fresh round home.
+            { "m1_garand", "M1 Garand", 13, 8, 40, 80, 2.20f, 0.13f, 3.2f,
+              650.0f, 1.65f, 0.35f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+              1.0f, 42.0f, 3.0f, false,
+              "Content/Models/MainPlayer/Guns/M1Grand/m1grand.glb", "", true },
         }};
 
         const uint32_t ak = 1u << 0;

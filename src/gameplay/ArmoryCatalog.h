@@ -49,6 +49,7 @@ struct ArmoryCatalog {
         800,    // 10 AK-74
         700,    // 11 M9
         1800,   // 12 Kriss Vector
+        2200,   // 13 M1 Garand
     };
 
     // One line of shop copy per weapon. The combo box gave a bare name and left
@@ -68,6 +69,7 @@ struct ArmoryCatalog {
         "Battle rifle. Heavy round, steady cadence, takes every rail.",
         "Sidearm. Draws and reloads faster than any rifle, and hits softer.",
         "SMG. Empties a magazine faster than anything else, but hits softest at range.",
+        "Battle rifle. Heaviest semi-auto round in the armory, 8-round clip, iron sights only.",
     };
 
     static constexpr int kGrenadeCount = 3;

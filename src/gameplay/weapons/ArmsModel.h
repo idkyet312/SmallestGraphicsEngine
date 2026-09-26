@@ -519,7 +519,7 @@ public:
     // Highest weapon id the per-weapon table covers. Mirrors GunModel's
     // kMaxWeapon, spelled out rather than included: ArmsModel is deliberately
     // unaware of GunModel, so the weapon index is passed in from outside.
-    static constexpr int kMaxGripWeapon = 12;
+    static constexpr int kMaxGripWeapon = 13;
 
     // Per-weapon nudge ADDED to the shared grip point above, in gun-local
     // units. Zero means "sits exactly where the shared value puts it", which is
@@ -561,6 +561,9 @@ public:
             // Tuned in game: the support hand sits a touch left and low on
             // the Vector's squared-off handguard.
             {-0.025f, -0.050f, 0.0f }, // Kriss Vector
+            // Tuned in game: support hand slightly left and forward onto the
+            // wood handguard.
+            {-0.010f,  0.000f, 0.030f }, // M1 Garand
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxGripWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -572,6 +575,7 @@ public:
         if (weapon == 9) return { -0.030f, -0.030f, 0.000f };
         if (weapon == 11) return { 0.100f, 0.110f, -0.170f };
         if (weapon == 12) return { -0.025f, -0.050f, 0.000f };
+        if (weapon == 13) return { -0.010f, 0.000f, 0.030f };
         return { 0.0f, 0.0f, 0.0f };
     }
 

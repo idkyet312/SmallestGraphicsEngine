@@ -798,6 +798,13 @@ GunAudio                    g_shotgunAudio;
 GunAudio                    g_ak74Audio;
 // And the Kriss Vector: an SMG report, not the rifle crack.
 GunAudio                    g_krissAudio;
+// And the M1 Garand: its own rifle report, in its own voice, so its 0.13s
+// semi-auto cadence does not cut off a shot still ringing.
+GunAudio                    g_garandAudio;
+// The Garand's en-bloc clip ejects with a distinct metallic "ping" on reload.
+// Played on top of the normal reload sound, not instead of it -- see
+// PlayReloadSound() in Combat.h.
+GunAudio                    g_garandClipEjectAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;

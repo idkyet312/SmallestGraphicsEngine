@@ -15,6 +15,14 @@ static void PlayReloadSound() {
     else if (GunModel::R700Selected())     pitch = 1.06f;
     pitch += ((float)std::rand() / RAND_MAX) * 0.05f;
     g_reloadAudio.Play(0.85f, pitch);
+    // The Garand's en-bloc clip ejects with its own distinct "ping" on top of
+    // the normal reload sound, not instead of it -- both call sites that reach
+    // here (the R-key press and the dry-fire auto-reload) go through this one
+    // function, so gating on the selected weapon here covers both.
+    if (GunModel::GarandSelected()) {
+        const float ejectPitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
+        g_garandClipEjectAudio.Play(0.9f, ejectPitch);
+    }
 }
 
 // Fires the selected weapon if it has a round chambered. Returns false when the
@@ -75,16 +83,18 @@ static bool ShootPlayerWeapon() {
         const float pitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
         g_shotgunAudio.Play(0.96f, pitch);
     } else {
-        scene.ShootProjectile(weaponStats);
+        scene.ShootProjectile(weaponStats, GunModel::GarandSelected());
         const float pitch = (weaponStats.suppressed ? 1.18f : 0.96f) +
             ((float)std::rand() / RAND_MAX) * 0.08f;
-        // The M9, the AK-74 and the Kriss each fire their own sample; the rest of
-        // this path still shares rifle_shot.wav. The suppressed drop applies to
-        // all of them, so a canned weapon reads as one whichever it is.
-        GunAudio& report = GunModel::M9Selected()    ? g_m9Audio
-                         : GunModel::AK74Selected()  ? g_ak74Audio
-                         : GunModel::KrissSelected() ? g_krissAudio
-                                                     : g_gunAudio;
+        // The M9, the AK-74, the Kriss and the Garand each fire their own
+        // sample; the rest of this path still shares rifle_shot.wav. The suppressed
+        // drop applies to all of them, so a canned weapon reads as one
+        // whichever it is.
+        GunAudio& report = GunModel::M9Selected()     ? g_m9Audio
+                         : GunModel::AK74Selected()   ? g_ak74Audio
+                         : GunModel::KrissSelected()  ? g_krissAudio
+                         : GunModel::GarandSelected() ? g_garandAudio
+                                                      : g_gunAudio;
         report.Play(weaponStats.suppressed ? 0.30f : 0.82f, pitch);
     }
     const uint32_t projectileCount = static_cast<uint32_t>(
