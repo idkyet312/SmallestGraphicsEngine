@@ -443,7 +443,7 @@ static void ResolveActorSeparation() {
 static constexpr float kTankBoardReach = 2.5f;
 // A player-fired round flies faster than the AI's dodgeable one: nobody has
 // to be given a chance to sidestep the player's gun.
-static constexpr float kPlayerTankShellSpeed = 90.0f;
+static constexpr float kPlayerTankShellSpeed = 99.0f;
 static float g_playerTankReload = 0.0f;
 // SGE_TANK_BOARD_TEST's stand-in for the keys, read where the keys are, so the
 // scripted drive and the real one take the same single path to the solver.
@@ -485,7 +485,7 @@ static bool ToggleTankDriving(bool anyDistance = false) {
         ExitPlayerTank();
         return true;
     }
-    if (g_drivingHumvee || ClientOwnedByHost() ||
+    if (g_drivingHumvee ||
         scene.player.health <= 0.0f || scene.player.downed) return false;
     EnemyTankState* best = nullptr;
     float bestSurface = anyDistance ? FLT_MAX : kTankBoardReach;

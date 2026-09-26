@@ -802,14 +802,15 @@ static void GrabOrThrowObject() {
 // DamageNetworkedHelicopter, spelled out again because that lives in
 // Multiplayer.h, which is included after this file.
 static void ReportBarrelHelicopterDamage(uint8_t airframe, float damage,
-                                         const XMFLOAT3& hit) {
+                                         const XMFLOAT3& hit,
+                                         bool fromPlayer) {
     if (g_netSession.Active()) {
         g_netSession.ReportWorldImpact(airframe, damage, hit.x, hit.y, hit.z,
                                        /*kind=*/3);
         return;
     }
-    if (airframe == 0) DamageHelicopter(damage, hit);
-    else DamageSecondaryHelicopter(damage, hit);
+    if (airframe == 0) DamageHelicopter(damage, hit, fromPlayer);
+    else DamageSecondaryHelicopter(damage, hit, fromPlayer);
 }
 
 static void SpawnBarrelExplosionFX(const XMFLOAT3& center) {
@@ -861,7 +862,7 @@ static void ApplyBarrelBlastToHostTargets(const XMFLOAT3& center,
         if (distance < reach)
             ReportBarrelHelicopterDamage(
                 0, 120.0f * (1.0f - distance / reach),
-                g_helicopterPosition);
+                g_helicopterPosition, fromPlayer);
     }
     if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead &&
         g_helicopterModel) {
@@ -873,7 +874,7 @@ static void ApplyBarrelBlastToHostTargets(const XMFLOAT3& center,
         if (distance < reach)
             ReportBarrelHelicopterDamage(
                 1, 120.0f * (1.0f - distance / reach),
-                g_secondaryHelicopterPosition);
+                g_secondaryHelicopterPosition, fromPlayer);
     }
     // Blast takes the emplacement too, so C4 or a rocket is a valid answer
     // to it rather than the gun being immune to everything but bullets.

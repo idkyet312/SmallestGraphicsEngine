@@ -96,6 +96,11 @@ static void PlayBanditDeathEvents() {
             else if (playerCredit)
                 AwardCombatEvent(MoneyEvent::EnemyKilled);
         }
+        // Multiplayer kills are tallied by the host session per shooter; this
+        // only covers a run with no session, under the same credit rule.
+        if (!g_netSession.Active() && playerCredit &&
+            bandit->faction != Faction::Marine)
+            ++g_singlePlayerScore.kills;
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,
                                   bandit->position.z, 0.9f, pitch,

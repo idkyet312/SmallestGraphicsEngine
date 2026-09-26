@@ -220,6 +220,7 @@ struct InsertionHelicopterState {
 enum class DrivenVehicleKind : uint8_t {
     None = 0,
     Humvee,
+    Tank,
 };
 
 // The vehicle a player is at the wheel of. A driven vehicle is simulated by
@@ -231,12 +232,12 @@ enum class DrivenVehicleKind : uint8_t {
 // same wheel and what hides a driver's body out at the chase camera.
 struct DrivenVehicleState {
     DrivenVehicleKind kind = DrivenVehicleKind::None;
-    uint8_t index = 0;   // level Humvee spawn index (EnemyHumveeSnapshot::index)
+    uint8_t index = 0;   // level Humvee spawn index (EnemyHumveeSnapshot::index) or Tank index (EnemyTankSnapshot::index)
     uint8_t padding[2] = {};
     // Chassis body centre and orientation, as the driver's solver has them.
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
-    // Radians, HumveeGameplayState::turretYaw: the driver aims it too.
+    // Radians, HumveeGameplayState::turretYaw or EnemyTankState::turretYaw: the driver aims it too.
     float turretYaw = 0.0f;
 };
 

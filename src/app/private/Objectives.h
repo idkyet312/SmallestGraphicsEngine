@@ -358,16 +358,14 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
         }
     }
 
-    // Otherwise the player, but only while they are airborne: this is an
-    // anti-air gun, and its barrels do not depress onto a man on foot. Walking
-    // up to the emplacement is the way it is meant to be taken out, so a player
-    // on the ground is deliberately safe from it.
+    // Otherwise the player, but only in a vehicle that is off the ground: this
+    // is an anti-air gun, and it engages machines, not soldiers. A player on
+    // foot is never a target -- not on a rope, not under canopy, not dropping
+    // off a cliff -- so walking up to the emplacement is always the way in.
     //
-    // "Airborne" is not simply !IsGrounded. A jump leaves the ground for a
-    // fraction of a second, and letting that draw AA fire would mean the gun
-    // engages a player who is sprinting past it on foot. What counts is being
-    // carried or roped by the BlackHawk, or standing clear of the terrain by
-    // more than a jump's height -- a cliff, a rooftop, a fall.
+    // A vehicle only counts once it clears the terrain by more than
+    // AATurretMinTargetAltitude, so a Humvee cresting a bump or the BlackHawk
+    // sitting on its pad draws nothing.
     if (!hasTarget && scene.player.health > 0.0f && !g_insertionChoicePending) {
         const XMFLOAT3& p = scene.camera.Position;
         // Camera sits PlayerHeight above whatever it stands on, so that has to
@@ -379,12 +377,11 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
         // measured against the seabed -- so a swimmer over deep water reads as
         // high above ground and would draw fire from a gun whose whole premise
         // is that it cannot depress onto someone at surface level.
+        const bool inVehicle =
+            vehicles.blackHawkCarryingPlayer || PlayerInVehicle();
         const bool playerAirborne =
-            !scene.camera.IsSwimming &&
-            (vehicles.blackHawkCarryingPlayer ||
-             vehicles.BlackHawkIsRappelling() ||
-             (!scene.camera.IsGrounded &&
-              altitude >= VehicleSystem::AATurretMinTargetAltitude));
+            !scene.camera.IsSwimming && inVehicle &&
+            altitude >= VehicleSystem::AATurretMinTargetAltitude;
         // Engaged out to the same 85 m it always used against the player. The
         // gun reaches much further against aircraft, but a player -- airborne
         // or not -- is a small target, and the shorter range keeps the
@@ -396,9 +393,9 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
             d2 >= VehicleSystem::AATurretGroundMinRange *
                   VehicleSystem::AATurretGroundMinRange) {
             target = p;
-            // Lead the fall/ride rather than the last position: a player under
-            // canopy or on a rope is moving, and a gun that aims where they
-            // were would never connect.
+            // Lead the ride rather than the last position: a vehicle in the
+            // air is moving, and a gun that aims where it was would never
+            // connect.
             //
             // Full 3D velocity. This was vertical-only because the camera
             // exposes just VerticalVelocity, which meant a player drifting
@@ -1068,7 +1065,16 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
                                const XMFLOAT3& hit, bool fromRemoteCharge,
                                bool fromPlayer = true, bool localShot = true) {
     if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
-    if (!ObjectivePlaneDamageAllowed(entityId, fromPlayer)) return;
+    if (!ObjectivePlaneDamageAllowed(entityId, fromPlayer)) {
+        // The gate that silently ate every C4 charge once playerOwned became
+        // the test. A refusal here should only ever be non-player fire.
+        // Rounds (34) are left out so an enemy burst does not flood the log.
+        if (damage >= 100.0f) SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Objective plane refused " + std::to_string(damage) +
+            " damage (not player fire, fromRemoteCharge=" +
+            std::to_string(fromRemoteCharge) + ")");
+        return;
+    }
     // `fromPlayer` says a player caused this and gates what may be damaged;
     // `localShot` says it was this machine's player and gates what is paid for.
     // A teammate's round downing the objective plane must land for everyone and
@@ -1102,6 +1108,13 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     // shooting owes them feedback: the marker confirms the round connected, and
     // reads lethal on the hit that finally brings it down. Gated on `applied`
     // so rounds into an already-downed wreck (health <= 0) do not keep marking.
+    if (isObjectivePlane && damage >= 100.0f)
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Objective plane taking " + std::to_string(damage) +
+            " damage (fromRemoteCharge=" + std::to_string(fromRemoteCharge) +
+            ", localShot=" + std::to_string(localShot) +
+            ", applied=" + std::to_string(result.applied) +
+            ", destroyed=" + std::to_string(result.destroyed) + ")");
     if (isObjectivePlane && result.applied) {
         PlayMetalHitAudio(hit, 1.05f);
         if (localShot) scene.TriggerHitMarker(result.destroyed);

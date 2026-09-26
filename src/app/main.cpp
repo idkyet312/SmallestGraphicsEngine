@@ -3049,7 +3049,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     0,
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : enemyDamage * falloff,
-                                    g_helicopterPosition);
+                                    g_helicopterPosition,
+                                    projectile.playerOwned);
                             }
                         }
                         if (SecondaryHelicopterPresent() &&
@@ -3065,7 +3066,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     1,
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : enemyDamage * falloff,
-                                    g_secondaryHelicopterPosition);
+                                    g_secondaryHelicopterPosition,
+                                    projectile.playerOwned);
                             }
                         }
                         if (!g_boatDead && g_boatModel) {
@@ -3210,12 +3212,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // the mast-volume test that authorised the demolition in
                         // the first place -- if the charge rigged the tower, that
                         // same charge brings it down.
+                        // A charge is only ever a player's, including one the
+                        // host detonated for a client (playerOwned false
+                        // there). The objectives take it as player fire and
+                        // file it under the planter, who is the one paid.
+                        const bool objectiveFromPlayer =
+                            projectile.playerOwned || c4Blast;
+                        const net::PlayerId objectiveShooter = c4Blast
+                            ? static_cast<net::PlayerId>(projectile.chargeOwner)
+                            : net::kInvalidPlayerId;
                         if (c4Blast) {
                             if (riggedTower != 0)
                                 DamageObjectivePrefabEntity(
                                     riggedTower, blastDamage, center,
                                     /*remoteCharge=*/true,
-                                    projectile.playerOwned);
+                                    objectiveFromPlayer, objectiveShooter);
                         }
                         // The aircraft needs the same volume treatment, and for
                         // the same reason: the radius pass measures to the
@@ -3240,7 +3251,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     : ObjectivePlaneRocketDamage(hitPlane);
                                 DamageObjectivePrefabEntity(
                                     hitPlane, planeDamage, center, c4Blast,
-                                    projectile.playerOwned);
+                                    objectiveFromPlayer, objectiveShooter);
                             }
                         }
                         projectile.active = false;
@@ -3738,7 +3749,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // Player rounds on the gunship's hull -- same sheet metal.
                     PlayMetalHitAudio(helicopterHit, 0.85f);
                     DamageNetworkedHelicopter(
-                        0, 34.0f * projectile.damageMultiplier, helicopterHit);
+                        0, 34.0f * projectile.damageMultiplier, helicopterHit,
+                        projectile.playerOwned);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
                     stopProjectileAt(helicopterHit);
@@ -3755,7 +3767,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     PlayMetalHitAudio(helicopterHit, 0.85f);
                     DamageNetworkedHelicopter(
-                        1, 34.0f * projectile.damageMultiplier, helicopterHit);
+                        1, 34.0f * projectile.damageMultiplier, helicopterHit,
+                        projectile.playerOwned);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
                     stopProjectileAt(helicopterHit);

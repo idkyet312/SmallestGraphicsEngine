@@ -264,14 +264,15 @@ static void DamageBulletPrefabEntity(uint64_t entityId, float damage,
 // the airframe's health, so the hit is reported and the outcome comes back in
 // the vehicle state; offline it is applied where it happened.
 static void DamageNetworkedHelicopter(uint8_t airframe, float damage,
-                                      const XMFLOAT3& hit) {
+                                      const XMFLOAT3& hit,
+                                      bool fromPlayer = false) {
     if (MultiplayerActive()) {
         g_netSession.ReportWorldImpact(airframe, damage, hit.x, hit.y, hit.z,
                                        /*kind=*/3);
         return;
     }
-    if (airframe == 0) DamageHelicopter(damage, hit);
-    else DamageSecondaryHelicopter(damage, hit);
+    if (airframe == 0) DamageHelicopter(damage, hit, fromPlayer);
+    else DamageSecondaryHelicopter(damage, hit, fromPlayer);
 }
 
 // Blast damage aimed at one objective by entity id -- the rigged comm tower and
@@ -279,14 +280,18 @@ static void DamageNetworkedHelicopter(uint8_t airframe, float damage,
 // radius sweep and so are damaged through a direct call. Same rule as the
 // bullet path: in a session the host owns the outcome, so report it and let the
 // committed edge come back, rather than collapsing the mast locally.
+// `shooter` names the planter of a charge the host detonated for someone else,
+// so the kill is credited to them rather than to the host.
 static void DamageObjectivePrefabEntity(uint64_t entityId, float damage,
                                         const XMFLOAT3& center,
-                                        bool remoteCharge, bool playerOwned) {
+                                        bool remoteCharge, bool playerOwned,
+                                        net::PlayerId shooter =
+                                            net::kInvalidPlayerId) {
     if (MultiplayerActive())
         g_netSession.ReportWorldImpact(entityId, damage, center.x, center.y,
                                        center.z, /*kind=*/1, 0.0f, 0.0f, 0,
                                        0.0f, 0.0f, 0.0f, playerOwned,
-                                       remoteCharge);
+                                       remoteCharge, shooter);
     else
         DamagePrefabEntity(entityId, damage, center, remoteCharge, playerOwned);
 }
@@ -892,14 +897,20 @@ static void PublishHostArmor() {
         out.entityId = tank.entityId;
         out.dead = tank.dead ? 1 : 0;
         out.killer = tank.killer;
-        out.x = tank.position.x;
-        out.y = tank.position.y;
-        out.z = tank.position.z;
-        out.qx = tank.rotation.x;
-        out.qy = tank.rotation.y;
-        out.qz = tank.rotation.z;
-        out.qw = tank.rotation.w;
-        out.turretYaw = tank.turretYaw;
+        // A client-driven tank passes the driver's pose straight on: the
+        // host's eased copy lags it, and each client eases again on arrival.
+        const XMFLOAT3& position =
+            tank.remoteDriven ? tank.netPosition : tank.position;
+        const XMFLOAT4& rotation =
+            tank.remoteDriven ? tank.netRotation : tank.rotation;
+        out.x = position.x;
+        out.y = position.y;
+        out.z = position.z;
+        out.qx = rotation.x;
+        out.qy = rotation.y;
+        out.qz = rotation.z;
+        out.qw = rotation.w;
+        out.turretYaw = tank.remoteDriven ? tank.netTurretYaw : tank.turretYaw;
         out.health = tank.health;
         g_hostTankScratch.push_back(out);
     }
@@ -2210,6 +2221,24 @@ static void UpdateMultiplayerSession(float frameDelta,
             vehicle.turretYaw = g_humveeGameplay[g_activeHumveeIndex].turretYaw;
         }
     }
+    // Tank the player is driving: find its replication index and send pose + turret.
+    if (g_playerTankEntity != 0) {
+        for (uint8_t i = 0; i < g_enemyTanks.size() && i < net::kMaxReplicatedTanks; ++i) {
+            if (g_enemyTanks[i].entityId != g_playerTankEntity) continue;
+            auto& vehicle = local.vehicle;
+            vehicle.kind = net::DrivenVehicleKind::Tank;
+            vehicle.index = i;
+            vehicle.x = g_enemyTanks[i].position.x;
+            vehicle.y = g_enemyTanks[i].position.y;
+            vehicle.z = g_enemyTanks[i].position.z;
+            vehicle.qx = g_enemyTanks[i].rotation.x;
+            vehicle.qy = g_enemyTanks[i].rotation.y;
+            vehicle.qz = g_enemyTanks[i].rotation.z;
+            vehicle.qw = g_enemyTanks[i].rotation.w;
+            vehicle.turretYaw = g_enemyTanks[i].turretYaw;
+            break;
+        }
+    }
     if (IsGameplayScreen() && !g_game.loading.Active() &&
         !g_insertionChoicePending && !g_baseMode && BlackHawkVisible()) {
         auto& helicopter = local.helicopter;
@@ -2442,6 +2471,32 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                 }
                 state.turretYaw = state.netTurretYaw;
                 state.netPosed = true;
+            }
+        }
+        // Tanks other players are driving. Same as Humvees: client simulates
+        // the body and posts its pose via input; host eases it and replicates.
+        // Captured stays set once they climb out, so it sits parked as it
+        // does for the host's own player.
+        for (EnemyTankState& tank : g_enemyTanks) tank.remoteDriven = false;
+        for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+            const net::DrivenVehicleState& vehicle = remote.vehicle;
+            if (vehicle.kind != net::DrivenVehicleKind::Tank ||
+                vehicle.index >= g_enemyTanks.size()) continue;
+            if (g_playerTankEntity == g_enemyTanks[vehicle.index].entityId)
+                continue;  // Host is driving this one locally
+            EnemyTankState& tank = g_enemyTanks[vehicle.index];
+            tank.captured = true;  // Stop AI from simulating it
+            tank.remoteDriven = true;
+            tank.netPosition = { vehicle.x, vehicle.y, vehicle.z };
+            XMStoreFloat4(&tank.netRotation, XMQuaternionNormalize(
+                XMVectorSet(vehicle.qx, vehicle.qy, vehicle.qz, vehicle.qw)));
+            tank.netTurretYaw = vehicle.turretYaw;
+            if (!tank.netPosed) {
+                // Start easing from where the body actually is.
+                tank.position = tank.netPosition;
+                tank.rotation = tank.netRotation;
+                tank.turretYaw = tank.netTurretYaw;
+                tank.netPosed = true;
             }
         }
         // Apply what clients reported hitting, then publish the result. Both

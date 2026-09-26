@@ -578,6 +578,11 @@ static bool g_showPauseSettings = false;
 // start, report and stop a session -- so the session object and the panel's UI
 // state have to exist before either file.
 static net::NetSession g_netSession;
+// Single-player scoreboard line. The session keeps these for every player in
+// multiplayer; with no session there is nobody to keep them, so the local run
+// tallies its own. Survives a restart on purpose -- the deaths column would
+// always read zero otherwise -- and is cleared on the way back to the menu.
+static net::ScoreboardEntry g_singlePlayerScore{};
 static bool g_showMultiplayerMenu = false;
 // Edited by the host/join fields. Fixed char buffers rather than std::string
 // because that is what ImGui::InputText writes into.

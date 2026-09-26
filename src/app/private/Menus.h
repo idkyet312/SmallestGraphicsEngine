@@ -688,6 +688,9 @@ static void RenderDownedOverlay() {
 
 static void RenderDeathScreen(HWND hwnd) {
     if (!deathCursorReleased) {
+        // First frame of this death: the latch is re-armed per level start,
+        // so it counts each death once.
+        if (!MultiplayerActive()) ++g_singlePlayerScore.deaths;
         cameraLocked = true;
         ReleaseCapture();
         SetCursorVisible(true);
@@ -788,8 +791,8 @@ static void RenderSquadWipeScreen(HWND hwnd) {
     ImGui::End();
 }
 
-// Multiplayer scoreboard overlay, shown when TAB is held during gameplay.
-// Lists all players: name/id, kills, deaths, revives.
+// Scoreboard overlay, shown when TAB is held during gameplay. Lists every
+// session player in multiplayer, or the local run's tally in single player.
 static void RenderScoreboard() {
     if ((FocusedKeyState(VK_TAB) & 0x8000) == 0) return;
 
@@ -811,7 +814,12 @@ static void RenderScoreboard() {
         ImGui::Separator();
 
         static std::vector<net::ScoreboardEntry> entries;
-        g_netSession.GetScoreboard(entries);
+        if (MultiplayerActive()) {
+            g_netSession.GetScoreboard(entries);
+        } else {
+            entries.assign(1, g_singlePlayerScore);
+            entries[0].id = 0;
+        }
 
         if (entries.empty()) {
             ImGui::TextColored(UITheme::kTextDim, "No session");
@@ -819,9 +827,11 @@ static void RenderScoreboard() {
             for (const auto& entry : entries) {
                 if (entry.id >= net::kMaxPlayers) continue;
                 char name[24];
+                const bool you = !MultiplayerActive() ||
+                                 entry.id == g_netSession.LocalId();
                 std::snprintf(name, sizeof(name), "PLAYER-%d%s",
                               static_cast<int>(entry.id) + 1,
-                              entry.id == g_netSession.LocalId() ? " (you)" : "");
+                              you ? " (you)" : "");
                 ImGui::Text("%-16s %6u %6u %7u", name,
                             entry.kills, entry.deaths, entry.revives);
             }
@@ -1631,7 +1641,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
         "AK47", "Remington 870", "RPG-7", "R700 Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-        "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74", "M9"
+        "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74", "M9", "Kriss Vector"
     };
 
     // ---- Armory storefront -------------------------------------------------

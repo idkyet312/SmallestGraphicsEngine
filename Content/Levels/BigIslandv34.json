@@ -1,0 +1,1870 @@
+{
+  "deploymentRadius": 157.60000610351563,
+  "entities": [
+    {
+      "enabled": true,
+      "id": 1,
+      "name": "Player Spawn",
+      "transform": {
+        "position": [
+          0.0,
+          5.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "player_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 3,
+      "name": "Tree 3",
+      "transform": {
+        "position": [
+          -7.027832984924316,
+          2.5,
+          0.3076993227005005
+        ],
+        "rotation": [
+          0.0,
+          245.69590759277344,
+          0.17005595564842224
+        ],
+        "scale": [
+          1.0,
+          10.367531776428223,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 8,
+      "name": "enemy_spawn 8",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 9,
+      "name": "helicopter 9",
+      "transform": {
+        "position": [
+          0.0,
+          14.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "helicopter"
+    },
+    {
+      "enabled": true,
+      "id": 10,
+      "name": "enemy_spawn 8 Copy",
+      "transform": {
+        "position": [
+          1.0,
+          0.3417011499404907,
+          -92.5
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 11,
+      "name": "enemy_spawn 8 Copy Copy",
+      "transform": {
+        "position": [
+          18.12390899658203,
+          0.26149362325668335,
+          -100.13651275634766
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 12,
+      "name": "enemy_spawn 8 Copy Copy Copy",
+      "transform": {
+        "position": [
+          12.874608039855957,
+          1.3096510171890259,
+          -94.22502899169922
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 15,
+      "name": "humvee 15",
+      "transform": {
+        "position": [
+          20.31810760498047,
+          7.645159721374512,
+          -73.73634338378906
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 17,
+      "name": "enemy_spawn 8 Copy Copy Copy",
+      "transform": {
+        "position": [
+          15.147960662841797,
+          0.26149362325668335,
+          -84.24089050292969
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 18,
+      "name": "enemy_spawn 8 Copy Copy Copy Copy",
+      "transform": {
+        "position": [
+          9.5,
+          3.4506452083587646,
+          -45.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 19,
+      "name": "enemy_spawn 8 Copy Copy Copy Copy Copy",
+      "transform": {
+        "position": [
+          4.0,
+          3.4711408615112305,
+          -44.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 23,
+      "name": "Tree 23",
+      "transform": {
+        "position": [
+          -40.865779876708984,
+          3.4278507232666016,
+          -61.30976867675781
+        ],
+        "rotation": [
+          0.0,
+          44.04411315917969,
+          -0.2886800765991211
+        ],
+        "scale": [
+          1.0,
+          13.222923278808594,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 25,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          75.21920776367188,
+          2.5672671794891357,
+          -28.407819747924805
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 26,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          79.12928009033203,
+          2.6590354442596436,
+          5.442404270172119
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 27,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          -34.686424255371094,
+          1.9682248830795288,
+          82.25711059570313
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 30,
+      "name": "humvee 30",
+      "transform": {
+        "position": [
+          68.5,
+          7.809331893920898,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 31,
+      "name": "humvee 31",
+      "transform": {
+        "position": [
+          75.0,
+          6.7418718338012695,
+          -1.5
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 32,
+      "name": "humvee 32",
+      "transform": {
+        "position": [
+          69.0,
+          7.702256202697754,
+          4.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 33,
+      "name": "enemy_spawn 8 Copy",
+      "transform": {
+        "position": [
+          -128.0,
+          0.6826154589653015,
+          1.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 34,
+      "name": "humvee 32 Copy",
+      "transform": {
+        "position": [
+          -75.5,
+          13.939854621887207,
+          -107.5
+        ],
+        "rotation": [
+          180.0,
+          15.0332612991333,
+          180.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 35,
+      "name": "Military Airport",
+      "prefab": "props/airport",
+      "transform": {
+        "position": [
+          21.064605712890625,
+          3.169553756713867,
+          -28.842018127441406
+        ],
+        "rotation": [
+          180.0,
+          -89.9999771118164,
+          180.0
+        ],
+        "scale": [
+          0.6248981952667236,
+          0.6249600052833557,
+          0.6248981952667236
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 36,
+      "name": "enemy_spawn 36",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 37,
+      "name": "ally_spawn 37",
+      "transform": {
+        "position": [
+          -28.920753479003906,
+          1.6110355854034424,
+          -129.927490234375
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "ally_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 38,
+      "name": "ally_spawn 38",
+      "transform": {
+        "position": [
+          -25.41749382019043,
+          0.701634407043457,
+          -135.63790893554688
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "ally_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 39,
+      "name": "enemy_spawn 39",
+      "transform": {
+        "position": [
+          4.973114013671875,
+          2.1317965984344482,
+          -102.84437561035156
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 40,
+      "name": "enemy_spawn 40",
+      "transform": {
+        "position": [
+          16.750009536743164,
+          2.360976219177246,
+          -120.35660552978516
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 41,
+      "name": "explosive_barrel 41",
+      "transform": {
+        "position": [
+          13.905040740966797,
+          3.140528678894043,
+          -104.13179016113281
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 42,
+      "name": "humvee 42",
+      "transform": {
+        "position": [
+          -114.81058502197266,
+          6.021663665771484,
+          -33.97265625
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 43,
+      "name": "humvee 43",
+      "transform": {
+        "position": [
+          -119.70609283447266,
+          5.980013847351074,
+          -24.69219970703125
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 44,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          -92.42726135253906,
+          3.672675609588623,
+          48.97932434082031
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 45,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          -81.06278228759766,
+          3.2733397483825684,
+          63.896461486816406
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 46,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          113.74239349365234,
+          1.5452044010162354,
+          90.28150939941406
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 47,
+      "name": "Turret",
+      "prefab": "props/turret",
+      "transform": {
+        "position": [
+          103.01705932617188,
+          1.5076349973678589,
+          97.48882293701172
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 48,
+      "name": "enemy_spawn 48",
+      "transform": {
+        "position": [
+          74.1021499633789,
+          1.1622827053070068,
+          95.69081115722656
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 49,
+      "name": "enemy_spawn 49",
+      "transform": {
+        "position": [
+          64.45829772949219,
+          1.9703733921051025,
+          92.78009796142578
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 50,
+      "name": "explosive_barrel 50",
+      "transform": {
+        "position": [
+          69.53514099121094,
+          2.8573808670043945,
+          88.31990051269531
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 51,
+      "name": "ally_spawn 51",
+      "transform": {
+        "position": [
+          60.51675033569336,
+          0.33748626708984375,
+          109.51740264892578
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "ally_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 52,
+      "name": "Objective Plane",
+      "prefab": "props/objective_plane",
+      "transform": {
+        "position": [
+          1.9793567657470703,
+          2.469557285308838,
+          3.327117919921875
+        ],
+        "rotation": [
+          180.0,
+          3.5336766242980957,
+          180.0
+        ],
+        "scale": [
+          0.9999904632568359,
+          1.0,
+          0.9999904632568359
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 53,
+      "name": "Fuel Silo",
+      "prefab": "props/fuel_silo",
+      "transform": {
+        "position": [
+          -50.091583251953125,
+          2.6360576152801514,
+          62.14645767211914
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 54,
+      "name": "Fuel Silo",
+      "prefab": "props/fuel_silo",
+      "transform": {
+        "position": [
+          -81.97055053710938,
+          1.7307112216949463,
+          -11.98295783996582
+        ],
+        "rotation": [
+          0.0,
+          59.01937484741211,
+          0.0
+        ],
+        "scale": [
+          0.9999983906745911,
+          1.0,
+          0.9999983906745911
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 55,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -33.71113586425781,
+          2.382497549057007,
+          2.752716064453125
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 56,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -24.398698806762695,
+          2.7039949893951416,
+          -69.45002746582031
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 57,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -16.560955047607422,
+          2.5450658798217773,
+          -64.53434753417969
+        ],
+        "rotation": [
+          0.0,
+          -29.999982833862305,
+          0.0
+        ],
+        "scale": [
+          0.999999463558197,
+          1.0,
+          0.999999463558197
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 58,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -14.687911033630371,
+          3.155031681060791,
+          -77.91061401367188
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 59,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          32.27003479003906,
+          2.7957677841186523,
+          -70.2261962890625
+        ],
+        "rotation": [
+          0.0,
+          -89.98018646240234,
+          0.0
+        ],
+        "scale": [
+          0.9999861717224121,
+          1.0,
+          0.9999861717224121
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 60,
+      "name": "Container Copy",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          32.27003479003906,
+          5.295767784118652,
+          -70.2261962890625
+        ],
+        "rotation": [
+          0.0,
+          -89.98018646240234,
+          0.0
+        ],
+        "scale": [
+          0.9999786019325256,
+          1.0,
+          0.9999786019325256
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 61,
+      "name": "Container Copy",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          26.270034790039063,
+          2.7957677841186523,
+          -70.2261962890625
+        ],
+        "rotation": [
+          0.0,
+          -89.98018646240234,
+          0.0
+        ],
+        "scale": [
+          0.9999788999557495,
+          1.0,
+          0.9999788999557495
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 62,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -16.629114151000977,
+          2.318082571029663,
+          -117.32475280761719
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 63,
+      "name": "Container Copy",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -14.129114151000977,
+          2.3386101722717285,
+          -114.32475280761719
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 64,
+      "name": "Container Copy Copy",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -14.129114151000977,
+          4.7207794189453125,
+          -114.32475280761719
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 65,
+      "name": "Watch Tower",
+      "prefab": "props/watchtower",
+      "transform": {
+        "position": [
+          -12.876714706420898,
+          3.3351056575775146,
+          -91.41863250732422
+        ],
+        "rotation": [
+          0.0,
+          89.99996948242188,
+          0.0
+        ],
+        "scale": [
+          0.9999992251396179,
+          1.0,
+          0.9999992251396179
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 66,
+      "name": "enemy_spawn 66",
+      "overrides": {
+        "enemyWeapon": "sniper"
+      },
+      "transform": {
+        "position": [
+          -21.33015251159668,
+          15.44261646270752,
+          -96.54603576660156
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 8658,
+      "name": "Metal Barrack",
+      "prefab": "props/metal_barrack",
+      "transform": {
+        "position": [
+          21.190702438354492,
+          2.0925891399383545,
+          -87.84782409667969
+        ],
+        "rotation": [
+          0.0,
+          -89.9999771118164,
+          0.0
+        ],
+        "scale": [
+          0.9999765157699585,
+          1.0,
+          0.9999765157699585
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 8659,
+      "name": "Metal Barrack Copy",
+      "prefab": "props/metal_barrack",
+      "transform": {
+        "position": [
+          21.19597053527832,
+          2.387263059616089,
+          -98.78607177734375
+        ],
+        "rotation": [
+          180.0,
+          -90.0,
+          180.0
+        ],
+        "scale": [
+          0.9999886751174927,
+          1.0,
+          0.9999886751174927
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 21260,
+      "name": "Car Park Asphalt",
+      "prefab": "props/carpark_asphalt",
+      "transform": {
+        "position": [
+          -10.564804077148438,
+          2.916149854660034,
+          -9.575836181640625
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 21261,
+      "name": "Car Park Asphalt Copy",
+      "prefab": "props/carpark_asphalt",
+      "transform": {
+        "position": [
+          -38.0413932800293,
+          2.855638027191162,
+          -9.594722747802734
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22311,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -23.60317039489746,
+          3.1628475189208984,
+          -40.335479736328125
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22312,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -30.112842559814453,
+          3.1993532180786133,
+          -24.596416473388672
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22313,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -45.817237854003906,
+          3.131187915802002,
+          -36.457557678222656
+        ],
+        "rotation": [
+          0.0,
+          -36.881309509277344,
+          0.0
+        ],
+        "scale": [
+          0.9999992251396179,
+          1.0,
+          0.9999992251396179
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22314,
+      "name": "Container",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -47.77461624145508,
+          3.10048770904541,
+          -23.98699188232422
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          0.9999997615814209,
+          1.0,
+          0.9999997615814209
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22315,
+      "name": "Container Copy",
+      "prefab": "props/container",
+      "transform": {
+        "position": [
+          -47.79732894897461,
+          5.508103370666504,
+          -23.978355407714844
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          0.9999997615814209,
+          1.0,
+          0.9999997615814209
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22316,
+      "name": "enemy_spawn 22316",
+      "transform": {
+        "position": [
+          -28.157121658325195,
+          2.50473952293396,
+          -35.34190368652344
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22317,
+      "name": "enemy_spawn 22317",
+      "transform": {
+        "position": [
+          -42.994346618652344,
+          2.580379009246826,
+          -30.786882400512695
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22318,
+      "name": "enemy_spawn 22318",
+      "transform": {
+        "position": [
+          -30.33727264404297,
+          2.5797946453094482,
+          -48.649696350097656
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22319,
+      "name": "Watch Tower",
+      "prefab": "props/watchtower",
+      "transform": {
+        "position": [
+          6.569831848144531,
+          2.866610050201416,
+          24.79001235961914
+        ],
+        "rotation": [
+          0.0,
+          -90.0,
+          0.0
+        ],
+        "scale": [
+          0.9999895691871643,
+          1.0,
+          0.9999895691871643
+        ]
+      },
+      "type": "prefab"
+    },
+    {
+      "enabled": true,
+      "id": 22320,
+      "name": "enemy_spawn 22320",
+      "overrides": {
+        "enemyWeapon": "sniper"
+      },
+      "transform": {
+        "position": [
+          15.703998565673828,
+          15.892205238342285,
+          29.55072593688965
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22321,
+      "name": "enemy_spawn 22321",
+      "transform": {
+        "position": [
+          -103.61837768554688,
+          0.4062991142272949,
+          39.892555236816406
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22322,
+      "name": "enemy_spawn 22322",
+      "transform": {
+        "position": [
+          -35.18651580810547,
+          3.7059242725372314,
+          104.7645492553711
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22323,
+      "name": "enemy_spawn 22323",
+      "transform": {
+        "position": [
+          10.777904510498047,
+          2.172557830810547,
+          96.46646881103516
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22324,
+      "name": "enemy_spawn 22324",
+      "transform": {
+        "position": [
+          -0.6401100158691406,
+          1.387615442276001,
+          74.21728515625
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22325,
+      "name": "enemy_spawn 22320 Copy",
+      "overrides": {
+        "enemyWeapon": "sniper"
+      },
+      "transform": {
+        "position": [
+          17.230609893798828,
+          15.892205238342285,
+          29.06052017211914
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22452,
+      "name": "Abrams Tank (Enemy)",
+      "prefab": "props/abrams_tank",
+      "transform": {
+        "position": [
+          -19.61911392211914,
+          2.4998629093170166,
+          3.2648754119873047
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    }
+  ],
+  "insertionMode": "player_choice",
+  "lighting": {
+    "dxrDDGI": {
+      "enabled": false,
+      "hysteresis": 0.949999988079071,
+      "intensity": 0.44999998807907104,
+      "maxProbes": 2048,
+      "maxRayDistance": 24.0,
+      "multiBounceStrength": 0.3499999940395355,
+      "normalBias": 0.18000000715255737,
+      "probesPerFrame": 16,
+      "raysPerProbe": 64,
+      "showProbes": false,
+      "surfaceOffset": 0.3499999940395355,
+      "surfaceSpacing": 3.0,
+      "viewBias": 0.05000000074505806
+    }
+  },
+  "name": "mil",
+  "patrolBoatEnabled": false,
+  "schemaVersion": 1,
+  "splines": [
+    {
+      "alignToPath": true,
+      "closed": false,
+      "conformToTerrain": true,
+      "id": 805,
+      "name": "Spline 1",
+      "pitchToSlope": true,
+      "points": [
+        [
+          -12.85590934753418,
+          3.3288004398345947,
+          -98.80123901367188
+        ],
+        [
+          1.106198787689209,
+          2.1975297927856445,
+          -100.22049713134766
+        ]
+      ],
+      "prefab": "props/fence",
+      "spacing": 3.1080000400543213,
+      "yawOffset": 0.0
+    },
+    {
+      "alignToPath": true,
+      "closed": false,
+      "conformToTerrain": true,
+      "id": 21558,
+      "name": "Spline 2",
+      "pitchToSlope": true,
+      "points": [
+        [
+          22.234668731689453,
+          2.2510035037994385,
+          -103.87039947509766
+        ],
+        [
+          38.36378479003906,
+          2.5874545574188232,
+          -106.2075424194336
+        ],
+        [
+          65.65300750732422,
+          2.5904831886291504,
+          -93.03356170654297
+        ],
+        [
+          54.073734283447266,
+          2.5904879570007324,
+          17.641759872436523
+        ],
+        [
+          3.4289188385009766,
+          3.4288132190704346,
+          34.321685791015625
+        ]
+      ],
+      "prefab": "props/fence",
+      "spacing": 3.1080000400543213,
+      "yawOffset": 0.0
+    },
+    {
+      "alignToPath": true,
+      "closed": false,
+      "conformToTerrain": true,
+      "id": 21832,
+      "name": "Spline 3",
+      "pitchToSlope": true,
+      "points": [
+        [
+          -51.09607696533203,
+          2.579880952835083,
+          34.868553161621094
+        ],
+        [
+          -81.319091796875,
+          2.755890369415283,
+          30.694534301757813
+        ],
+        [
+          -84.06212615966797,
+          2.436500310897827,
+          -16.5902099609375
+        ]
+      ],
+      "prefab": "props/fence",
+      "spacing": 3.1080000400543213,
+      "yawOffset": 0.0
+    },
+    {
+      "alignToPath": true,
+      "closed": false,
+      "conformToTerrain": true,
+      "id": 22183,
+      "name": "Spline 4",
+      "pitchToSlope": true,
+      "points": [
+        [
+          -82.3916244506836,
+          2.6013286113739014,
+          -53.969696044921875
+        ],
+        [
+          -38.815284729003906,
+          2.5802760124206543,
+          -75.97952270507813
+        ],
+        [
+          -26.457054138183594,
+          3.8553037643432617,
+          -95.10771942138672
+        ]
+      ],
+      "prefab": "props/fence",
+      "spacing": 3.1080000400543213,
+      "yawOffset": 0.0
+    }
+  ],
+  "terrain": {
+    "flat": false,
+    "foliageClear": [],
+    "heightScale": 0.0,
+    "islandScaleX": 3.9000000953674316,
+    "islandScaleZ": 3.9000000953674316,
+    "originTileX": 0,
+    "originTileZ": 0,
+    "sculpt": [
+      {
+        "baseHeight": 2.5101213455200195,
+        "edgeFalloff": 1.0,
+        "operation": "stamp",
+        "radius": 712.6858520507813,
+        "replace": 1.0,
+        "rotation": 0.0,
+        "strength": 1.0,
+        "texture": "BigIslandv33/BigIslandv33_baked.png",
+        "value": 8.51012134552002,
+        "x": 5.35247802734375,
+        "z": -38.65081787109375
+      }
+    ],
+    "tilesX": 16,
+    "tilesZ": 16
+  },
+  "virtualShadowMaps": true
+}

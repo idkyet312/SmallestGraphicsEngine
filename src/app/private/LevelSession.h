@@ -112,6 +112,7 @@ static void OpenMainMenu() {
     g_game.world.Prefabs().ResetGameplayState();
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
+    g_singlePlayerScore = {};
     // No level any more: a host that walks out to the menu says so, rather than
     // leaving clients believing they are still sharing a map with it.
     g_activeLevelKind = net::LevelKind::None;

@@ -124,7 +124,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 12;
+    static constexpr int kWeaponCount = 13;
     static constexpr size_t kAttachmentCount = 3;
     // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
     // twice the climb per shot. Scales the camera recoil -- the part that
@@ -200,6 +200,14 @@ public:
               240.0f, 0.62f, 0.26f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 26.0f, 1.4f, false,
               "Content/Models/MainPlayer/Guns/m9/M9.glb", "", true },
+            // .45 SMG. Fastest cycle in armory, lowest per-shot damage of the
+            // automatics, flattest climb. Full-auto backup to the pistol for
+            // magazine depth, so reload speed splits the difference between
+            // sidearm (fast) and rifle (slow).
+            { "kriss_vector", "Kriss Vector", 12, 25, 100, 200, 1.35f, 0.05f, 0.75f,
+              280.0f, 0.30f, 0.14f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+              1.0f, 42.0f, 1.2f, false,
+              "Content/Models/MainPlayer/Guns/Kriss/KRISS+VECTOR.glb", "" },
         }};
 
         const uint32_t ak = 1u << 0;
@@ -215,9 +223,13 @@ public:
         // rail: both are authored against a rifle's receiver rail, and the M9
         // has no rail to mount them on.
         const uint32_t m9 = 1u << 11;
+        // The Kriss export carries raised flip-up iron sights front and rear, so
+        // it takes the rifles' can and laser but not the red dot: the rear leaf
+        // would stand up through the sight body.
+        const uint32_t kriss = 1u << 12;
         attachments_ = {{
             { "silencer", "Silencer", AttachmentSlot::Muzzle, 10,
-              ak | ak74 | svd | m4 | m9,
+              ak | ak74 | svd | m4 | m9 | kriss,
               { 0.86f, 1.0f, 1.0f, 0.25f, 0.55f, 0.35f, 0.60f, 0.0f },
               true, false, false, "procedural/attachments/silencer" },
             { "red_dot", "Red Dot Sight", AttachmentSlot::Optic, 20,
@@ -225,7 +237,7 @@ public:
               { 1.0f, 1.0f, 0.55f, 1.0f, 1.0f, 1.0f, 1.0f, -6.0f },
               false, true, false, "procedural/attachments/red_dot" },
             { "laser", "Visible Laser", AttachmentSlot::SideRail, 30,
-              ak | ak74 | shotgun | svd | m4,
+              ak | ak74 | shotgun | svd | m4 | kriss,
               { 1.0f, 0.72f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f },
               false, false, true, "procedural/attachments/visible_laser" },
         }};

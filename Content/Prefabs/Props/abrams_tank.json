@@ -30,7 +30,7 @@
       "fireRange": 110,
       "standoff": 35,
       "reload": 6.0,
-      "shellSpeed": 45,
+      "shellSpeed": 67.5,
       "turretRate": 0.55
     }
   }

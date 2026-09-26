@@ -741,7 +741,8 @@ public:
                            float impulse = 0.0f, uint32_t impactId = 0,
                            float dirX = 0.0f, float dirY = 0.0f,
                            float dirZ = 0.0f, bool playerOwned = true,
-                           bool remoteCharge = false) {
+                           bool remoteCharge = false,
+                           PlayerId shooter = kInvalidPlayerId) {
         const uint32_t assignedImpactId = impactId ? impactId : AllocateImpactId();
         if (!Active() || !ValidWorldTarget(entityId, kind, assignedImpactId) ||
             !(damage > 0.0f) ||
@@ -751,8 +752,13 @@ public:
             !Finite3(dirX, dirY, dirZ) ||
             radius < 0.0f) return;
         if (role_ == Role::Host) {
+            // `shooter` lets the host file an impact under another player:
+            // it detonates everyone's charges, and the demolition is theirs.
             worldImpacts_.push_back({ assignedImpactId,
-                                       kind, localId_, playerOwned,
+                                       kind,
+                                       shooter != kInvalidPlayerId
+                                           ? shooter : localId_,
+                                       playerOwned,
                                        remoteCharge, entityId,
                                        damage,
                                        radius, impulse, dirX, dirY, dirZ,
@@ -1711,8 +1717,13 @@ private:
     // zero quaternion here would not fail loudly -- it would fling the chassis.
     static bool ValidDrivenVehicle(const DrivenVehicleState& v) {
         if (v.kind == DrivenVehicleKind::None) return true;
-        if (v.kind != DrivenVehicleKind::Humvee || v.index >= kMaxReplicatedHumvees)
+        if (v.kind == DrivenVehicleKind::Humvee) {
+            if (v.index >= kMaxReplicatedHumvees) return false;
+        } else if (v.kind == DrivenVehicleKind::Tank) {
+            if (v.index >= kMaxReplicatedTanks) return false;
+        } else {
             return false;
+        }
         if (!Finite3(v.x, v.y, v.z) || !Finite3(v.qx, v.qy, v.qz) ||
             !std::isfinite(v.qw) || !std::isfinite(v.turretYaw)) return false;
         const float lengthSq = v.qx * v.qx + v.qy * v.qy + v.qz * v.qz +

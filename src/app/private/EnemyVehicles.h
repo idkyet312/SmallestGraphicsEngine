@@ -2,13 +2,17 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
-static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
+// `fromPlayer` only feeds the offline scoreboard: in a session the host applies
+// every report and cannot tell whose round it was.
+static void DamageHelicopter(float damage, const XMFLOAT3& hit,
+                             bool fromPlayer = false) {
     if (damage <= 0.0f || g_helicopterDead || !g_helicopterModel) return;
     const VehicleSystem::DamageResult result =
         g_game.vehicles.DamagePrimaryHelicopter(damage);
     if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
     if (!result.destroyed) return;
+    if (fromPlayer && !g_netSession.Active()) ++g_singlePlayerScore.kills;
     scene.SpawnExplosionFX(g_helicopterPosition, 7.0f, 1.0f);
     scene.SpawnSmokeBurst(g_helicopterPosition, 1.25f, 1.5f);
 }
@@ -26,7 +30,8 @@ static bool SecondaryHelicopterPresent() {
     return g_stressTestMode || g_game.vehicles.DropshipActive();
 }
 
-static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
+static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit,
+                                      bool fromPlayer = false) {
     if (damage <= 0.0f || g_secondaryHelicopterDead || !g_helicopterModel ||
         !SecondaryHelicopterPresent()) return;
     const VehicleSystem::DamageResult result =
@@ -34,6 +39,7 @@ static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
     if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
     if (!result.destroyed) return;
+    if (fromPlayer && !g_netSession.Active()) ++g_singlePlayerScore.kills;
     scene.SpawnExplosionFX(g_secondaryHelicopterPosition, 7.0f, 1.0f);
     scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 1.25f, 1.5f);
 }

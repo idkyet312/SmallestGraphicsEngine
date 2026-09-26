@@ -183,7 +183,25 @@ static void UpdateBlackHawkCrashEffects(float deltaTime) {
 
     // Riding it down hurts. Not instantly lethal at full health, so a healthy
     // player walks away from the wreck.
-    scene.DamagePlayer(55.0f);
+    //
+    // Only near the wreck, though: this used to land wherever the player was,
+    // so a bird shot down long after dropping them off hurt them across the
+    // map. RidePlayerInBlackHawk runs first and has already thrown a rider
+    // 4 m clear, which the full-damage radius covers; past it the hit fades
+    // out, and beyond kCrashHurtRadius the wreck does nothing.
+    constexpr float kCrashFullDamageRadius = 6.0f;
+    constexpr float kCrashHurtRadius = 15.0f;
+    const float dx = scene.camera.Position.x - impact.x;
+    const float dy = scene.camera.Position.y - scene.camera.PlayerHeight -
+                     impact.y;
+    const float dz = scene.camera.Position.z - impact.z;
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance >= kCrashHurtRadius) return;
+    const float falloff = distance <= kCrashFullDamageRadius
+        ? 1.0f
+        : 1.0f - (distance - kCrashFullDamageRadius) /
+                     (kCrashHurtRadius - kCrashFullDamageRadius);
+    scene.DamagePlayerFrom(55.0f * falloff, impact);
 }
 
 // Normalized to a fixed footprint (so the cabin is big enough to carry the

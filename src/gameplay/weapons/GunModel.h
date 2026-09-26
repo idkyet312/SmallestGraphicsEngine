@@ -121,6 +121,15 @@ public:
     }
     static bool M9Loaded() { return M9Mesh() != nullptr; }
 
+    // Kriss Vector: a submachine gun following the M9. Like the sidearm it is
+    // a complete weapon class with its own stats, fit and grip, but takes
+    // silencer/laser attachments where the M9 does not.
+    static std::shared_ptr<SceneMesh>& KrissMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool KrissLoaded() { return KrissMesh() != nullptr; }
+
     // The M4's iron sights, split from the body at load. Drawn only when no
     // optic is fitted: a red dot mounts directly over them, and the rear leaf
     // would otherwise stand up through the sight body.
@@ -141,7 +150,7 @@ public:
 
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
-    static constexpr int kMaxWeapon = 11;
+    static constexpr int kMaxWeapon = 12;
 
     // The AK-74 is the standard-issue rifle. The AK-47 in slot 0 is retired
     // from selection (see kHiddenWeapon) but stays loaded, because its mesh is
@@ -192,7 +201,7 @@ public:
 
     static int& SelectedWeapon() {
         // 0 AK (hidden), 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame,
-        // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74, 11 M9
+        // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74, 11 M9, 12 Kriss Vector
         static int weapon = kDefaultWeapon;
         return weapon;
     }
@@ -201,7 +210,7 @@ public:
             "AK47", "Remington 870", "RPG-7", "R700 Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
             "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74",
-            "M9"
+            "M9", "Kriss Vector"
         };
         return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
@@ -223,6 +232,7 @@ public:
     static bool M4Selected() { return SelectedWeapon() == 9 && M4Loaded(); }
     static bool AK74Selected() { return SelectedWeapon() == 10 && AK74Loaded(); }
     static bool M9Selected() { return SelectedWeapon() == 11 && M9Loaded(); }
+    static bool KrissSelected() { return SelectedWeapon() == 12 && KrissLoaded(); }
     static const char* SelectedWeaponName() {
         return WeaponName(SelectedWeapon());
     }
@@ -235,6 +245,7 @@ public:
         if (M4Selected()) return M4Mesh();
         if (AK74Selected()) return AK74Mesh();
         if (M9Selected()) return M9Mesh();
+        if (KrissSelected()) return KrissMesh();
         if (R700Selected()) return R700Mesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
@@ -272,6 +283,10 @@ public:
             // between them the mesh ends up needing a large positive Z to
             // bring it back into frame, unlike any of the long guns.
             { 0.050f, -0.110f, 1.825f }, // M9 grip
+            // Tuned in game against the KRISS+VECTOR render. Lower than the AK:
+            // the Vector's receiver hangs deep below its bore line, so the
+            // same handguard pocket would leave the frame riding high.
+            { 0.020f, -0.205f, -0.440f }, // Kriss Vector handguard
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -305,6 +320,7 @@ public:
             // to its bounding box, and a clean 180 leaves the muzzle reading a
             // hair off the sight line at this scale.
             { 0.0f, 180.3f, 0.0f }, // M9
+            { 0.0f, 0.0f, 0.0f },   // Kriss Vector: long gun, no rotation needed
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -362,6 +378,7 @@ public:
             // 0.28/0.285 against the render, which is where the slide stops
             // looking slab-sided without the barrel going thin.
             { 0.280f, 0.285f, 0.350f }, // M9
+            { 1.00f, 1.00f, 1.00f },    // Kriss Vector: SMG sized to rifle scale
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -401,6 +418,9 @@ public:
             // WeaponCustomization.h); this is the shared starting pose, kept so
             // widening that mask later puts a sight near the slide, not adrift.
             { 0.012f, 0.154f, 0.376f }, // M9
+            // The Kriss carries an integral top rail running most of the length.
+            // Optic sits forward of the M4 and AK patterns.
+            { 0.012f, 0.154f, 0.376f }, // Kriss Vector receiver rail
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -427,6 +447,7 @@ public:
             {-5.0f, -1.0f, 0.0f }, // M4A1
             { 0.0f,  0.0f, 0.0f }, // AK-74
             { 0.0f,  0.0f, 0.0f }, // M9
+            { 0.0f,  0.0f, 0.0f }, // Kriss Vector
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -444,7 +465,8 @@ public:
             // believable size on its rail.
             3.07f, // M4A1
             1.00f, // AK-74: imports at the AK47 proportions
-            1.00f  // M9
+            1.00f, // M9
+            1.00f  // Kriss Vector
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -474,6 +496,7 @@ public:
             {-0.000f,  0.164f,  0.789f }, // M4A1
             { 0.000f, -1.000f, -0.600f }, // AK-74
             { 0.000f, -1.000f, -0.600f }, // M9
+            { 0.000f, -1.000f, -0.600f }, // Kriss Vector
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -543,6 +566,7 @@ public:
         case 9: return M4Loaded();
         case 10: return AK74Loaded();
         case 11: return M9Loaded();
+        case 12: return KrissLoaded();
         default: return false;
         }
     }
@@ -727,6 +751,7 @@ public:
         // After the AK47 above, whose material this reuses.
         LoadAK74();
         LoadM9();
+        LoadKriss();
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open
@@ -1036,6 +1061,68 @@ private:
                 first && first->normalTexture ? 1 : 0,
                 first && first->metallicRoughnessTexture ? 1 : 0);
             std::fprintf(file, "m9_bounds x[%.3f..%.3f] y[%.3f..%.3f] z[%.3f..%.3f]\n",
+                         s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
+            std::fclose(file);
+        }
+    }
+
+    // The Kriss Vector SMG. Its GLB carries a complete PBR set per part
+    // (body, flip-up iron sights, magazine), so like the AK-74 it borrows no
+    // material and has no ordering dependency on the AK47 load above it.
+    static void LoadKriss() {
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/Kriss/KRISS+VECTOR.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "Kriss GLB unavailable; weapon slot stays empty\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims);
+        if (prims.empty()) {
+            std::cerr << "Kriss GLB had no geometry\n";
+            return;
+        }
+
+        Orient(prims);
+        // The export runs its barrel down -X: the thin 0.13-unit cylinder sits
+        // at the -X end and the 0.7-tall stock at +X (measured along the body).
+        // Orient grows the gun forward from its low end, so without this the
+        // stock would point downrange. Turned in place rather than with a fit
+        // rotation so the shared 0..kBarrelLength frame, and with it the grip
+        // offsets, still hold.
+        FlipHarpoonGun180(prims);
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
+        KrissMesh() = mesh;
+        std::cout << "Kriss loaded: " << mesh->primitives.size()
+                  << " primitive(s)\n";
+        if (FILE* file = std::fopen("gun_load.log", "a")) {
+            size_t triangles = 0, vertices = 0;
+            for (const MeshPrimitive& primitive : mesh->primitives) {
+                triangles += primitive.indices.size() / 3;
+                vertices += primitive.vertices.size() / 12;
+            }
+            const auto& first = mesh->primitives.front().material;
+            std::fprintf(file,
+                "kriss_loaded=1 prims=%zu verts=%zu tris=%zu"
+                " albedo=%d normal=%d packedMR=%d\n",
+                mesh->primitives.size(), vertices, triangles,
+                first && first->baseColorTexture ? 1 : 0,
+                first && first->normalTexture ? 1 : 0,
+                first && first->metallicRoughnessTexture ? 1 : 0);
+            std::fprintf(file, "kriss_bounds x[%.3f..%.3f] y[%.3f..%.3f] z[%.3f..%.3f]\n",
                          s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
             std::fclose(file);
         }

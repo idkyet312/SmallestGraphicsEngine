@@ -48,6 +48,7 @@ struct ArmoryCatalog {
         1500,   // 9  M4A1
         800,    // 10 AK-74
         700,    // 11 M9
+        1800,   // 12 Kriss Vector
     };
 
     // One line of shop copy per weapon. The combo box gave a bare name and left
@@ -66,6 +67,7 @@ struct ArmoryCatalog {
         "Carbine. Flatter recoil than the AK and faster to aim.",
         "Battle rifle. Heavy round, steady cadence, takes every rail.",
         "Sidearm. Draws and reloads faster than any rifle, and hits softer.",
+        "SMG. Empties a magazine faster than anything else, but hits softest at range.",
     };
 
     static constexpr int kGrenadeCount = 3;

@@ -11,7 +11,7 @@
 //     "muzzle": [5.93, -0.27, 0.0],      // in turret space, metres
 //     "hitHeight": 2.71,                 // hull hit box top, model space
 //     "health": 1500, "detectRange": 140, "fireRange": 110,
-//     "standoff": 35, "reload": 6.0, "shellSpeed": 45
+//     "standoff": 35, "reload": 6.0, "shellSpeed": 67.5
 //   }
 //
 // The hull and turret stay ordinary prefab render batches -- the editor places
@@ -91,7 +91,7 @@ struct EnemyTankState {
     float fireRange = 110.0f;
     float standoff = 35.0f;
     float reloadSeconds = 6.0f;
-    float shellSpeed = 45.0f;
+    float shellSpeed = 67.5f;
     // Scales the shell's blast on the player and its crater, 1 = main gun.
     float shellDamage = 1.0f;
     float turretRate = 0.55f;   // rad/s
@@ -108,6 +108,12 @@ struct EnemyTankState {
     // a wreck in the first one is laid down silently: it died before this
     // machine joined, and the explosion belongs to that moment, not this one.
     bool netSeen = false;
+    // Whether this remote-driven tank has had its initial pose set, so we can
+    // ease toward the net pose rather than snapping.
+    bool netPosed = false;
+    // Host only: a client is driving it this frame. Their machine runs the
+    // body; the host drops its own and follows their reported pose.
+    bool remoteDriven = false;
     // Taken over by the player. The AI never drives or fires it again: once
     // the player climbs out it sits where it was left, braked.
     bool captured = false;
@@ -462,6 +468,8 @@ static void WreckEnemyTank(EnemyTankState& tank, bool localKill,
     }
     g_pendingExplosionAudio.push_back({ 0.0f, 1.0f, 0.7f, false });
     if (localKill) CreditPlayerDestruction();
+    // Offline scoreboard; a session's host tallies per shooter instead.
+    if (localKill && !g_netSession.Active()) ++g_singlePlayerScore.kills;
     if (g_game.session.TimerRunning()) {
         g_game.mission.RecordDestruction();
         if (localKill) AwardCombatEvent(MoneyEvent::PropDestroyed);
@@ -841,7 +849,8 @@ static void UpdateEnemyTanks(float dt) {
             }
             continue;
         }
-        if (hostOwned) continue;
+        // A client's own tank is theirs to drive; every other one is the host's.
+        if (hostOwned && tank.entityId != g_playerTankEntity) continue;
         // Captured: driven from the player's input, or parked once they left.
         if (tank.captured) {
             if (tank.entityId != g_playerTankEntity)
@@ -1018,7 +1027,12 @@ static void SyncEnemyTankPoses(float dt) {
     // state arrives at the net tick, and snapping to it steps visibly.
     const float ease = 1.0f - std::exp(-14.0f * (std::max)(0.0f, dt));
     for (EnemyTankState& tank : g_enemyTanks) {
-        if (hostOwned) {
+        // Pose comes off the wire: the host's tanks on a client (except the
+        // one this client drives), and on the host a tank a client drives.
+        const bool follow =
+            (hostOwned && tank.entityId != g_playerTankEntity) ||
+            tank.remoteDriven;
+        if (follow) {
             // A body registered before the session began (single player,
             // then joined) is dropped: the host's solver owns this tank now.
             if (tank.physicsHandle != 0) {
@@ -1036,7 +1050,7 @@ static void SyncEnemyTankPoses(float dt) {
                 std::cos(tank.netTurretYaw - tank.turretYaw)) * ease;
         }
         DestructionBodyPose pose;
-        bool haveBody = !hostOwned &&
+        bool haveBody = !follow &&
             g_destruction.GetGroundVehiclePose(tank.physicsHandle, pose);
         if (haveBody) {
             tank.position = pose.position;
@@ -1062,7 +1076,7 @@ static void SyncEnemyTankPoses(float dt) {
         // No body: the physics world was rebuilt under it (a destruction
         // reset), or it was just pulled back from below the world. Recreate it
         // where the tank is rather than losing it.
-        if (!haveBody && !hostOwned && g_destruction.IsInitialized()) {
+        if (!haveBody && !follow && g_destruction.IsInitialized()) {
             XMFLOAT3 axis;
             XMStoreFloat3(&axis, XMVector3Rotate(
                 XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f),
