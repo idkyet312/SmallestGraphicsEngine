@@ -1304,6 +1304,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enableScreenSpaceReflections = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
                 scene.useVisibilityBuffer = false;
+            // Weapon index (GunModel::WeaponName). Every frame, since level
+            // start applies the loadout after the capture is armed.
+            char captureWeapon[8] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_WEAPON", captureWeapon,
+                                        sizeof(captureWeapon)) > 0)
+                GunModel::SelectedWeapon() = atoi(captureWeapon);
             if (++poseCaptureFrames == poseCaptureTarget) {
                 char path[MAX_PATH] = "capture.ppm";
                 GetEnvironmentVariableA("SGE_CAPTURE_PATH", path, sizeof(path));

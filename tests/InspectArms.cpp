@@ -11,9 +11,15 @@
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
+#define NOMINMAX
+#include <windows.h>
+
+#include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv) {
     const std::string path = argc > 1 ? argv[1]
@@ -47,6 +53,18 @@ int main(int argc, char** argv) {
         std::printf("embedded[%u] '%s' %ux%u fmt='%s' bytes=%u\n", t,
                     tex->mFilename.C_Str(), tex->mWidth, tex->mHeight,
                     tex->achFormatHint, tex->mHeight == 0 ? tex->mWidth : 0);
+        // SGE_INSPECT_DUMP=<dir> writes each compressed embedded texture out
+        // as-is, so the maps can be looked at without the engine.
+        char dumpDir[512] = {};
+        if (tex->mHeight == 0 &&
+            GetEnvironmentVariableA("SGE_INSPECT_DUMP", dumpDir, sizeof(dumpDir)) > 0) {
+            const std::string out = std::string(dumpDir) + "/embedded" +
+                std::to_string(t) + "." + tex->achFormatHint;
+            if (FILE* file = std::fopen(out.c_str(), "wb")) {
+                std::fwrite(tex->pcData, 1, tex->mWidth, file);
+                std::fclose(file);
+            }
+        }
     }
 
     // What each material asks for, per texture slot.
@@ -207,6 +225,61 @@ int main(int argc, char** argv) {
         std::printf("mesh[%u] mat='%s' signedVolume=%+.1f -> %s\n", m,
                     materialName.C_Str(), volume / 6.0,
                     volume >= 0.0 ? "CCW/outward" : "CW/inverted");
+    }
+
+    // Bone-group weight check. Per mesh: vertices fully and partly weighted to
+    // bones whose name contains SGE_INSPECT_BONE (default "righthand", the
+    // collapsed free hand), triangles straddling the group, >4-influence
+    // vertices, and a histogram of the group's share of each vertex.
+    if (raw) {
+        char boneFilter[64] = "righthand";
+        GetEnvironmentVariableA("SGE_INSPECT_BONE", boneFilter, sizeof(boneFilter));
+        std::printf("\n-- bone group weights (bones containing '%s') --\n", boneFilter);
+        for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
+            const aiMesh* mesh = scene->mMeshes[m];
+            std::vector<float> hidden(mesh->mNumVertices, 0.0f);
+            std::vector<float> total(mesh->mNumVertices, 0.0f);
+            std::vector<unsigned> count(mesh->mNumVertices, 0);
+            for (unsigned b = 0; b < mesh->mNumBones; ++b) {
+                const aiBone* bone = mesh->mBones[b];
+                std::string name = bone->mName.C_Str();
+                for (char& c : name) c = (char)std::tolower((unsigned char)c);
+                const bool isHidden = name.find(boneFilter) != std::string::npos;
+                for (unsigned w = 0; w < bone->mNumWeights; ++w) {
+                    const aiVertexWeight& vw = bone->mWeights[w];
+                    if (vw.mWeight <= 0.0f) continue;
+                    total[vw.mVertexId] += vw.mWeight;
+                    ++count[vw.mVertexId];
+                    if (isHidden) hidden[vw.mVertexId] += vw.mWeight;
+                }
+            }
+            unsigned partial = 0, full = 0, over4 = 0;
+            unsigned histogram[10] = {};
+            for (unsigned v = 0; v < mesh->mNumVertices; ++v) {
+                const float f = total[v] > 0.0f ? hidden[v] / total[v] : 0.0f;
+                if (f > 0.999f) ++full;
+                else if (f > 0.001f) ++partial;
+                if (count[v] > 4) ++over4;
+                if (f > 0.001f) ++histogram[(std::min)(9, (int)(f * 10.0f))];
+            }
+            unsigned mixedTris = 0;
+            for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
+                const aiFace& face = mesh->mFaces[f];
+                bool anyFull = false, anyVisible = false;
+                for (unsigned i = 0; i < face.mNumIndices; ++i) {
+                    const unsigned v = face.mIndices[i];
+                    const float h = total[v] > 0.0f ? hidden[v] / total[v] : 0.0f;
+                    if (h > 0.999f) anyFull = true; else anyVisible = true;
+                }
+                if (anyFull && anyVisible) ++mixedTris;
+            }
+            std::printf("mesh[%u] verts=%u fullyHidden=%u partiallyHidden=%u "
+                        "stretchedTris=%u over4Influences=%u\n", m,
+                        mesh->mNumVertices, full, partial, mixedTris, over4);
+            std::printf("    share histogram (0.0-0.1 .. 0.9-1.0):");
+            for (unsigned h : histogram) std::printf(" %u", h);
+            std::printf("\n");
+        }
     }
     return 0;
 }

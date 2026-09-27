@@ -34,6 +34,7 @@
 #include "ProceduralRunAnimation.h"
 #include "ShaderDX12.h"
 #include "SkinnedFBXImporter.h"
+#include "StaticBufferDX12.h"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <array>
@@ -395,6 +396,7 @@ public:
         ProceduralRunClip() =
             ProceduralRunAnimation::Build(Source().skeleton);
         DropUnskinnedPrimitives();
+        RigidSleeveCuffs();
         ApplyEmbeddedTextures();
         if (!CreatePaletteBuffers()) {
             std::cerr << "FPS view model palette buffers failed\n";
@@ -441,6 +443,7 @@ public:
                 Source().node->mesh->primitives.size(), skinned, vertices,
                 triangles, Source().skeleton.BoneCount());
             std::fprintf(file, "droppedUnskinned=%zu\n", s_droppedPrimitives);
+            std::fprintf(file, "rigidSleeveVertices=%zu\n", s_rigidSleeveVertices);
             std::fprintf(file, "clips=%zu chosen='%s'\n", Source().clips.size(),
                          Animation().clip ? Animation().clip->name.c_str() : "none");
             for (const AnimationClip& clip : Source().clips) {
@@ -947,6 +950,85 @@ private:
         s_droppedPrimitives = before - primitives.size();
     }
 
+    // Pin the sleeves to the forearms. The asset weights up to half of each
+    // cuff vertex to the hand bones (201 per side, measured), so the grip
+    // pose's wrist bend dragged the cuff after the hand: a spike stood up off
+    // the rim and the dark inner lining, weighted differently from the outer
+    // shell, poked through it. A sleeve does not follow the wrist, so its hand
+    // weight moves to the forearm and the hand turns inside the cuff instead.
+    // Sleeves are found structurally -- a primitive none of whose vertices is
+    // owned outright by a hand -- so the skin mesh keeps its wrist blend.
+    static void RigidSleeveCuffs() {
+        const Skeleton& skeleton = Source().skeleton;
+        std::vector<int> handRoot(skeleton.names.size(), -1);
+        for (size_t b = 0; b < skeleton.names.size(); ++b) {
+            std::string name = skeleton.names[b];
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            const size_t colon = name.find_last_of(':');
+            const std::string leaf =
+                colon == std::string::npos ? name : name.substr(colon + 1);
+            if (leaf == "lefthand" || leaf == "righthand")
+                handRoot[b] = static_cast<int>(b);
+        }
+        // Fingers inherit their wrist. Parents precede children in the
+        // skeleton, so one forward pass resolves every descendant.
+        for (size_t b = 0; b < skeleton.parent.size() && b < handRoot.size(); ++b) {
+            const int parent = skeleton.parent[b];
+            if (handRoot[b] < 0 && parent >= 0 && handRoot[parent] >= 0)
+                handRoot[b] = handRoot[parent];
+        }
+        const auto handOf = [&](uint32_t bone) {
+            return bone < handRoot.size() ? handRoot[bone] : -1;
+        };
+
+        s_rigidSleeveVertices = 0;
+        for (MeshPrimitive& primitive : Source().node->mesh->primitives) {
+            if (primitive.skin.empty()) continue;
+            bool ownedByHand = false;
+            for (const SkinVertex& s : primitive.skin) {
+                float handWeight = 0.0f;
+                for (int i = 0; i < 4; ++i)
+                    if (handOf(s.boneIndex[i]) >= 0) handWeight += s.boneWeight[i];
+                if (handWeight > 0.999f) { ownedByHand = true; break; }
+            }
+            if (ownedByHand) continue;
+
+            size_t changed = 0;
+            for (SkinVertex& s : primitive.skin) {
+                bool touched = false;
+                for (int i = 0; i < 4; ++i) {
+                    const int root = handOf(s.boneIndex[i]);
+                    if (root < 0 || s.boneWeight[i] <= 0.0f) continue;
+                    const int forearm = skeleton.parent[root];
+                    if (forearm < 0) continue;
+                    // Fold into an existing forearm slot rather than holding
+                    // the same bone twice.
+                    int slot = i;
+                    for (int j = 0; j < 4; ++j)
+                        if (j != i && s.boneIndex[j] == static_cast<uint32_t>(forearm) &&
+                            s.boneWeight[j] > 0.0f) slot = j;
+                    if (slot != i) {
+                        s.boneWeight[slot] += s.boneWeight[i];
+                        s.boneWeight[i] = 0.0f;
+                        s.boneIndex[i] = 0;
+                    } else {
+                        s.boneIndex[i] = static_cast<uint32_t>(forearm);
+                    }
+                    touched = true;
+                }
+                if (touched) ++changed;
+            }
+            if (changed == 0) continue;
+            const UINT skinBytes =
+                static_cast<UINT>(primitive.skin.size() * sizeof(SkinVertex));
+            CreateStaticBufferDX12(g_dx12.device.Get(), primitive.skin.data(),
+                skinBytes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                primitive.skinBuffer, "SkinWeights");
+            s_rigidSleeveVertices += changed;
+        }
+    }
+
     // Measure the mesh and work out the transform that puts it on the weapon.
     // Nothing is written back into the vertices: they must stay in the space the
     // skeleton's bind matrices were built in, or skinning breaks. Only the
@@ -1184,17 +1266,47 @@ private:
         return bones;
     }
 
-    // Zero out the hidden bones' palette entries. A zero matrix sends every
-    // vertex weighted to that bone to the origin, collapsing the triangles to
-    // degenerate slivers that rasterise to nothing -- the standard trick for
-    // hiding part of a skinned mesh without editing the geometry or splitting
-    // the draw. Runs after ComputePalette, so the animation is untouched.
+    // Collapse the hidden bones onto the posed joint at the root of their
+    // group (the free wrist, or the head), hiding that part of the skinned
+    // mesh without editing the geometry or splitting the draw. Runs after
+    // ComputePalette, so the animation is untouched.
+    // Not a zero matrix: that sends vertices to the model origin at the feet.
+    // Vertices blending hand and forearm weight were dragged partway there,
+    // and triangles straddling the cut stretched into long slivers -- measured
+    // on PlayerArms.fbx at 431 blended vertices and 83 slivers, which read as
+    // torn, jagged edges on the glove. Collapsing to the joint keeps both
+    // inside the forearm, so the cut tapers into the sleeve.
     static void CollapseHiddenBones() {
         const auto collapse = [](const std::vector<int>& bones) {
-            for (int bone : bones)
-                if (bone >= 0 &&
-                    static_cast<size_t>(bone) < PaletteCPU().size())
-                    PaletteCPU()[bone] = XMFLOAT4X4(); // all zeros
+            const std::vector<int>& parent = Source().skeleton.parent;
+            const auto hidden = [&](int bone) {
+                return std::find(bones.begin(), bones.end(), bone) != bones.end();
+            };
+            for (int bone : bones) {
+                if (bone < 0 || static_cast<size_t>(bone) >= PaletteCPU().size())
+                    continue;
+                int root = bone;
+                while (static_cast<size_t>(root) < parent.size() &&
+                       parent[root] >= 0 && hidden(parent[root]))
+                    root = parent[root];
+                XMFLOAT3 joint(0.0f, 0.0f, 0.0f);
+                if (static_cast<size_t>(root) < PoseGlobals().size()) {
+                    const XMFLOAT4X4& global = PoseGlobals()[root];
+                    joint = XMFLOAT3(global._41, global._42, global._43);
+                }
+                // Shrink the bone's own skinning toward the joint rather than
+                // zeroing it: a zero linear part also zeroes the normals, and a
+                // normalised zero normal is a NaN. At this scale the hand is a
+                // fraction of a millimetre. The palette is stored transposed,
+                // so the translation sits in the 4th column.
+                constexpr float kScale = 1e-3f;
+                XMFLOAT4X4& m = PaletteCPU()[bone];
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) m.m[r][c] *= kScale;
+                m._14 = kScale * m._14 + (1.0f - kScale) * joint.x;
+                m._24 = kScale * m._24 + (1.0f - kScale) * joint.y;
+                m._34 = kScale * m._34 + (1.0f - kScale) * joint.z;
+            }
         };
         if (HideHead()) collapse(HiddenBones());
         if (HideFreeHand()) collapse(FreeHandBones());
@@ -1291,4 +1403,5 @@ private:
     static inline XMFLOAT3 s_hi{};
     // Unskinned primitives discarded at load, for the load log.
     static inline size_t s_droppedPrimitives = 0;
+    static inline size_t s_rigidSleeveVertices = 0;
 };
