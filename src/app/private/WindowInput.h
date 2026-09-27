@@ -100,13 +100,14 @@ static void ProcessInput(HWND) {
     if (!PlayerInVehicle()) ApplyVirtualInput();
 
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) {
-        // A tank keeps the last input it was given: with the keys unread it
-        // would roll on under a released W, so it brakes -- unless the
-        // unattended drive test is steering it, which has no captured cursor.
+        // Driven vehicles keep their last input when keys are unread, so brake
+        // them here; the unattended tank test still supplies its own input.
         if (g_playerTankEntity != 0)
             DrivePlayerTank(g_tankTestInputActive ? g_tankTestThrottle : 0.0f,
                             g_tankTestInputActive ? g_tankTestTurn : 0.0f,
                             !g_tankTestInputActive);
+        if (g_drivingHumvee && g_activeHumveeIndex < g_humveeGameplay.size())
+            g_destruction.SetVehicleInput(g_activeHumveeIndex, 0.0f, 0.0f, true);
         return;
     }
 
@@ -156,34 +157,14 @@ static void ProcessInput(HWND) {
         const float throttle =
             ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
             ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
-        const float manualSteering =
+        const float turn =
             ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
             ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f);
-        float steering = manualSteering * 0.45f;
-        XMFLOAT4X4 vehiclePose;
-        XMFLOAT3 vehicleForward;
-        if (g_destruction.GetVehicleTransform(
-                g_activeHumveeIndex, vehiclePose, nullptr, &vehicleForward)) {
-            XMVECTOR desiredVector = XMVectorSet(
-                scene.camera.Front.x, 0.0f, scene.camera.Front.z, 0.0f);
-            XMVECTOR vehicleVector = XMVectorSet(
-                vehicleForward.x, 0.0f, vehicleForward.z, 0.0f);
-            if (XMVectorGetX(XMVector3LengthSq(desiredVector)) > 0.001f &&
-                XMVectorGetX(XMVector3LengthSq(vehicleVector)) > 0.001f) {
-                desiredVector = XMVector3Normalize(desiredVector);
-                vehicleVector = XMVector3Normalize(vehicleVector);
-                const float dot = (std::max)(-1.0f, (std::min)(1.0f,
-                    XMVectorGetX(XMVector3Dot(vehicleVector, desiredVector))));
-                const float cross = vehicleForward.z * XMVectorGetX(desiredVector) -
-                                    vehicleForward.x * XMVectorGetZ(desiredVector);
-                const float headingError = std::atan2(cross, dot);
-                steering += headingError * 1.45f;
-            }
-        }
-        steering = (std::max)(-1.0f, (std::min)(1.0f, steering));
+        // The Humvee's steering axle is behind its rendered nose, reversing
+        // the wheel input needed for A/D relative to the tank.
         g_destruction.SetVehicleInput(
-            g_activeHumveeIndex, throttle, steering,
-            (FocusedKeyState(VK_SPACE) & 0x8000) != 0);
+            g_activeHumveeIndex, throttle, turn,
+            (FocusedKeyState(VK_SPACE) & 0x8000) != 0 || throttle == 0.0f);
         for (size_t index = 0; index < g_destruction.VehicleCount(); ++index)
             if (index != g_activeHumveeIndex)
                 g_destruction.SetVehicleInput(index, 0.0f, 0.0f, true);
