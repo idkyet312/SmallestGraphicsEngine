@@ -159,7 +159,8 @@ public:
 
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
-    static constexpr int kMaxWeapon = 13;
+    static constexpr int kMaxWeapon = 14;
+    static constexpr int kTargetDesignatorWeapon = 14;
 
     // The AK-74 is the standard-issue rifle. The AK-47 in slot 0 is retired
     // from selection (see kHiddenWeapon) but stays loaded, because its mesh is
@@ -211,7 +212,7 @@ public:
     static int& SelectedWeapon() {
         // 0 AK (hidden), 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame,
         // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74, 11 M9, 12 Kriss Vector,
-        // 13 M1 Garand
+        // 13 M1 Garand, 14 missile target designator
         static int weapon = kDefaultWeapon;
         return weapon;
     }
@@ -220,7 +221,8 @@ public:
             "AK47", "Remington 870", "RPG-7", "R700 Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
             "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74",
-            "M9", "Kriss Vector", "M1 Garand"
+            "M9", "Kriss Vector", "M1 Garand",
+            "Missile Target Designator"
         };
         return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
@@ -244,10 +246,17 @@ public:
     static bool M9Selected() { return SelectedWeapon() == 11 && M9Loaded(); }
     static bool KrissSelected() { return SelectedWeapon() == 12 && KrissLoaded(); }
     static bool GarandSelected() { return SelectedWeapon() == 13 && GarandLoaded(); }
+    static bool TargetDesignatorSelected() {
+        return SelectedWeapon() == kTargetDesignatorWeapon;
+    }
     static const char* SelectedWeaponName() {
         return WeaponName(SelectedWeapon());
     }
     static std::shared_ptr<SceneMesh>& PlayerMesh() {
+        if (TargetDesignatorSelected()) {
+            static std::shared_ptr<SceneMesh> noImportedMesh;
+            return noImportedMesh;
+        }
         if (HarpoonSelected())
             return HarpoonGunLoaded() ? HarpoonGunMesh() :
                 (ShotgunLoaded() ? ShotgunMesh() : Mesh());
@@ -301,6 +310,7 @@ public:
             { 0.020f, -0.205f, -0.440f }, // Kriss Vector handguard
             // Tuned in game against the m1garand render.
             {-0.002f, -0.068f, -0.515f }, // M1 Garand handguard
+            { 0.000f, -0.045f,  0.120f }, // target designator body
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -339,6 +349,7 @@ public:
             // toward the muzzle end Orient grows from (+X after the node's
             // baked transform), same as the AK and M4. No fixup needed.
             { 0.0f, 0.0f, 0.0f },   // M1 Garand: long gun, no rotation needed
+            { 0.0f, 0.0f, 0.0f },   // target designator
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -398,6 +409,7 @@ public:
             { 0.280f, 0.285f, 0.350f }, // M9
             { 1.00f, 1.00f, 1.00f },    // Kriss Vector: SMG sized to rifle scale
             { 1.80f, 1.80f, 1.80f },    // M1 Garand: tuned in game
+            { 1.00f, 1.00f, 1.00f },    // target designator
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -443,6 +455,7 @@ public:
             // No optic accepts the Garand (iron sights only, like the M9); this
             // is the shared starting pose, unused until that mask changes.
             { 0.012f, 0.154f, 0.376f }, // M1 Garand
+            { 0.012f, 0.154f, 0.376f }, // target designator (no optic)
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -471,6 +484,7 @@ public:
             { 0.0f,  0.0f, 0.0f }, // M9
             { 0.0f,  0.0f, 0.0f }, // Kriss Vector
             { 0.0f,  0.0f, 0.0f }, // M1 Garand
+            { 0.0f,  0.0f, 0.0f }, // target designator
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -490,7 +504,8 @@ public:
             1.00f, // AK-74: imports at the AK47 proportions
             1.00f, // M9
             1.00f, // Kriss Vector
-            1.00f  // M1 Garand
+            1.00f, // M1 Garand
+            1.00f  // target designator
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -522,6 +537,7 @@ public:
             { 0.000f, -1.000f, -0.600f }, // M9
             { 0.000f, -1.000f, -0.600f }, // Kriss Vector
             { 0.000f, -1.000f, -0.600f }, // M1 Garand
+            { 0.000f, -1.000f, -0.600f }, // target designator
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -569,6 +585,7 @@ public:
 
     static bool PlayerLoaded() {
         return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||
+            TargetDesignatorSelected() ||
             PlayerMesh() != nullptr;
     }
     // "Can the player select this?", not merely "is the asset in memory". Every
@@ -593,6 +610,7 @@ public:
         case 11: return M9Loaded();
         case 12: return KrissLoaded();
         case 13: return GarandLoaded();
+        case kTargetDesignatorWeapon: return true; // procedural viewmodel
         default: return false;
         }
     }

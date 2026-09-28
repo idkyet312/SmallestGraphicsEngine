@@ -4016,6 +4016,39 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     shader.NextDrawCall();
                 }
                 shader.Use(scene.wireframeMode);
+            } else if (GunModel::TargetDesignatorSelected()) {
+                struct DesignatorPart { XMFLOAT3 center, size, color; };
+                const DesignatorPart parts[] = {
+                    {{ 0.0f,  0.02f, 0.30f}, {0.17f, 0.11f, 0.25f},
+                     {0.075f, 0.085f, 0.075f}},
+                    {{ 0.0f, -0.16f, 0.22f}, {0.08f, 0.19f, 0.09f},
+                     {0.045f, 0.052f, 0.045f}},
+                    {{ 0.0f,  0.05f, 0.57f}, {0.10f, 0.10f, 0.13f},
+                     {0.025f, 0.030f, 0.032f}},
+                    {{ 0.0f,  0.13f, 0.27f}, {0.13f, 0.025f, 0.15f},
+                     {0.025f, 0.030f, 0.032f}},
+                };
+                for (const DesignatorPart& part : parts) {
+                    model = XMMatrixScaling(part.size.x, part.size.y,
+                                            part.size.z) *
+                            XMMatrixTranslation(part.center.x, part.center.y,
+                                                part.center.z) * xf;
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    shader.SetObjectMaterial(part.color, false, false,
+                                             0.35f, 0.82f,
+                                             nullptr, nullptr, nullptr);
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
+                model = XMMatrixScaling(0.065f, 0.065f, 0.018f) *
+                        XMMatrixTranslation(0.0f, 0.05f, 0.645f) * xf;
+                shader.UseAdditive();
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(0.9f, 0.12f, 0.04f),
+                                           0.9f);
+                DrawCube(geo);
+                shader.NextDrawCall();
+                shader.Use(scene.wireframeMode);
             } else if (GunModel::HarpoonSelected() &&
                        !GunModel::HarpoonGunLoaded()) {
                 struct HarpoonPart { XMFLOAT3 center, size, color; };

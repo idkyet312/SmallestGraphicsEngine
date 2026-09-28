@@ -2859,7 +2859,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (projectile.grenade || projectile.rocket) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
-                        if (projectile.grenade && !projectile.missile &&
+                        if (projectile.grenade &&
+                            (!projectile.missile || projectile.playerOwned ||
+                             projectile.netGrenadeId != 0) &&
                             !projectile.remoteCharge && MultiplayerActive()) {
                             if (g_netSession.CurrentRole() == net::Role::Client &&
                                 !projectile.netAuthoritative) {

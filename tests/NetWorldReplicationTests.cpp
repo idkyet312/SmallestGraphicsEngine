@@ -292,7 +292,7 @@ int main() {
 
     // Host-authored hostile and non-hostile kinds retain their wire meaning.
     for (GrenadeKind kind : { GrenadeKind::Frag, GrenadeKind::Molotov,
-                              GrenadeKind::Vortex }) {
+                              GrenadeKind::Vortex, GrenadeKind::Missile }) {
         const size_t before = wire.size();
         const uint32_t id = host.PublishGrenadeSpawn(
             0, 0, kind, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 1.0f, true);
@@ -307,10 +307,11 @@ int main() {
     }
     client.Update(0.0f, local);
     client.DrainGrenadeSpawns(spawns);
-    Check(spawns.size() == 3 && spawns[0].hostile &&
+    Check(spawns.size() == 4 && spawns[0].hostile &&
           spawns[0].kind == GrenadeKind::Frag &&
           spawns[1].kind == GrenadeKind::Molotov &&
-          spawns[2].kind == GrenadeKind::Vortex,
+          spawns[2].kind == GrenadeKind::Vortex &&
+          spawns[3].kind == GrenadeKind::Missile,
           "client must receive all hostile grenade kinds");
 
     // Escape boat state is host-authoritative and travels beside the vehicle

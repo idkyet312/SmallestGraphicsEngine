@@ -1740,7 +1740,7 @@ private:
     }
     static bool ValidGrenade(GrenadeKind kind) {
         return kind == GrenadeKind::Frag || kind == GrenadeKind::Molotov ||
-               kind == GrenadeKind::Vortex;
+               kind == GrenadeKind::Vortex || kind == GrenadeKind::Missile;
     }
     // These numbers drive a height field and a collision rebuild, so a NaN or a
     // wild radius does not fail loudly -- it corrupts the ground. The ceilings

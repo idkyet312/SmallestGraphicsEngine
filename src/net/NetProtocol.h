@@ -95,7 +95,8 @@ namespace net {
 //     says which bodies are marines (a padding byte after `killer`, so the
 //     struct keeps its 36 bytes) -- a client built every replica as a bandit.
 // 27: C4 carries a turret attachment and a host charge id for late-join replay.
-inline constexpr uint32_t kProtocolVersion = 27;
+// 28: grenade kind 3 carries player-designated bombardment missiles.
+inline constexpr uint32_t kProtocolVersion = 28;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -774,6 +775,7 @@ enum class GrenadeKind : uint8_t {
     Frag = 0,
     Molotov,
     Vortex,
+    Missile,
 };
 
 // Client throw request. `clientToken` is unique for the throwing player's

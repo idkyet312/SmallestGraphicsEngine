@@ -28,6 +28,8 @@ static void PlayReloadSound() {
 // Fires the selected weapon if it has a round chambered. Returns false when the
 // shot was blocked (empty magazine or mid-reload) so callers can skip arming the
 // fire cooldown. Ammo is only enforced outside god mode -- see Scene::ConsumeAmmo.
+static bool FindDesignatorTarget(XMFLOAT3& target);
+static void CallDesignatedMissileStrike(const XMFLOAT3& target);
 static bool ShootPlayerWeapon() {
     // A downed player cannot shoot. Gated here rather than at each of the three
     // call sites (auto-fire, click, and the vehicle path) so a fourth one
@@ -36,6 +38,10 @@ static bool ShootPlayerWeapon() {
     const int slot = GunModel::SelectedWeapon();
     const SGE::ResolvedWeaponStats weaponStats =
         scene.player.ResolveWeaponStats(slot);
+    XMFLOAT3 designatedTarget{};
+    if (GunModel::TargetDesignatorSelected() &&
+        !FindDesignatorTarget(designatedTarget))
+        return false;
     if (!scene.ConsumeAmmo(slot)) {
         // Dry fire: auto-reload if there are spare rounds, so the player is not
         // stuck clicking an empty gun without knowing why. BeginReload returns
@@ -45,7 +51,9 @@ static bool ShootPlayerWeapon() {
         return false;
     }
     const size_t projectileStart = scene.projectiles.size();
-    if (GunModel::HarpoonSelected()) {
+    if (GunModel::TargetDesignatorSelected()) {
+        CallDesignatedMissileStrike(designatedTarget);
+    } else if (GunModel::HarpoonSelected()) {
         scene.ShootHarpoonProjectile();
         const float pitch = 0.62f + ((float)std::rand() / RAND_MAX) * 0.05f;
         g_gunAudio.Play(1.0f, pitch);
@@ -118,7 +126,8 @@ static bool ShootPlayerWeapon() {
     // still turn -- picking targets on the edge of a group remains the skill.
     const float noiseRadius = SkinnedEnemy::GunshotHearingRadius() *
         weaponStats.noiseRadiusMultiplier;
-    g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius, true });
+    if (noiseRadius > 0.0f)
+        g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius, true });
     return true;
 }
 
@@ -213,6 +222,52 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start,
                                      XMFLOAT3* hitNormal = nullptr,
                                      bool fencePanelsTransparent = false,
                                      bool ignoreAATurretColliders = false);
+
+static bool FindDesignatorTarget(XMFLOAT3& target) {
+    const XMFLOAT3 origin = scene.camera.Position;
+    const XMFLOAT3 aim = scene.camera.GetAimFront();
+    constexpr float kMaxDesignatorRange = 350.0f;
+    const XMFLOAT3 end{
+        origin.x + aim.x * kMaxDesignatorRange,
+        origin.y + aim.y * kMaxDesignatorRange,
+        origin.z + aim.z * kMaxDesignatorRange };
+    float bestDistanceSq = FLT_MAX;
+    const auto accept = [&](const XMFLOAT3& hit) {
+        const float dx = hit.x - origin.x;
+        const float dy = hit.y - origin.y;
+        const float dz = hit.z - origin.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq > 0.25f && distanceSq < bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            target = hit;
+        }
+    };
+    XMFLOAT3 hit{};
+    if (scene.useMeshTerrain && g_terrain.supported) {
+        // Keep each sweep short enough to catch hills along a long, shallow
+        // sight line; HitTerrainSegment caps its samples at 32 per call.
+        constexpr int kTerrainSlices = 14;
+        XMFLOAT3 start = origin;
+        for (int slice = 1; slice <= kTerrainSlices; ++slice) {
+            const float t = static_cast<float>(slice) / kTerrainSlices;
+            const XMFLOAT3 stop{
+                origin.x + (end.x - origin.x) * t,
+                origin.y + (end.y - origin.y) * t,
+                origin.z + (end.z - origin.z) * t };
+            if (HitTerrainSegment(start, stop, 0.0f, hit)) {
+                accept(hit);
+                break;
+            }
+            start = stop;
+        }
+    }
+    if (HitPrefabColliderSegment(origin, end, 0.0f, hit, nullptr,
+                                 nullptr, true)) accept(hit);
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegmentForVision(origin, end, 0.0f, hit))
+        accept(hit);
+    return bestDistanceSq < FLT_MAX;
+}
 
 static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
                                  const XMFLOAT3& target) {
@@ -488,6 +543,32 @@ static void LaunchMissileStrike(const XMFLOAT3& origin,
         ? XMFLOAT3{ dx / horizontal, 0.0f, dz / horizontal }
         : XMFLOAT3{ 0.0f, -1.0f, 0.0f };
     scene.projectiles.push_back(missile);
+}
+
+// Use the deploy bombardment's off-island approach, altitude and flight time.
+// The four impact points surround the designator mark and land in sequence;
+// each round is still the same impact-fused missile and uses the same blast.
+static void CallDesignatedMissileStrike(const XMFLOAT3& center) {
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    constexpr int kRounds = 4;
+    constexpr float kSpread = 12.0f;
+    const float bearing = ((float)std::rand() / (float)RAND_MAX) * XM_2PI;
+    for (int round = 0; round < kRounds; ++round) {
+        const float angle = bearing + round * (XM_2PI / kRounds);
+        const float x = center.x + std::cos(angle) * kSpread;
+        const float z = center.z + std::sin(angle) * kSpread;
+        const XMFLOAT3 impact{
+            x, TerrainRendererDX12::HeightAt(params, x, z), z };
+        const XMFLOAT3 origin{
+            impact.x + std::cos(bearing) * kBombardmentStandoff,
+            impact.y + kBombardmentAltitude,
+            impact.z + std::sin(bearing) * kBombardmentStandoff };
+        LaunchMissileStrike(origin, impact,
+                            kBombardmentFlightSeconds + 0.35f * round);
+    }
+    g_rpgFireAudio.PlayAt(center.x, center.y, center.z,
+                          0.9f, 0.62f, 220.0f);
 }
 
 // Red targeting beam a charging sniper paints on the player. Drawn as a thin

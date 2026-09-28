@@ -124,7 +124,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 14;
+    static constexpr int kWeaponCount = 15;
     static constexpr size_t kAttachmentCount = 3;
     // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
     // twice the climb per shot. Scales the camera recoil -- the part that
@@ -222,6 +222,10 @@ public:
               650.0f, 1.65f, 0.35f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 3.0f, false,
               "Content/Models/MainPlayer/Guns/M1Grand/m1grand.glb", "", true },
+            { "target_designator", "Missile Target Designator", 14, 1, 2, 4,
+              4.20f, 8.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
+              0.0f, 1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
+              "procedural/weapons/target_designator", "", true },
         }};
 
         const uint32_t ak = 1u << 0;

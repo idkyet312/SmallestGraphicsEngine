@@ -1847,7 +1847,8 @@ static void ApplyNetworkBarrelsAndBlasts() {
 }
 
 static net::GrenadeKind NetworkGrenadeKind(const Projectile& p) {
-    return p.molotov ? net::GrenadeKind::Molotov
+    return p.missile ? net::GrenadeKind::Missile
+         : p.molotov ? net::GrenadeKind::Molotov
          : p.vortex ? net::GrenadeKind::Vortex : net::GrenadeKind::Frag;
 }
 
@@ -1890,6 +1891,8 @@ static void UpdateNetworkGrenades() {
         p.position = p.previousPosition = { spawn.x, spawn.y, spawn.z };
         p.velocity = { spawn.velocityX, spawn.velocityY, spawn.velocityZ };
         p.grenade = true;
+        p.missile = spawn.kind == net::GrenadeKind::Missile;
+        p.impactFuse = p.missile;
         p.molotov = spawn.kind == net::GrenadeKind::Molotov;
         p.vortex = spawn.kind == net::GrenadeKind::Vortex;
         p.hostile = spawn.hostile;
@@ -1935,6 +1938,7 @@ static void UpdateNetworkGrenades() {
         if (!p) {
             Projectile blast{};
             blast.grenade = true;
+            blast.missile = event.kind == net::GrenadeKind::Missile;
             blast.molotov = event.kind == net::GrenadeKind::Molotov;
             blast.vortex = event.kind == net::GrenadeKind::Vortex;
             blast.hostile = event.hostile;
@@ -1960,7 +1964,7 @@ static void UpdateNetworkGrenades() {
     for (Projectile& p : scene.projectiles) {
         if (!p.grenade || p.held || (!p.active && !p.detonate) ||
             p.netGrenadeId != 0 || p.netClientToken != 0 ||
-            p.missile || p.remoteCharge) continue;
+            (p.missile && !p.playerOwned) || p.remoteCharge) continue;
         if (g_netSession.CurrentRole() == net::Role::Host) {
             const uint32_t id = g_netSession.PublishGrenadeSpawn(
                 0, g_netSession.LocalId(), NetworkGrenadeKind(p),

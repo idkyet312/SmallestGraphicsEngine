@@ -575,11 +575,18 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.Magazine(0) == 5);
     CHECK(player.Reserve(0) == 0);
-    // 13: the suppressed SVD took slot 8, the M4A1 slot 9, the AK-74 slot 10,
-    // the M9 slot 11, and the Kriss Vector slot 12. Tracks
-    // WeaponCustomizationSystem::kWeaponCount, which is what PlayerState sizes
-    // its ammo arrays from.
-    CHECK(PlayerState::kWeaponSlots == 13);
+    CHECK(PlayerState::kWeaponSlots == 15);
+    CHECK(MissionLoadout::kWeaponCount == PlayerState::kWeaponSlots);
+    const auto* designator = player.weapons.FindWeapon(14);
+    CHECK(designator != nullptr);
+    if (designator) {
+        CHECK(designator->id == "target_designator");
+        CHECK(designator->magazineCapacity == 1);
+        CHECK(designator->semiAutomatic);
+    }
+    CHECK(player.SetAmmo(14, 1, 0));
+    CHECK(player.ConsumeAmmo(14));
+    CHECK(!player.ConsumeAmmo(14));
     CHECK(player.SetAmmo(4, 1, 0));
     CHECK(player.ConsumeAmmo(4));
     CHECK(player.Magazine(4) == 0);
