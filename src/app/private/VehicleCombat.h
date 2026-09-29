@@ -3,7 +3,13 @@
 // Private application implementation; included once by main.cpp in dependency order.
 
 static void UpdateHumveeChaseCamera(float dt) {
-    if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) return;
+    static size_t trackedHumvee = kNoHumvee;
+    static XMFLOAT3 smoothedTarget{};
+    static XMFLOAT3 cameraOffset{};
+    if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) {
+        trackedHumvee = kNoHumvee;
+        return;
+    }
     XMFLOAT4X4 pose;
     XMFLOAT3 position, forward;
     if (!g_destruction.GetVehicleTransform(
@@ -11,17 +17,37 @@ static void UpdateHumveeChaseCamera(float dt) {
 
     const XMVECTOR target = XMLoadFloat3(&position) +
         XMVectorSet(0.0f, 1.65f, 0.0f, 0.0f);
-    // Camera Front comes from mouse look. Orbit around vehicle using that view
-    // direction instead of forcing camera behind chassis heading every frame.
-    const XMVECTOR orbitView = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
-    const XMVECTOR desired = target - orbitView * 6.5f;
+    if (trackedHumvee != g_activeHumveeIndex) {
+        trackedHumvee = g_activeHumveeIndex;
+        XMStoreFloat3(&smoothedTarget, target);
+        XMStoreFloat3(&cameraOffset,
+            XMLoadFloat3(&scene.camera.Position) - target);
+    }
+    // The chassis only advances on fixed physics steps. Smooth the point both
+    // camera position and aim follow, so a step cannot jerk the view direction.
+    const float targetFollow = 1.0f - std::exp(-20.0f * (std::max)(0.0f, dt));
+    XMStoreFloat3(&smoothedTarget, XMVectorLerp(
+        XMLoadFloat3(&smoothedTarget), target, targetFollow));
+
+    // Mouse look owns Yaw/Pitch. Front is the result of the previous camera
+    // placement, so feeding it back into the orbit makes the camera wobble.
+    const float yaw = XMConvertToRadians(scene.camera.Yaw);
+    const float pitch = XMConvertToRadians(scene.camera.Pitch);
+    const XMVECTOR orbitView = XMVectorSet(
+        std::cos(yaw) * std::cos(pitch), std::sin(pitch),
+        std::sin(yaw) * std::cos(pitch), 0.0f);
+    const XMVECTOR desiredOffset = -orbitView * 6.5f;
     const float follow = 1.0f - std::exp(-8.0f * (std::max)(0.0f, dt));
-    const XMVECTOR cameraPosition = XMVectorLerp(
-        XMLoadFloat3(&scene.camera.Position), desired, follow);
+    XMStoreFloat3(&cameraOffset, XMVectorLerp(
+        XMLoadFloat3(&cameraOffset), desiredOffset, follow));
+    const XMVECTOR cameraPosition =
+        XMLoadFloat3(&smoothedTarget) + XMLoadFloat3(&cameraOffset);
     XMStoreFloat3(&scene.camera.Position, cameraPosition);
 
+    const XMVECTOR look = XMLoadFloat3(&smoothedTarget) - cameraPosition;
     XMStoreFloat3(&scene.camera.Front,
-        XMVector3Normalize(target - cameraPosition));
+        XMVectorGetX(XMVector3LengthSq(look)) > 1e-4f
+            ? XMVector3Normalize(look) : orbitView);
     scene.camera.Up = { 0.0f, 1.0f, 0.0f };
 }
 

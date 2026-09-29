@@ -1268,7 +1268,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
         }
     }
 
-    if (scene.player.health <= 0.0f) {
+    if (scene.player.health <= 0.0f && !scene.player.downed) {
         // Banded across the full width rather than floating unbacked: at 1x font
         // scale the bare string was small and easy to miss against a busy scene.
         const char* dead = "YOU DIED";

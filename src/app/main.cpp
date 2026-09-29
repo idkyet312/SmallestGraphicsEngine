@@ -6829,7 +6829,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         } else {
             if (!DeploymentPlanningVisible()) {
-                RenderPlayerHUD(scene);
+                // The death panel owns its message; the HUD also draws one.
+                if (scene.player.health > 0.0f || scene.player.downed ||
+                    scene.player.godMode)
+                    RenderPlayerHUD(scene);
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawMarineFriendlyMarkers(
