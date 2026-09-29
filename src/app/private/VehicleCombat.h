@@ -4,7 +4,6 @@
 
 static void UpdateHumveeChaseCamera(float dt) {
     static size_t trackedHumvee = kNoHumvee;
-    static XMFLOAT3 smoothedTarget{};
     static XMFLOAT3 cameraOffset{};
     if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) {
         trackedHumvee = kNoHumvee;
@@ -12,23 +11,17 @@ static void UpdateHumveeChaseCamera(float dt) {
     }
     XMFLOAT4X4 pose;
     XMFLOAT3 position, forward;
-    if (!g_destruction.GetVehicleTransform(
+    if (!HumveeVisualPose(
             g_activeHumveeIndex, pose, &position, &forward)) return;
 
     const XMVECTOR target = XMLoadFloat3(&position) +
         XMVectorSet(0.0f, 1.65f, 0.0f, 0.0f);
     if (trackedHumvee != g_activeHumveeIndex) {
         trackedHumvee = g_activeHumveeIndex;
-        XMStoreFloat3(&smoothedTarget, target);
         XMStoreFloat3(&cameraOffset,
             XMLoadFloat3(&scene.camera.Position) - target);
     }
-    // The chassis only advances on fixed physics steps. Smooth the point both
-    // camera position and aim follow, so a step cannot jerk the view direction.
-    const float targetFollow = 1.0f - std::exp(-20.0f * (std::max)(0.0f, dt));
-    XMStoreFloat3(&smoothedTarget, XMVectorLerp(
-        XMLoadFloat3(&smoothedTarget), target, targetFollow));
-
+    // The camera and rendered Humvee share one interpolated chassis pose.
     // Mouse look owns Yaw/Pitch. Front is the result of the previous camera
     // placement, so feeding it back into the orbit makes the camera wobble.
     const float yaw = XMConvertToRadians(scene.camera.Yaw);
@@ -40,11 +33,10 @@ static void UpdateHumveeChaseCamera(float dt) {
     const float follow = 1.0f - std::exp(-8.0f * (std::max)(0.0f, dt));
     XMStoreFloat3(&cameraOffset, XMVectorLerp(
         XMLoadFloat3(&cameraOffset), desiredOffset, follow));
-    const XMVECTOR cameraPosition =
-        XMLoadFloat3(&smoothedTarget) + XMLoadFloat3(&cameraOffset);
+    const XMVECTOR cameraPosition = target + XMLoadFloat3(&cameraOffset);
     XMStoreFloat3(&scene.camera.Position, cameraPosition);
 
-    const XMVECTOR look = XMLoadFloat3(&smoothedTarget) - cameraPosition;
+    const XMVECTOR look = target - cameraPosition;
     XMStoreFloat3(&scene.camera.Front,
         XMVectorGetX(XMVector3LengthSq(look)) > 1e-4f
             ? XMVector3Normalize(look) : orbitView);

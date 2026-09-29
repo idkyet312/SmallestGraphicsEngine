@@ -370,11 +370,11 @@ public:
         return m_terrain ? GrassTerrainDensity(x, z) : 0.0f;
     }
 
-    bool TerrainSandDominant(float x, float z) const {
+    bool TerrainSandExposed(float x, float z) const {
         if (!m_terrain) return false;
         float grass = 0.0f, dirt = 0.0f, sand = 0.0f, rock = 0.0f;
         TerrainLayerWeights(x, z, grass, dirt, sand, rock);
-        return sand >= (std::max)({ grass, dirt, rock });
+        return sand >= kSandNoGrassWeight;
     }
 
     // Wind controls, surfaced to the UI.
@@ -714,6 +714,11 @@ private:
         TerrainLayerWeights(x, z, grass, dirt, sand, rock);
         const float nonGrass = (std::max)({ dirt, sand, rock });
         if (grass <= nonGrass) return 0.0f;
+        // Height blending can show sand before it wins the base layer weights.
+        // Fade the tufts through that transition so blades do not stand over it.
+        const float sandClearance = 1.0f -
+            SmoothStep(kSandFadeWeight, kSandNoGrassWeight, sand);
+        if (sandClearance <= 0.0f) return 0.0f;
         // Where grass is the material, plant it fully. The raw weight is a
         // blend fraction against the layers it beat, so ground the terrain
         // draws as solid grass still returned ~0.9 and threw away a tenth of
@@ -723,7 +728,8 @@ private:
         // making the interior actually dense. The 1.6x gain reaches full density
         // a little inside the boundary rather than only at a pure 1.0 weight,
         // which is what leaves a soft fringe instead of a hard mown line.
-        return std::clamp((grass - nonGrass) * 1.6f + grass * 0.35f, 0.0f, 1.0f);
+        return sandClearance *
+            std::clamp((grass - nonGrass) * 1.6f + grass * 0.35f, 0.0f, 1.0f);
     }
 
     // Can a tuft grow here? Rejects the sea, the wet sand at the waterline, and
@@ -1094,6 +1100,8 @@ private:
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.
     static constexpr float kCellSize      = 8.0f;
+    static constexpr float kSandFadeWeight = 0.10f;
+    static constexpr float kSandNoGrassWeight = 0.30f;
 
     std::function<float(float, float)> m_terrain;
     std::function<bool(float, float)> m_blocked;

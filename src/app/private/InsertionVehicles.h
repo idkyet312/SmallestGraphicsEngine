@@ -275,6 +275,11 @@ static void ConfigureBlackHawkBounds() {
     const float targetLength = kInsertionAirframeTrim *
         (g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 27.2f : 20.0f);
     g_blackHawkModelScale = targetLength / horizontalLength;
+    // The walkable-cabin oversize only matters with someone aboard; empty and
+    // flying off it shrinks back to the 20 m real-proportion airframe.
+    g_game.vehicles.blackHawkExteriorScale =
+        g_insertionAirframe == InsertionAirframe::NewBlackHawk
+            ? 20.0f / 27.2f : 1.0f;
 }
 
 // Depth-first search for a node by name.

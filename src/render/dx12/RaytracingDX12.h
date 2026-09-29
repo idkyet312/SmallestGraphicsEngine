@@ -661,7 +661,7 @@ inline void RenderRaytracing(Scene& scene) {
     XMMATRIX proj = scene.GetProjectionMatrix();
     XMMATRIX invViewProj = XMMatrixInverse(nullptr, view * proj);
     XMStoreFloat4x4(&g_rt.mappedConstants->invViewProj, XMMatrixTranspose(invViewProj));
-    g_rt.mappedConstants->cameraPos = scene.camera.Position;
+    g_rt.mappedConstants->cameraPos = scene.camera.VisualPosition();
     g_rt.mappedConstants->lightPos = scene.lightPos;
     g_rt.mappedConstants->lightColor = scene.EffectiveLightColor();
 

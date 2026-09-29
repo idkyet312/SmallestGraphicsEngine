@@ -2,6 +2,11 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+static void PlayGarandClipEjectSound() {
+    const float ejectPitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
+    g_garandClipEjectAudio.Play(0.9f, ejectPitch);
+}
+
 // Reload click. Pitched per weapon so the heavier guns sound heavier: the RPG
 // and shotgun drop below unity, the AK sits near it, the SVD just above.
 static void PlayReloadSound() {
@@ -15,14 +20,11 @@ static void PlayReloadSound() {
     else if (GunModel::R700Selected())     pitch = 1.06f;
     pitch += ((float)std::rand() / RAND_MAX) * 0.05f;
     g_reloadAudio.Play(0.85f, pitch);
-    // The Garand's en-bloc clip ejects with its own distinct "ping" on top of
-    // the normal reload sound, not instead of it -- both call sites that reach
-    // here (the R-key press and the dry-fire auto-reload) go through this one
-    // function, so gating on the selected weapon here covers both.
-    if (GunModel::GarandSelected()) {
-        const float ejectPitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
-        g_garandClipEjectAudio.Play(0.9f, ejectPitch);
-    }
+    // A partial Garand reload ejects its clip here; an empty clip already
+    // pinged when the final shot was fired.
+    if (GunModel::GarandSelected() &&
+        scene.player.Magazine(GunModel::SelectedWeapon()) > 0)
+        PlayGarandClipEjectSound();
 }
 
 // Fires the selected weapon if it has a round chambered. Returns false when the
@@ -54,7 +56,7 @@ static bool ShootPlayerWeapon() {
     if (GunModel::TargetDesignatorSelected()) {
         CallDesignatedMissileStrike(designatedTarget);
     } else if (GunModel::HarpoonSelected()) {
-        scene.ShootHarpoonProjectile();
+        scene.ShootHarpoonProjectile(slot);
         const float pitch = 0.62f + ((float)std::rand() / RAND_MAX) * 0.05f;
         g_gunAudio.Play(1.0f, pitch);
     } else if (GunModel::C4Selected()) {
@@ -76,22 +78,22 @@ static bool ShootPlayerWeapon() {
         // rather than rifle_shot.wav: the old 0.70 existed to drag a generic
         // rifle crack down into a boom, and applying it to a report already
         // mastered as one drops it an octave into a cannon.
-        scene.ShootSniperProjectile(weaponStats);
+        scene.ShootSniperProjectile(weaponStats, slot);
         const float pitch = (weaponStats.suppressed ? 1.20f : 0.98f) +
             ((float)std::rand() / RAND_MAX) * 0.04f;
         g_r700Audio.Play(weaponStats.suppressed ? 0.34f : 1.0f, pitch);
     } else if (GunModel::RPGSelected()) {
-        scene.ShootRocket();
+        scene.ShootRocket(slot);
         const float pitch = 0.68f + ((float)std::rand() / RAND_MAX) * 0.05f;
         g_rpgFireAudio.Play(1.0f, pitch);
     } else if (GunModel::ShotgunSelected()) {
-        scene.ShootShotgun();
+        scene.ShootShotgun(slot);
         // Near unity, same reasoning as the R700 above: 0.78 was pulling
         // rifle_shot.wav down into a shell blast, and the sample now is one.
         const float pitch = 0.97f + ((float)std::rand() / RAND_MAX) * 0.06f;
         g_shotgunAudio.Play(0.96f, pitch);
     } else {
-        scene.ShootProjectile(weaponStats, GunModel::GarandSelected());
+        scene.ShootProjectile(weaponStats, GunModel::GarandSelected(), slot);
         const float pitch = (weaponStats.suppressed ? 1.18f : 0.96f) +
             ((float)std::rand() / RAND_MAX) * 0.08f;
         // The M9, the AK-74, the Kriss and the Garand each fire their own
@@ -128,6 +130,12 @@ static bool ShootPlayerWeapon() {
         weaponStats.noiseRadiusMultiplier;
     if (noiseRadius > 0.0f)
         g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius, true });
+    if (GunModel::GarandSelected() && scene.AmmoEnforced() &&
+        scene.player.Magazine(slot) == 0) {
+        // Eject the clip on the last real shot, even when no spare clip remains.
+        PlayGarandClipEjectSound();
+        if (scene.BeginReload(slot)) PlayReloadSound();
+    }
     return true;
 }
 

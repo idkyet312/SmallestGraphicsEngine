@@ -339,6 +339,22 @@ if ($CookedOnly) {
     Write-Host ("  cooked-only: dropped {0} source meshes ({1:N2} GB)" -f `
         $dropped, ($droppedBytes / 1GB)) -ForegroundColor DarkGray
 }
+# Source packs whose license forbids handing out the raw files ship as cooks
+# only, whatever -CookedOnly says. The Corrugated Metal Pack's textures are
+# Textures.com photographs ("may not be redistributed"): the .sgeasset carries
+# them BC-encoded inside the mesh, which is use in a product, while the loose
+# JPEGs beside the FBX would be the photographs themselves. Every FBX in the
+# pack has a cooked twin, so nothing that loads through the cache loses its
+# textures. The one by-path load -- the MetalWall roughness map in
+# AssetMaterials.h -- finds no file and keeps the flat roughness factor.
+$cookedOnlyPacks = @('Corrugated metal pack')
+foreach ($relative in @($copyPlan.Keys)) {
+    $parts = $relative.Split('\')
+    if ($parts[0] -eq 'Models' -and $parts.Count -gt 2 -and
+        $cookedOnlyPacks -contains $parts[1]) {
+        $copyPlan.Remove($relative)
+    }
+}
 $requiredBytes = [long](($copyPlan.Values | Measure-Object Length -Sum).Sum)
 $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($stage))
 if ($drive.AvailableFreeSpace -lt ($requiredBytes + 512MB)) {
@@ -456,6 +472,7 @@ Controls
   Tab           show or hide the UI
   Esc           menu
 '@ | Set-Content (Join-Path $stage 'README.txt') -Encoding ascii
+Copy-Item (Join-Path $repo 'THIRD_PARTY_NOTICES.md') (Join-Path $stage 'THIRD_PARTY_NOTICES.md') -Force
 
 # -- Verify the package can resolve its own imports ----------------------------
 # Every DLL in the staged folder is re-walked, and each dependent must be either

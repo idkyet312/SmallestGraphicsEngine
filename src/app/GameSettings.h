@@ -14,11 +14,13 @@
 // build still loads on an older one.
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include "../gameplay/weapons/WeaponCustomization.h"
 
 struct GameSettings {
     // Multiplies raw mouse delta in Camera::ProcessMouseMovement. The camera's
@@ -87,6 +89,50 @@ struct GameSettings {
     // undo that mix for everyone who never opens this menu.
     float musicVolume = 0.55f;
 
+    // Display settings. These control window mode and camera presentation, and
+    // are resolved in ApplyGameSettings() which runs at boot and after any
+    // level load or editor entry.
+
+    // Vertical sync. On maps to scene.vsyncInterval = 1 (every vblank); the
+    // editor panel still offers 2..4. Off by default because Scene's own
+    // default is 0 -- the shipping frame pacing does not change for a player
+    // who never opens this menu.
+    bool vsync = false;
+
+    // Borderless fullscreen, the mode the game has always booted into. Read at
+    // window creation; afterwards the main loop moves the window to match it,
+    // and F11 writes it back, so the menu and the key agree.
+    bool fullscreen = true;
+
+    // Hip-fire field of view in vertical degrees. The camera and ADS blend
+    // from this. Clamped to a usable range so a corrupt hand-edited file
+    // cannot produce an unusable view.
+    float fieldOfView = 60.0f;
+    static constexpr float kMinFieldOfView = 50.0f;
+    static constexpr float kMaxFieldOfView = 100.0f;
+
+    // Inverts the Y axis in ProcessMouseMovement so the camera pans down when
+    // the mouse moves down (and vice versa). Intended for players who grew up
+    // on flight sims rather than FPS games.
+    bool invertMouseY = false;
+
+    // Walking/running camera bob multiplier. 0 is off, 1 is the stock bob.
+    float cameraBob = 1.0f;
+    static constexpr float kMinCameraBob = 0.0f;
+    static constexpr float kMaxCameraBob = 3.0f;
+    static constexpr float kDefaultCameraBob = 1.0f;
+
+    // Visual firing jolt for each weapon ID. Aim recoil and blast shake are
+    // independent, so zero removes the camera jolt without changing accuracy.
+    static constexpr float kDefaultWeaponCameraShake = 1.0f;
+    static constexpr float kMaxWeaponCameraShake = 30.0f;
+    std::array<float, SGE::WeaponCustomizationSystem::kWeaponCount>
+        weaponCameraShake = [] {
+            std::array<float, SGE::WeaponCustomizationSystem::kWeaponCount> values{};
+            values.fill(kDefaultWeaponCameraShake);
+            return values;
+        }();
+
     static constexpr float kDefaultMasterVolume = 1.0f;
     static constexpr float kDefaultBusVolume = 1.0f;
     static constexpr float kDefaultMusicVolume = 0.55f;
@@ -98,6 +144,11 @@ struct GameSettings {
     static constexpr float kDefaultSeeThroughStrength = 1.0f;
     static constexpr float kMinSeeThroughStrength = 0.0f;
     static constexpr float kMaxSeeThroughStrength = 1.0f;
+
+    static constexpr bool  kDefaultVsync = false;
+    static constexpr bool  kDefaultFullscreen = true;
+    static constexpr float kDefaultFieldOfView = 60.0f;
+    static constexpr bool  kDefaultInvertMouseY = false;
 
     void Clamp() {
         mouseSensitivity = (std::max)(kMinSensitivity,
@@ -118,6 +169,15 @@ struct GameSettings {
         volume(ambienceVolume);
         volume(uiVolume);
         volume(musicVolume);
+        // FOV must stay within view angles a player can handle, whatever a
+        // hand-edited file says.
+        cameraBob = (std::max)(kMinCameraBob,
+                    (std::min)(kMaxCameraBob, cameraBob));
+        fieldOfView = (std::max)(kMinFieldOfView,
+                      (std::min)(kMaxFieldOfView, fieldOfView));
+        for (float& shake : weaponCameraShake)
+            shake = shake > 0.0f ? (std::min)(kMaxWeaponCameraShake, shake)
+                                 : 0.0f;
     }
 
     void ResetToDefaults() {
@@ -133,6 +193,12 @@ struct GameSettings {
         ambienceVolume = kDefaultBusVolume;
         uiVolume = kDefaultBusVolume;
         musicVolume = kDefaultMusicVolume;
+        vsync = kDefaultVsync;
+        fullscreen = kDefaultFullscreen;
+        fieldOfView = kDefaultFieldOfView;
+        cameraBob = kDefaultCameraBob;
+        invertMouseY = kDefaultInvertMouseY;
+        weaponCameraShake.fill(kDefaultWeaponCameraShake);
     }
 };
 
@@ -220,6 +286,33 @@ inline bool LoadGameSettings(GameSettings& out) {
         else if (key == "MusicVolume") {
             out.musicVolume = std::strtof(value.c_str(), nullptr);
         }
+        else if (key == "VSync") {
+            out.vsync =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "Fullscreen") {
+            out.fullscreen =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "FieldOfView") {
+            out.fieldOfView = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "CameraBob") {
+            out.cameraBob = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "InvertMouseY") {
+            out.invertMouseY =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key.rfind("WeaponCameraShake", 0) == 0) {
+            const std::string suffix = key.substr(sizeof("WeaponCameraShake") - 1);
+            char* end = nullptr;
+            const long weapon = std::strtol(suffix.c_str(), &end, 10);
+            if (!suffix.empty() && *end == '\0' && weapon >= 0 &&
+                weapon < static_cast<long>(out.weaponCameraShake.size()))
+                out.weaponCameraShake[static_cast<size_t>(weapon)] =
+                    std::strtof(value.c_str(), nullptr);
+        }
     }
 
     // Whatever the file said, the result has to be usable.
@@ -234,6 +327,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "; Delete this file to restore defaults.\n"
          << "[Input]\n"
          << "MouseSensitivity=" << settings.mouseSensitivity << "\n"
+         << "InvertMouseY="
+         << (settings.invertMouseY ? 1 : 0) << "\n"
          << "[Gameplay]\n"
          << "SeeThroughWeaponWhenAiming="
          << (settings.seeThroughWeaponWhenAiming ? 1 : 0) << "\n"
@@ -241,6 +336,13 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << settings.seeThroughWeaponStrength << "\n"
          << "RealisticAiming="
          << (settings.realisticAiming ? 1 : 0) << "\n"
+         << "[Display]\n"
+         << "VSync="
+         << (settings.vsync ? 1 : 0) << "\n"
+         << "Fullscreen="
+         << (settings.fullscreen ? 1 : 0) << "\n"
+         << "FieldOfView=" << settings.fieldOfView << "\n"
+         << "CameraBob=" << settings.cameraBob << "\n"
          << "[HUD]\n"
          << "ShowCrosshair="
          << (settings.showCrosshair ? 1 : 0) << "\n"
@@ -254,5 +356,9 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "[Debug]\n"
          << "DebugLoadingScreen="
          << (settings.debugLoadingScreen ? 1 : 0) << "\n";
+    file << "[WeaponCameraShake]\n";
+    for (size_t weapon = 0; weapon < settings.weaponCameraShake.size(); ++weapon)
+        file << "WeaponCameraShake" << weapon << '='
+             << settings.weaponCameraShake[weapon] << '\n';
     return file.good();
 }

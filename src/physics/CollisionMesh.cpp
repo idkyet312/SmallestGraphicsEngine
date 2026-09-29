@@ -636,12 +636,70 @@ CollisionMeshPushout CollisionMeshResolveCapsule(
         const float originX = base.x + offset.x;
         const float originY = base.y + offset.y;
         const float originZ = base.z + offset.z;
-        const float boxMin[3] = { originX - radius, originY - radius,
+        // Reaches stepHeight below the feet as well, so a floor the player is
+        // walking down onto (a slope, the next stair) is reported and the
+        // caller can keep them on it instead of free-falling every frame.
+        const float boxMin[3] = { originX - radius,
+                                  originY - (std::max)(radius, stepHeight),
                                   originZ - radius };
         const float boxMax[3] = { originX + radius, originY + usableHeight + radius,
                                   originZ + radius };
         GatherOverlappingTriangles(mesh, boxMin, boxMax, candidates);
         if (candidates.empty()) break;
+
+        // Highest un-rounded walkable top in the footprint: risers below it
+        // are being stepped onto.
+        float stepTop = 0.0f;
+        bool hasStepTop = false;
+        // Floor first, from the footprint rather than the feet sphere. The
+        // sphere's closest point on a slope sits uphill of the feet, which put
+        // floorY R(1-cos) above the real ground; on a stair it latched onto a
+        // tread edge the feet were not over. Here each walkable triangle within
+        // `radius` of the feet in XZ contributes its plane height under the
+        // feet -- min'd with the height at its nearest point, so a coplanar
+        // uphill neighbour on a slope cannot report more than the ground here.
+        for (uint32_t index : candidates) {
+            const float* v = mesh.triangles.data() +
+                             static_cast<size_t>(index) * 9;
+            float normal[3];
+            if (!TriangleNormal(v, normal)) continue;
+            if (normal[1] < 0.0f) {
+                normal[0] = -normal[0]; normal[1] = -normal[1];
+                normal[2] = -normal[2];
+            }
+            if (normal[1] <= 0.7f) continue;
+            const float flat[9] = { v[0], 0.0f, v[2], v[3], 0.0f, v[5],
+                                    v[6], 0.0f, v[8] };
+            const float feetXZ[3] = { originX, 0.0f, originZ };
+            float nearest[3];
+            const float offsetSquared =
+                PointTriangleDistanceSquared(feetXZ, flat, nearest);
+            if (offsetSquared > radius * radius) continue;
+            const auto planeHeight = [&](float x, float z) {
+                return v[1] - (normal[0] * (x - v[0]) +
+                               normal[2] * (z - v[2])) / normal[1];
+            };
+            const float top = (std::min)(planeHeight(originX, originZ),
+                                         planeHeight(nearest[0], nearest[2]));
+            // Round-bottomed footprint: ground offset d from the feet supports
+            // them R - sqrt(R^2 - d^2) lower, like a capsule resting on an
+            // edge. A step or a ramp-to-landing crest then rises continuously
+            // as it slides under the feet instead of popping a full riser the
+            // frame it enters the footprint.
+            const float height = top - (radius -
+                std::sqrt((std::max)(radius * radius - offsetSquared, 0.0f)));
+            if (height > originY + stepHeight ||
+                height < originY - stepHeight) continue;
+            if (!hasStepTop || top > stepTop) {
+                stepTop = top;
+                hasStepTop = true;
+            }
+            if (!result.hasFloor || height > result.floorY) {
+                result.floorY = height;
+                result.hasFloor = true;
+                result.touched = true;
+            }
+        }
 
         float deepest = 0.0f;
         float pushNormal[3] = { 0.0f, 0.0f, 0.0f };
@@ -650,6 +708,12 @@ CollisionMeshPushout CollisionMeshResolveCapsule(
                              static_cast<size_t>(index) * 9;
             float normal[3];
             if (!TriangleNormal(v, normal)) continue;
+            // A riser or tread edge that tops out at or below the floor just
+            // found is being stepped onto, not walked into. Pushing off it
+            // shoved the player back and up at every stair.
+            if (hasStepTop &&
+                (std::max)({ v[1], v[4], v[7] }) <= stepTop + 0.02f)
+                continue;
 
             for (int sample = 0; sample < kSamples; ++sample) {
                 const float point[3] = { originX, originY + centerY[sample],
@@ -674,14 +738,10 @@ CollisionMeshPushout CollisionMeshResolveCapsule(
                     upward[0] = -upward[0]; upward[1] = -upward[1];
                     upward[2] = -upward[2];
                 }
+                // Walkable ground within step reach was handled by the
+                // footprint pass above; it never pushes.
                 const bool walkable = upward[1] > 0.7f;
-                if (walkable && closest[1] <= originY + stepHeight) {
-                    if (!result.hasFloor || closest[1] > result.floorY) {
-                        result.floorY = closest[1];
-                        result.hasFloor = true;
-                    }
-                    continue;
-                }
+                if (walkable && closest[1] <= originY + stepHeight) continue;
 
                 const float distance = std::sqrt((std::max)(distanceSquared, 0.0f));
                 const float penetration = radius - distance;
@@ -744,7 +804,8 @@ CollisionMeshPushout CollisionMeshInstanceResolveCapsule(
     const float* boundsMax = &instance.worldBoundsMax.x;
     if (base.x + radius < boundsMin[0] || base.x - radius > boundsMax[0] ||
         base.z + radius < boundsMin[2] || base.z - radius > boundsMax[2] ||
-        base.y + height < boundsMin[1] || base.y > boundsMax[1])
+        base.y + height < boundsMin[1] ||
+        base.y - (std::max)(radius, stepHeight) > boundsMax[1])
         return result;
 
     const XMMATRIX inverse = XMLoadFloat4x4(&instance.inverseWorld);

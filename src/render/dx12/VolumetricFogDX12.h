@@ -462,8 +462,8 @@ private:
         for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
             XMStoreFloat4x4(&constants.shadowCascadeMatrices[i],
                 XMMatrixTranspose(g_shadowCascadeMatrices[i]));
-        constants.cameraPositionNear = { scene.camera.Position.x, scene.camera.Position.y,
-            scene.camera.Position.z, scene.cameraNear };
+        constants.cameraPositionNear = { scene.camera.VisualPosition().x, scene.camera.VisualPosition().y,
+            scene.camera.VisualPosition().z, scene.cameraNear };
         constants.cameraForwardFar = { scene.camera.Front.x, scene.camera.Front.y,
             scene.camera.Front.z, scene.EffectiveCameraFarPlane() };
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));

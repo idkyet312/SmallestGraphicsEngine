@@ -317,9 +317,12 @@ public:
     // `sparesProtected` marks the damage as indirect (spreading fire, debris
     // impact), which leaves ProtectedChunkMarker geometry untouched. A direct
     // player hit leaves it false so the player can still cut those chunks.
+    // `useSegmentHit` targets the fence panel cached by HitTestSegment when a
+    // projectile strikes a seam shared with another panel.
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
                            float radius, float damage = 2.0f,
-                           bool sparesProtected = false);
+                           bool sparesProtected = false,
+                           bool useSegmentHit = false);
     // Laser-only hard cut: immediately severs the exact impacted chunk. Support
     // cells and already-detached single chunks do not resist this path.
     //

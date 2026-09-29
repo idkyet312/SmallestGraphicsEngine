@@ -14,6 +14,23 @@ static void RenderMainMenu(HWND hwnd) {
         RenderLoadingScreen();
         return;
     }
+    // Test hook: SGE_AUTO_SETTINGS=<tab> boots straight into that settings
+    // page, so the layout can be captured without driving the mouse.
+    static bool autoSettingsChecked = false;
+    if (!autoSettingsChecked) {
+        autoSettingsChecked = true;
+        char tab[8] = {};
+        if (GetEnvironmentVariableA("SGE_AUTO_SETTINGS", tab, sizeof(tab)) > 0) {
+            SettingsUI::s_tab = (std::max)(0, (std::min)(
+                std::atoi(tab), SettingsUI::kTabCount - 1));
+            g_showSettingsMenu = true;
+        }
+    }
+    // Settings are their own full-screen page, drawn instead of the menu.
+    if (g_showSettingsMenu) {
+        RenderSettingsMenu(g_showSettingsMenu);
+        return;
+    }
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImDrawList* background = ImGui::GetBackgroundDrawList();
@@ -260,14 +277,6 @@ static void RenderMainMenu(HWND hwnd) {
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
 
-    // Settings replace the menu body below the title, keeping the wordmark and
-    // accent rule in place so it reads as the same screen rather than a
-    // separate one the player has navigated to.
-    if (g_showSettingsMenu) {
-        RenderSettingsMenu();
-        ImGui::End();
-        return;
-    }
     if (g_showMultiplayerMenu) {
         RenderMultiplayerMenu();
         ImGui::End();
@@ -1906,6 +1915,8 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         slotTab("Slot 2", 1);
     }
     ImGui::TextDisabled("Buying a weapon racks it in the highlighted slot.");
+    DrawWeaponCameraShakeSlider(
+        loadout.weapons[static_cast<size_t>(armorySlot)]);
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
     for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
@@ -3249,6 +3260,13 @@ static void RenderWinScreen(HWND hwnd) {
 // needs to still recognise, so this is a scrim over the game rather than a
 // replacement for it.
 static void RenderPauseMenu(HWND hwnd) {
+    // Settings take the whole screen, the same page the main menu opens. The
+    // pause screen's own flag, so BACK returns to these rows and the main
+    // menu is left exactly as the player left it.
+    if (g_showPauseSettings) {
+        RenderSettingsMenu(g_showPauseSettings);
+        return;
+    }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
     // Dark enough to carry white text over a bright desert or a muzzle flash,
@@ -3333,16 +3351,6 @@ static void RenderPauseMenu(HWND hwnd) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
         ImGui::TextColored(UITheme::kWarning, "MULTIPLAYER  -  GAME STILL LIVE");
         ImGui::Dummy(ImVec2(0.0f, 12.0f));
-    }
-
-    // Settings replace the rows below the wordmark rather than opening over
-    // them, which is exactly how the main menu shows the same panel.
-    if (g_showPauseSettings) {
-        // Closes the pause screen's own flag, so BACK returns to these rows
-        // and the main menu is left exactly as the player left it.
-        RenderSettingsMenu(g_showPauseSettings);
-        ImGui::End();
-        return;
     }
 
     ImGui::SetWindowFontScale(1.7f);

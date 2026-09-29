@@ -1351,7 +1351,7 @@ static void UpdateBoat(float dt) {
 
 static XMFLOAT3 HumveeTurretMountWorld(size_t vehicleIndex) {
     XMFLOAT4X4 physicsPose;
-    if (!g_destruction.GetVehicleTransform(vehicleIndex, physicsPose)) {
+    if (!HumveeVisualPose(vehicleIndex, physicsPose)) {
         if (vehicleIndex >= g_levelHumveeSpawns.size()) return {};
         const Transform& humvee = g_levelHumveeSpawns[vehicleIndex];
         XMStoreFloat4x4(&physicsPose,

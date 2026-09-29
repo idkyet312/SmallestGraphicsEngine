@@ -439,6 +439,11 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
     // roof uses, which does carry all three. Left as-is deliberately rather than
     // pretending the factor does something: see matDarkMetal for the untextured
     // case, where the factors really are live.
+    //
+    // The roughness map is a Textures.com photograph, and package-release.ps1
+    // leaves that pack's loose images out of the build, so a packaged game gets
+    // no file here and the wall keeps the flat 0.66 -- roughnessOnlyTexture
+    // stays false and the factor does apply in that case.
     assignGeneratedMetal("MetalWall",
                "Content/Models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
                HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);

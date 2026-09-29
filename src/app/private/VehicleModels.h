@@ -4,6 +4,67 @@
 
 size_t LevelHumveeCount() { return g_levelHumveeSpawns.size(); }
 
+struct HumveeVisualPoseSample {
+    XMFLOAT3 position{};
+    XMFLOAT4 rotation{ 0.0f, 0.0f, 0.0f, 1.0f };
+    bool valid = false;
+};
+static std::vector<HumveeVisualPoseSample> g_humveePreviousPhysicsPoses;
+
+// Retain the pose immediately before each fixed step. The render pose stays
+// one physics step behind, then advances smoothly as the accumulator fills.
+void CaptureHumveePhysicsPoses() {
+    g_humveePreviousPhysicsPoses.resize(g_humveeGameplay.size());
+    for (size_t index = 0; index < g_humveeGameplay.size(); ++index) {
+        HumveeVisualPoseSample& sample = g_humveePreviousPhysicsPoses[index];
+        XMFLOAT4X4 pose;
+        if (!g_destruction.GetVehicleTransform(index, pose, &sample.position)) {
+            sample.valid = false;
+            continue;
+        }
+        XMStoreFloat4(&sample.rotation, XMQuaternionNormalize(
+            XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose))));
+        sample.valid = true;
+    }
+}
+
+bool HumveeVisualPose(size_t index, XMFLOAT4X4& pose,
+                      XMFLOAT3* position = nullptr,
+                      XMFLOAT3* forward = nullptr) {
+    XMFLOAT3 currentPosition;
+    if (!g_destruction.GetVehicleTransform(index, pose, &currentPosition))
+        return false;
+    if (index < g_humveePreviousPhysicsPoses.size()) {
+        const HumveeVisualPoseSample& previous =
+            g_humveePreviousPhysicsPoses[index];
+        const float dx = currentPosition.x - previous.position.x;
+        const float dy = currentPosition.y - previous.position.y;
+        const float dz = currentPosition.z - previous.position.z;
+        // A teleport or a level rebuild is a new pose, not a drive path.
+        if (previous.valid && dx * dx + dy * dy + dz * dz < 9.0f) {
+            const float alpha = (std::clamp)(g_game.physicsClock.Alpha(),
+                                             0.0f, 1.0f);
+            const XMVECTOR blendedPosition = XMVectorLerp(
+                XMLoadFloat3(&previous.position),
+                XMLoadFloat3(&currentPosition), alpha);
+            const XMVECTOR currentRotation = XMQuaternionNormalize(
+                XMQuaternionRotationMatrix(XMLoadFloat4x4(&pose)));
+            const XMVECTOR blendedRotation = XMQuaternionSlerp(
+                XMLoadFloat4(&previous.rotation), currentRotation, alpha);
+            XMStoreFloat3(&currentPosition, blendedPosition);
+            XMStoreFloat4x4(&pose,
+                XMMatrixRotationQuaternion(blendedRotation) *
+                XMMatrixTranslation(currentPosition.x, currentPosition.y,
+                                    currentPosition.z));
+        }
+    }
+    if (position) *position = currentPosition;
+    if (forward) XMStoreFloat3(forward, XMVector3Normalize(
+        XMVector3TransformNormal(XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f),
+                                 XMLoadFloat4x4(&pose))));
+    return true;
+}
+
 XMMATRIX HumveeWorldMatrix(size_t index) {
     const XMMATRIX model =
         XMMatrixTranslation(-g_humveeModelCenter.x, -g_humveeModelMinY,
@@ -15,7 +76,7 @@ XMMATRIX HumveeWorldMatrix(size_t index) {
     const bool authoring =
         g_game.session.Screen() == GameScreen::LevelEditor &&
         !g_levelEditor.IsPlaying();
-    if (!authoring && g_destruction.GetVehicleTransform(index, physicsPose)) {
+    if (!authoring && HumveeVisualPose(index, physicsPose)) {
         // Model floor sits 0.95 m below chassis center.
         return model * XMMatrixTranslation(0.0f, -0.95f, 0.0f) *
                XMLoadFloat4x4(&physicsPose);
@@ -48,7 +109,7 @@ void HumveeHeadlightPose(size_t index, XMFLOAT3& position,
     XMFLOAT3 chassisPosition{};
     XMFLOAT3 chassisForward{};
     XMMATRIX pose;
-    if (g_destruction.GetVehicleTransform(
+    if (HumveeVisualPose(
             index, poseStorage, &chassisPosition, &chassisForward)) {
         pose = XMLoadFloat4x4(&poseStorage);
     } else {
@@ -196,10 +257,10 @@ static void ConfigureHelicopterBounds() {
 }
 
 XMMATRIX BlackHawkWorldMatrix() {
+    const float scale = g_game.vehicles.BlackHawkDrawScale();
     return XMMatrixTranslation(-g_blackHawkModelCenter.x, -g_blackHawkModelMinY,
                                -g_blackHawkModelCenter.z) *
-           XMMatrixScaling(g_blackHawkModelScale, g_blackHawkModelScale,
-                           g_blackHawkModelScale) *
+           XMMatrixScaling(scale, scale, scale) *
            XMMatrixRotationRollPitchYaw(g_game.vehicles.blackHawkPitch,
                                         g_blackHawkYaw,
                                         g_game.vehicles.blackHawkRoll) *

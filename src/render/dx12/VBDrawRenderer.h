@@ -1158,7 +1158,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             // pre-existing, accepted sub-pixel tradeoff; it is not terrain's to
             // correct here.
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-            shader.SetCamera(scene.camera.Position);
+            shader.SetCamera(scene.camera.VisualPosition());
             vb.SetTerrainProjection(proj);
             if (g_terrain.DrawVisibility(shader, terrainParams))
                 vb.terrainVisibilityActiveThisFrame = true;
@@ -1293,7 +1293,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             g_profiler, "VB Resolve", g_dx12.commandList.Get());
         vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
             previousViewProjection,
-            scene.camera.Position, scene.cameraNear,
+            scene.camera.VisualPosition(), scene.cameraNear,
             scene.EffectiveCameraFarPlane(),
             scene.contactShadowStrength, scene.ambientOcclusionRadius,
             scene.contactShadowLinearDepth,

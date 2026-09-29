@@ -389,7 +389,7 @@ public:
         const float nightBlend = (std::max)(0.0f, (std::min)(1.0f,
             (-XMVectorGetY(sun) - 0.10f) / 0.18f));
         data.exposure = 1.32f + (0.10f - 1.32f) * nightBlend;
-        data.cameraPosition = camera.Position;
+        data.cameraPosition = camera.VisualPosition();
         data.time = time;
         data.hdriEnabled = hdriEnabled ? 1.0f : 0.0f;
         data.atmosphereParams = atmosphereParams;

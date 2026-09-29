@@ -221,7 +221,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) { std::cerr << "Window creation failed\n"; return -1; }
     ShowWindow(hwnd, nCmdShow);
-    ToggleFullscreen(hwnd);
+    // Player settings before anything reads them -- here rather than beside
+    // ApplyGameSettings below, because the window mode is decided now. A
+    // missing file is the normal first run: the defaults stand, and the file
+    // appears the first time a setting is changed.
+    LoadGameSettings(g_settings);
+    if (g_settings.fullscreen) ToggleFullscreen(hwnd);
     UpdateWindow(hwnd);
 
     // Take the render size off the window now that it is in its final
@@ -318,6 +323,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         "Content/Audio/Destruction/impact_02_rock.ogg");
     g_destructionImpactAudio[2].Initialize(
         "Content/Audio/Destruction/impact_03_wood.ogg");
+    // Palm trees have no debris/audio system of their own (Crysis-style
+    // felling lives in PalmTrees.h); hook it into the same smoke-burst and
+    // wood break/impact audio the building destruction above already uses.
+    g_trees.SetDebrisCallback([](const XMFLOAT3& pos, const XMFLOAT3& dir,
+                                bool groundImpact) {
+        if (groundImpact) {
+            scene.SpawnSmokeBurst(pos, 0.55f, 0.35f);
+        } else {
+            // Splinter burst at the break: reuse bullet-impact dust, offset
+            // along the fall direction so it reads as chips flying off the
+            // cut rather than a puff sitting on the trunk's centerline.
+            const XMFLOAT3 normal(dir.x, 0.2f, dir.z);
+            scene.SpawnBulletImpact(pos, normal);
+            scene.SpawnSmokeBurst(pos, 0.3f, 0.22f);
+        }
+        if (g_palmBreakAudioCooldown > 0.0f) return;
+        const float dx = pos.x - scene.camera.Position.x;
+        const float dy = pos.y - scene.camera.Position.y;
+        const float dz = pos.z - scene.camera.Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float volume = (groundImpact ? 0.55f : 0.7f) *
+            (std::max)(0.0f, 1.0f - distance / 42.0f);
+        if (volume <= 0.015f) return;
+        const float pitch = 0.9f + ((float)std::rand() / RAND_MAX) * 0.2f;
+        std::array<GunAudio, 3>& bank =
+            groundImpact ? g_destructionImpactAudio : g_destructionBreakAudio;
+        bank[std::rand() % bank.size()].Play(volume, pitch);
+        g_palmBreakAudioCooldown = 0.12f;
+    });
     scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
                                       bool grenade) {
         // Every explosion is also a light source. Routed through the audio
@@ -409,10 +443,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // popup and editor panel inherits the HUD's palette instead of ImGui's
     // default grey.
     ApplyEngineUITheme();
-    // Player settings before anything reads them. A missing file is the normal
-    // first run: the defaults already in g_settings stand, and the file appears
-    // the first time a setting is changed.
-    LoadGameSettings(g_settings);
+    // Settings were loaded at window creation; push them into the scene now
+    // that it exists.
     ApplyGameSettings();
     // Career wallet, same story: no file means a fresh career at zero rather
     // than an error. Only the balance is restored -- kit is hired per mission,
@@ -1226,6 +1258,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
+        // The window follows the setting rather than a toggle request, so the
+        // menu checkbox and RESET TO DEFAULTS cannot leave the two out of step.
+        // F11 writes the setting from the window, so both directions agree.
+        if (g_settings.fullscreen != isFullscreen) ToggleFullscreen(hwnd);
         UpdateDeploymentPlanningCamera(deltaTime);
         // Player throws happen during input. Create the rigid body before
         // Scene::Update so manual projectile gravity never runs for one frame.
@@ -1405,6 +1441,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime,
             !nonLocomotionCameraMotion);
+        scene.camera.UpdateMovementView(deltaTime, playerHorizontalSpeed,
+            scene.adsBlend,
+            scene.camera.FPSMode && scene.camera.IsGrounded &&
+            !scene.camera.IsSwimming && !scene.camera.IsSliding &&
+            !scene.ejected && !poseCapture && !scene.player.downed &&
+            scene.player.health > 0.0f && !nonLocomotionCameraMotion &&
+            !g_game.vehicles.insertionBoatCarryingPlayer);
         // Each weapon can carry its own nudge on top of the shared grip point,
         // so the body offset is re-solved when the selection changes. A weapon
         // whose nudge is still zero resolves to exactly the shared value, which
@@ -1512,6 +1555,51 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             g_game.vehicles.UpdateBlackHawk(
                 armedInsertionThisFrame ? 0.0f : deltaTime);
+            // SGE_BLACKHAWK_TRACE=1: the insertion airframe's phase and draw
+            // scale twice a second, to check the exterior shrink in a real run.
+            {
+                static const bool trace =
+                    GetEnvironmentVariableA("SGE_BLACKHAWK_TRACE", nullptr, 0) > 0;
+                static float traceTimer = 0.0f;
+                traceTimer -= deltaTime;
+                VehicleSystem& vehicles = g_game.vehicles;
+                // SGE_BLACKHAWK_FORCE_CRASH=<metres>: shoot the empty bird
+                // down that far out from the drop-off, to see the wreck.
+                static char forceCrash[16] = {};
+                static const bool forceCrashSet = GetEnvironmentVariableA(
+                    "SGE_BLACKHAWK_FORCE_CRASH", forceCrash,
+                    sizeof(forceCrash)) > 0;
+                if (forceCrashSet && !vehicles.blackHawkCarryingPlayer &&
+                    vehicles.blackHawkPhase ==
+                        VehicleSystem::BlackHawkPhase::Departing) {
+                    const float fx = vehicles.blackHawkPosition.x -
+                                     vehicles.blackHawkDropOff.x;
+                    const float fz = vehicles.blackHawkPosition.z -
+                                     vehicles.blackHawkDropOff.z;
+                    if (std::sqrt(fx * fx + fz * fz) >=
+                        static_cast<float>(std::atof(forceCrash)))
+                        vehicles.BeginBlackHawkCrash();
+                }
+                if (trace && traceTimer <= 0.0f && vehicles.blackHawkVisible) {
+                    traceTimer = 0.5f;
+                    const float dx = vehicles.blackHawkPosition.x -
+                                     vehicles.blackHawkDropOff.x;
+                    const float dz = vehicles.blackHawkPosition.z -
+                                     vehicles.blackHawkDropOff.z;
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                        "BlackHawkTrace phase=%d carrying=%d dist=%.1f "
+                        "progress=%.3f modelScale=%.4f exterior=%.3f draw=%.4f",
+                        static_cast<int>(vehicles.blackHawkPhase),
+                        vehicles.blackHawkCarryingPlayer ? 1 : 0,
+                        std::sqrt(dx * dx + dz * dz),
+                        vehicles.blackHawkShrinkProgress,
+                        vehicles.blackHawkModelScale,
+                        vehicles.blackHawkExteriorScale,
+                        vehicles.BlackHawkDrawScale());
+                    SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+                }
+            }
             // Between the airframe and the player: the rope needs the pose the
             // update just produced, and the player is then placed from the rope.
             // Shares the arming guard, so a load-sized delta cannot be dumped
@@ -1638,6 +1726,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             0.0f, g_destructionBreakAudioCooldown - deltaTime);
         g_destructionImpactAudioCooldown = (std::max)(
             0.0f, g_destructionImpactAudioCooldown - deltaTime);
+        g_palmBreakAudioCooldown = (std::max)(
+            0.0f, g_palmBreakAudioCooldown - deltaTime);
         for (GunAudio& sound : g_destructionBreakAudio) sound.Update();
         for (GunAudio& sound : g_destructionImpactAudio) sound.Update();
         g_hitAudio.Update();
@@ -2283,13 +2373,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (inBand && hasLineOfSight && blastSafe) {
                             const float chance = marineThrower
                                 ? kMarineGrenadeChance : kBanditGrenadeChance;
-                            if (RandomUnit() < chance) {
-                                BanditThrowGrenade(
-                                    *bandit, target, !marineThrower);
-                                // Only on the roll that actually threw, so a
-                                // thrower that declined does not mime it.
-                                bandit->PlayGrenadeThrow();
-                            }
+                            // Only on the roll that passed, so a thrower that
+                            // declined does not mime it. The round itself is
+                            // spawned below, once the wind-up reaches release.
+                            if (RandomUnit() < chance)
+                                bandit->PlayGrenadeThrow(target, !marineThrower);
                             // Re-arm whether or not the roll passed, so a
                             // thrower that declines does not retry every frame.
                             const float cooldownMin = marineThrower
@@ -2302,6 +2390,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 RandomUnit() * (cooldownMax - cooldownMin);
                         }
                     }
+                }
+                // Released halfway through the throw clip rather than on the
+                // frame the throw was decided, so the grenade leaves the hand
+                // as the arm comes through. Outside the gate above: a throw
+                // already wound up still lands if the target state changes.
+                {
+                    XMFLOAT3 throwTarget;
+                    bool throwHostile = false;
+                    if (bandit->TakeGrenadeRelease(throwTarget, throwHostile))
+                        BanditThrowGrenade(*bandit, throwTarget, throwHostile);
                 }
                 // Only the player's velocity is tracked, so lead only the shots
                 // actually aimed at the player. NearestHostileTarget also
@@ -2545,6 +2643,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const auto destructionBegin = std::chrono::steady_clock::now();
                 constexpr double kDestructionFrameBudgetMs = 6.0;
                 while (g_game.physicsClock.Consume(physicsStep)) {
+                    CaptureHumveePhysicsPoses();
                     g_destruction.Update(physicsStep);
                     if (std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() -
@@ -4017,7 +4116,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         g_destruction.ApplyRadialDamage(
                             hit, scene.destructionDamageRadius,
                             projectile.harpoon ? 2.5f :
-                            34.0f * projectile.damageMultiplier);
+                            34.0f * projectile.damageMultiplier,
+                            /*sparesProtected=*/false,
+                            /*useSegmentHit=*/fencePieceHit);
                     }
                     if (networkedSurfaceHit || protectedHit) {
                         // Nothing to pull or shove: the impulse rides with the
@@ -4733,7 +4834,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         visBuffer.SetSunLens(
             scene.enableSunLens && !deploymentHideAtmosphere,
             scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
-            scene.camera.Position, scene.lightPos, scene.lightColor,
+            scene.camera.VisualPosition(), scene.lightPos, scene.lightColor,
             scene.directionalLightIntensity);
         auto drawSky = [&]() {
             ProfilerDX12::Scope profile(g_profiler, "Sky", g_dx12.commandList.Get());
@@ -4931,6 +5032,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
+                if (!PalmMeshCutter::PrepareCapMaterial())
+                    std::cerr << "Palm cut texture unavailable; using wood tint\n";
                 g_trees.SetTerrainSampler(terrainSampler);
                 ResetPalmTrees();
 

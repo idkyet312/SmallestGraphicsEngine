@@ -548,6 +548,106 @@ int main() {
             empty, XMFLOAT3(0, 0, 0), 0.35f, 1.8f, 0.45f).touched);
     }
 
+    // --- Ramp floor and step-height floor detection -------------------------
+    {
+        // Test 1: Ramp floor is under the feet, not uphill.
+        // 30-degree ramp rising along +X: corners (0,0,-2), (0,0,2), (6,h,2), (6,h,-2)
+        // where h = 6*tan(30deg) ≈ 3.464
+        std::vector<float> triangles;
+        const float rampHeight = 6.0f * std::tan(XM_PI / 6.0f);  // 6 * tan(30deg)
+        PushTriangle(triangles, 0, 0, -2, 0, 0, 2, 6, rampHeight, 2);
+        PushTriangle(triangles, 0, 0, -2, 6, rampHeight, 2, 6, rampHeight, -2);
+        CollisionMesh mesh;
+        CHECK(BuildCollisionMesh(triangles, mesh, {}, nullptr));
+
+        // Feet at x=3, y=3*tan(30deg), z=0 (on the ramp surface).
+        const float footY = 3.0f * std::tan(XM_PI / 6.0f);
+        CollisionMeshPushout result = CollisionMeshResolveCapsule(
+            mesh, XMFLOAT3(3, footY, 0), 0.35f, 1.7f, 0.45f);
+        CHECK(result.hasFloor);
+        CHECK(NearlyEqual(result.floorY, footY, 0.01f));
+        CHECK(std::abs(result.displacement.y) < 1e-3f);
+    }
+    {
+        // Test 2: Floor below the feet within step reach is reported (walking downhill).
+        // Same ramp, but feet are elevated by 0.2 above the surface.
+        std::vector<float> triangles;
+        const float rampHeight = 6.0f * std::tan(XM_PI / 6.0f);
+        PushTriangle(triangles, 0, 0, -2, 0, 0, 2, 6, rampHeight, 2);
+        PushTriangle(triangles, 0, 0, -2, 6, rampHeight, 2, 6, rampHeight, -2);
+        CollisionMesh mesh;
+        CHECK(BuildCollisionMesh(triangles, mesh, {}, nullptr));
+
+        // Feet at x=3, y=3*tan(30deg)+0.2, z=0 (0.2 above ramp).
+        const float footY = 3.0f * std::tan(XM_PI / 6.0f) + 0.2f;
+        const float floorY = 3.0f * std::tan(XM_PI / 6.0f);
+        CollisionMeshPushout result = CollisionMeshResolveCapsule(
+            mesh, XMFLOAT3(3, footY, 0), 0.35f, 1.7f, 0.45f);
+        CHECK(result.hasFloor);
+        CHECK(NearlyEqual(result.floorY, floorY, 0.01f));
+    }
+    {
+        // Test 3: Standing exactly on the top of the mesh keeps the floor.
+        // Flat box at y=1.0 spanning x[-1,1], y[0,1], z[-1,1].
+        std::vector<float> triangles = MakeBox(-1.0f, 1.0f, false);
+        CollisionMesh mesh;
+        CHECK(BuildCollisionMesh(triangles, mesh, {}, nullptr));
+
+        // First: feet exactly at y=1.0 (on the surface).
+        CollisionMeshPushout at = CollisionMeshResolveCapsule(
+            mesh, XMFLOAT3(0, 1.0f, 0), 0.35f, 1.7f, 0.45f);
+        CHECK(at.hasFloor);
+        CHECK(NearlyEqual(at.floorY, 1.0f, 0.01f));
+
+        // Second: feet at y=1.0+1e-4 (just barely above).
+        CollisionMeshPushout above = CollisionMeshResolveCapsule(
+            mesh, XMFLOAT3(0, 1.0f + 1e-4f, 0), 0.35f, 1.7f, 0.45f);
+        CHECK(above.hasFloor);
+        CHECK(NearlyEqual(above.floorY, 1.0f, 0.01f));
+    }
+    {
+        // Test 4: Stair riser does not push back.
+        // Two stacked boxes: A at x[0,1] y[0,0.18] z[-1,1], B at x[1,2] y[0,0.36] z[-1,1].
+        // Feet at x=0.8, y=0.18, z=0 (on A, 0.2 away from B's riser).
+        std::vector<float> triangles;
+        // Box A: x[0,1] y[0,0.18] z[-1,1]
+        std::vector<float> boxA = MakeBox(0.0f, 1.0f, false);
+        // Scale A's y by 0.18 and z by 1
+        for (size_t i = 0; i < boxA.size(); i += 9) {
+            // Each triangle: 3 vertices x,y,z
+            boxA[i + 1] *= 0.18f;  // v0.y
+            boxA[i + 4] *= 0.18f;  // v1.y
+            boxA[i + 7] *= 0.18f;  // v2.y
+        }
+        // Box B: x[1,2] y[0,0.36] z[-1,1]
+        // Offset: translate x by 1, scale y by 0.36
+        std::vector<float> boxB = MakeBox(0.0f, 1.0f, false);
+        for (size_t i = 0; i < boxB.size(); i += 9) {
+            boxB[i]     += 1.0f;  // v0.x
+            boxB[i + 3] += 1.0f;  // v1.x
+            boxB[i + 6] += 1.0f;  // v2.x
+            boxB[i + 1] *= 0.36f; // v0.y
+            boxB[i + 4] *= 0.36f; // v1.y
+            boxB[i + 7] *= 0.36f; // v2.y
+        }
+        triangles.insert(triangles.end(), boxA.begin(), boxA.end());
+        triangles.insert(triangles.end(), boxB.begin(), boxB.end());
+        CollisionMesh mesh;
+        CHECK(BuildCollisionMesh(triangles, mesh, {}, nullptr));
+
+        // Feet at x=0.8, y=0.18, z=0 (on box A, 0.2 from B's riser at x=1.0).
+        CollisionMeshPushout result = CollisionMeshResolveCapsule(
+            mesh, XMFLOAT3(0.8f, 0.18f, 0), 0.35f, 1.7f, 0.45f);
+        CHECK(result.hasFloor);
+        // Round-bottomed footprint: 0.2 m short of the riser the capsule is
+        // partway up the step, not on top of it -- that ramp is what keeps the
+        // eye from popping a full riser in one frame.
+        const float partway = 0.36f - (0.35f - std::sqrt(0.35f * 0.35f - 0.2f * 0.2f));
+        CHECK(NearlyEqual(result.floorY, partway, 0.01f));
+        CHECK(result.floorY > 0.18f);                     // Climbing, not stuck
+        CHECK(result.displacement.x > -1e-3f);            // No backward push
+    }
+
     // --- Memory accounting -------------------------------------------------
     {
         std::vector<float> triangles = MakeBox(-1.0f, 1.0f, false);

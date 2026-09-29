@@ -153,8 +153,9 @@ public:
         const XMMATRIX viewProjection =
             scene.GetViewMatrix() * scene.GetProjectionMatrix();
         XMVECTOR direction = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
+        const XMFLOAT3 shaftEye = scene.camera.VisualPosition();
         XMVECTOR sunWorld = XMVectorAdd(
-            XMLoadFloat3(&scene.camera.Position),
+            XMLoadFloat3(&shaftEye),
             XMVectorScale(direction, 4000.0f));
         XMVECTOR clip = XMVector3Transform(sunWorld, viewProjection);
         XMFLOAT4 projected;

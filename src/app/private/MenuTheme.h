@@ -187,199 +187,703 @@ static bool UIMenuRow(const char* label, float height = 34.0f) {
     return pressed;
 }
 
-// Settings panel. Drawn instead of the menu body rather than as a popup over
-// it, so the one column of controls stays the whole screen's subject.
+// ---- Settings screen -------------------------------------------------------
 //
-// Every control writes the INI on release rather than on every frame the value
-// changes: dragging a slider produces a value per frame, and rewriting the file
-// at that rate would be pointless disk churn for a value the player has not
-// settled on yet.
-// `openFlag` is the caller's own "settings are showing" state, cleared by the
-// BACK button. Passed in rather than hardcoded because two screens draw this
-// panel -- the main menu and the pause screen -- and each has to close its own
-// flag; sharing one would leave the main menu displaying settings because a
-// paused player happened to open them.
-static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
-    UISectionLabel("MOUSE");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+// A full-screen page rather than a column swapped into the menu body: once
+// there are more than a handful of options, one long scrolling column buries
+// most of them below the fold. Category tabs across the top, label-left /
+// control-right rows, and a description panel for whatever the cursor is over
+// -- the layout players already know from every shooter's options page.
 
-    ImGui::TextColored(UITheme::kTextDim, "SENSITIVITY");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+// From Multiplayer.h, included after this file. The pause screen's copy of the
+// page has to warn that the world keeps running behind it.
+static bool MultiplayerActive();
+
+// The menu's typefaces, rasterized at the sizes they are actually drawn at.
+// Both stay null when no font file is found, and every use falls back to the
+// built-in font -- the menu is then exactly what it was before. Declared here
+// rather than beside LoadMenuFonts because the settings header uses them.
+static ImFont* g_menuTitleFont = nullptr;
+static ImFont* g_menuBodyFont = nullptr;
+
+namespace SettingsUI {
+constexpr float kRowHeight = 56.0f;
+constexpr float kRowGap = 6.0f;
+constexpr int kTabCount = 5;
+static const char* const kTabs[kTabCount] = {
+    "CONTROLS", "GAMEPLAY", "AUDIO", "VIDEO", "INTERFACE",
+};
+static const char* const kTabBlurbs[kTabCount] = {
+    "Mouse feel and look direction.",
+    "How aiming and the weapon behave.",
+    "Master volume and the individual mix buses.",
+    "Window mode, frame pacing and field of view.",
+    "Crosshair and loading screen detail.",
+};
+
+// Persists across opens so BACK and back in lands on the same page.
+static int s_tab = 0;
+// Whatever row the cursor is over this frame. Reset at the top of the page and
+// read by the description panel, which is drawn after the list.
+static const char* s_hoverTitle = nullptr;
+static const char* s_hoverDesc = nullptr;
+static char s_hoverDefault[64] = {};
+
+struct Row {
+    ImVec2 min;
+    float width;
+    bool hovered;
+};
+
+// Draws a row's plate and label, records it as the described row when
+// hovered, and leaves the cursor where the control goes (right half).
+// Colours go through GetColorU32 so a BeginDisabled around the row dims the
+// label and plate along with the control.
+static Row BeginRow(const char* label, const char* description,
+                    bool indent = false) {
+    ImGui::PushID(label);
+    Row row;
+    row.min = ImGui::GetCursorScreenPos();
+    row.width = ImGui::GetContentRegionAvail().x;
+    const ImVec2 max(row.min.x + row.width, row.min.y + kRowHeight);
+    row.hovered = ImGui::IsWindowHovered(
+                      ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                  ImGui::IsMouseHoveringRect(row.min, max);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(row.min, max,
+                        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f,
+                                                  row.hovered ? 0.085f : 0.03f)),
+                        4.0f);
+    if (row.hovered) {
+        draw->AddRectFilled(row.min, ImVec2(row.min.x + 3.0f, max.y),
+                            ImGui::GetColorU32(UITheme::kAccent));
+        s_hoverTitle = label;
+        s_hoverDesc = description;
+        s_hoverDefault[0] = '\0';
+    }
+
+    const float textX = row.min.x + (indent ? 40.0f : 20.0f);
+    const float textY = row.min.y + (kRowHeight - ImGui::GetFontSize()) * 0.5f;
+    if (indent) {
+        // A short tick in front of a bus shows it hangs off the row above
+        // without a tree control's chrome.
+        draw->AddLine(ImVec2(row.min.x + 22.0f, row.min.y + kRowHeight * 0.5f),
+                      ImVec2(row.min.x + 32.0f, row.min.y + kRowHeight * 0.5f),
+                      ImGui::GetColorU32(UITheme::kTextDim), 1.0f);
+    }
+    draw->AddText(ImVec2(textX, textY),
+                  ImGui::GetColorU32(row.hovered ? ImVec4(1, 1, 1, 1)
+                                                 : UITheme::kText),
+                  label);
+
+    ImGui::SetCursorScreenPos(ImVec2(
+        row.min.x + row.width * 0.5f,
+        row.min.y + (kRowHeight - ImGui::GetFrameHeight()) * 0.5f));
+    return row;
+}
+
+static float ControlWidth(const Row& row) { return row.width * 0.5f - 20.0f; }
+
+// Moves the cursor under the row. The Dummy is what tells the child window
+// the content reaches this far, so the list scrolls to the last row.
+static void EndRow(const Row& row) {
+    ImGui::SetCursorScreenPos(
+        ImVec2(row.min.x, row.min.y + kRowHeight + kRowGap));
+    ImGui::Dummy(ImVec2(row.width, 0.0f));
+    ImGui::PopID();
+}
+
+// Pill switch in place of a checkbox. A 13 px tick box reads as a debug
+// panel; a switch with ON/OFF beside it reads at a glance from across a room.
+static bool Toggle(bool* value) {
+    const ImVec2 size(52.0f, 26.0f);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton("##toggle", size);
+    if (pressed) *value = !*value;
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float radius = size.y * 0.5f;
+    const ImVec4 track = *value
+        ? (hovered ? UITheme::kAccent : UITheme::kAccentDim)
+        : ImVec4(1.0f, 1.0f, 1.0f, hovered ? 0.22f : 0.14f);
+    draw->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
+                        ImGui::GetColorU32(track), radius);
+    const float knobX = *value ? p.x + size.x - radius : p.x + radius;
+    draw->AddCircleFilled(ImVec2(knobX, p.y + radius), radius - 4.0f,
+                          ImGui::GetColorU32(ImVec4(1, 1, 1, 1)), 24);
+
+    const char* state = *value ? "ON" : "OFF";
+    const ImVec2 stateSize = ImGui::CalcTextSize(state);
+    draw->AddText(ImVec2(p.x - stateSize.x - 14.0f,
+                         p.y + (size.y - stateSize.y) * 0.5f),
+                  ImGui::GetColorU32(*value ? UITheme::kText
+                                            : UITheme::kTextDim),
+                  state);
+    return pressed;
+}
+
+// Switch row, right-aligned in the row. Returns true on the frame it flips.
+static bool ToggleRow(const char* label, const char* description,
+                      bool* value) {
+    const Row row = BeginRow(label, description);
+    ImGui::SetCursorScreenPos(ImVec2(row.min.x + row.width - 20.0f - 52.0f,
+                                     row.min.y + (kRowHeight - 26.0f) * 0.5f));
+    const bool changed = Toggle(value);
+    EndRow(row);
+    return changed;
+}
+
+struct SliderResult {
+    bool changed;   // value moved this frame -- apply live
+    bool released;  // drag finished with an edit -- clamp and save
+};
+
+static SliderResult SliderRow(const char* label, const char* description,
+                              const char* id, float* value, float minValue,
+                              float maxValue, const char* format,
+                              ImGuiSliderFlags flags = 0,
+                              const char* defaultFormat = nullptr,
+                              float defaultValue = 0.0f, bool indent = false) {
+    const Row row = BeginRow(label, description, indent);
+    if (row.hovered && defaultFormat)
+        std::snprintf(s_hoverDefault, sizeof(s_hoverDefault), defaultFormat,
+                      defaultValue);
+    ImGui::SetNextItemWidth(ControlWidth(row));
+    // Accent fill up to the value, drawn on the channel under the slider so
+    // the frame's own text stays on top. A bare grab on an empty track makes
+    // the level hard to read at a glance; a filled bar does not.
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->ChannelsSplit(2);
+    draw->ChannelsSetCurrent(1);
+    SliderResult result;
+    result.changed =
+        ImGui::SliderFloat(id, value, minValue, maxValue, format, flags);
+    result.released = ImGui::IsItemDeactivatedAfterEdit();
+    const ImVec2 itemMin = ImGui::GetItemRectMin();
+    const ImVec2 itemMax = ImGui::GetItemRectMax();
+    float fraction = (flags & ImGuiSliderFlags_Logarithmic) && minValue > 0.0f
+        ? std::log(*value / minValue) / std::log(maxValue / minValue)
+        : (*value - minValue) / (maxValue - minValue);
+    fraction = (std::max)(0.0f, (std::min)(1.0f, fraction));
+    draw->ChannelsSetCurrent(0);
+    if (fraction > 0.0f)
+        draw->AddRectFilled(itemMin,
+                            ImVec2(itemMin.x + (itemMax.x - itemMin.x) * fraction,
+                                   itemMax.y),
+                            ImGui::GetColorU32(ImVec4(UITheme::kAccent.x,
+                                                      UITheme::kAccent.y,
+                                                      UITheme::kAccent.z,
+                                                      0.30f)),
+                            4.0f);
+    draw->ChannelsMerge();
+    EndRow(row);
+    return result;
+}
+
+// "<  VALUE  >" picker for a setting with named alternatives, where a switch
+// would leave one of the two options nameless.
+static bool SelectorRow(const char* label, const char* description,
+                        const char* valueText) {
+    const Row row = BeginRow(label, description);
+    const float width = ControlWidth(row);
+    const float h = ImGui::GetFrameHeight();
+    bool pressed = false;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    if (ImGui::ArrowButton("##prev", ImGuiDir_Left)) pressed = true;
+    ImGui::SameLine();
+    const ImVec2 mid = ImGui::GetCursorScreenPos();
+    const float midWidth = (std::max)(0.0f, width - h * 2.0f);
+    if (ImGui::InvisibleButton("##value", ImVec2(midWidth, h))) pressed = true;
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("##next", ImGuiDir_Right)) pressed = true;
+    ImGui::PopStyleVar();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(mid, ImVec2(mid.x + midWidth, mid.y + h),
+                        ImGui::GetColorU32(ImGuiCol_FrameBg));
+    const ImVec2 textSize = ImGui::CalcTextSize(valueText);
+    draw->AddText(ImVec2(mid.x + (midWidth - textSize.x) * 0.5f,
+                         mid.y + (h - textSize.y) * 0.5f),
+                  ImGui::GetColorU32(ImVec4(1, 1, 1, 1)), valueText);
+    EndRow(row);
+    return pressed;
+}
+
+// Small keycap for the footer and tab strip hints.
+static float KeyCap(ImDrawList* draw, ImVec2 pos, const char* key,
+                    float height) {
+    const ImVec2 textSize = ImGui::CalcTextSize(key);
+    const float width = (std::max)(height, textSize.x + 16.0f);
+    draw->AddRect(pos, ImVec2(pos.x + width, pos.y + height),
+                  IM_COL32(255, 255, 255, 90), 4.0f, 0, 1.0f);
+    draw->AddText(ImVec2(pos.x + (width - textSize.x) * 0.5f,
+                         pos.y + (height - textSize.y) * 0.5f),
+                  IM_COL32(255, 255, 255, 190), key);
+    return width;
+}
+
+// Hand-tracked wordmark, the same treatment as MILBOX and PAUSED.
+static void Wordmark(ImVec2 pos, const char* text) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float tracking = ImGui::GetFontSize() * 0.14f;
+    float x = pos.x;
+    for (const char* c = text; *c; ++c) {
+        const char glyph[2] = { *c, '\0' };
+        draw->AddText(ImVec2(x, pos.y), IM_COL32(255, 255, 255, 255), glyph);
+        x += ImGui::CalcTextSize(glyph).x + tracking;
+    }
+}
+
+static void ControlsTab() {
     // Logarithmic: the useful range is bunched at the low end, where a linear
     // slider would put every usable value in its first fifth and make fine
-    // adjustment impossible.
-    if (ImGui::SliderFloat("##sensitivity", &g_settings.mouseSensitivity,
-                           GameSettings::kMinSensitivity,
-                           GameSettings::kMaxSensitivity,
-                           "%.3f", ImGuiSliderFlags_Logarithmic)) {
-        // Apply live so the player can feel the change while dragging, which
-        // is the only way to judge a sensitivity.
-        ApplyGameSettings();
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
+    // adjustment impossible. Applied live because a sensitivity can only be
+    // judged while it moves.
+    const SliderResult sensitivity = SliderRow(
+        "Mouse Sensitivity", "Lower is slower and steadier.",
+        "##sensitivity", &g_settings.mouseSensitivity,
+        GameSettings::kMinSensitivity, GameSettings::kMaxSensitivity, "%.3f",
+        ImGuiSliderFlags_Logarithmic, "Default  %.2f",
+        GameSettings::kDefaultSensitivity);
+    if (sensitivity.changed) ApplyGameSettings();
+    if (sensitivity.released) {
         g_settings.Clamp();
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Lower is slower and steadier. Default %.2f.",
-                       GameSettings::kDefaultSensitivity);
 
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    UISectionLabel("WEAPON");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-
-    if (ImGui::Checkbox("See through weapon when aiming",
-                        &g_settings.seeThroughWeaponWhenAiming)) {
+    if (ToggleRow("Invert Mouse Y", "Down becomes up, up becomes down.",
+                  &g_settings.invertMouseY)) {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Approximates what your off eye sees past the gun.");
+}
 
-    // The slider only means anything once the effect is on, so it is disabled
-    // rather than hidden -- a control that vanishes makes the checkbox above it
-    // look like it did nothing.
-    ImGui::BeginDisabled(!g_settings.seeThroughWeaponWhenAiming);
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    ImGui::TextColored(UITheme::kTextDim, "AMOUNT");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-    if (ImGui::SliderFloat("##seethrough",
-                           &g_settings.seeThroughWeaponStrength,
-                           GameSettings::kMinSeeThroughStrength,
-                           GameSettings::kMaxSeeThroughStrength, "%.2f")) {
-        // Live, like the sensitivity above: this is a look, and the only way to
-        // judge it is to aim with it.
-        ApplyGameSettings();
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        g_settings.Clamp();
-        ApplyGameSettings();
-        SaveGameSettings(g_settings);
-    }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Higher clears more of the weapon. Default %.2f.",
-                       GameSettings::kDefaultSeeThroughStrength);
-    ImGui::EndDisabled();
-
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    UISectionLabel("AIMING");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-
-    // A button showing the mode that is active rather than a checkbox: the two
-    // models are named alternatives, and "Realistic aiming [x]" makes the other
-    // one nameless. Clicking swaps to the other.
-    if (UIMenuButton(g_settings.realisticAiming ? "REALISTIC AIMING"
-                                                : "CLASSIC AIMING", 38.0f)) {
+static void GameplayTab() {
+    if (SelectorRow("Aiming Model",
+                    g_settings.realisticAiming
+                        ? "Realistic: the gun leads and the camera follows. "
+                          "A fast turn swings your body."
+                        : "Classic: camera and muzzle are one line. Where you "
+                          "look is where you shoot.",
+                    g_settings.realisticAiming ? "REALISTIC" : "CLASSIC")) {
         g_settings.realisticAiming = !g_settings.realisticAiming;
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       g_settings.realisticAiming
-                           ? "The gun leads and the camera follows. A fast "
-                             "turn swings your body."
-                           : "Camera and muzzle are one line. Where you look "
-                             "is where you shoot.");
 
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    UISectionLabel("AUDIO");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    if (ToggleRow("See Through Weapon When Aiming",
+                  "Approximates what your off eye sees past the gun.",
+                  &g_settings.seeThroughWeaponWhenAiming)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
 
-    // Master first and indented buses under it, because that is the shape of
-    // the submix graph: master trims everything including the reverb tail,
+    // Disabled rather than hidden -- a row that vanishes makes the switch
+    // above it look like it did nothing.
+    ImGui::BeginDisabled(!g_settings.seeThroughWeaponWhenAiming);
+    const SliderResult amount = SliderRow(
+        "See-Through Amount", "Higher clears more of the weapon.",
+        "##seethrough", &g_settings.seeThroughWeaponStrength,
+        GameSettings::kMinSeeThroughStrength,
+        GameSettings::kMaxSeeThroughStrength, "%.2f", 0, "Default  %.2f",
+        GameSettings::kDefaultSeeThroughStrength, true);
+    if (amount.changed) ApplyGameSettings();
+    if (amount.released) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+}
+
+static void AudioTab() {
+    // Master first and the buses indented under it, because that is the shape
+    // of the submix graph: master trims everything including the reverb tail,
     // while the buses are independent of it and of each other.
-    //
-    // Each writes live on drag and saves on release, the same two-step the
-    // sensitivity uses -- a mix can only be judged by ear while it moves, and
-    // writing the file on every frame of a drag would be a write per frame.
     struct VolumeRow {
         const char* label;
         const char* id;
+        const char* description;
         float* value;
         AudioBus bus;
         bool master;
     };
     const VolumeRow rows[] = {
-        { "MASTER",   "##volmaster",   &g_settings.masterVolume,
-          AudioBus::Weapons,  true  },
-        { "WEAPONS",  "##volweapons",  &g_settings.weaponsVolume,
-          AudioBus::Weapons,  false },
-        { "VOICES",   "##volvoices",   &g_settings.voicesVolume,
-          AudioBus::Voices,   false },
-        { "AMBIENCE", "##volambience", &g_settings.ambienceVolume,
-          AudioBus::Ambience, false },
-        { "MUSIC",    "##volmusic",    &g_settings.musicVolume,
-          AudioBus::Music,    false },
-        { "INTERFACE","##volui",       &g_settings.uiVolume,
-          AudioBus::UI,       false },
+        { "Master Volume", "##volmaster",
+          "Trims everything, reverb tail included.",
+          &g_settings.masterVolume, AudioBus::Weapons, true },
+        { "Weapons", "##volweapons", "Gunfire, reloads and explosions.",
+          &g_settings.weaponsVolume, AudioBus::Weapons, false },
+        { "Voices", "##volvoices", "Callouts and dialogue.",
+          &g_settings.voicesVolume, AudioBus::Voices, false },
+        { "Ambience", "##volambience", "Wind, water and the world around you.",
+          &g_settings.ambienceVolume, AudioBus::Ambience, false },
+        { "Music", "##volmusic", "Menu and mission music.",
+          &g_settings.musicVolume, AudioBus::Music, false },
+        { "Interface", "##volui", "Menu clicks and HUD cues.",
+          &g_settings.uiVolume, AudioBus::UI, false },
     };
     for (const VolumeRow& row : rows) {
-        if (!row.master) ImGui::Dummy(ImVec2(0.0f, 4.0f));
-        ImGui::TextColored(UITheme::kTextDim, "%s", row.label);
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
         // Shown 0-100 rather than 0.00-1.00: a volume is the one control
         // players already read as a percentage. The slider edits a scaled
-        // copy because ImGui formats whatever value it is given, so a 0..1
-        // slider with a %% format would read "1%" at full volume.
+        // copy because ImGui formats whatever value it is given.
         float percent = *row.value * 100.0f;
-        if (ImGui::SliderFloat(row.id, &percent, 0.0f, 100.0f, "%.0f%%",
-                               ImGuiSliderFlags_AlwaysClamp)) {
+        const SliderResult result = SliderRow(
+            row.label, row.description, row.id, &percent, 0.0f, 100.0f,
+            "%.0f%%", ImGuiSliderFlags_AlwaysClamp, nullptr, 0.0f,
+            !row.master);
+        if (result.changed) {
             *row.value = percent / 100.0f;
             if (row.master) AudioDevice::SetMasterVolume(*row.value);
             else            AudioDevice::SetBusVolume(row.bus, *row.value);
         }
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
+        if (result.released) {
             g_settings.Clamp();
             ApplyGameSettings();
             SaveGameSettings(g_settings);
         }
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Master trims everything. The rest are independent.");
+}
 
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    UISectionLabel("HUD");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+static void VideoTab() {
+    if (ToggleRow("Fullscreen (Borderless)",
+                  "On: borderless fullscreen. Off: windowed.",
+                  &g_settings.fullscreen)) {
+        // Only records the choice. ToggleFullscreen lives in
+        // WindowAndGeometry.h, included after this file; the main loop moves
+        // the window to whatever g_settings.fullscreen says each frame.
+        SaveGameSettings(g_settings);
+    }
 
-    if (ImGui::Checkbox("Show crosshair", &g_settings.showCrosshair)) {
+    if (ToggleRow("VSync", "Locks frame rate to display refresh.",
+                  &g_settings.vsync)) {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Off leaves the weapon's own sights as the only aiming "
-                       "reference. Optics are unaffected.");
 
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    UISectionLabel("DEBUG");
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    const SliderResult fov = SliderRow(
+        "Field of View", "Hip-fire vertical field of view.", "##fov",
+        &g_settings.fieldOfView, GameSettings::kMinFieldOfView,
+        GameSettings::kMaxFieldOfView, "%.0f degrees", 0, "Default  %.0f",
+        GameSettings::kDefaultFieldOfView);
+    if (fov.changed) ApplyGameSettings();
+    if (fov.released) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
 
-    if (ImGui::Checkbox("Detailed loading screen",
-                        &g_settings.debugLoadingScreen)) {
+    const SliderResult bob = SliderRow(
+        "Camera Bob", "Head bob while walking and running. Zero is off.",
+        "##camerabob", &g_settings.cameraBob, GameSettings::kMinCameraBob,
+        GameSettings::kMaxCameraBob, "%.2fx", 0, "Default  %.2fx",
+        GameSettings::kDefaultCameraBob);
+    if (bob.changed) ApplyGameSettings();
+    if (bob.released) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+}
+
+static void InterfaceTab() {
+    if (ToggleRow("Show Crosshair",
+                  "Off leaves the weapon's own sights as the only aiming "
+                  "reference. Optics are unaffected.",
+                  &g_settings.showCrosshair)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+
+    if (ToggleRow("Detailed Loading Screen",
+                  "Off shows just LOADING. On shows stage timings, uploads "
+                  "and GPU state.",
+                  &g_settings.debugLoadingScreen)) {
         // No ApplyGameSettings: the loading screen reads the flag directly
         // every frame it draws, so there is nothing to push anywhere.
         SaveGameSettings(g_settings);
     }
-    ImGui::TextColored(UITheme::kTextDim,
-                       "Off shows just LOADING. On shows stage timings, "
-                       "uploads and GPU state.");
+}
+} // namespace SettingsUI
 
-    ImGui::Dummy(ImVec2(0.0f, 16.0f));
-    if (UIMenuButton("RESET TO DEFAULTS", 38.0f)) {
+// Shared by the deployment rack and the in-world counter. The weapon ID owns
+// the value, so swapping loadout slots never swaps the player's preference.
+static void DrawWeaponCameraShakeSlider(int weapon) {
+    if (weapon < 0 ||
+        weapon >= static_cast<int>(g_settings.weaponCameraShake.size())) return;
+    if (weapon == GunModel::kLaserWeapon ||
+        weapon == GunModel::kFlamethrowerWeapon ||
+        weapon == GunModel::kRemoteChargeWeapon ||
+        weapon == GunModel::kTargetDesignatorWeapon) {
+        ImGui::TextDisabled("This tool has no firing camera shake.");
+        return;
+    }
+    ImGui::PushID(weapon);
+    ImGui::TextColored(UITheme::kTextDim, "FIRING CAMERA SHAKE  /  %s",
+                       GunModel::WeaponName(weapon));
+    float percent = g_settings.weaponCameraShake[static_cast<size_t>(weapon)] *
+                    100.0f;
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::SliderFloat("##camera_shake", &percent, 0.0f, 3000.0f,
+                           "%.0f%%", ImGuiSliderFlags_AlwaysClamp)) {
+        g_settings.weaponCameraShake[static_cast<size_t>(weapon)] =
+            percent / 100.0f;
+        ApplyGameSettings();
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextDisabled("Visual shot kick only; aim recoil is unchanged.");
+    ImGui::PopID();
+}
+
+// Every control writes the INI on release rather than on every frame the value
+// changes: dragging a slider produces a value per frame, and rewriting the file
+// at that rate would be pointless disk churn for a value the player has not
+// settled on yet.
+//
+// `openFlag` is the caller's own "settings are showing" state, cleared by
+// BACK. Passed in rather than hardcoded because two screens open this page --
+// the main menu and the pause screen -- and each has to close its own flag;
+// sharing one would leave the main menu displaying settings because a paused
+// player happened to open them. ESC closes it too, in WindowInput.h.
+static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
+    using namespace SettingsUI;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+
+    // Near-opaque: this page is the whole screen's subject. The pause copy
+    // leaves a trace of the frame behind so it still reads as "in a mission".
+    ImGui::GetBackgroundDrawList()->AddRectFilledMultiColor(
+        ImVec2(0, 0), display,
+        IM_COL32(6, 10, 9, 236), IM_COL32(12, 20, 18, 236),
+        IM_COL32(4, 7, 6, 248), IM_COL32(3, 5, 5, 248));
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(display, ImGuiCond_Always);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##SettingsScreen", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    // Content is capped at 1280 and centred, so an ultrawide does not stretch
+    // a label a metre away from its control.
+    const float side = (std::max)(32.0f, (display.x - 1280.0f) * 0.5f);
+    const float contentWidth = display.x - side * 2.0f;
+    const float right = side + contentWidth;
+    const float top = (std::max)(24.0f, display.y * 0.05f);
+
+    s_hoverTitle = nullptr;
+    s_hoverDesc = nullptr;
+    s_hoverDefault[0] = '\0';
+
+    // ---- Header -----------------------------------------------------------
+    if (g_menuTitleFont) ImGui::PushFont(g_menuTitleFont);
+    else ImGui::SetWindowFontScale(4.0f);
+    const float titleHeight = ImGui::GetFontSize();
+    Wordmark(ImVec2(side, top), "SETTINGS");
+    if (g_menuTitleFont) ImGui::PopFont();
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+
+    // The pause screen's warning, carried over: multiplayer does not stop for
+    // this page either, and a player tweaking audio needs to know that.
+    if (&openFlag == &g_showPauseSettings && MultiplayerActive()) {
+        const char* warning = "MULTIPLAYER  -  GAME STILL LIVE";
+        const ImVec2 size = ImGui::CalcTextSize(warning);
+        draw->AddText(ImVec2(right - size.x,
+                             top + (titleHeight - size.y) * 0.5f),
+                      ImGui::GetColorU32(UITheme::kWarning), warning);
+    }
+
+    const float ruleY = top + titleHeight + 14.0f;
+    draw->AddRectFilled(ImVec2(side, ruleY), ImVec2(right, ruleY + 1.0f),
+                        IM_COL32(255, 255, 255, 50));
+
+    // ---- Tabs -------------------------------------------------------------
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Q, false))
+            s_tab = (s_tab + kTabCount - 1) % kTabCount;
+        if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+            s_tab = (s_tab + 1) % kTabCount;
+    }
+
+    const float tabsY = ruleY + 14.0f;
+    const float tabHeight = 44.0f;
+    const float capHeight = 26.0f;
+    float tabX = side;
+    tabX += KeyCap(draw, ImVec2(tabX, tabsY + (tabHeight - capHeight) * 0.5f),
+                   "Q", capHeight) + 12.0f;
+    for (int i = 0; i < kTabCount; ++i) {
+        const ImVec2 textSize = ImGui::CalcTextSize(kTabs[i]);
+        const ImVec2 tabMin(tabX, tabsY);
+        const ImVec2 tabMax(tabX + textSize.x + 40.0f, tabsY + tabHeight);
+        ImGui::SetCursorScreenPos(tabMin);
+        ImGui::PushID(i);
+        if (ImGui::InvisibleButton("##tab",
+                                   ImVec2(tabMax.x - tabMin.x, tabHeight)))
+            s_tab = i;
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+
+        const bool selected = s_tab == i;
+        if (hovered && !selected)
+            draw->AddRectFilled(tabMin, tabMax, IM_COL32(255, 255, 255, 14),
+                                4.0f);
+        if (selected)
+            draw->AddRectFilled(ImVec2(tabMin.x + 12.0f, tabMax.y - 3.0f),
+                                ImVec2(tabMax.x - 12.0f, tabMax.y),
+                                ImGui::GetColorU32(UITheme::kAccent));
+        draw->AddText(ImVec2(tabMin.x + 20.0f,
+                             tabMin.y + (tabHeight - textSize.y) * 0.5f),
+                      selected  ? IM_COL32(255, 255, 255, 255)
+                      : hovered ? IM_COL32(255, 255, 255, 200)
+                                : IM_COL32(255, 255, 255, 120),
+                      kTabs[i]);
+        tabX = tabMax.x + 4.0f;
+    }
+    KeyCap(draw, ImVec2(tabX + 8.0f, tabsY + (tabHeight - capHeight) * 0.5f),
+           "E", capHeight);
+    draw->AddRectFilled(ImVec2(side, tabsY + tabHeight),
+                        ImVec2(right, tabsY + tabHeight + 1.0f),
+                        IM_COL32(255, 255, 255, 22));
+
+    // ---- Body -------------------------------------------------------------
+    const float footerHeight = 76.0f;
+    const float footerTop = display.y - footerHeight;
+    const float bodyTop = tabsY + tabHeight + 24.0f;
+    const float bodyHeight = (std::max)(80.0f, footerTop - 16.0f - bodyTop);
+    const float gap = 32.0f;
+    const float listWidth = contentWidth * 0.62f;
+    const float panelWidth = contentWidth - listWidth - gap;
+
+    ImGui::SetCursorScreenPos(ImVec2(side, bodyTop));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 14.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 3.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1.0f, 1.0f, 1.0f, 0.07f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+                          ImVec4(1.0f, 1.0f, 1.0f, 0.11f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+                          ImVec4(1.0f, 1.0f, 1.0f, 0.15f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 1.0f, 0.07f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccentDim);
+    ImGui::BeginChild("##settingsList", ImVec2(listWidth, bodyHeight),
+                      ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+    switch (s_tab) {
+    case 0: ControlsTab();  break;
+    case 1: GameplayTab();  break;
+    case 2: AudioTab();     break;
+    case 3: VideoTab();     break;
+    default: InterfaceTab(); break;
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(5);
+
+    // Description panel: what the hovered row does, so the rows themselves
+    // can stay one line tall.
+    if (panelWidth > 160.0f) {
+        ImGui::SetCursorScreenPos(ImVec2(side + listWidth + gap, bodyTop));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.035f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 22.0f));
+        ImGui::BeginChild("##settingsInfo",
+                          ImVec2(panelWidth, (std::min)(bodyHeight, 320.0f)),
+                          ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar);
+        ImGui::PushTextWrapPos(0.0f);
+        const char* heading = s_hoverTitle ? s_hoverTitle : kTabs[s_tab];
+        const char* body = s_hoverTitle ? s_hoverDesc : kTabBlurbs[s_tab];
+        ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", heading);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        {
+            const ImVec2 at = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                at, ImVec2(at.x + 32.0f, at.y + 2.0f),
+                ImGui::GetColorU32(UITheme::kAccent));
+            ImGui::Dummy(ImVec2(32.0f, 2.0f));
+        }
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        if (body) ImGui::TextColored(UITheme::kTextDim, "%s", body);
+        if (s_hoverDefault[0]) {
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            ImGui::TextColored(UITheme::kAccent, "%s", s_hoverDefault);
+        }
+        if (!s_hoverTitle) {
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            ImGui::TextColored(UITheme::kTextDim,
+                               "Hover a setting for details.");
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+    }
+
+    // ---- Footer -----------------------------------------------------------
+    draw->AddRectFilled(ImVec2(side, footerTop), ImVec2(right, footerTop + 1.0f),
+                        IM_COL32(255, 255, 255, 40));
+    const float buttonHeight = 44.0f;
+    const float buttonY = footerTop + (footerHeight - buttonHeight) * 0.5f;
+
+    ImGui::SetCursorScreenPos(ImVec2(
+        side, footerTop + (footerHeight - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
+
+    const float backWidth = 160.0f;
+    const float resetWidth = 220.0f;
+    const float backX = right - backWidth;
+    const float resetX = backX - 12.0f - resetWidth;
+
+    // ESC hint left of the buttons. Saving already happened at the point of
+    // change, so leaving is BACK, not a cancel that implies unsaved edits.
+    {
+        const char* hint = "BACK";
+        const ImVec2 hintSize = ImGui::CalcTextSize(hint);
+        const float hintX = resetX - 28.0f - hintSize.x;
+        draw->AddText(ImVec2(hintX, buttonY + (buttonHeight - hintSize.y) * 0.5f),
+                      IM_COL32(255, 255, 255, 150), hint);
+        const float capWidth = ImGui::CalcTextSize("ESC").x + 16.0f;
+        KeyCap(draw, ImVec2(hintX - 10.0f - capWidth,
+                            buttonY + (buttonHeight - capHeight) * 0.5f),
+               "ESC", capHeight);
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(resetX, buttonY));
+    if (ImGui::Button("RESET TO DEFAULTS", ImVec2(resetWidth, buttonHeight))) {
         g_settings.ResetToDefaults();
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    // Saving already happened at the point of change, so backing out is not a
-    // "cancel" -- say BACK rather than implying unsaved edits are being kept.
-    if (UIPrimaryButton("BACK", 44.0f)) {
+    ImGui::SetCursorScreenPos(ImVec2(backX, buttonY));
+    ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+    if (ImGui::Button("BACK", ImVec2(backWidth, buttonHeight))) {
         SaveGameSettings(g_settings);
         openFlag = false;
     }
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
+    ImGui::PopStyleColor(3);
+
+    ImGui::End();
 }
 
 // Defined in Multiplayer.h, which is included after this file because it needs
@@ -630,12 +1134,6 @@ static uint64_t UITextureFromFile(const char* imagePath) {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return gpu.ptr;
 }
-
-// The menu's typefaces, rasterized at the sizes they are actually drawn at.
-// Both stay null when no font file is found, and every use falls back to the
-// built-in font -- the menu is then exactly what it was before.
-static ImFont* g_menuTitleFont = nullptr;
-static ImFont* g_menuBodyFont = nullptr;
 
 // Rasterizing at the display size is the whole point: the wordmark used to be
 // the 13px built-in bitmap blown up 5.2x, which is why its edges were soft and

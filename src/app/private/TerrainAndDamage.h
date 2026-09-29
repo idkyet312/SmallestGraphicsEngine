@@ -371,7 +371,26 @@ static void ApplyRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
         // the tighter span it has always used: it is a shallow scrape, and
         // clearing out to its lip strips turf the wreck never touched.
         const float grassSpan = isCrater ? 1.18f : 0.6f;
-        if (g_grass.TerrainSandDominant(stamp.x, stamp.z)) {
+        bool sandExposed = g_grass.TerrainSandExposed(stamp.x, stamp.z);
+        if (isCrater && !sandExposed) {
+            // A cut on a bank can reach sand on one side while its centre stays
+            // grassy. Check the floor and lower wall before keeping the turf.
+            constexpr float directions[][2] = {
+                { 1.0f, 0.0f }, { 0.7071f, 0.7071f }, { 0.0f, 1.0f },
+                { -0.7071f, 0.7071f }, { -1.0f, 0.0f },
+                { -0.7071f, -0.7071f }, { 0.0f, -1.0f },
+                { 0.7071f, -0.7071f }
+            };
+            for (const auto& direction : directions) {
+                if (g_grass.TerrainSandExposed(
+                        stamp.x + direction[0] * stamp.radius * 0.7f,
+                        stamp.z + direction[1] * stamp.radius * 0.7f)) {
+                    sandExposed = true;
+                    break;
+                }
+            }
+        }
+        if (sandExposed) {
             g_grass.AddRuntimeExclusion(
                 stamp.x, stamp.z, stamp.radius * grassSpan);
         }
@@ -693,6 +712,11 @@ static float g_winScreenAge = 0.0f;
 // the camera, or the player's sensitivity silently reverts when a level loads.
 static void ApplyGameSettings() {
     scene.camera.MouseSensitivity = g_settings.mouseSensitivity;
+    // Camera rebuild clears InvertY back to false, so this must be reapplied
+    // on every path like the sensitivity above: boot, level load, editor entry.
+    scene.camera.InvertY = g_settings.invertMouseY;
+    scene.camera.MovementViewIntensity = g_settings.cameraBob;
+    scene.weaponCameraShake = g_settings.weaponCameraShake;
     // Unlike the sensitivity above, these two survive a camera rebuild -- but
     // they are reapplied here anyway so every path that reloads settings ends
     // with the scene agreeing with the file.
@@ -704,6 +728,10 @@ static void ApplyGameSettings() {
     // level comes up in the mode the player chose rather than the default.
     // UpdateBodycamAim is left to the frame loop; this only sets the intent.
     scene.camera.BodycamAiming = g_settings.realisticAiming;
+    // Both live on the scene, not the camera, so a rebuild keeps them -- set
+    // here so the menu and the file win over the editor panel's own sliders.
+    scene.vsyncInterval = g_settings.vsync ? 1 : 0;
+    scene.cameraFOV = g_settings.fieldOfView;
     // Push the saved mix onto the live submix graph. Safe before the device is
     // up: AudioDevice stores the value and applies it to the voice when one
     // exists, which is what lets this run at boot as well as on every change.

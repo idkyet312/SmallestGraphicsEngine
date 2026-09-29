@@ -1563,18 +1563,32 @@ public:
                preparingShot_ && stationaryAimTime_ >= AimUpSeconds();
     }
 
-    // Play the throw wind-up. Called by whoever actually spawned the grenade,
-    // so the body and the round can never disagree about whether a throw
-    // happened -- the decision, the roll and the cooldown all live with the
-    // caller, and this is only the animation.
+    // Start the throw wind-up. The decision, the roll and the cooldown all live
+    // with the caller; this plays the animation and holds the grenade until
+    // the arm comes through at the clip's midpoint (kThrowReleaseFraction),
+    // when TakeGrenadeRelease hands the target back for the caller to spawn
+    // the round. A thrower killed or grabbed during the wind-up never lets go.
     //
     // Cancels the firing pose outright: the burst that led into the throw is
     // over, and leaving its timer running would put the rifle back up the
     // moment the wind-up ends.
-    void PlayGrenadeThrow() {
+    void PlayGrenadeThrow(const DirectX::XMFLOAT3& target, bool hostile) {
         if (dead_ || held_ || rappelling_) return;
         throwPlaying_ = true;
         firingTimer_ = 0.0f;
+        throwReleasePending_ = true;
+        throwReleaseReady_ = false;
+        throwTarget_ = target;
+        throwHostile_ = hostile;
+    }
+
+    // True once per throw, on the frame the wind-up reaches its release point.
+    bool TakeGrenadeRelease(DirectX::XMFLOAT3& target, bool& hostile) {
+        if (!throwReleaseReady_) return false;
+        throwReleaseReady_ = false;
+        target = throwTarget_;
+        hostile = throwHostile_;
+        return true;
     }
 
     // targetVelocity lets the shot be led: the aim point becomes where the
@@ -2329,6 +2343,8 @@ private:
         reloadPending_ = false;
         reloadPlaying_ = false;
         throwPlaying_ = false;
+        throwReleasePending_ = false;
+        throwReleaseReady_ = false;
         firingTimer_ = 0.0f;
         deathEventPending_ = true;
         killCreditPending_ = playerCredit;
@@ -2433,6 +2449,14 @@ private:
     // from outside: the grenade is spawned by the caller that rolled for it,
     // and this is the body catching up with the round already in the air.
     bool throwPlaying_ = false;
+    // The grenade leaves the hand this far through the throw clip.
+    static constexpr float kThrowReleaseFraction = 0.5f;
+    // Wind-up started, round not yet released / released this frame and
+    // waiting for the caller to spawn it.
+    bool throwReleasePending_ = false;
+    bool throwReleaseReady_ = false;
+    DirectX::XMFLOAT3 throwTarget_{};
+    bool throwHostile_ = false;
     // Seconds of firing pose still owed, counted down every frame. A timer
     // rather than a flag because rounds arrive discretely while the pose has to
     // span the gaps between them.
@@ -2445,11 +2469,28 @@ private:
     // miming a throw it did not make.
     bool UpdateThrowPose(float dt) {
         if (!throwPlaying_) return false;
-        if (dead_ || held_ || rappelling_) { throwPlaying_ = false; return false; }
+        if (dead_ || held_ || rappelling_) {
+            throwPlaying_ = false;
+            throwReleasePending_ = false;
+            return false;
+        }
         const AnimationClip* toss = model.FindClip("ThrowGrenade");
-        if (!toss) { throwPlaying_ = false; return false; }
+        if (!toss) {
+            // No clip to wait on: let go straight away rather than never.
+            throwPlaying_ = false;
+            if (throwReleasePending_) {
+                throwReleasePending_ = false;
+                throwReleaseReady_ = true;
+            }
+            return false;
+        }
         if (anim.clip != toss) { anim.Play(toss); anim.loop = false; }
         anim.Advance(dt);
+        if (throwReleasePending_ &&
+            anim.time >= toss->duration * kThrowReleaseFraction) {
+            throwReleasePending_ = false;
+            throwReleaseReady_ = true;
+        }
         // Non-looping, so time saturates at the end rather than wrapping.
         if (anim.time < toss->duration) return true;
         // Play() leaves `loop` alone, so hand it back or every cycle after

@@ -502,6 +502,7 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     }
     const size_t slotIndex = static_cast<size_t>(g_armoryShopSlot);
     const size_t otherIndex = slotIndex == 0 ? 1 : 0;
+    DrawWeaponCameraShakeSlider(carried[slotIndex]);
 
     // Reserve room for the manifest line and the leave-counter action below;
     // the stock list scrolls once the catalogue exceeds this viewport.

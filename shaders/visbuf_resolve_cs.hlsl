@@ -1732,22 +1732,25 @@ struct TerrainVBGrads {
 // footprint stable instead of picking up depth discontinuities at silhouettes.
 void TerrainWorldDerivatives(uint2 pixel, float3 worldPos, float3 geoNormal,
                              out float3 worldDx, out float3 worldDy) {
-    float3 origin = cameraPos;
-    float denominator = dot(geoNormal, worldPos - origin);
-
+    // Each neighbour ray is built from two points unprojected through the
+    // same matrix, never from cameraPos. cameraPos is the stable player eye
+    // while the view matrix carries the walking bob; a few centimetres of
+    // origin error dwarfs a pixel footprint and pulsed the mip with the bob.
     float3 farX = ReconstructWorldPosOffset(pixel, float2(1.5, 0.5), 1.0);
     float3 farY = ReconstructWorldPosOffset(pixel, float2(0.5, 1.5), 1.0);
-    float3 dirX = normalize(farX - origin);
-    float3 dirY = normalize(farY - origin);
+    float3 midX = ReconstructWorldPosOffset(pixel, float2(1.5, 0.5), 0.5);
+    float3 midY = ReconstructWorldPosOffset(pixel, float2(0.5, 1.5), 0.5);
+    float3 dirX = normalize(farX - midX);
+    float3 dirY = normalize(farY - midY);
 
     float nDotX = dot(geoNormal, dirX);
     float nDotY = dot(geoNormal, dirY);
     // Grazing angles make the plane intersection blow up. Fall back to a zero
     // offset rather than emitting an enormous mip bias.
     float3 hitX = abs(nDotX) > 1e-4
-        ? origin + dirX * (denominator / nDotX) : worldPos;
+        ? midX + dirX * (dot(geoNormal, worldPos - midX) / nDotX) : worldPos;
     float3 hitY = abs(nDotY) > 1e-4
-        ? origin + dirY * (denominator / nDotY) : worldPos;
+        ? midY + dirY * (dot(geoNormal, worldPos - midY) / nDotY) : worldPos;
 
     worldDx = hitX - worldPos;
     worldDy = hitY - worldPos;

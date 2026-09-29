@@ -3479,10 +3479,14 @@ struct DestructionDX12::Impl {
         const uint32_t structureId = panel.structureId;
         panel.support = false;
         panel.retired = true;
-        // Drop the intact panel's render and collision ownership before Blast
-        // emits its split event. Only the generated fragments may replace it.
-        RetireChunkFromRuntime(*target, chunkIndex);
+        // Let the split callback read the original body pose and chunk set.
+        // The retired flag keeps the dead panel out of every child runtime.
         ProcessGroup();
+
+        // A one-chunk fracture may not emit a split event. In that case the
+        // original runtime still owns the panel and must release its collision.
+        if (ActorRuntime* owner = FindChunkOwner(chunkIndex))
+            RetireChunkFromRuntime(*owner, chunkIndex);
 
         // A destroyed one-chunk actor may produce no visible child, leaving an
         // empty runtime for us to retire explicitly.
@@ -5274,7 +5278,8 @@ bool DestructionDX12::ResolveAttachment(
 }
 
 void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius,
-                                        float damage, bool sparesProtected) {
+                                        float damage, bool sparesProtected,
+                                        bool useSegmentHit) {
     if (!m->initialized) return;
     // Bullet struck a person, not a Blast chunk. Preserve building bonds.
     if (m->lastRagdollHit >= 0) return;
@@ -5284,7 +5289,17 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     // Explosions and lasers use their dedicated immediate-destruction paths.
     Impl::ActorRuntime* hitActor = nullptr;
     uint32_t hitChunk = InvalidIndex;
-    if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return;
+    // The segment test already identified the fence panel struck by a round.
+    // A second nearest-bounds search can choose its neighbour at a shared seam.
+    if (useSegmentHit && m->lastRagdollHit < 0 &&
+        m->lastHitChunk < m->chunks.size() &&
+        m->chunks[m->lastHitChunk].fencePiece &&
+        !m->chunks[m->lastHitChunk].retired) {
+        hitChunk = m->lastHitChunk;
+        hitActor = m->FindChunkOwner(hitChunk);
+    }
+    if (!hitActor &&
+        !m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return;
     // Indirect damage (spreading fire, debris impacts) leaves objective
     // geometry alone; a direct player hit does not pass this flag.
     if (sparesProtected && hitChunk < m->chunks.size() &&

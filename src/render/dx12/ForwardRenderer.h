@@ -2326,7 +2326,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     // so this tracks SHADOW_MAP_SIZE by convention.
                     shadowMap ? 1.0f / (float)shadowMap->GetDesc().Width
                               : 1.0f / 4096.0f);
-    shader.SetCamera(scene.camera.Position);
+    shader.SetCamera(scene.camera.VisualPosition());
 
     // Clustered light cull
     scene.clusteredRenderer.setScreenSize(

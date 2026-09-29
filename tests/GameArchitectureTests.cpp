@@ -515,6 +515,57 @@ int main() {
     // A completed descent releases the rope rather than leaking the world.
     CHECK(fastInsertion.blackHawkRopeReleaseRequested);
 
+    // The oversized walkable airframe shrinks to exterior size only once it is
+    // leaving empty, and only once it is well clear of the drop-off.
+    fastInsertion.blackHawkModelScale = 2.0f;
+    fastInsertion.blackHawkExteriorScale = 0.5f;
+    CHECK(std::abs(fastInsertion.BlackHawkDrawScale() - 2.0f) < 0.001f);
+    fastInsertion.UpdateBlackHawk(0.05f);
+    CHECK(std::abs(fastInsertion.BlackHawkDrawScale() - 2.0f) < 0.001f);
+    for (int stepIndex = 0; stepIndex < 2000; ++stepIndex) {
+        const float dx = fastInsertion.blackHawkPosition.x;
+        const float dz = fastInsertion.blackHawkPosition.z;
+        if (std::sqrt(dx * dx + dz * dz) >
+            VehicleSystem::BlackHawkShrinkEndDistance) break;
+        const float before = fastInsertion.BlackHawkDrawScale();
+        fastInsertion.UpdateBlackHawk(0.05f);
+        CHECK(fastInsertion.BlackHawkDrawScale() <= before + 0.0001f);
+    }
+    CHECK(std::abs(fastInsertion.BlackHawkDrawScale() - 1.0f) < 0.001f);
+
+    // Shot down just after drop-off: shrinks on a clock while falling, then
+    // freezes once down (the wreck's collision is baked from that scale).
+    VehicleSystem emptyCrash;
+    emptyCrash.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, true);
+    emptyCrash.blackHawkModelScale = 2.0f;
+    emptyCrash.blackHawkExteriorScale = 0.5f;
+    emptyCrash.blackHawkPhase = VehicleSystem::BlackHawkPhase::Departing;
+    emptyCrash.blackHawkCarryingPlayer = false;
+    emptyCrash.blackHawkPosition = { 0.0f, 400.0f, 0.0f };
+    emptyCrash.blackHawkCrashGroundY = 0.0f;
+    emptyCrash.BeginBlackHawkCrash();
+    emptyCrash.UpdateBlackHawk(VehicleSystem::BlackHawkCrashShrinkTime * 0.5f);
+    CHECK(std::abs(emptyCrash.BlackHawkDrawScale() - 1.5f) < 0.001f);
+    emptyCrash.UpdateBlackHawk(VehicleSystem::BlackHawkCrashShrinkTime);
+    CHECK(std::abs(emptyCrash.BlackHawkDrawScale() - 1.0f) < 0.001f);
+
+    // A crash with the player still aboard keeps the walkable cabin size while
+    // it falls, then lands as an exterior-size wreck.
+    VehicleSystem crewedCrash;
+    crewedCrash.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, false);
+    crewedCrash.blackHawkModelScale = 2.0f;
+    crewedCrash.blackHawkExteriorScale = 0.5f;
+    CHECK(crewedCrash.blackHawkCarryingPlayer);
+    crewedCrash.BeginBlackHawkCrash();
+    crewedCrash.UpdateBlackHawk(0.05f);
+    CHECK(std::abs(crewedCrash.BlackHawkDrawScale() - 2.0f) < 0.001f);
+    for (int stepIndex = 0; stepIndex < 400 &&
+         crewedCrash.blackHawkPhase != VehicleSystem::BlackHawkPhase::Down;
+         ++stepIndex)
+        crewedCrash.UpdateBlackHawk(0.05f);
+    CHECK(crewedCrash.blackHawkPhase == VehicleSystem::BlackHawkPhase::Down);
+    CHECK(std::abs(crewedCrash.BlackHawkDrawScale() - 1.0f) < 0.001f);
+
     // Rope cut mid-descent. NotifyBlackHawkRopeCut latches the progress the cut
     // happened at (which the fall damage is scaled from), refuses to fire twice,
     // and refuses to fire at all when no descent is in progress.

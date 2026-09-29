@@ -15,6 +15,10 @@ class PalmMeshCutter {
 public:
     static std::shared_ptr<SceneMesh> BuildWholeTrunk();
 
+    // Record the cut-face texture upload during level loading, before its mip
+    // pass is flushed and before gameplay starts creating cut geometry.
+    static bool PrepareCapMaterial();
+
     // cutY is in PalmModel local space. impactDirectionXZ tilts the cut slightly
     // toward the incoming damage so breaks do not look machine-sawn.
     static PalmMeshCut Cut(const std::shared_ptr<SceneMesh>& source,

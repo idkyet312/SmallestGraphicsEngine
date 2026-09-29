@@ -10,6 +10,7 @@
 #include "TimeOfDay.h"
 #include "ChargeAnchor.h"
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
@@ -613,6 +614,8 @@ struct Scene {
     bool c4DetonateHeld = false;
     float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
+    std::array<float, SGE::WeaponCustomizationSystem::kWeaponCount>
+        weaponCameraShake{};
     // The launcher's own kick, 1 at the shot and falling linearly to 0 over
     // kLauncherRecoilSeconds. The rifle channels above return in ~0.1 s, which
     // on a single rocket shot is six frames: the tube looked like it never
@@ -1304,6 +1307,7 @@ struct Scene {
     }
 
     Scene() {
+        weaponCameraShake.fill(1.0f);
         cube1.position = { 0.0f, 1.0f, 0.0f };
         cube1.scale    = { 2.0f, 2.0f, 2.0f };
         cube1.color    = { 0.85f, 0.25f, 0.3f };
@@ -2413,13 +2417,20 @@ struct Scene {
         ++localShotCounter;
     }
 
+    void AddWeaponFireTrauma(float amount, int weaponId) {
+        const float scale = weaponId >= 0 &&
+            weaponId < static_cast<int>(weaponCameraShake.size())
+                ? weaponCameraShake[static_cast<size_t>(weaponId)] : 1.0f;
+        camera.AddFireTrauma(amount, scale);
+    }
+
     // kickAfterShot: the round leaves along the aim as it was when the trigger
     // broke, and only then does the camera climb -- the same order the R700
     // uses. Without it the shot's own kick is applied first, so every round
     // lands above the sight picture. The Garand opts in; the automatics keep
     // the original order, where each round rides its own kick.
     void ShootProjectile(const SGE::ResolvedWeaponStats& stats,
-                         bool kickAfterShot = false) {
+                         bool kickAfterShot, int weaponId) {
         // Bullets leave inside the cone the reticle is showing, so sights
         // tighten grouping in two ways: the bloom itself collapses under ADS,
         // and the kick halves. Sighted fire is steadier but still climbs -- the
@@ -2435,7 +2446,7 @@ struct Scene {
                            randomYaw);
         // Carbine tap. Scaled by the same recoilScale the aim kick uses, so
         // the shake tracks the climb whatever that scale ends up being.
-        camera.AddFireTrauma(0.045f * recoilScale);
+        AddWeaponFireTrauma(0.045f * recoilScale, weaponId);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
         const XMFLOAT3 shotAim = kickAfterShot ? preKickAim : camera.GetAimFront();
@@ -2489,7 +2500,7 @@ struct Scene {
         laserBeam.life = laserBeam.maxLife;
     }
 
-    void ShootHarpoonProjectile() {
+    void ShootHarpoonProjectile(int weaponId) {
         // Harpoon, rocket and shotgun author their kick inline rather than
         // through ResolvedWeaponStats, so the global scale has to be applied
         // here too -- without it these three would be the only weapons left at
@@ -2498,7 +2509,7 @@ struct Scene {
             SGE::WeaponCustomizationSystem::kGlobalRecoilScale, 0.0f);
         // Harpoon gun: a spring-driven launch rather than a powder charge, so
         // it thumps rather than cracks.
-        camera.AddFireTrauma(0.06f);
+        AddWeaponFireTrauma(0.06f, weaponId);
         gunRecoilBack = (std::min)(0.14f, gunRecoilBack + 0.11f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 3.2f);
         TriggerMuzzleFlash(0.9f, 0.72f);
@@ -2731,7 +2742,8 @@ struct Scene {
     // the round: a can traps most of the muzzle blast, which is what produces
     // both the flash and part of the kick. Damage and velocity are untouched --
     // the suppressed rifle hits exactly as hard as the bare one.
-    void ShootSniperProjectile(const SGE::ResolvedWeaponStats& stats) {
+    void ShootSniperProjectile(const SGE::ResolvedWeaponStats& stats,
+                               int weaponId) {
         // No spread, ever. The SVD puts its round exactly where the crosshair
         // sits regardless of stance or movement -- a marksman rifle whose shot
         // wanders is not one, and the 5x damage multiplier only means something
@@ -2743,7 +2755,7 @@ struct Scene {
         // Marksman rifle. A shade less than the shotgun despite the bigger aim
         // kick: this weapon is fired from a scope, where a shaking view is far
         // more disruptive than it is at the hip.
-        camera.AddFireTrauma(stats.suppressed ? 0.085f : 0.10f);
+        AddWeaponFireTrauma(stats.suppressed ? 0.085f : 0.10f, weaponId);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
         gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
         // A suppressed muzzle still flares, just far less. Killing it outright
@@ -2766,7 +2778,7 @@ struct Scene {
         projectiles.push_back(p);
     }
 
-    void ShootRocket() {
+    void ShootRocket(int weaponId) {
         // The rocket leaves first, from where the tube and the crosshair are
         // at the trigger pull. Recoil used to be applied before these were
         // read, so the round came out of the kicked-up tube along a view that
@@ -2792,7 +2804,7 @@ struct Scene {
         // Launcher backblast: the hardest shove of any weapon here, and the one
         // shot where a real jolt is expected. Still under the firing ceiling --
         // the rocket's own detonation supplies the big shake a moment later.
-        camera.AddFireTrauma(0.19f);
+        AddWeaponFireTrauma(0.19f, weaponId);
         launcherRecoil = 1.0f;
     }
 
@@ -3013,7 +3025,9 @@ struct Scene {
 
     // Gun world-space model matrix
     XMMATRIX GetGunModelMatrix() const {
-        XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
+        const XMFLOAT3 gunEye = ejected ? ViewmodelAnchorPosition()
+                                         : camera.VisualPosition();
+        XMVECTOR camPos   = XMLoadFloat3(&gunEye);
         XMVECTOR camFront = XMLoadFloat3(&camera.Front);
         XMVECTOR camRight = XMVector3Cross(XMLoadFloat3(&camera.Up), camFront);
         XMVECTOR camUp    = XMLoadFloat3(&camera.Up);
@@ -3039,7 +3053,9 @@ struct Scene {
         // While ejected the weapon must stay parked at the body the player left
         // behind, not ride the free camera -- otherwise flying out to inspect the
         // view model just drags it along and you never see it from outside.
-        const XMVECTOR camPos   = XMLoadFloat3(&ViewmodelAnchorPosition());
+        const XMFLOAT3 gunEye = ejected ? ViewmodelAnchorPosition()
+                                         : camera.VisualPosition();
+        const XMVECTOR camPos   = XMLoadFloat3(&gunEye);
         const XMVECTOR camFront = XMVector3Normalize(XMLoadFloat3(&ViewmodelAnchorFront()));
         const XMVECTOR worldUp  = XMLoadFloat3(&camera.Up);
 
@@ -3177,14 +3193,14 @@ struct Scene {
         remoteTracers.push_back(tracer);
     }
 
-    void ShootShotgun() {
+    void ShootShotgun(int weaponId) {
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * 2.2f;
         camera.ApplyRecoil(recoilPitch * 2.8f *
             SGE::WeaponCustomizationSystem::kGlobalRecoilScale, randomYaw);
         // Shotgun: heaviest per-shot kick in the rack, and slow enough between
         // shots that the shake fully decays rather than stacking.
-        camera.AddFireTrauma(0.13f);
+        AddWeaponFireTrauma(0.13f, weaponId);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.13f);
         gunRecoilKick = (std::min)(11.0f, gunRecoilKick + 7.5f);
         TriggerMuzzleFlash(1.35f, 1.45f);

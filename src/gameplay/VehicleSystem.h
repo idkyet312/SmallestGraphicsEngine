@@ -1033,6 +1033,27 @@ public:
     DirectX::XMFLOAT3 blackHawkModelCenter{};
     float blackHawkModelMinY = 0.0f;
     float blackHawkModelScale = 1.0f;
+    // The MH-60 is modelled oversized so its cabin is walkable. Once nobody is
+    // aboard that is just a giant aircraft, so it eases down to this fraction
+    // of blackHawkModelScale (real proportions) as it flies off or goes down.
+    // 1 for an airframe already at real size. Set by the model loader.
+    float blackHawkExteriorScale = 1.0f;
+    // 0 = cabin size, 1 = exterior size. Only ever grows during a departure
+    // or crash, is forced to 1 on impact, and is frozen once the wreck is
+    // down -- its collision is baked from the draw matrix on impact.
+    float blackHawkShrinkProgress = 0.0f;
+    // Distance from the drop-off over which a departure shrinks: far enough
+    // out that perspective hides the change.
+    static constexpr float BlackHawkShrinkStartDistance = 30.0f;
+    static constexpr float BlackHawkShrinkEndDistance = 90.0f;
+    // A crash can start right over the LZ, so it shrinks on a clock instead.
+    static constexpr float BlackHawkCrashShrinkTime = 1.5f;
+    float BlackHawkDrawScale() const {
+        const float t = blackHawkShrinkProgress;
+        const float eased = t * t * (3.0f - 2.0f * t);
+        return blackHawkModelScale *
+               (1.0f + (blackHawkExteriorScale - 1.0f) * eased);
+    }
     DirectX::XMFLOAT3 blackHawkPosition{ 0.0f, BlackHawkStartHeight, 0.0f };
     // Drop-off point: the player spawn, projected onto the terrain.
     DirectX::XMFLOAT3 blackHawkDropOff{ 0.0f, 0.0f, 0.0f };
@@ -1432,6 +1453,11 @@ public:
                 blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
                 blackHawkLanded = true;
                 blackHawkJustCrashed = true;
+                // Nobody walks the cabin of a wreck, so it lands at exterior
+                // size. Snapped here, under the impact explosion, for a bird
+                // that went down with the player aboard and never shrank;
+                // before the caller bakes collision from the draw matrix.
+                blackHawkShrinkProgress = 1.0f;
                 // Anyone still aboard is thrown clear on impact; the caller
                 // reads this to place and hurt them.
                 blackHawkDroppedPlayer = blackHawkCarryingPlayer;
@@ -1444,6 +1470,27 @@ public:
             break;
         case BlackHawkPhase::Gone:
             break;
+        }
+
+        // Cabin size while anyone could be inside it; exterior size once it is
+        // leaving empty. Down keeps whatever it reached -- see the field.
+        if (blackHawkCarryingPlayer ||
+            blackHawkPhase == BlackHawkPhase::Inbound ||
+            blackHawkPhase == BlackHawkPhase::Descending ||
+            blackHawkPhase == BlackHawkPhase::Rappelling ||
+            blackHawkPhase == BlackHawkPhase::Unloading) {
+            blackHawkShrinkProgress = 0.0f;
+        } else if (blackHawkPhase == BlackHawkPhase::Departing) {
+            const float dx = blackHawkPosition.x - blackHawkDropOff.x;
+            const float dz = blackHawkPosition.z - blackHawkDropOff.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            const float target = (std::max)(0.0f, (std::min)(1.0f,
+                (distance - BlackHawkShrinkStartDistance) /
+                (BlackHawkShrinkEndDistance - BlackHawkShrinkStartDistance)));
+            blackHawkShrinkProgress = (std::max)(blackHawkShrinkProgress, target);
+        } else if (blackHawkPhase == BlackHawkPhase::Crashing) {
+            blackHawkShrinkProgress = (std::min)(1.0f,
+                blackHawkShrinkProgress + dt / BlackHawkCrashShrinkTime);
         }
 
         // Velocity by difference, for anything that needs to lead the airframe

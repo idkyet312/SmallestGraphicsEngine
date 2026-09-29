@@ -20,6 +20,9 @@ public:
     float MouseSensitivity;
     bool BodycamAiming = false;
     bool BodycamActive = false;
+    bool InvertY = false;
+    // Scales the walking view bob; 0 is off. Set from GameSettings.
+    float MovementViewIntensity = 1.0f;
     float BodycamFollowSpeed = 6.0f;
     float AimYawOffset = 0.0f;
     float AimPitchOffset = 0.0f;
@@ -94,6 +97,11 @@ public:
     // Swim tuning. Water this shallow is waded, not swum -- as a fraction of
     // player height, so crouching does not change where the beach becomes sea.
     static constexpr float kWadeDepthFraction = 0.75f;
+    // Floor this far below a grounded player is walked down onto, not fallen
+    // to. Covers a stair riser and a walkable slope at sprint speed.
+    static constexpr float kMaxStepDown = 0.5f;
+    // Rate the stair-step view offset decays back to the real eye (1/s).
+    static constexpr float kStepViewSettle = 14.0f;
     // How far the eyes ride below the surface while treading water. Small, so
     // the waterline sits at chin height and the view stays clear.
     static constexpr float kEyesUnderSurface = 0.22f;
@@ -119,8 +127,49 @@ public:
         updateCameraVectors();
     }
 
+    // Rendering alone gets the walking offset; collision and shot origins keep
+    // the stable player position.
+    XMFLOAT3 VisualPosition() const {
+        if (!FPSMode) return Position;
+        return { Position.x + movementViewOffset_.x,
+                 Position.y + movementViewOffset_.y + stepViewOffset_,
+                 Position.z + movementViewOffset_.z };
+    }
+
+    void UpdateMovementView(float dt, float horizontalSpeed, float adsBlend,
+                            bool walking) {
+        if (dt <= 0.0f) return;
+        const float speed = walking ? std::clamp(horizontalSpeed, 0.0f, 8.0f)
+                                    : 0.0f;
+        const float target = std::clamp((speed - 0.7f) / 4.3f, 0.0f, 1.0f);
+        const float settle = 1.0f - std::exp(-12.0f * dt);
+        movementViewStrength_ += (target - movementViewStrength_) * settle;
+        if (target > 0.0f)
+            movementViewPhase_ = std::fmod(
+                movementViewPhase_ + speed * dt * (XM_2PI / 2.8f),
+                XM_2PI * 2.0f);
+
+        const float aimScale = 1.0f - 0.85f *
+            std::clamp(adsBlend, 0.0f, 1.0f);
+        const float side = std::sin(movementViewPhase_ * 0.5f) *
+            0.018f * movementViewStrength_ * aimScale * MovementViewIntensity;
+        const float rise = std::sin(movementViewPhase_) *
+            0.045f * movementViewStrength_ * aimScale * MovementViewIntensity;
+        XMVECTOR right = XMVector3Cross(
+            XMLoadFloat3(&Up), XMLoadFloat3(&Front));
+        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        else
+            right = XMVector3Normalize(right);
+        XMFLOAT3 rightAxis;
+        XMStoreFloat3(&rightAxis, right);
+        movementViewOffset_ = { rightAxis.x * side, rise,
+                                rightAxis.z * side };
+    }
+
     XMMATRIX GetViewMatrix() {
-        XMVECTOR pos = XMLoadFloat3(&Position);
+        const XMFLOAT3 visualPosition = VisualPosition();
+        XMVECTOR pos = XMLoadFloat3(&visualPosition);
         XMVECTOR front = XMLoadFloat3(&Front);
         XMVECTOR up = XMLoadFloat3(&Up);
         if (explosionTrauma_ > 0.001f) {
@@ -135,12 +184,45 @@ public:
             pos += right * (std::sin(explosionShakeTime_ * 43.0f) * 0.055f * strength);
             pos += up * (std::sin(explosionShakeTime_ * 61.0f + 1.3f) * 0.035f * strength);
         }
+        if (firePitchOffset_ != 0.0f || fireYawOffset_ != 0.0f) {
+            const float yaw = XMConvertToRadians(fireYawOffset_);
+            const float pitch = XMConvertToRadians(firePitchOffset_);
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(front, up));
+            front = XMVector3Normalize(front + right * std::tan(yaw) +
+                                       up * std::tan(pitch));
+        }
         return XMMatrixLookAtLH(pos, XMVectorAdd(pos, front), up);
     }
 
     void Update(float deltaTime) {
         explosionShakeTime_ += deltaTime;
         explosionTrauma_ = (std::max)(0.0f, explosionTrauma_ - deltaTime * 1.8f);
+        if (firePitchOffset_ != 0.0f || firePitchVelocity_ != 0.0f ||
+            fireYawOffset_ != 0.0f || fireYawVelocity_ != 0.0f) {
+            constexpr float kSettleRate = 24.0f;
+            const float dt = (std::max)(0.0f, deltaTime);
+            const float decay = std::exp(-kSettleRate * dt);
+            const auto settle = [&](float& offset, float& velocity,
+                                    float maxAngle) {
+                const float travel = velocity + kSettleRate * offset;
+                offset = (offset + travel * dt) * decay;
+                velocity = (velocity - kSettleRate * travel * dt) * decay;
+                if (offset > maxAngle) {
+                    offset = maxAngle;
+                    velocity = (std::min)(velocity, 0.0f);
+                } else if (offset < -maxAngle) {
+                    offset = -maxAngle;
+                    velocity = (std::max)(velocity, 0.0f);
+                }
+                if (std::abs(offset) < 0.0001f &&
+                    std::abs(velocity) < 0.001f) {
+                    offset = 0.0f;
+                    velocity = 0.0f;
+                }
+            };
+            settle(firePitchOffset_, firePitchVelocity_, 6.0f);
+            settle(fireYawOffset_, fireYawVelocity_, 2.0f);
+        }
         explosionFovKick_ *= std::exp(-8.5f * (std::max)(0.0f, deltaTime));
         if (explosionFovKick_ < 0.01f) explosionFovKick_ = 0.0f;
         if (FPSMode) {
@@ -201,18 +283,41 @@ public:
                 // gate on IsGrounded and none of them should fire mid-water.
                 IsGrounded = false;
             } else {
+                const bool wasGrounded = IsGrounded;
+                // Last frame's settled pose: horizontal walking has already
+                // been applied by ProcessKeyboard before this runs.
+                const XMFLOAT3 before = lastSettledPosition_;
                 // Apply gravity
                 VerticalVelocity -= Gravity * deltaTime;
                 Position.y += VerticalVelocity * deltaTime;
 
-                // Ground collision
-                if (Position.y <= groundLevel) {
+                // Ground collision. A grounded player walking downhill or down
+                // a stair stays glued to floor within step reach; gravity alone
+                // left them airborne every frame on the way down a slope.
+                const bool snapDown = wasGrounded && VerticalVelocity <= 0.0f &&
+                                      Position.y - groundLevel <= kMaxStepDown;
+                if (Position.y <= groundLevel || snapDown) {
                     Position.y = groundLevel;
                     VerticalVelocity = 0.0f;
                     IsGrounded = true;
                 } else {
                     IsGrounded = false;
                 }
+
+                // Stair steps change height faster than any walkable slope
+                // would for the distance moved. Absorb that jump into a
+                // decaying view offset so the eye glides over the step.
+                if (wasGrounded && IsGrounded) {
+                    const float dx = Position.x - before.x;
+                    const float dz = Position.z - before.z;
+                    const float rise = Position.y - before.y;
+                    if (std::abs(rise) <= kMaxStepDown &&
+                        std::abs(rise) > std::sqrt(dx * dx + dz * dz) * 1.1f + 0.02f)
+                        stepViewOffset_ = std::clamp(stepViewOffset_ - rise,
+                                                     -kMaxStepDown, kMaxStepDown);
+                }
+                stepViewOffset_ *= std::exp(-kStepViewSettle * deltaTime);
+                lastSettledPosition_ = Position;
             }
             SwimInput = 0.0f;
         }
@@ -313,6 +418,7 @@ public:
     void ProcessMouseMovement(float xoffset, float yoffset) {
         xoffset *= MouseSensitivity;
         yoffset *= MouseSensitivity;
+        if (InvertY) yoffset = -yoffset;
         if (BodycamActive) {
             // Accumulate into the lead only -- the body is turned by the spring
             // in UpdateBodycamAim and nowhere else.
@@ -430,24 +536,27 @@ public:
         explosionTrauma_ = (std::min)(0.72f, explosionTrauma_ + amount);
     }
 
-    // Small kick from firing. Same shake channel again, with a much lower cap
-    // than either a blast or a hit: sustained automatic fire adds a tap per
-    // round, and without its own ceiling a held trigger would ramp the view up
-    // to grenade-level shake within a second.
-    //
-    // Deliberately capped BELOW where the shake gets disorienting rather than
-    // scaled per shot, because the trauma curve is squared -- at 0.22 the shake
-    // is a tremor, and letting it stack to 0.5 would be four times that.
-    //
-    // The cap only limits what firing itself may ADD. Trauma already above it
-    // (a grenade just went off, the player was just shot) is left alone rather
-    // than clamped down -- otherwise pulling the trigger during a blast would
-    // cancel the blast's shake, which is backwards.
-    void AddFireTrauma(float amount) {
-        constexpr float kFireTraumaCeiling = 0.22f;
-        if (explosionTrauma_ >= kFireTraumaCeiling) return;
-        explosionTrauma_ =
-            (std::min)(kFireTraumaCeiling, explosionTrauma_ + amount);
+    // Add velocity to a short, view-only spring. Automatic fire builds on the
+    // current motion instead of restarting a waveform every round; blast and
+    // hit trauma stay on their separate channel.
+    void AddFireTrauma(float amount, float shakeScale = 1.0f) {
+        const float scale = std::clamp(shakeScale, 0.0f, 30.0f);
+        if (scale == 0.0f) {
+            firePitchOffset_ = firePitchVelocity_ = 0.0f;
+            fireYawOffset_ = fireYawVelocity_ = 0.0f;
+            return;
+        }
+        const float kick = amount * scale;
+        const float yawSign = fireYawRight_ ? 1.0f : -1.0f;
+        fireYawRight_ = !fireYawRight_;
+        firePitchOffset_ = std::clamp(firePitchOffset_ + kick * 0.65f,
+                                      -6.0f, 6.0f);
+        firePitchVelocity_ = std::clamp(firePitchVelocity_ + kick * 120.0f,
+                                        -300.0f, 300.0f);
+        fireYawOffset_ = std::clamp(fireYawOffset_ + yawSign * kick * 0.18f,
+                                    -2.0f, 2.0f);
+        fireYawVelocity_ = std::clamp(fireYawVelocity_ + yawSign * kick * 28.0f,
+                                      -90.0f, 90.0f);
     }
 
     float ExplosionFovKick() const { return explosionFovKick_; }
@@ -460,8 +569,18 @@ public:
     }
 
 private:
+    XMFLOAT3 movementViewOffset_{};
+    float stepViewOffset_ = 0.0f;
+    XMFLOAT3 lastSettledPosition_{};
+    float movementViewPhase_ = 0.0f;
+    float movementViewStrength_ = 0.0f;
     float explosionTrauma_ = 0.0f;
     float explosionShakeTime_ = 0.0f;
+    float firePitchOffset_ = 0.0f;
+    float firePitchVelocity_ = 0.0f;
+    float fireYawOffset_ = 0.0f;
+    float fireYawVelocity_ = 0.0f;
+    bool fireYawRight_ = false;
     float explosionFovKick_ = 0.0f;
 
     void updateCameraVectors() {

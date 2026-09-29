@@ -222,6 +222,7 @@ static void ApplyHumveeLevelPlan(const RuntimeLevelPlan& plan) {
 }
 
 static void InitializeLevelHumveePhysics() {
+    g_humveePreviousPhysicsPoses.clear();
     g_destruction.ClearVehicles();
     if (g_emptyLevelMode || g_trainingRangeMode || g_baseMode ||
         !g_levelPlacesHumvee)

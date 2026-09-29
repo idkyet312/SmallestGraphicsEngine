@@ -366,8 +366,8 @@ private:
             XMMatrixTranspose(XMMatrixInverse(nullptr, vp)));
         XMStoreFloat4x4(&constants.viewProjection, XMMatrixTranspose(vp));
         constants.cameraNear = {
-            scene.camera.Position.x, scene.camera.Position.y,
-            scene.camera.Position.z, scene.cameraNear };
+            scene.camera.VisualPosition().x, scene.camera.VisualPosition().y,
+            scene.camera.VisualPosition().z, scene.cameraNear };
         constants.screenParams = {
             static_cast<float>(g_dx12.screenWidth),
             static_cast<float>(g_dx12.screenHeight),

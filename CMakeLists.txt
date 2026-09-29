@@ -679,6 +679,18 @@ if(BUILD_TESTING)
     target_link_libraries(SphereMeshCutTests PRIVATE SGEProjectHeaders)
     add_test(NAME SphereMeshCutTests COMMAND SphereMeshCutTests)
 
+    # Jagged palm-trunk fracture cut. Stubs the two GLBImporter statics
+    # PalmMeshCutter.cpp calls (see tests/PalmMeshCutterStub.cpp) so this pulls
+    # in neither a D3D12 device nor GLBImporter.cpp's own heavy asset-importer
+    # dependency chain -- the geometry and mating checks are pure arithmetic
+    # over a synthetic cylinder standing in for the sliced palm trunk.
+    add_executable(PalmMeshCutterTests
+        tests/PalmMeshCutterTests.cpp
+        tests/PalmMeshCutterStub.cpp
+        src/world/vegetation/PalmMeshCutter.cpp)
+    target_link_libraries(PalmMeshCutterTests PRIVATE SGEProjectHeaders d3d12)
+    add_test(NAME PalmMeshCutterTests COMMAND PalmMeshCutterTests)
+
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     add_executable(RagdollRigFitTests tests/RagdollRigFitTests.cpp)
     target_link_libraries(RagdollRigFitTests PRIVATE SGEProjectHeaders)

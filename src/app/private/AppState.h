@@ -803,9 +803,8 @@ GunAudio                    g_krissAudio;
 // And the M1 Garand: its own rifle report, in its own voice, so its 0.13s
 // semi-auto cadence does not cut off a shot still ringing.
 GunAudio                    g_garandAudio;
-// The Garand's en-bloc clip ejects with a distinct metallic "ping" on reload.
-// Played on top of the normal reload sound, not instead of it -- see
-// PlayReloadSound() in Combat.h.
+// The Garand's en-bloc clip ejects with a distinct metallic "ping" after its
+// last round or when reloaded early -- see Combat.h.
 GunAudio                    g_garandClipEjectAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
@@ -817,6 +816,7 @@ std::array<GunAudio, 3>     g_destructionBreakAudio;
 std::array<GunAudio, 3>     g_destructionImpactAudio;
 static float                g_destructionBreakAudioCooldown = 0.0f;
 static float                g_destructionImpactAudioCooldown = 0.0f;
+static float                g_palmBreakAudioCooldown = 0.0f;
 struct PendingExplosionAudio {
     float delay = 0.0f;
     float volume = 1.0f;

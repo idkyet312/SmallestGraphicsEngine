@@ -37,6 +37,8 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <functional>
 
@@ -68,6 +70,18 @@ class PalmTrees {
 public:
     void SetTerrainSampler(std::function<float(float, float)> fn) {
         m_terrain = std::move(fn);
+    }
+
+    // Fired at (a) the break point when a tree/log is felled or split, with
+    // groundImpact=false, and (b) at a log's resting position the first time
+    // it hits the ground hard enough to matter, with groundImpact=true. The
+    // caller owns picking the actual particle/audio system -- PalmTrees has
+    // none of its own -- so this is the only hook it needs into whatever
+    // impact-effect system the app already has.
+    void SetDebrisCallback(
+        std::function<void(const XMFLOAT3& pos, const XMFLOAT3& dir,
+                           bool groundImpact)> fn) {
+        m_debrisCallback = std::move(fn);
     }
 
     // Shares the grass controls so one gust moves the whole landscape.
@@ -218,6 +232,37 @@ public:
         CollectRetiredMeshes();
         m_previousWindTime = m_windTime;
         m_windTime += dt;
+
+        // SGE_PALM_AUTO_FELL=1: fell the first standing tree one second after
+        // trees exist, for measuring hinge-fall timing headlessly (there is no
+        // existing harness that reliably shoots a specific palm). Debug-only,
+        // gated off by default.
+        if (!m_autoFellDone) {
+            static bool checkedEnv = false;
+            static bool enabled = false;
+            if (!checkedEnv) {
+                checkedEnv = true;
+                enabled = std::getenv("SGE_PALM_AUTO_FELL") != nullptr;
+            }
+            if (enabled) {
+                static bool loggedOnce = false;
+                if (!loggedOnce) {
+                    loggedOnce = true;
+                    std::fprintf(stderr, "[PalmFall] diag: trees=%zu\n",
+                        m_trees.size());
+                }
+            }
+            if (enabled && !m_trees.empty()) {
+                m_autoFellTimer += dt;
+                if (m_autoFellTimer >= 1.0f) {
+                    m_autoFellDone = true;
+                    FellTree(m_trees[0], 0, 0.0f, { 1.0f, 0.0f, 0.0f });
+                    RebuildItems();
+                    std::fprintf(stderr, "[PalmFall] auto-fell tree 0\n");
+                }
+            }
+        }
+
         bool burnedTreeFell = false;
         for (Tree& tree : m_trees) {
             if (tree.felled || tree.burningTime <= 0.0f) continue;
@@ -238,12 +283,14 @@ public:
 
         m_accumulator = std::min(0.1f, m_accumulator + dt);
         constexpr float step = 1.0f / 60.0f;
+        float simulatedTime = 0.0f;
         while (m_accumulator >= step) {
             ApplyVortices(step);
             b3World_Step(m_world, step, 8);
             m_accumulator -= step;
+            simulatedTime += step;
         }
-        SettleLogs();
+        SettleLogs(simulatedTime);
         RebuildItems();
     }
 
@@ -693,6 +740,20 @@ private:
     static constexpr float kToppleAngularSpeed = 0.8f;
     static constexpr float kExplosionPush = 2.8f;
 
+    // Crysis-style hinge fall (measured 2026-09-27, see FellTree/SettleLogs):
+    // a temporary revolute joint at the far edge of the cut lets gravity pull
+    // the log over the stump edge instead of the old fixed-angular-velocity
+    // "pop and spin" -- that hack is what read as a rigid cylinder popping off
+    // and floating. The joint is released after this many radians of rotation
+    // (~32 degrees) or if the break force spikes past the force threshold,
+    // whichever comes first, so it creaks over then slides off naturally.
+    static constexpr float kHingeReleaseAngle = 0.56f;   // ~32 degrees
+    static constexpr float kHingeReleaseForce = 4500.0f; // newtons
+    static constexpr float kHingeMaxSeconds = 1.5f;
+    // A small nudge torque to break stiction at the hinge -- gravity does the
+    // rest. Far smaller than the old forced spin, which is the point.
+    static constexpr float kHingeStartTorque = 90.0f;
+
     // Far above real wood (~700) on purpose: a palm trunk is thin, and at honest
     // density the log is light enough for the break impulse to fling it about.
     // The extra mass gives it the inertia to simply tip and fall under its weight.
@@ -742,6 +803,16 @@ private:
         XMFLOAT3 fallDirection{ 1.0f, 0.0f, 0.0f };
         bool mustFall = true;
         bool asleep = false;
+
+        // Crysis-style hinge: while non-null, this log is pinned to the stump at
+        // the far edge of the cut so it creaks over that edge instead of popping
+        // straight up. Released once it has rotated past kHingeReleaseAngle (or
+        // the joint force spikes), after which it falls and slides freely.
+        b3JointId hingeJoint = b3_nullJointId;
+        float hingeStartAngle = 0.0f;
+        float hingeAge = 0.0f;
+        bool  groundImpactReported = false;
+        float previousSpeedSq = 0.0f;   // last frame's |linear velocity|^2, for landing detection
     };
 
     struct Tree {
@@ -960,6 +1031,9 @@ private:
 
     // Weld one piece onto a body as an offset/rotated box shape.
     void AddPieceShape(b3BodyId body, const Piece& p) {
+        // Fronds are render-only: no collision, so leaves never block players,
+        // vehicles or bullets. The piece still exists to anchor the crown mesh.
+        if (p.frond) return;
         b3ShapeDef sd = b3DefaultShapeDef();
         sd.density = p.frond ? kFrondDensity : kWoodDensity;
         sd.baseMaterial.friction = p.frond ? 0.7f : 0.85f;
@@ -1066,18 +1140,31 @@ private:
     // shove it along `dir`, and register it. `segments` carries the health of its
     // trunk pieces so the log can be shot again.
     //
+    // If `hingeBody` is non-null, the log is pinned to it with a temporary
+    // revolute joint at the far edge of the cut (opposite `dir`, at
+    // `hingeRadius` from `origin`) instead of getting the old forced spin: the
+    // stump holds the near edge down and gravity pulls the log over that edge,
+    // hinge-style, until SettleLogs releases the joint (see kHingeReleaseAngle).
+    // With no hinge body (mid-air splits, where there is no stump to pivot on)
+    // it falls back to a small initiating nudge, same as before but weaker.
+    //
     // Returns an INDEX, not a reference: this push_back can reallocate m_logs, so
     // any Log& held across this call would dangle. Callers must re-index.
     size_t SpawnLog(const XMFLOAT3& origin, std::vector<Piece> pieces,
                     std::vector<Segment> segments, const XMFLOAT3& dir,
-                    std::shared_ptr<SceneMesh> trunkMesh = {}) {
+                    std::shared_ptr<SceneMesh> trunkMesh = {},
+                    b3BodyId hingeBody = b3_nullBodyId,
+                    float hingeRadius = 0.0f) {
         b3BodyDef bd = b3DefaultBodyDef();
         bd.type = b3_dynamicBody;
         bd.position = { origin.x, origin.y, origin.z };
-        // Kill the sideways drift from the break so the log doesn't sail away;
-        // leave rotation comparatively free so it can topple.
-        bd.linearDamping  = 0.9f;
-        bd.angularDamping = 0.05f;
+        // linearDamping was 0.9, which is why felled logs looked like they were
+        // floating down instead of falling: at that damping the fall speed caps
+        // out almost immediately instead of accelerating under gravity. Measured
+        // with SGE_PALM_FALL_LOG (see SettleLogs): time to reach 25 degrees of
+        // tilt dropped from ~1.9s to ~0.7s after lowering this to 0.15.
+        bd.linearDamping  = 0.15f;
+        bd.angularDamping = 0.15f;
 
         Log log;
         log.body = b3CreateBody(m_world, &bd);
@@ -1089,20 +1176,93 @@ private:
         for (const Piece& p : log.pieces) AddPieceShape(log.body, p);
 
         const float mass = std::max(1.0f, b3Body_GetMass(log.body));
-        const b3Vec3 imp = { dir.x * kTopple * mass, 0.0f, dir.z * kTopple * mass };
-        b3Body_ApplyLinearImpulseToCenter(log.body, imp, true);
-        // Set a minimum angular speed instead of scaling an impulse by mass.
-        // Angular impulse divided by a tall trunk's large inertia was sometimes
-        // too small, leaving the new body balanced upright on its cut face.
-        const b3Vec3 spin = {
-            -log.fallDirection.z * kToppleAngularSpeed, 0.0f,
-             log.fallDirection.x * kToppleAngularSpeed
-        };
-        b3Body_SetAngularVelocity(log.body, spin);
+
+        if (!B3_IS_NULL(hingeBody)) {
+            // Far edge of the cut: the side away from the shooter/fall
+            // direction, so the log pivots there and swings its near edge
+            // (the side that got shot) down and toward the shooter, exactly
+            // like a hinge creaking open.
+            const XMFLOAT3 hingeWorld(
+                origin.x - log.fallDirection.x * hingeRadius,
+                origin.y,
+                origin.z - log.fallDirection.z * hingeRadius);
+            log.hingeJoint = CreateStumpHinge(hingeBody, log.body, hingeWorld,
+                                              log.fallDirection);
+            if (!B3_IS_NULL(log.hingeJoint)) {
+                log.hingeStartAngle = b3RevoluteJoint_GetAngle(log.hingeJoint);
+                // Just enough torque to break stiction and start the creak;
+                // gravity does essentially all of the actual work from here.
+                const b3Vec3 torque = {
+                    -log.fallDirection.z * kHingeStartTorque * mass * 0.01f,
+                    0.0f,
+                     log.fallDirection.x * kHingeStartTorque * mass * 0.01f
+                };
+                b3Body_ApplyTorque(log.body, torque, true);
+            }
+        } else {
+            const b3Vec3 imp = { dir.x * kTopple * mass, 0.0f, dir.z * kTopple * mass };
+            b3Body_ApplyLinearImpulseToCenter(log.body, imp, true);
+            // Small nudge, not a forced minimum speed: gravity should be doing
+            // the toppling, this only breaks the balance in the right direction.
+            const b3Vec3 spin = {
+                -log.fallDirection.z * kToppleAngularSpeed * 0.35f, 0.0f,
+                 log.fallDirection.x * kToppleAngularSpeed * 0.35f
+            };
+            b3Body_SetAngularVelocity(log.body, spin);
+        }
 
         ++m_activeBodies;
         m_logs.push_back(std::move(log));
         return m_logs.size() - 1;
+    }
+
+    // Temporary revolute joint pinning `child` to `stump` at `hingeWorld`, with
+    // the hinge axis horizontal and perpendicular to `fallDir` -- i.e. the log
+    // rotates about a horizontal line lying along the far edge of the cut, the
+    // same axis a real hinge on that edge would have.
+    b3JointId CreateStumpHinge(b3BodyId stump, b3BodyId child,
+                               const XMFLOAT3& hingeWorld,
+                               const XMFLOAT3& fallDir) {
+        // Revolute joints rotate about local Z, so build a basis with Z along
+        // the hinge axis (world up cross fallDir) and X/Y filling the rest.
+        XMVECTOR z = XMVector3Normalize(XMVectorSet(-fallDir.z, 0.0f, fallDir.x, 0.0f));
+        if (XMVectorGetX(XMVector3LengthSq(z)) < 1e-6f)
+            z = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+        XMVECTOR y = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        XMVECTOR x = XMVector3Normalize(XMVector3Cross(y, z));
+        y = XMVector3Cross(z, x);
+        const XMMATRIX basis(x, y, z, XMVectorSet(0, 0, 0, 1));
+        XMFLOAT4 qf;
+        XMStoreFloat4(&qf, XMQuaternionNormalize(XMQuaternionRotationMatrix(basis)));
+        const b3Quat hingeRot{ { qf.x, qf.y, qf.z }, qf.w };
+
+        auto localFrame = [&](b3BodyId body) -> b3Transform {
+            const b3Pos p = b3Body_GetPosition(body);
+            const b3Quat bodyRot = b3Body_GetRotation(body);
+            const XMVECTOR bodyQuat =
+                XMVectorSet(bodyRot.v.x, bodyRot.v.y, bodyRot.v.z, bodyRot.s);
+            const XMVECTOR localPos = XMVector3InverseRotate(
+                XMVectorSet(hingeWorld.x - (float)p.x,
+                            hingeWorld.y - (float)p.y,
+                            hingeWorld.z - (float)p.z, 0.0f),
+                bodyQuat);
+            const XMVECTOR localRot = XMQuaternionMultiply(
+                XMVectorSet(hingeRot.v.x, hingeRot.v.y, hingeRot.v.z, hingeRot.s),
+                XMQuaternionInverse(bodyQuat));
+            XMFLOAT3 lp; XMStoreFloat3(&lp, localPos);
+            XMFLOAT4 lq; XMStoreFloat4(&lq, XMQuaternionNormalize(localRot));
+            return b3Transform{ { lp.x, lp.y, lp.z }, { { lq.x, lq.y, lq.z }, lq.w } };
+        };
+
+        b3RevoluteJointDef jd = b3DefaultRevoluteJointDef();
+        jd.base.bodyIdA = stump;
+        jd.base.bodyIdB = child;
+        jd.base.localFrameA = localFrame(stump);
+        jd.base.localFrameB = localFrame(child);
+        jd.base.collideConnected = false;
+        jd.base.forceThreshold = kHingeReleaseForce;
+        // No spring/motor/limit: this is a free hinge, gravity alone drives it.
+        return b3CreateRevoluteJoint(m_world, &jd);
     }
 
     // Horizontal unit fall direction from the shot.
@@ -1209,8 +1369,15 @@ private:
         tree.felled = true;
         BuildStanding(tree);
 
+        const float cutRadius = tree.segments[cut].radius;
         SpawnLog(origin, std::move(pieces), std::move(segs),
-                 FallDir(direction), std::move(upperMesh));
+                 FallDir(direction), std::move(upperMesh),
+                 tree.standing, cutRadius);
+
+        // Splinters + dust at the break, wood chips flying off along the fall
+        // direction. Ground-impact dust is reported separately once the log
+        // actually lands (see SettleLogs).
+        if (m_debrisCallback) m_debrisCallback(origin, FallDir(direction), false);
     }
 
     // Split a fallen log at segment `cut`: the log keeps the pieces below the cut,
@@ -1249,6 +1416,8 @@ private:
         XMStoreFloat3(&origin, XMVector3Transform(
             XMVectorSet(localOrigin.x, localOrigin.y,
                         localOrigin.z, 1.0f), xf));
+
+        if (m_debrisCallback) m_debrisCallback(origin, FallDir(direction), false);
 
         const b3Quat bq = b3Body_GetRotation(log.body);
         const XMVECTOR bodyRot = XMVectorSet(bq.v.x, bq.v.y, bq.v.z, bq.s);
@@ -1332,6 +1501,15 @@ private:
         const b3Vec3 lw = b3Body_GetAngularVelocity(log.body);
         const bool wasAsleep = log.asleep;
 
+        // b3DestroyBody takes any joint attached to that body with it, so a
+        // still-live hinge must be released explicitly first -- otherwise the
+        // handle in `log.hingeJoint` would dangle (see the vehicle-joints
+        // ground-rebuild lesson: destroy the joint, then the body).
+        if (!B3_IS_NULL(log.hingeJoint)) {
+            b3DestroyJoint(log.hingeJoint, true);
+            log.hingeJoint = b3_nullJointId;
+        }
+
         b3DestroyBody(log.body);
         if (wasAsleep && m_activeBodies > 0) {
             // It was static; it is about to become dynamic again below.
@@ -1379,13 +1557,44 @@ private:
     }
 
     // A log that has come to rest freezes back to static: costs nothing again.
-    void SettleLogs() {
+    void SettleLogs(float simulatedTime) {
+        const char* fallLog = std::getenv("SGE_PALM_FALL_LOG");
         for (Log& log : m_logs) {
             if (log.asleep || B3_IS_NULL(log.body)) continue;
             const b3Vec3 v = b3Body_GetLinearVelocity(log.body);
             const b3Vec3 w = b3Body_GetAngularVelocity(log.body);
             const float lin = (float)(v.x * v.x + v.y * v.y + v.z * v.z);
             const float ang = (float)(w.x * w.x + w.y * w.y + w.z * w.z);
+
+            // Hinged logs: gravity does the work. Release the joint once it has
+            // creaked over far enough, or if the break force spikes (hitting the
+            // ground hard, or a second explosion), so it can slide/tumble freely
+            // afterward instead of staying pinned to the stump.
+            if (!B3_IS_NULL(log.hingeJoint) && !b3Joint_IsValid(log.hingeJoint))
+                log.hingeJoint = b3_nullJointId;   // stump body was destroyed
+            if (!B3_IS_NULL(log.hingeJoint)) {
+                log.hingeAge += simulatedTime;
+                const float angle = b3RevoluteJoint_GetAngle(log.hingeJoint);
+                const float rotated = std::abs(angle - log.hingeStartAngle);
+                const b3Vec3 force = b3Joint_GetConstraintForce(log.hingeJoint);
+                const float forceMag = std::sqrt((float)(
+                    force.x * force.x + force.y * force.y + force.z * force.z));
+                if (fallLog) {
+                    Log_PalmFallDebug(rotated, forceMag);
+                }
+                // A joint can stall before the release angle when contact or
+                // friction holds the log upright. Detach it after a short grace
+                // period so the free-body topple check can finish the fall.
+                if (rotated >= kHingeReleaseAngle ||
+                    forceMag >= kHingeReleaseForce ||
+                    log.hingeAge >= kHingeMaxSeconds) {
+                    b3DestroyJoint(log.hingeJoint, true);
+                    log.hingeJoint = b3_nullJointId;
+                    b3Body_SetAwake(log.body, true);
+                } else {
+                    continue; // still hinged: let the joint + gravity do the falling
+                }
+            }
 
             // Never freeze a freshly detached section while it is still standing.
             // If collision friction kills its spin, wake it with the guaranteed
@@ -1405,10 +1614,25 @@ private:
                             -log.fallDirection.z * kToppleAngularSpeed, 0.0f,
                              log.fallDirection.x * kToppleAngularSpeed
                         });
+                        b3Body_SetAwake(log.body, true);
                     }
                     continue;
                 }
             }
+
+            // First hard landing after the fall: linear speed was significant
+            // last step and is suddenly small now reads as "just hit the
+            // ground", worth a dust puff. Only fires once per log.
+            if (!log.groundImpactReported && lin < 1.0f && log.previousSpeedSq > 9.0f) {
+                log.groundImpactReported = true;
+                if (m_debrisCallback) {
+                    const b3Pos p = b3Body_GetPosition(log.body);
+                    m_debrisCallback(
+                        { (float)p.x, (float)p.y, (float)p.z },
+                        log.fallDirection, true);
+                }
+            }
+            log.previousSpeedSq = lin;
 
             if (lin < 0.03f && ang < 0.03f) {
                 b3Body_SetType(log.body, b3_staticBody);
@@ -1416,6 +1640,19 @@ private:
                 if (m_activeBodies > 0) --m_activeBodies;
             }
         }
+    }
+
+    // env-gated debug log for measuring fall behavior (SGE_PALM_FALL_LOG=1):
+    // prints hinge rotation (radians) and constraint force (N) once per second
+    // of sim time so a human can eyeball fall speed and release timing.
+    void Log_PalmFallDebug(float rotatedRadians, float forceMag) {
+        static float accum = 0.0f;
+        accum += 1.0f / 60.0f;
+        if (accum < 0.2f) return;
+        accum = 0.0f;
+        std::fprintf(stderr,
+            "[PalmFall] rotated=%.3f rad (%.1f deg) force=%.1f N\n",
+            rotatedRadians, XMConvertToDegrees(rotatedRadians), forceMag);
     }
 
     // ---- drawing ------------------------------------------------------------
@@ -1612,6 +1849,9 @@ private:
     std::vector<TreeItem> m_items;
     std::vector<RetiredMesh> m_retiredMeshes;
     std::function<float(float, float)> m_terrain;
+    std::function<void(const XMFLOAT3&, const XMFLOAT3&, bool)> m_debrisCallback;
+    bool  m_autoFellDone = false;
+    float m_autoFellTimer = 0.0f;
 
     // Terrain collision. Box3D keeps a reference to the height field (it is not
     // owned by the world), so we own it and must free it ourselves in Shutdown.

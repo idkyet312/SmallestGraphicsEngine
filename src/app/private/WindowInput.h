@@ -154,17 +154,35 @@ static void ProcessInput(HWND) {
         HumveeGameplayState& state = g_humveeGameplay[g_activeHumveeIndex];
         state.turretFireCooldown = (std::max)(
             0.0f, state.turretFireCooldown - deltaTime);
-        const float throttle =
+        const float throttleKey =
             ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
             ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
-        const float turn =
+        const float turnKey =
             ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
             ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f);
+        // Keys are digital; feeding them raw snaps the wheels and drive torque
+        // and jolts the chassis. Ramp toward the key target, faster on release.
+        static float smoothThrottle = 0.0f;
+        static float smoothTurn = 0.0f;
+        static size_t smoothedVehicle = kNoHumvee;
+        if (smoothedVehicle != g_activeHumveeIndex) {
+            smoothedVehicle = g_activeHumveeIndex;
+            smoothThrottle = smoothTurn = 0.0f;
+        }
+        const auto approach = [](float value, float target,
+                                          float rise, float fall) {
+            const float rate = (std::abs(target) > std::abs(value) ||
+                                (target * value < 0.0f)) ? rise : fall;
+            const float step = rate * deltaTime;
+            return value + (std::clamp)(target - value, -step, step);
+        };
+        smoothThrottle = approach(smoothThrottle, throttleKey, 2.5f, 4.0f);
+        smoothTurn = approach(smoothTurn, turnKey, 3.0f, 5.0f);
         // The Humvee's steering axle is behind its rendered nose, reversing
         // the wheel input needed for A/D relative to the tank.
         g_destruction.SetVehicleInput(
-            g_activeHumveeIndex, throttle, turn,
-            (FocusedKeyState(VK_SPACE) & 0x8000) != 0 || throttle == 0.0f);
+            g_activeHumveeIndex, smoothThrottle, smoothTurn,
+            (FocusedKeyState(VK_SPACE) & 0x8000) != 0 || throttleKey == 0.0f);
         for (size_t index = 0; index < g_destruction.VehicleCount(); ++index)
             if (index != g_activeHumveeIndex)
                 g_destruction.SetVehicleInput(index, 0.0f, 0.0f, true);
@@ -606,7 +624,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == VK_ESCAPE) {
-            if (IsEditorPlaying())
+            // The settings page is one level deep on whichever screen opened
+            // it, so ESC backs out of it first -- on the main menu the branch
+            // below would otherwise quit the game from inside Settings.
+            if (g_showSettingsMenu || g_showPauseSettings) {
+                SaveGameSettings(g_settings);
+                g_showSettingsMenu = false;
+                g_showPauseSettings = false;
+            }
+            else if (IsEditorPlaying())
                 g_game.commands.Request(GameCommand::EditorStopPlay);
             else if (IsEditorEditing()) {
                 if (!g_levelEditor.IsDirty()) OpenMainMenu();
@@ -790,7 +816,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::string("UI hidden for screenshot: ") +
                 (g_deploymentDebugHideUI ? "ON (F9 to restore)" : "OFF"));
         }
-        else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
+        else if (wParam == VK_F11) {
+            ToggleFullscreen(hwnd);
+            // Sync the setting with the new fullscreen state and persist it.
+            g_settings.fullscreen = isFullscreen;
+            SaveGameSettings(g_settings);
+        }
         return 0;
 
     case WM_DESTROY:

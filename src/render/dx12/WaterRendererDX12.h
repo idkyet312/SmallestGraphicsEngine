@@ -1134,9 +1134,9 @@ private:
             XMMatrixTranspose(XMMatrixInverse(
                 nullptr, currentViewProjection)));
         constants.cameraTime = {
-            scene.camera.Position.x,
-            scene.camera.Position.y,
-            scene.camera.Position.z,
+            scene.camera.VisualPosition().x,
+            scene.camera.VisualPosition().y,
+            scene.camera.VisualPosition().z,
             volume.GetTime()
         };
         constants.previousCameraTime = {
