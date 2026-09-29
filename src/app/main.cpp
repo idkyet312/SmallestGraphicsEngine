@@ -273,6 +273,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         MessageBoxA(hwnd, e.what(), "DX12 Error", MB_OK | MB_ICONERROR);
         return -1;
     }
+    {
+        UINT renderWidth = SCR_WIDTH, renderHeight = SCR_HEIGHT;
+        DesiredDLSSRenderSize(renderWidth, renderHeight);
+        ResizeSceneSurfaceDX12(renderWidth, renderHeight);
+    }
 
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
@@ -517,7 +522,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         : "Mesh shader path unavailable; using raster fallback\n");
 
     BootStep("Initializing occlusion depth...");
-    if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
+    if (!occlusionDepth.Init(g_dx12.screenWidth, g_dx12.screenHeight)) {
         std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
     }
     BootStep("Initializing FXAA...");
@@ -551,7 +556,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         scene.enableScreenSpaceReflections = false;
     }
     BootStep("Initializing water renderer...");
-    if (!waterRenderer.Init(SCR_WIDTH, SCR_HEIGHT)) {
+    if (!waterRenderer.Init(g_dx12.screenWidth, g_dx12.screenHeight)) {
         std::cerr << "Tropical water renderer init failed (non-fatal)\n";
     } else if (!waterRenderer.UltraAvailable()) {
         std::cerr << "Ultra water unavailable: "
@@ -572,7 +577,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
         (!g_useMeshShader || g_meshShader.msaaSupported);
-    if (!msaa.Init(SCR_WIDTH, SCR_HEIGHT) || !msaaPipelinesReady) {
+    if (!msaa.Init(g_dx12.screenWidth, g_dx12.screenHeight) ||
+        !msaaPipelinesReady) {
         std::cerr << "4x MSAA unavailable (non-fatal)\n";
         scene.enableMSAA = false;
     }
@@ -585,7 +591,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(
         g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
-    const bool visibilityBufferReady = visBuffer.Init(SCR_WIDTH, SCR_HEIGHT);
+    const bool visibilityBufferReady = visBuffer.Init(
+        g_dx12.screenWidth, g_dx12.screenHeight, SCR_WIDTH, SCR_HEIGHT);
     ThrowIfFailed(g_dx12.commandList->Close());
     {
         ID3D12CommandList* visibilityInitLists[] = { g_dx12.commandList.Get() };
@@ -635,7 +642,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
     BootStep("Initializing grass MSAA...");
     if (!visibilityBufferReady || !mainShader.GetHDRMSAAGrassPipelineState() ||
-        !grassMSAA.Init(SCR_WIDTH, SCR_HEIGHT)) {
+        !grassMSAA.Init(g_dx12.screenWidth, g_dx12.screenHeight)) {
         std::cerr << "Visibility grass 4x MSAA unavailable (non-fatal)\n";
         scene.enableGrassMSAA = false;
     } else {
@@ -1340,6 +1347,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enableScreenSpaceReflections = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
                 scene.useVisibilityBuffer = false;
+            // DLSS A/B: off entirely, or with the jitter sign flipped.
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NODLSS", nullptr, 0) > 0)
+                DLSS::GetSettings().enabled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
+                visBuffer.temporalEffectsEnabled = true;
+            if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
+                DLSS::GetSettings().invertJitter = true;
             // Weapon index (GunModel::WeaponName). Every frame, since level
             // start applies the loadout after the capture is armed.
             char captureWeapon[8] = {};
@@ -4426,6 +4440,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
         presentPrepProfile.reset();
 
+        UINT renderWidth = g_dx12.displayWidth;
+        UINT renderHeight = g_dx12.displayHeight;
+        DesiredDLSSRenderSize(renderWidth, renderHeight);
+        ResizeSceneForDLSS(renderWidth, renderHeight);
+
         // ?? begin frame ??
         UpdateRemoteInsertionVisuals(deltaTime);
 
@@ -4698,6 +4717,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool usingRaytracing = renderPath == RenderPath::Raytracing;
         const bool usingVisibility =
             renderPath == RenderPath::VisibilityBuffer;
+        visBuffer.extensionMotionVectors = g_settings.extensionMotionVectors;
         // Only the visibility path writes this flag, so clear it on every other
         // path. Left stale at true, the forward renderer would skip its terrain
         // draw on a frame where nothing rasterized terrain at all.
@@ -4739,6 +4759,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.InvalidateTemporalHistory();
             visibilityWasActive = usingVisibility;
         }
+        // DLSS takes over temporal accumulation on the visibility path. Set
+        // before the jitter is read: DLSS needs the jittered projection and
+        // the motion vectors whether or not the built-in TAA is enabled.
+        {
+            const bool dlssWanted = usingVisibility &&
+                !visBuffer.validationMode && DLSS::Available() &&
+                DLSS::GetSettings().enabled;
+            if (dlssWanted != visBuffer.dlssActive)
+                visBuffer.InvalidateTemporalHistory();
+            visBuffer.dlssActive = dlssWanted;
+            screenSpaceReflections.animateNoise =
+                dlssWanted || visBuffer.temporalEffectsEnabled;
+        }
         scene.temporalJitterPixels = usingVisibility
             ? visBuffer.GetTemporalJitterPixels()
             : XMFLOAT2(0.0f, 0.0f);
@@ -4749,7 +4782,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // static geometry that does not change per frame.
         {
             const auto& ddgiStatus = g_dxrDDGI.GetStatus();
-            const bool wantEnhanced = scene.enhancedVisuals && usingVisibility &&
+            const bool rrRequested = DLSS::GetSettings().enabled &&
+                DLSS::GetSettings().rayReconstruction &&
+                DLSS::RayReconstructionAvailable();
+            const bool wantEnhanced = (scene.enhancedVisuals || rrRequested) &&
+                usingVisibility &&
                 !visBuffer.validationMode && ddgiStatus.dxrSupported &&
                 ddgiStatus.inlineRaytracingSupported &&
                 visBuffer.EnhancedVisualsReady();
@@ -4774,7 +4811,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 wantEnhanced, scene.enhancedRTShadows,
                 scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
                 g_dxrDDGI.Scene().TLASAddress(),
-                scene.enhancedRTReflections);
+                scene.enhancedRTReflections || rrRequested);
+            visBuffer.rayReconstructionActive = rrRequested &&
+                visBuffer.enhancedVisualsActive &&
+                g_dx12.screenWidth == g_dx12.displayWidth &&
+                g_dx12.screenHeight == g_dx12.displayHeight &&
+                visBuffer.debugViewMode == 0 &&
+                visBuffer.EnsureRayReconstructionGuides();
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
@@ -4789,6 +4832,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             !usingRaytracing && visBuffer.initialized && visBuffer.validationMode;
         const bool commonHDRValidationTarget =
             usingVisibility || visibilityParityValidation;
+        bool rrEvaluated = false;
         const bool msaaActive =
             scene.enableMSAA && msaa.initialized &&
             !usingRaytracing && !usingVisibility && !visibilityParityValidation;
@@ -5971,6 +6015,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
                     (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
             }
+            if (visBuffer.rayReconstructionActive) {
+                visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
+                {
+                    ProfilerDX12::Scope profile(g_profiler,
+                        "DLSS Ray Reconstruction", g_dx12.commandList.Get());
+                    DLSSFrameInputs inputs;
+                    inputs.cmdList = g_dx12.commandList.Get();
+                    inputs.color = visBuffer.GetOutputResource();
+                    inputs.depth = visBuffer.ActiveDepthBuffer();
+                    inputs.motion = visBuffer.GetMotionResource();
+                    inputs.normalRoughness =
+                        visBuffer.GetNormalRoughnessResource();
+                    inputs.diffuseAlbedo = visBuffer.GetRRDiffuseAlbedo();
+                    inputs.specularAlbedo = visBuffer.GetRRSpecularAlbedo();
+                    inputs.specularHitDistance =
+                        visBuffer.GetRRSpecularHitDistance();
+                    inputs.rayReconstruction = true;
+                    inputs.width = g_dx12.screenWidth;
+                    inputs.height = g_dx12.screenHeight;
+                    inputs.outputWidth = inputs.width;
+                    inputs.outputHeight = inputs.height;
+                    inputs.jitterPixels = scene.temporalJitterPixels;
+                    XMStoreFloat4x4(&inputs.view, scene.GetViewMatrix());
+                    XMStoreFloat4x4(&inputs.projection,
+                                    scene.GetUnjitteredProjectionMatrix());
+                    inputs.nearPlane = scene.cameraNear;
+                    inputs.farPlane = scene.EffectiveCameraFarPlane();
+                    inputs.verticalFovRadians =
+                        XMConvertToRadians(scene.EffectiveCameraFOV());
+                    inputs.reset = visBuffer.dlssHistoryReset;
+                    rrEvaluated = DLSS::Evaluate(inputs);
+                    if (rrEvaluated) visBuffer.dlssHistoryReset = false;
+                }
+                visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
+            }
             // RenderVBDraw has bound HDR colour and the populated depth buffer.
             // Fill the background before forward materials can blend over it.
             if (lateSky) drawSky();
@@ -6526,12 +6605,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ProfilerDX12::Scope profile(
                 g_profiler, "Common HDR Post", g_dx12.commandList.Get());
             visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
+            bool dlssUpscaled = false;
+            // DLAA over the finished HDR scene -- after SSR, water, fog and
+            // transparency, before exposure, bloom and tone mapping -- so the
+            // reflection noise is inside what DLSS accumulates.
+            if (usingVisibility && visBuffer.dlssActive && !rrEvaluated &&
+                !bentGTAODiagnosticActive && visBuffer.debugViewMode == 0) {
+                ProfilerDX12::Scope dlssProfile(
+                    g_profiler, "DLSS", g_dx12.commandList.Get());
+                DLSSFrameInputs dlssInputs;
+                dlssInputs.cmdList = g_dx12.commandList.Get();
+                dlssInputs.color = visBuffer.GetOutputResource();
+                dlssInputs.depth = visBuffer.ActiveDepthBuffer();
+                dlssInputs.motion = visBuffer.GetMotionResource();
+                dlssInputs.width = g_dx12.screenWidth;
+                dlssInputs.height = g_dx12.screenHeight;
+                dlssInputs.outputWidth = g_dx12.displayWidth;
+                dlssInputs.outputHeight = g_dx12.displayHeight;
+                dlssInputs.output = visBuffer.DLSSUpscaledResource();
+                dlssInputs.screenPercentage =
+                    DLSS::GetSettings().screenPercentage;
+                dlssInputs.jitterPixels = scene.temporalJitterPixels;
+                XMStoreFloat4x4(&dlssInputs.view, scene.GetViewMatrix());
+                XMStoreFloat4x4(&dlssInputs.projection,
+                                scene.GetUnjitteredProjectionMatrix());
+                dlssInputs.nearPlane = scene.cameraNear;
+                dlssInputs.farPlane = scene.EffectiveCameraFarPlane();
+                dlssInputs.verticalFovRadians =
+                    XMConvertToRadians(scene.EffectiveCameraFOV());
+                dlssInputs.reset = visBuffer.dlssHistoryReset;
+                if (DLSS::Evaluate(dlssInputs)) {
+                    visBuffer.dlssHistoryReset = false;
+                    dlssUpscaled = dlssInputs.output != nullptr;
+                }
+            }
             if (usingVisibility && !visBuffer.validationMode &&
                 !bentGTAODiagnosticActive)
                 visBuffer.UpdateExposure(g_dx12.commandList.Get());
             // TAA reprojection remains valid during ordinary camera movement;
             // HZB history is intentionally stricter and must not gate it.
-            visBuffer.PostProcess(g_dx12.commandList.Get(), usingVisibility);
+            visBuffer.PostProcess(g_dx12.commandList.Get(), usingVisibility,
+                                  dlssUpscaled);
             visBuffer.CopyToBackBuffer(g_dx12.commandList.Get());
             if (usingVisibility)
                 visBuffer.TransitionBuffersForUpload(g_dx12.commandList.Get());
@@ -6692,10 +6806,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         {
             D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
                 g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
-            D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-            g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
-            g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
-            g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            // UI has depth testing disabled; the scene DSV may be smaller than
+            // the display target while DLSS Super Resolution is active.
+            g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+            const D3D12_VIEWPORT displayViewport = DisplayViewportDX12();
+            const D3D12_RECT displayScissor = DisplayScissorDX12();
+            g_dx12.commandList->RSSetViewports(1, &displayViewport);
+            g_dx12.commandList->RSSetScissorRects(1, &displayScissor);
         }
 
         // ?? ImGui ??

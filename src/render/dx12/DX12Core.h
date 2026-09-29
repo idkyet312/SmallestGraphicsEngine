@@ -17,6 +17,7 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include "DLSSDX12.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -115,9 +116,11 @@ struct DX12Context {
     UINT frameIndex = 0;
     UINT currentBackBufferIndex = 0;
     
-    // Screen dimensions
+    // Scene render dimensions can be lower than the swapchain for DLSS SR.
     UINT screenWidth = 0;
     UINT screenHeight = 0;
+    UINT displayWidth = 0;
+    UINT displayHeight = 0;
     
     // Viewport and scissor rect
     D3D12_VIEWPORT viewport = {};
@@ -345,6 +348,8 @@ inline void MoveToNextFrame() {
 inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     g_dx12.screenWidth = width;
     g_dx12.screenHeight = height;
+    g_dx12.displayWidth = width;
+    g_dx12.displayHeight = height;
     
     UINT dxgiFactoryFlags = 0;
 
@@ -492,8 +497,17 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     swapChainDesc.SampleDesc.Count = 1;
     swapChainDesc.Flags = g_dx12.tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     
+    // Streamline (DLSS) in manual-hooking mode: the device stays native, and
+    // only the factory that creates the swapchain is upgraded to an SL proxy
+    // so Present reaches Streamline's per-frame bookkeeping. Without the SL
+    // DLLs this is the native factory and nothing changes.
+    DLSS::Startup();
+    DLSS::SetDevice(g_dx12.device.Get(), g_dx12.adapter.Get());
+    ComPtr<IDXGIFactory2> swapChainFactory;
+    swapChainFactory.Attach(DLSS::SwapChainFactory(g_dx12.factory.Get()));
+
     ComPtr<IDXGISwapChain1> swapChain1;
-    ThrowIfFailed(g_dx12.factory->CreateSwapChainForHwnd(
+    ThrowIfFailed(swapChainFactory->CreateSwapChainForHwnd(
         g_dx12.commandQueue.Get(), hwnd, &swapChainDesc, nullptr, nullptr, &swapChain1));
     
     // Disable Alt+Enter fullscreen
@@ -664,7 +678,8 @@ inline void ResizeDX12(UINT width, UINT height) {
     
     // Wait for GPU to finish
     WaitForGPU();
-    
+    DLSS::ReleaseResources();
+
     // Release render targets
     for (UINT i = 0; i < FRAME_COUNT; i++) {
         g_dx12.renderTargets[i].Reset();
@@ -723,10 +738,59 @@ inline void ResizeDX12(UINT width, UINT height) {
     // Update viewport and scissor rect
     g_dx12.screenWidth = width;
     g_dx12.screenHeight = height;
+    g_dx12.displayWidth = width;
+    g_dx12.displayHeight = height;
     g_dx12.viewport.Width = (float)width;
     g_dx12.viewport.Height = (float)height;
     g_dx12.scissorRect.right = (LONG)width;
     g_dx12.scissorRect.bottom = (LONG)height;
+}
+
+// The swapchain stays at display size while the scene depth and viewport follow
+// DLSS's input size. Call only before recording a frame, after draining the GPU.
+inline void ResizeSceneSurfaceDX12(UINT width, UINT height) {
+    if (!g_dx12.initialized || width == 0 || height == 0 ||
+        (g_dx12.screenWidth == width && g_dx12.screenHeight == height))
+        return;
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = g_dx12.depthStencilBuffer->GetDesc();
+    desc.Width = width;
+    desc.Height = height;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1.0f;
+    g_dx12.depthStencilBuffer.Reset();
+    ThrowIfFailed(g_dx12.device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+        IID_PPV_ARGS(&g_dx12.depthStencilBuffer)));
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    g_dx12.device->CreateDepthStencilView(g_dx12.depthStencilBuffer.Get(),
+        &dsv, g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    g_dx12.screenWidth = width;
+    g_dx12.screenHeight = height;
+    g_dx12.viewport.Width = static_cast<float>(width);
+    g_dx12.viewport.Height = static_cast<float>(height);
+    g_dx12.scissorRect.right = static_cast<LONG>(width);
+    g_dx12.scissorRect.bottom = static_cast<LONG>(height);
+}
+
+inline D3D12_VIEWPORT DisplayViewportDX12() {
+    D3D12_VIEWPORT viewport = g_dx12.viewport;
+    viewport.Width = static_cast<float>(g_dx12.displayWidth);
+    viewport.Height = static_cast<float>(g_dx12.displayHeight);
+    return viewport;
+}
+
+inline D3D12_RECT DisplayScissorDX12() {
+    D3D12_RECT scissor = g_dx12.scissorRect;
+    scissor.right = static_cast<LONG>(g_dx12.displayWidth);
+    scissor.bottom = static_cast<LONG>(g_dx12.displayHeight);
+    return scissor;
 }
 
 // Cleanup DX12
@@ -742,7 +806,9 @@ inline void CleanupDX12() {
         ThrowIfFailed(g_dx12.copyQueue->Signal(g_dx12.copyFence.Get(), value));
         WaitForFenceCPU(g_dx12.copyFence.Get(), value);
     }
-    
+    // Streamline must shut down before the device and swapchain it hooks.
+    DLSS::Shutdown();
+
     if (g_dx12.fenceEvent) {
         CloseHandle(g_dx12.fenceEvent);
         g_dx12.fenceEvent = nullptr;

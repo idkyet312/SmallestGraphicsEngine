@@ -2,6 +2,64 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+static void DesiredDLSSRenderSize(UINT& width, UINT& height) {
+    const UINT displayWidth = g_dx12.displayWidth;
+    const UINT displayHeight = g_dx12.displayHeight;
+    const bool nativeRR = DLSS::GetSettings().rayReconstruction &&
+        DLSS::RayReconstructionAvailable();
+    const bool eligible = DLSS::GetSettings().enabled &&
+        !nativeRR && DLSS::Available() &&
+        scene.useVisibilityBuffer && !scene.useRaytracing &&
+        !visBuffer.validationMode && visBuffer.debugViewMode == 0 &&
+        !(DeploymentPlanningActive() && g_deploymentDebugForceForward);
+    static UINT cachedDisplayWidth = 0, cachedDisplayHeight = 0;
+    static UINT cachedWidth = 0, cachedHeight = 0;
+    static float cachedPercentage = -1.0f;
+    static bool cachedEligible = false;
+    if (cachedDisplayWidth != displayWidth ||
+        cachedDisplayHeight != displayHeight ||
+        cachedPercentage != DLSS::GetSettings().screenPercentage ||
+        cachedEligible != eligible) {
+        cachedDisplayWidth = displayWidth;
+        cachedDisplayHeight = displayHeight;
+        cachedPercentage = DLSS::GetSettings().screenPercentage;
+        cachedEligible = eligible;
+        cachedWidth = displayWidth;
+        cachedHeight = displayHeight;
+        if (eligible)
+            DLSS::RenderSize(displayWidth, displayHeight,
+                cachedPercentage, cachedWidth, cachedHeight);
+    }
+    width = cachedWidth;
+    height = cachedHeight;
+}
+
+static void ResizeSceneForDLSS(UINT width, UINT height) {
+    static bool previousRR = false;
+    const bool rrChanged = previousRR !=
+        DLSS::GetSettings().rayReconstruction;
+    previousRR = DLSS::GetSettings().rayReconstruction;
+    if (width == g_dx12.screenWidth && height == g_dx12.screenHeight)
+        if (!rrChanged) return;
+    WaitForGPU();
+    DLSS::ReleaseResources();
+    if (rrChanged && visBuffer.initialized)
+        visBuffer.InvalidateTemporalHistory();
+    if (width == g_dx12.screenWidth && height == g_dx12.screenHeight)
+        return;
+    ResizeSceneSurfaceDX12(width, height);
+    std::cout << "Scene render resolution: " << width << 'x' << height
+              << " / " << g_dx12.displayWidth << 'x'
+              << g_dx12.displayHeight << " display\n";
+    if (occlusionDepth.initialized) occlusionDepth.Resize(width, height);
+    if (msaa.initialized) msaa.Resize(width, height);
+    if (visBuffer.initialized)
+        visBuffer.Resize(width, height,
+                         g_dx12.displayWidth, g_dx12.displayHeight);
+    if (grassMSAA.initialized) grassMSAA.Resize(width, height);
+    if (waterRenderer.initialized) waterRenderer.Resize(width, height);
+}
+
 static void ApplyVirtualInput() {
     if (!HasInputFocus()) return;
     Camera& cam = scene.camera;
@@ -434,15 +492,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WaitForGPU();
                 SCR_WIDTH = w; SCR_HEIGHT = h;
                 ResizeDX12(SCR_WIDTH, SCR_HEIGHT);
-                if (occlusionDepth.initialized) occlusionDepth.Resize(SCR_WIDTH, SCR_HEIGHT);
+                UINT renderWidth = SCR_WIDTH, renderHeight = SCR_HEIGHT;
+                DesiredDLSSRenderSize(renderWidth, renderHeight);
+                ResizeSceneSurfaceDX12(renderWidth, renderHeight);
+                if (occlusionDepth.initialized)
+                    occlusionDepth.Resize(renderWidth, renderHeight);
                 if (fxaa.initialized) fxaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (nightVision.initialized)
                     nightVision.Resize(SCR_WIDTH, SCR_HEIGHT);
-                if (msaa.initialized) msaa.Resize(SCR_WIDTH, SCR_HEIGHT);
-                if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
-                if (grassMSAA.initialized) grassMSAA.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (msaa.initialized) msaa.Resize(renderWidth, renderHeight);
+                if (visBuffer.initialized)
+                    visBuffer.Resize(renderWidth, renderHeight,
+                                     SCR_WIDTH, SCR_HEIGHT);
+                if (grassMSAA.initialized)
+                    grassMSAA.Resize(renderWidth, renderHeight);
                 if (waterRenderer.initialized)
-                    waterRenderer.Resize(SCR_WIDTH, SCR_HEIGHT);
+                    waterRenderer.Resize(renderWidth, renderHeight);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
         }

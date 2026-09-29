@@ -731,6 +731,10 @@ static void ApplyGameSettings() {
     // Both live on the scene, not the camera, so a rebuild keeps them -- set
     // here so the menu and the file win over the editor panel's own sliders.
     scene.vsyncInterval = g_settings.vsync ? 1 : 0;
+    DLSS::GetSettings().enabled = g_settings.dlssEnabled;
+    DLSS::GetSettings().rayReconstruction = g_settings.dlssRayReconstruction;
+    DLSS::GetSettings().preset = static_cast<DLSS::Preset>(g_settings.dlssPreset);
+    DLSS::GetSettings().screenPercentage = g_settings.dlssScreenPercentage;
     scene.cameraFOV = g_settings.fieldOfView;
     // Push the saved mix onto the live submix graph. Safe before the device is
     // up: AudioDevice stores the value and applies it to the voice when one

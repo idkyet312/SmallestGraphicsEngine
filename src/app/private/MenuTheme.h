@@ -565,6 +565,61 @@ static void VideoTab() {
         SaveGameSettings(g_settings);
     }
 
+    const bool dlssAvailable = DLSS::Available();
+    ImGui::BeginDisabled(!dlssAvailable);
+    if (ToggleRow("NVIDIA DLSS",
+                  dlssAvailable
+                      ? "Upscales the visibility renderer; 100% uses native DLAA."
+                      : DLSS::Status(),
+                  &g_settings.dlssEnabled)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!dlssAvailable || !g_settings.dlssEnabled);
+    static const char* dlssPresets[] = {"K", "L", "M"};
+    if (ImGui::Combo("DLSS Model Preset", &g_settings.dlssPreset,
+                     dlssPresets, IM_ARRAYSIZE(dlssPresets))) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::BeginDisabled(!DLSS::RayReconstructionAvailable());
+    if (ToggleRow("DLSS Ray Reconstruction",
+                  DLSS::RayReconstructionAvailable()
+                      ? "Denoises enhanced ray-traced reflections at native resolution."
+                      : DLSS::RayReconstructionStatus(),
+                  &g_settings.dlssRayReconstruction)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+    if (g_settings.dlssEnabled)
+        ImGui::TextDisabled("DLSS status: %s", DLSS::Status());
+    if (ToggleRow("Extension Motion Vectors",
+                  "Tracks supported animated characters and the viewmodel for temporal upscaling.",
+                  &g_settings.extensionMotionVectors)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::BeginDisabled(g_settings.dlssRayReconstruction);
+    const SliderResult dlssPercentage = SliderRow(
+        "DLSS Screen Percentage",
+        "Internal render resolution per axis. 100% uses native DLAA.",
+        "##dlsspercentage", &g_settings.dlssScreenPercentage,
+        GameSettings::kMinDLSSScreenPercentage,
+        GameSettings::kMaxDLSSScreenPercentage, "%.0f%%",
+        ImGuiSliderFlags_AlwaysClamp, "Default  %.0f%%",
+        GameSettings::kDefaultDLSSScreenPercentage);
+    if (dlssPercentage.released) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
     const SliderResult fov = SliderRow(
         "Field of View", "Hip-fire vertical field of view.", "##fov",
         &g_settings.fieldOfView, GameSettings::kMinFieldOfView,

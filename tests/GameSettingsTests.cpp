@@ -120,6 +120,50 @@ int main() {
         CHECK(defaults.vsync == GameSettings::kDefaultVsync);
     }
 
+    // DLSS choice, preset and render percentage survive restarts and reject bad INI values.
+    {
+        GameSettings written;
+        written.dlssEnabled = true;
+        written.dlssRayReconstruction = true;
+        written.dlssPreset = 2;
+        written.extensionMotionVectors = true;
+        written.dlssScreenPercentage = 67.0f;
+        CHECK(SaveGameSettings(written));
+
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssEnabled);
+        CHECK(read.dlssRayReconstruction);
+        CHECK(read.dlssPreset == 2);
+        CHECK(read.extensionMotionVectors);
+        CHECK(read.dlssScreenPercentage == 67.0f);
+
+        WriteSettingsFile("DLSSPreset=-1\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssPreset == GameSettings::kMinDLSSPreset);
+        WriteSettingsFile("DLSSPreset=9\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssPreset == GameSettings::kMaxDLSSPreset);
+
+        WriteSettingsFile("DLSSScreenPercentage=0\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssScreenPercentage ==
+              GameSettings::kMinDLSSScreenPercentage);
+        WriteSettingsFile("DLSSScreenPercentage=200\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssScreenPercentage ==
+              GameSettings::kMaxDLSSScreenPercentage);
+
+        GameSettings defaults;
+        CHECK(!defaults.dlssEnabled);
+        CHECK(!defaults.dlssRayReconstruction);
+        CHECK(defaults.dlssPreset == GameSettings::kDefaultDLSSPreset);
+        CHECK(defaults.extensionMotionVectors ==
+              GameSettings::kDefaultExtensionMotionVectors);
+        CHECK(defaults.dlssScreenPercentage ==
+              GameSettings::kDefaultDLSSScreenPercentage);
+    }
+
     // Fullscreen round-trip and default.
     {
         GameSettings written;

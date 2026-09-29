@@ -12,6 +12,8 @@
 class ScreenSpaceReflectionsDX12 {
 public:
     bool initialized = false;
+    // Set by the caller when a temporal resolver follows this pass.
+    bool animateNoise = false;
 
     ~ScreenSpaceReflectionsDX12() {
         if (constantBuffer_ && mappedConstants_) constantBuffer_->Unmap(0, nullptr);
@@ -382,11 +384,20 @@ private:
             scene.screenSpaceRTGI ? 1.0f : 0.0f,
             scene.screenSpaceRTGIStrength,
             static_cast<float>(scene.screenSpaceRTRaySteps) };
+        // The default path has no history of its own, so its step jitter only
+        // advances when a temporal resolver (DLSS or TAA) runs after it. A
+        // pattern fixed per pixel is noise no temporal filter can average out;
+        // a moving one without a filter is shimmer.
+        const bool ngActive = scene.screenSpaceRTEnabled &&
+            (scene.screenSpaceRTSpecular || scene.screenSpaceRTGI ||
+             scene.screenSpaceRTAO);
+        UINT noiseFrame = ngFrameIndex_;
+        if (!ngActive) noiseFrame = animateNoise ? (legacyNoiseFrame_++ & 1023u) : 0u;
         constants.ngTrace = {
             scene.screenSpaceRTRayGrowth,
             scene.screenSpaceRTAO ? scene.screenSpaceRTAOStrength : 0.0f,
             scene.screenSpaceRTAORadius,
-            static_cast<float>(ngFrameIndex_) };
+            static_cast<float>(noiseFrame) };
         constants.ngTemporal = {
             scene.screenSpaceRTAccumulation,
             ngHistoryValid_ ? 1.0f : 0.0f,
@@ -456,6 +467,7 @@ private:
     UINT copyWidth_ = 0;
     UINT copyHeight_ = 0;
     UINT ngFrameIndex_ = 0;
+    UINT legacyNoiseFrame_ = 0;
     UINT ngWriteIndex_ = 0;
     bool ngHistoryValid_ = false;
 };

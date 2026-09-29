@@ -167,8 +167,10 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetCPUDescriptorHandle(
             g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
         commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        commandList->RSSetViewports(1, &g_dx12.viewport);
-        commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        const D3D12_VIEWPORT displayViewport = DisplayViewportDX12();
+        const D3D12_RECT displayScissor = DisplayScissorDX12();
+        commandList->RSSetViewports(1, &displayViewport);
+        commandList->RSSetScissorRects(1, &displayScissor);
         commandList->SetPipelineState(pipelineState_.Get());
         commandList->SetGraphicsRootSignature(rootSignature_.Get());
         ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };

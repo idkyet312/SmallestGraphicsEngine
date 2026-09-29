@@ -99,6 +99,21 @@ struct GameSettings {
     // who never opens this menu.
     bool vsync = false;
 
+    // DLSS reconstructs a smaller visibility render into the display target;
+    // at 100% it runs native DLAA. Keep it opt-in until measured.
+    bool dlssEnabled = false;
+    bool dlssRayReconstruction = false;
+    // Streamline DLSS preset: K=0, L=1, M=2. L is the SDK default.
+    int dlssPreset = 1;
+    static constexpr int kMinDLSSPreset = 0;
+    static constexpr int kMaxDLSSPreset = 2;
+    static constexpr int kDefaultDLSSPreset = 1;
+    bool extensionMotionVectors = false;
+    float dlssScreenPercentage = 100.0f;
+    static constexpr float kMinDLSSScreenPercentage = 33.0f;
+    static constexpr float kMaxDLSSScreenPercentage = 100.0f;
+    static constexpr float kDefaultDLSSScreenPercentage = 100.0f;
+
     // Borderless fullscreen, the mode the game has always booted into. Read at
     // window creation; afterwards the main loop moves the window to match it,
     // and F11 writes it back, so the menu and the key agree.
@@ -146,6 +161,9 @@ struct GameSettings {
     static constexpr float kMaxSeeThroughStrength = 1.0f;
 
     static constexpr bool  kDefaultVsync = false;
+    static constexpr bool  kDefaultDLSS = false;
+    static constexpr bool  kDefaultDLSSRayReconstruction = false;
+    static constexpr bool  kDefaultExtensionMotionVectors = false;
     static constexpr bool  kDefaultFullscreen = true;
     static constexpr float kDefaultFieldOfView = 60.0f;
     static constexpr bool  kDefaultInvertMouseY = false;
@@ -175,6 +193,12 @@ struct GameSettings {
                     (std::min)(kMaxCameraBob, cameraBob));
         fieldOfView = (std::max)(kMinFieldOfView,
                       (std::min)(kMaxFieldOfView, fieldOfView));
+        dlssPreset = (std::max)(kMinDLSSPreset,
+                     (std::min)(kMaxDLSSPreset, dlssPreset));
+        dlssScreenPercentage = dlssScreenPercentage >=
+            kMinDLSSScreenPercentage
+            ? (std::min)(kMaxDLSSScreenPercentage, dlssScreenPercentage)
+            : kMinDLSSScreenPercentage;
         for (float& shake : weaponCameraShake)
             shake = shake > 0.0f ? (std::min)(kMaxWeaponCameraShake, shake)
                                  : 0.0f;
@@ -194,6 +218,11 @@ struct GameSettings {
         uiVolume = kDefaultBusVolume;
         musicVolume = kDefaultMusicVolume;
         vsync = kDefaultVsync;
+        dlssEnabled = kDefaultDLSS;
+        dlssRayReconstruction = kDefaultDLSSRayReconstruction;
+        dlssPreset = kDefaultDLSSPreset;
+        extensionMotionVectors = kDefaultExtensionMotionVectors;
+        dlssScreenPercentage = kDefaultDLSSScreenPercentage;
         fullscreen = kDefaultFullscreen;
         fieldOfView = kDefaultFieldOfView;
         cameraBob = kDefaultCameraBob;
@@ -290,6 +319,24 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.vsync =
                 value == "1" || value == "true" || value == "yes";
         }
+        else if (key == "DLSS") {
+            out.dlssEnabled =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "DLSSRayReconstruction") {
+            out.dlssRayReconstruction =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "DLSSPreset") {
+            out.dlssPreset = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
+        }
+        else if (key == "ExtensionMotionVectors") {
+            out.extensionMotionVectors =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "DLSSScreenPercentage") {
+            out.dlssScreenPercentage = std::strtof(value.c_str(), nullptr);
+        }
         else if (key == "Fullscreen") {
             out.fullscreen =
                 value == "1" || value == "true" || value == "yes";
@@ -339,6 +386,16 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "[Display]\n"
          << "VSync="
          << (settings.vsync ? 1 : 0) << "\n"
+         << "DLSS="
+         << (settings.dlssEnabled ? 1 : 0) << "\n"
+         << "DLSSRayReconstruction="
+         << (settings.dlssRayReconstruction ? 1 : 0) << "\n"
+         << "DLSSPreset="
+         << settings.dlssPreset << "\n"
+         << "ExtensionMotionVectors="
+         << (settings.extensionMotionVectors ? 1 : 0) << "\n"
+         << "DLSSScreenPercentage="
+         << settings.dlssScreenPercentage << "\n"
          << "Fullscreen="
          << (settings.fullscreen ? 1 : 0) << "\n"
          << "FieldOfView=" << settings.fieldOfView << "\n"

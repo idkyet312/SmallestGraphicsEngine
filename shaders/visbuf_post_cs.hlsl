@@ -130,6 +130,13 @@ float3 Bloom(uint2 pixel) {
     return bloomInput.SampleLevel(lutSampler, uv, 0.0).rgb;
 }
 
+#if defined(SGE_DLSS_SR)
+float SceneDepthAt(uint2 pixel) {
+    const float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
+    return sceneDepth.SampleLevel(lutSampler, uv, 0.0);
+}
+#endif
+
 // Explicit mip: the post bloom SRV now exposes the whole pyramid rather than
 // mip 0 alone, so a caller can ask for a progressively wider blur for free.
 float3 BloomAt(float2 uv, float mip) {
@@ -184,6 +191,11 @@ float3 SampleFlare(float2 uv) {
 // knows about.
 float SunDepthVisibility(float2 sunUV) {
     float2 texel = 1.0 / float2(outputSize);
+#if defined(SGE_DLSS_SR)
+    uint depthWidth, depthHeight;
+    sceneDepth.GetDimensions(depthWidth, depthHeight);
+    texel = 1.0 / float2(depthWidth, depthHeight);
+#endif
     float visibility = 0.0;
     [unroll]
     for (int y = -2; y <= 2; ++y) {
@@ -211,7 +223,14 @@ float LinearizeDepth(float depth) {
 
 float3 CinematicInput(uint2 pixel) {
     int2 dimensions = int2(outputSize);
+#if defined(SGE_DLSS_SR)
+    // The input can be render-sized on a failed DLSS evaluation or display-
+    // sized after a successful one. Normalized sampling covers both.
+    float2 sceneUV = (float2(pixel) + 0.5) / float2(outputSize);
+    float3 color = hdrInput.SampleLevel(lutSampler, sceneUV, 0.0).rgb;
+#else
     float3 color = hdrInput.Load(int3(pixel, 0)).rgb;
+#endif
 
     if (motionBlurStrength > 0.0) {
         float2 velocityPixels = motionInput.Load(int3(pixel, 0)) * float2(outputSize);
@@ -231,7 +250,11 @@ float3 CinematicInput(uint2 pixel) {
         }
     }
 
+#if defined(SGE_DLSS_SR)
+    float depth = SceneDepthAt(pixel);
+#else
     float depth = sceneDepth.Load(int3(pixel, 0));
+#endif
     float viewDepth = LinearizeDepth(depth);
     float coc = min(abs(viewDepth - focusDistance) * aperture /
                     max(viewDepth, 0.1) * outputSize.y, 6.0);
@@ -371,7 +394,12 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         stableSurfaceOutput[pixel] = currentID;
     }
     if (debugViewMode != 0u) {
+#if defined(SGE_DLSS_SR)
+        float4 debugColor = hdrInput.SampleLevel(
+            lutSampler, (float2(pixel) + 0.5) / float2(outputSize), 0.0);
+#else
         float4 debugColor = hdrInput.Load(int3(pixel, 0));
+#endif
         historyOutput[pixel] = debugColor;
         ldrOutput[pixel] = debugColor;
         return;
@@ -445,7 +473,11 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     if (autoExposure <= 0.0) autoExposure = 1.0;
     // Forward sky uses ACES + display gamma. The VB background is stored as
     // linear HDR, so reproduce that exact transform for parity captures.
+#if defined(SGE_DLSS_SR)
+    float rawDepth = SceneDepthAt(pixel);
+#else
     float rawDepth = sceneDepth.Load(int3(pixel, 0));
+#endif
     bool validationSky = validationMode != 0u && rawDepth >= 0.9999;
     float2 lensUV = (float2(pixel) + 0.5) / float2(outputSize);
 

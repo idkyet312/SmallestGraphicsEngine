@@ -474,6 +474,28 @@ else()
         "thirdparty/Steam/steam_api64.dll not present; building without Steam")
 endif()
 
+# NVIDIA Streamline (DLSS). Headers only at build time: sl.interposer.dll is
+# loaded with LoadLibrary in manual-hooking mode (src/render/dx12/DLSSDX12.h),
+# so d3d12/dxgi stay linked natively and the game runs unchanged without the
+# DLLs or on a non-NVIDIA GPU. Production (signed) binaries are copied next
+# to the exe, where the loader looks for them.
+set(SGE_STREAMLINE_DIR "${CMAKE_SOURCE_DIR}/thirdparty/streamline-sdk-v2.14.1")
+if(EXISTS "${SGE_STREAMLINE_DIR}/include/sl.h")
+    target_sources(GraphicEngine PRIVATE src/render/dx12/DLSSDX12.cpp)
+    target_include_directories(GraphicEngine PRIVATE "${SGE_STREAMLINE_DIR}/include")
+    target_compile_definitions(GraphicEngine PRIVATE SGE_WITH_STREAMLINE=1)
+    foreach(sl_dll sl.interposer.dll sl.common.dll sl.dlss.dll
+                   sl.dlss_d.dll nvngx_dlss.dll nvngx_dlssd.dll)
+        add_custom_command(TARGET GraphicEngine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SGE_STREAMLINE_DIR}/bin/x64/${sl_dll}"
+                $<TARGET_FILE_DIR:GraphicEngine>)
+    endforeach()
+    message(STATUS "Streamline DLSS enabled (${SGE_STREAMLINE_DIR})")
+else()
+    message(STATUS "Streamline SDK absent; DLSS off")
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(VirtualShadowPagesTests tests/VirtualShadowPagesTests.cpp)

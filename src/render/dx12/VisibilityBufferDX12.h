@@ -219,7 +219,7 @@ public:
     // Keep allocation and copy counts tied to these values: omitting the last
     // descriptor makes bindless sample an uninitialized heap entry.
     static constexpr UINT kResolveDescriptorCount = 92;
-    static constexpr UINT kEnhancedResolveDescriptorCount = 105;
+    static constexpr UINT kEnhancedResolveDescriptorCount = 108;
     // Heap index of the spot shadow atlas (t92). Sits one past the terrain
     // splatmap, which was the previous last slot.
     static constexpr UINT kSpotShadowAtlasSlot = 91;
@@ -307,11 +307,16 @@ public:
 
     // Lighting stays HDR until the dedicated cinematic post pass.
     ComPtr<ID3D12Resource> outputTexture;
+    ComPtr<ID3D12Resource> dlssUpscaledTexture;
     ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
     ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
     ComPtr<ID3D12Resource> normalRoughnessTexture;
+    ComPtr<ID3D12Resource> rrDiffuseAlbedo;
+    ComPtr<ID3D12Resource> rrSpecularAlbedo;
+    ComPtr<ID3D12Resource> rrSpecularHitDistance;
+    bool rayReconstructionActive = false;
     ComPtr<ID3D12Resource> bloomTexture;
     // Two half-res targets: the flare passes ping-pong between them, because a
     // single texture cannot be bound as SRV and UAV in the same dispatch.
@@ -556,11 +561,12 @@ public:
     float rayMaskGIFraction = 0.0f;
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
+    ComPtr<ID3D12PipelineState> postUpscalePSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
-    // Four immutable variants cover colour-history parity and stable-surface
-    // write parity independently. Each holds 16 SRVs and 3 UAVs.
+    // Two source choices (render input or DLSS output), each with four history
+    // parity combinations. Immutable descriptors stay safe across frame slots.
     static constexpr UINT kPostDescriptorsPerVariant = 19;
-    static constexpr UINT kPostDescriptorVariantCount = 4;
+    static constexpr UINT kPostDescriptorVariantCount = 8;
     ComPtr<ID3D12RootSignature> bloomRootSig;
     ComPtr<ID3D12PipelineState> bloomDownsamplePSO;
     ComPtr<ID3D12PipelineState> bloomUpsamplePSO;
@@ -713,6 +719,12 @@ public:
     XMFLOAT4 sunLensColor = { 1.0f, 0.92f, 0.70f, 0.0f };
     float taaFeedback = 0.86f;
     bool temporalEffectsEnabled = false;
+    // DLSS owns temporal accumulation this frame. Keeps the sub-pixel jitter
+    // and motion vectors TAA would have used, but the post pass's own history
+    // blend is bypassed so the image is not accumulated twice.
+    bool dlssActive = false;
+    // Set wherever engine history is invalidated; consumed by the DLSS pass.
+    bool dlssHistoryReset = true;
     bool temporalHistoryValid = false;
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;
@@ -807,6 +819,12 @@ public:
 
     UINT width = 0;
     UINT height = 0;
+    UINT displayWidth = 0;
+    UINT displayHeight = 0;
+
+    ID3D12Resource* DLSSUpscaledResource() const {
+        return dlssUpscaledTexture.Get();
+    }
 
     struct ScopeViewStorage {
         UINT width = 1024, height = 1024;
@@ -1116,7 +1134,8 @@ public:
     std::string initError;
 
     XMFLOAT2 GetTemporalJitterPixels() const {
-        if (!temporalEffectsEnabled || validationMode) return { 0.0f, 0.0f };
+        if (!(temporalEffectsEnabled || dlssActive) || validationMode)
+            return { 0.0f, 0.0f };
         // Eight-sample Halton(2,3), centered on pixel. Sequence repeats only
         // after covering complementary sub-pixel locations.
         static constexpr XMFLOAT2 sequence[8] = {
@@ -1133,6 +1152,7 @@ public:
     }
 
     void InvalidateTemporalHistory() {
+        dlssHistoryReset = true;
         temporalHistoryValid = false;
         surfaceHistoryValid = false;
         svgfHistoryValid = false;
@@ -1178,9 +1198,12 @@ public:
         stableSurfaceIdentityActiveThisFrame = active;
     }
 
-    bool Init(UINT screenWidth, UINT screenHeight) {
+    bool Init(UINT screenWidth, UINT screenHeight,
+              UINT outputWidth = 0, UINT outputHeight = 0) {
         width = screenWidth;
         height = screenHeight;
+        displayWidth = outputWidth ? outputWidth : screenWidth;
+        displayHeight = outputHeight ? outputHeight : screenHeight;
 
         initError.clear();
         auto require = [&](bool success, const char* stage) {
@@ -2344,6 +2367,22 @@ public:
             barriers[2].Transition.pResource = normalRoughnessTexture.Get();
             cmdList->ResourceBarrier(3, barriers);
         }
+        if (rayReconstructionActive) {
+            ID3D12Resource* guides[] = { rrDiffuseAlbedo.Get(),
+                rrSpecularAlbedo.Get(), rrSpecularHitDistance.Get() };
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
+            for (UINT i = 0; i < 3; ++i) {
+                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[i].Transition.pResource = guides[i];
+                barriers[i].Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barriers[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barriers[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            cmdList->ResourceBarrier(3, barriers);
+        }
 
         // Also transition depth buffer to SRV for reading
         {
@@ -2382,11 +2421,12 @@ public:
         svgfMotionVectorsEnabledLastFrame =
             motionVectorsRequired && enhancedVisualsActive &&
             enhancedRTReflectionsActive && svgfTemporalEnabled;
-        fc.edgeAAEnabled = (edgeAAEnabled || ScopeSurfaceBound()) ? 1u : 0u;
+        fc.edgeAAEnabled = (!rayReconstructionActive &&
+            (edgeAAEnabled || ScopeSurfaceBound())) ? 1u : 0u;
         fc.contactShadowStrength = contactShadowStrength;
         fc.contactShadowMaxDistance = contactShadowMaxDistance;
         fc.contactShadowLinearDepth = contactShadowLinearDepth ? 1u : 0u;
-        fc.contactShadowNoiseFrame = temporalEffectsEnabled
+        fc.contactShadowNoiseFrame = (temporalEffectsEnabled || dlssActive)
             ? postFrameIndex : 0u;
         fc.bentNormalGTAOEnabled = bentNormalHistoryActive ? 1u : 0u;
         const UINT bentDebugMode = static_cast<UINT>(
@@ -2461,7 +2501,8 @@ public:
         // costs the lens its temporal accumulation and costs the main view
         // nothing.
         const bool svgfWillWriteHistory =
-            useEnhanced && svgfTemporalEnabled && debugViewMode == 0 &&
+            useEnhanced && svgfTemporalEnabled && !rayReconstructionActive &&
+            debugViewMode == 0 &&
             !ScopeSurfaceBound();
         // Reports whether the temporal pass ran, for the debug panel. Left to
         // the main view: the scope always answers false now, and the panel is
@@ -2858,7 +2899,8 @@ public:
         ID3D12DescriptorHeap* compositeDescHeap =
             svgfCompositeDescHeaps[frameSlot].Get();
         const bool atrousRan =
-            !ScopeSurfaceBound() && useEnhanced && svgfTemporalEnabled && svgfAtrousEnabled &&
+            !ScopeSurfaceBound() && useEnhanced && !rayReconstructionActive &&
+            svgfTemporalEnabled && svgfAtrousEnabled &&
             (debugViewMode == 0 || debugViewMode == 6) &&
             svgfAtrousPipelineReady && svgfAtrousPSO && svgfAtrousRootSig &&
             atrousDescHeap && svgfCompositePSO && svgfCompositeRootSig &&
@@ -3269,6 +3311,22 @@ public:
             barriers[2].Transition.pResource = normalRoughnessTexture.Get();
             cmdList->ResourceBarrier(3, barriers);
         }
+        if (rayReconstructionActive) {
+            ID3D12Resource* guides[] = { rrDiffuseAlbedo.Get(),
+                rrSpecularAlbedo.Get(), rrSpecularHitDistance.Get() };
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
+            for (UINT i = 0; i < 3; ++i) {
+                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[i].Transition.pResource = guides[i];
+                barriers[i].Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barriers[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barriers[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            cmdList->ResourceBarrier(3, barriers);
+        }
 
         // Preserve primary depth for the post reactive mask.
         if (!ScopeSurfaceBound()) {
@@ -3405,17 +3463,9 @@ public:
         }
         cmdList->ResourceBarrier(barrierCount, barriers);
 
-        // Clear motion to zero up front. Only the passes that own a motion PSO
-        // (skinned actors, viewmodel) bind the second RTV via
-        // BeginMotionDraws; everything else in this pass -- terrain, water,
-        // SSR, fog, light shafts -- still has single-RT PSOs, and D3D12 drops
-        // a draw whose PSO render-target count disagrees with the bound
-        // targets. Geometry disappearing is the visible symptom. Pixels left
-        // uncovered keep the zero written here, which reads as "no motion".
-        if (useMotion) {
-            const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            cmdList->ClearRenderTargetView(GetMotionRTV(), zero, 0, nullptr);
-        }
+        // Preserve the visibility pass's dense motion field. Skinned draws
+        // overwrite their own pixels through BeginMotionDraws; clearing here
+        // would erase camera motion for every background pixel.
 
         // Default to colour-only so untouched passes keep working.
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
@@ -3478,6 +3528,40 @@ public:
             ? motionRtvHeap->GetCPUDescriptorHandleForHeapStart()
             : D3D12_CPU_DESCRIPTOR_HANDLE{};
     }
+    ID3D12Resource* GetRRDiffuseAlbedo() const {
+        return rrDiffuseAlbedo.Get();
+    }
+    ID3D12Resource* GetRRSpecularAlbedo() const {
+        return rrSpecularAlbedo.Get();
+    }
+    ID3D12Resource* GetRRSpecularHitDistance() const {
+        return rrSpecularHitDistance.Get();
+    }
+    bool EnsureRayReconstructionGuides() {
+        if (rrDiffuseAlbedo && rrSpecularAlbedo && rrSpecularHitDistance)
+            return true;
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        auto create = [&](ComPtr<ID3D12Resource>& target) {
+            return SUCCEEDED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                nullptr, IID_PPV_ARGS(&target)));
+        };
+        if (!create(rrDiffuseAlbedo) || !create(rrSpecularAlbedo))
+            return false;
+        desc.Format = DXGI_FORMAT_R16_FLOAT;
+        return create(rrSpecularHitDistance);
+    }
     ID3D12Resource* GetNormalRoughnessResource() const {
         return normalRoughnessTexture.Get();
     }
@@ -3485,12 +3569,14 @@ public:
         return visibilityDepthTexture.Get();
     }
 
-    void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
+    void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory,
+                     bool dlssUpscaled = false) {
+        const bool scaledInput = width != displayWidth || height != displayHeight;
         const UINT historyIndex = postFrameIndex & 1u;
         const bool preserveDebugOutput =
             debugViewMode != 0 || BentNormalGTAODiagnosticActive();
         PrepareStableSurfaceHistory(
-            allowHistory && StableSurfaceIdentityRequired(
+            allowHistory && !scaledInput && StableSurfaceIdentityRequired(
                 enhancedResolveExecutedLastFrame),
             StableSurfaceModeSignature(
                 allowHistory, allowHistory && enhancedResolveExecutedLastFrame));
@@ -3525,20 +3611,24 @@ public:
         cmdList->ResourceBarrier(2, barriers);
 
         VBPostConstants constants = {};
-        constants.outputWidth = width;
-        constants.outputHeight = height;
+        constants.outputWidth = displayWidth;
+        constants.outputHeight = displayHeight;
         constants.exposure = validationMode ? 1.0f : exposure;
         constants.bloomStrength = validationMode ? 0.0f : bloomStrength;
         constants.vignetteStrength = validationMode ? 0.0f : vignetteStrength;
         constants.grainStrength = validationMode ? 0.0f : grainStrength;
         constants.frameIndex = postFrameIndex++;
-        constants.historyValid = (temporalEffectsEnabled && !validationMode &&
+        constants.historyValid = (temporalEffectsEnabled && !dlssActive &&
+            !scaledInput &&
+            !validationMode &&
             !preserveDebugOutput && allowHistory && temporalHistoryValid)
                 ? 1u : 0u;
-        constants.taaFeedback = (temporalEffectsEnabled && !validationMode)
+        constants.taaFeedback = (temporalEffectsEnabled && !dlssActive &&
+            !scaledInput &&
+            !validationMode)
             ? taaFeedback : 0.0f;
         constants.motionBlurStrength = (temporalEffectsEnabled &&
-            !validationMode) ? motionBlurStrength : 0.0f;
+            !validationMode && !scaledInput) ? motionBlurStrength : 0.0f;
         constants.focusDistance = focusDistance;
         // Depth of field disabled. It blurred the entire game view whenever
         // parity validation was off.
@@ -3555,7 +3645,7 @@ public:
             (surfaceHistoryValid && stableSurfaceIdentityActiveThisFrame &&
              (surfaceIDTemporalEnabled || historyDebugView) && !validationMode)
                 ? 1u : 0u;
-        constants.historyDebugView = historyDebugView ? 1u : 0u;
+        constants.historyDebugView = historyDebugView && !scaledInput ? 1u : 0u;
         constants.surfaceIdentityEnabled =
             stableSurfaceIdentityActiveThisFrame ? 1u : 0u;
         // Bloom-derived artefacts are only valid when the chain ran this frame.
@@ -3580,7 +3670,8 @@ public:
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
-        cmdList->SetPipelineState(postPSO.Get());
+        cmdList->SetPipelineState(scaledInput ? postUpscalePSO.Get()
+                                             : postPSO.Get());
         ID3D12DescriptorHeap* heaps[] = { postDescHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootConstantBufferView(0,
@@ -3588,11 +3679,13 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
         const UINT descriptorVariant =
+            (dlssUpscaled ? 4u : 0u) +
             historyIndex * 2u + stableSurfaceWriteIndex;
         table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize *
                      descriptorVariant * kPostDescriptorsPerVariant;
         cmdList->SetComputeRootDescriptorTable(1, table);
-        cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        cmdList->Dispatch((displayWidth + 7) / 8,
+                          (displayHeight + 7) / 8, 1);
 
         if (stableSurfaceIdentityActiveThisFrame) {
             D3D12_RESOURCE_BARRIER stableBarriers[2] = {};
@@ -3743,18 +3836,29 @@ public:
                           D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
-    void Resize(UINT newWidth, UINT newHeight) {
-        if (newWidth == width && newHeight == height) return;
+    void Resize(UINT newWidth, UINT newHeight,
+                UINT newDisplayWidth = 0, UINT newDisplayHeight = 0) {
+        const UINT targetDisplayWidth = newDisplayWidth ? newDisplayWidth : newWidth;
+        const UINT targetDisplayHeight = newDisplayHeight ? newDisplayHeight : newHeight;
+        if (newWidth == width && newHeight == height &&
+            targetDisplayWidth == displayWidth &&
+            targetDisplayHeight == displayHeight) return;
         width = newWidth;
         height = newHeight;
+        displayWidth = targetDisplayWidth;
+        displayHeight = targetDisplayHeight;
 
         visBufferRT.Reset();
         surfaceHistoryValid = false;
         outputTexture.Reset();
+        dlssUpscaledTexture.Reset();
         presentTexture.Reset();
         motionTexture.Reset();
         motionRtvHeap.Reset();
         normalRoughnessTexture.Reset();
+        rrDiffuseAlbedo.Reset();
+        rrSpecularAlbedo.Reset();
+        rrSpecularHitDistance.Reset();
         bloomTexture.Reset();
         visibilityDepthTexture.Reset();
         historyTextures[0].Reset();
@@ -3990,7 +4094,7 @@ private:
         // visibility motion buffer to reproject reflection history. Capture
         // mode deliberately disables TAA, so tying this data to the TAA switch
         // pins SVGF history to screen space as soon as the camera moves.
-        return temporalEffectsEnabled || aoTemporalMotionVectors ||
+        return temporalEffectsEnabled || dlssActive || aoTemporalMotionVectors ||
             (enhancedVisualsActive && enhancedRTReflectionsActive &&
              svgfTemporalEnabled);
     }
@@ -4078,6 +4182,8 @@ private:
 
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.Width = displayWidth;
+        desc.Height = displayHeight;
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
@@ -4086,6 +4192,18 @@ private:
             std::cerr << "Failed to create VB present texture" << std::endl;
             return false;
         }
+
+        if (width != displayWidth || height != displayHeight) {
+            desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            hr = g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&dlssUpscaledTexture));
+            if (FAILED(hr)) return false;
+        }
+
+        desc.Width = width;
+        desc.Height = height;
 
         desc.Format = DXGI_FORMAT_R16G16_FLOAT;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
@@ -4125,6 +4243,8 @@ private:
         if (FAILED(hr)) return false;
 
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.Width = displayWidth;
+        desc.Height = displayHeight;
         for (UINT i = 0; i < 2; ++i) {
             hr = g_dx12.device->CreateCommittedResource(
                 &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
@@ -4132,6 +4252,9 @@ private:
                 IID_PPV_ARGS(&historyTextures[i]));
             if (FAILED(hr)) return false;
         }
+
+        desc.Width = width;
+        desc.Height = height;
 
         // SVGF temporal accumulation: ping-pong history for denoised colour
         // (E[x]) and moments (E[x^2] + sample count in alpha).
@@ -4964,7 +5087,7 @@ private:
             // shading, so a scene whose acceleration structure has not been
             // rebuilt since this feature landed keeps the sky approximation.
             UINT  hitGeometryCount;
-            UINT  svgfPad2;
+            UINT  rrGuideEnable;
         } constants;
         static_assert(sizeof(EnhancedConstants) == 80,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
@@ -4982,15 +5105,19 @@ private:
         constants.reflectionClassify = enhancedReflectionClassifyActive ? 1u : 0u;
         constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
         constants.probeMissGI = enhancedProbeMissGIActive ? 1u : 0u;
-        constants.svgfTemporalEnable = (svgfTemporalEnabled && !ScopeSurfaceBound()) ? 1u : 0u;
+        constants.svgfTemporalEnable = (svgfTemporalEnabled &&
+            !rayReconstructionActive && !ScopeSurfaceBound()) ? 1u : 0u;
         constants.svgfMaxAccum = svgfMaxAccumFrames;
-        constants.svgfAtrousEnable = (svgfAtrousEnabled && !ScopeSurfaceBound()) ? 1u : 0u;
+        constants.svgfAtrousEnable = (svgfAtrousEnabled &&
+            !rayReconstructionActive && !ScopeSurfaceBound()) ? 1u : 0u;
         constants.svgfAtrousIters = std::clamp(
             svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
         constants.probeMissGIStrength = enhancedProbeMissGIStrength;
         constants.hitGeometryCount = hitGeometryCount;
-        constants.svgfPad2 = 0u;
+        constants.rrGuideEnable = (rayReconstructionActive &&
+            rrDiffuseAlbedo && rrSpecularAlbedo &&
+            rrSpecularHitDistance) ? 1u : 0u;
         const UINT64 constantOffset =
             static_cast<UINT64>(ViewFrameIndex()) * 256ull;
         memcpy(static_cast<BYTE*>(enhancedConstantMapped) + constantOffset,
@@ -5243,7 +5370,7 @@ private:
         //   [97]     u7       current stable surfaces
         //   [98]     t85      raytracing hit geometry bindings
         //   [99]     t86      bent-normal GTAO history
-        D3D12_DESCRIPTOR_RANGE ranges[20] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[23] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -5352,6 +5479,14 @@ private:
         ranges[19].BaseShaderRegister = 92;
         ranges[19].RegisterSpace = 0;
         ranges[19].OffsetInDescriptorsFromTableStart = 104;
+
+        for (UINT i = 0; i < 3; ++i) {
+            ranges[20 + i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            ranges[20 + i].NumDescriptors = 1;
+            ranges[20 + i].BaseShaderRegister = 8 + i;
+            ranges[20 + i].RegisterSpace = 0;
+            ranges[20 + i].OffsetInDescriptorsFromTableStart = 105 + i;
+        }
 
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -6308,6 +6443,18 @@ private:
         // valid; a null descriptor keeps the inactive branch well-defined.
         WriteBentNormalHistoryDescriptor(
             enhancedHeap, 99, nullptr);
+        ID3D12Resource* rrResources[] = { rrDiffuseAlbedo.Get(),
+            rrSpecularAlbedo.Get(), rrSpecularHitDistance.Get() };
+        for (UINT i = 0; i < 3; ++i) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = i == 2 ? DXGI_FORMAT_R16_FLOAT :
+                DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += static_cast<UINT64>(descSize) * (105 + i);
+            g_dx12.device->CreateUnorderedAccessView(
+                rrResources[i], nullptr, &uav, h);
+        }
         enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
     }
 
@@ -8049,6 +8196,26 @@ private:
         hr = g_dx12.device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&postPSO));
         if (FAILED(hr)) return false;
 
+        const D3D_SHADER_MACRO srDefines[] = {
+            { "SGE_DLSS_SR", "1" }, { nullptr, nullptr }
+        };
+        ComPtr<ID3DBlob> upscaleBlob;
+        hr = ShaderCacheDX12::CompileCached(source.data(), source.size(),
+            "shaders/visbuf_post_cs.hlsl", srDefines,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0, &upscaleBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "VB upscaled post CS error: "
+                << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        pso.CS = { upscaleBlob->GetBufferPointer(),
+                   upscaleBlob->GetBufferSize() };
+        hr = g_dx12.device->CreateComputePipelineState(
+            &pso, IID_PPV_ARGS(&postUpscalePSO));
+        if (FAILED(hr)) return false;
+
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
         heap.NumDescriptors = kPostDescriptorsPerVariant *
                               kPostDescriptorVariantCount;
@@ -8064,11 +8231,12 @@ private:
         if (!postDescHeap) return;
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (UINT sourceMode = 0; sourceMode < 2; ++sourceMode) {
         for (UINT parity = 0; parity < 2; ++parity) {
           for (UINT stableWrite = 0; stableWrite < 2; ++stableWrite) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            const UINT variant = parity * 2u + stableWrite;
+            const UINT variant = sourceMode * 4u + parity * 2u + stableWrite;
             handle.ptr += (SIZE_T)descriptorSize * variant *
                           kPostDescriptorsPerVariant;
 
@@ -8077,7 +8245,10 @@ private:
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D.MipLevels = 1;
-            g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, handle);
+            g_dx12.device->CreateShaderResourceView(
+                sourceMode && dlssUpscaledTexture
+                    ? dlssUpscaledTexture.Get() : outputTexture.Get(),
+                &srv, handle);
             handle.ptr += descriptorSize;
             srv.Format = DXGI_FORMAT_R16G16_FLOAT;
             g_dx12.device->CreateShaderResourceView(motionTexture.Get(), &srv, handle);
@@ -8216,6 +8387,7 @@ private:
             g_dx12.device->CreateUnorderedAccessView(
                 StableSurfaceResource(stableWrite), nullptr, &uav, handle);
           }
+        }
         }
     }
 

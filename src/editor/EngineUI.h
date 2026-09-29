@@ -3073,6 +3073,24 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             }
             ImGui::Separator();
 
+            {
+                DLSS::Settings& dlss = DLSS::GetSettings();
+                if (DLSS::Available()) {
+                    ImGui::Checkbox("NVIDIA DLSS (replaces TAA)",
+                                    &dlss.enabled);
+                    if (dlss.enabled) {
+                        int preset = static_cast<int>(dlss.preset);
+                        if (ImGui::Combo("  DLSS Preset", &preset,
+                                         "K (DLSS 4)\0L (DLSS 4.5)\0"
+                                         "M (DLSS 4.5, faster)\0"))
+                            dlss.preset = static_cast<DLSS::Preset>(preset);
+                        if (ImGui::Checkbox("  Invert DLSS Jitter",
+                                            &dlss.invertJitter))
+                            vb.InvalidateTemporalHistory();
+                    }
+                }
+                ImGui::TextDisabled("  DLSS: %s", DLSS::Status());
+            }
             if (ImGui::Checkbox("Temporal AA (TAA)",
                                 &vb.temporalEffectsEnabled))
                 vb.InvalidateTemporalHistory();

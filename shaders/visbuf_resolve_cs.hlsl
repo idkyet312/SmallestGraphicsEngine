@@ -338,7 +338,7 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // visibility-buffer bindings, so ray hits fall back to the sky
     // approximation instead of reading a wrong triangle.
     uint  enhancedHitGeometryCount;
-    uint  svgfPadding;
+    uint  rrGuideEnable;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
@@ -370,6 +370,9 @@ RWTexture2D<float4> outputReflectionSrc  : register(u6);
 StructuredBuffer<uint> stableTriangleIDs : register(t83);
 Texture2D<uint2> svgfStableSurfaceHistory : register(t84);
 RWTexture2D<uint2> svgfStableSurfaceCurrent : register(u7);
+RWTexture2D<float4> rrDiffuseAlbedo : register(u8);
+RWTexture2D<float4> rrSpecularAlbedo : register(u9);
+RWTexture2D<float> rrSpecularHitDistance : register(u10);
 
 // Binds a raytracing hit to this shader's persistent geometry.
 //
@@ -1203,8 +1206,10 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
 // map. Unbound geometry keeps the coarse environment fallback, preserving a
 // single ray with no recursive reflection path.
 float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
-                           float roughness, uint2 pixel, out bool hit) {
+                           float roughness, uint2 pixel, out bool hit,
+                           out float hitDistance) {
     hit = false;
+    hitDistance = 0.0;
     if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
 
     // Per-pixel hash, rotated per frame so consecutive frames draw different
@@ -1259,6 +1264,7 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     }
 
     hit = true;
+    hitDistance = query.CommittedRayT();
     // Shade the hit surface where its geometry is bound, so a reflection shows
     // what it actually reflects rather than a dimmed sky. Reflections are where
     // this matters most: they are high-contrast and directly visible, so a
@@ -1270,6 +1276,13 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     // acceleration rebuild): fall back to darkening the probe along the ray --
     // an occluded reflection is strictly less bright than the open-sky value.
     return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
+}
+
+float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
+                           float roughness, uint2 pixel, out bool hit) {
+    float unusedDistance;
+    return RayTracedReflection(worldPos, normal, viewDir, roughness,
+                               pixel, hit, unusedDistance);
 }
 
 // Fills a sparse-probe miss with a traced bounce.
@@ -2409,7 +2422,19 @@ struct ShadeResult {
     float3 color;
     float3 specularIBL;
     float  specularVariance;
+    float  specularHitDistance;
 };
+
+void WriteRRMaterialGuides(uint2 pixel, Surface surface) {
+    if (rrGuideEnable == 0u) return;
+    rrDiffuseAlbedo[pixel] =
+        float4(surface.albedo * (1.0 - surface.metal), 1.0);
+    float3 f0 = lerp(0.04.xxx, surface.albedo, surface.metal);
+    float2 brdf = brdfIntegrationLUT.SampleLevel(texSampler,
+        float2(saturate(dot(surface.normal, surface.viewDir)),
+               surface.rough), 0.0);
+    rrSpecularAlbedo[pixel] = float4(f0 * brdf.x + brdf.y, 1.0);
+}
 #endif
 
 // `commitTemporalHistory` is false for edge-AA sub-samples, which call this
@@ -2436,6 +2461,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     float3 outSpecularIBL = 0.0;
     float outSpecularVariance = 0.0;
     float3 reflectionVariance = 0.0;
+    float reflectionHitDistance = 0.0;
 #endif
     
     // Main light
@@ -2612,7 +2638,8 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
         outputRayMask[pixel] |= 2u;
         bool reflectionHit = false;
         float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
-                                            surface.rough, pixel, reflectionHit);
+                                            surface.rough, pixel, reflectionHit,
+                                            reflectionHitDistance);
         // A miss is a real sample of the reflection integral -- it means "sky
         // along that direction" -- so it carries the probe value rather than
         // no value at all.
@@ -2858,6 +2885,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     shadeResult.color = result;
     shadeResult.specularIBL = outSpecularIBL;
     shadeResult.specularVariance = outSpecularVariance;
+    shadeResult.specularHitDistance = reflectionHitDistance;
     return shadeResult;
 #else
     return result;
@@ -2907,6 +2935,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     outputRayMask[pixel] = 0u;
     outputReflectionSrc[pixel] = 0.0;
     svgfStableSurfaceCurrent[pixel] = uint2(0u, 0u);
+    if (rrGuideEnable != 0u) {
+        rrDiffuseAlbedo[pixel] = 0.0;
+        rrSpecularAlbedo[pixel] = 0.0;
+        rrSpecularHitDistance[pixel] = 0.0;
+    }
 #endif
 
     if (debugViewMode == 2u) {
@@ -3083,6 +3116,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
             float4(terrainSurface.normal, terrainSurface.rough);
 
 #if SGE_ENHANCED_VISUALS
+        WriteRRMaterialGuides(pixel, terrainSurface);
         // Terrain has no stable triangle identity, so give the denoiser a
         // surface key derived from the quantised world position instead. It is
         // stable frame to frame for a static surface, which is what the
@@ -3099,6 +3133,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         outputColor[pixel] = float4(terrainShade.color, 1.0);
         outputReflectionSrc[pixel] =
             float4(terrainShade.specularIBL, terrainShade.specularVariance);
+        if (rrGuideEnable != 0u)
+            rrSpecularHitDistance[pixel] =
+                terrainShade.specularHitDistance;
 #else
         float3 terrainResult =
             ShadeSurface(pixel, terrainSurface, terrainMotion);
@@ -3337,6 +3374,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
                                        wp0, wp1, wp2, n0, n1, n2,
                                        uv0, uv1, uv2, bary);
     outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
+#if SGE_ENHANCED_VISUALS
+    WriteRRMaterialGuides(pixel, surface);
+#endif
 
     // Bent-normal diagnostics use the same reprojected history and confidence
     // as lit shading. Keeping this separate from debugViewMode lets GTAO keep
@@ -3482,6 +3522,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         outputColor[pixel] = float4(sr.color, 1.0);
         outputReflectionSrc[pixel] =
             float4(sr.specularIBL, sr.specularVariance);
+        if (rrGuideEnable != 0u)
+            rrSpecularHitDistance[pixel] = sr.specularHitDistance;
     } else if (svgfTemporalEnabled != 0 && enhancedRTReflections != 0 &&
                surface.rough <= enhancedReflectionRoughnessCut &&
                !surface.isFoliage) {

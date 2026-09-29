@@ -71,7 +71,9 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
 {
     float maxDistance = ssrParams.x;
     float stride = maxDistance / 48.0;
-    float jitter = Hash(pixel);
+    // Golden-ratio rotation per frame; ngTrace.w stays 0 unless a temporal
+    // resolver follows, which keeps the pattern static without one.
+    float jitter = frac(Hash(pixel) + ngTrace.w * 0.61803398875);
     float previousDelta = -ssrParams.y;
     float previousT = ssrParams.y;
     hitUV = 0.0;
