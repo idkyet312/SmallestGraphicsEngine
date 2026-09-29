@@ -107,6 +107,13 @@ int main() {
           "the test level carries no file name");
     Check(wire.back().channel == Channel::Reliable,
           "a level change is reliable; a dropped one strands a client");
+    const size_t beforeRestart = wire.size();
+    host.RestartHostLevel(RestartPlanMode::Quick);
+    ServerLevelMessage restartOrder{};
+    Check(LastLevel(beforeRestart, restartOrder) &&
+          restartOrder.restartSerial != changed.restartSerial &&
+          restartOrder.restartPlan == RestartPlanMode::Quick,
+          "a quick restart must tell clients to replay their deployment");
 
     // A client only follows the server it is connected to, and only a bare file
     // name: a path from the network points this machine wherever the sender
@@ -145,6 +152,28 @@ int main() {
     client.Update(0.0f, local);
     Check(!client.TakePendingLevel(kind, file),
           "being told the level it is already on must not reload it");
+
+    ServerLevelMessage quick = level;
+    quick.restartSerial = 1;
+    quick.restartPlan = RestartPlanMode::Quick;
+    Receive(3, quick);
+    client.Update(0.0f, local);
+    Check(client.LevelRestartPending() &&
+          client.LevelRestartPlan() == RestartPlanMode::Quick &&
+          client.TakePendingLevel(kind, file),
+          "a quick restart must reach the client's level load");
+    client.ClearLevelRestart();
+
+    ServerLevelMessage changePlan = quick;
+    changePlan.restartSerial = 2;
+    changePlan.restartPlan = RestartPlanMode::ChangePlan;
+    Receive(3, changePlan);
+    client.Update(0.0f, local);
+    Check(client.LevelRestartPending() &&
+          client.LevelRestartPlan() == RestartPlanMode::ChangePlan &&
+          client.TakePendingLevel(kind, file),
+          "a plan change must reach the client's level load");
+    client.ClearLevelRestart();
 
     ServerLevelMessage traversal;
     traversal.kind = LevelKind::LevelFile;

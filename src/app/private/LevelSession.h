@@ -101,6 +101,8 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
+    g_deploymentRestartPending = net::RestartPlanMode::None;
+    g_replayPlanActive = false;
     scene.remoteCharges.clear();
     ReleasePrefabRigidBodies();
     g_game.world.Prefabs().ClearDerived();
@@ -1017,6 +1019,7 @@ static void BrowseAndStartCustomLevel(HWND hwnd) {
 
 static void RestartActiveLevel(HWND hwnd) {
     if (!g_activeCustomLevelName.empty()) {
+        const std::string activeFile = g_activeLevelFile;
         // Snapshot the live level, but undo the gameplay damage first: a
         // destructible that was killed last run has entity.enabled == false
         // (CombatSystem::DamagePrefab disables it), and restarting from that
@@ -1035,6 +1038,7 @@ static void RestartActiveLevel(HWND hwnd) {
         // Carry the current god mode through rather than hardcoding it: a
         // restart should put the player back in the run they were already in.
         StartLevelOne(hwnd, scene.player.godMode, false, false, &custom);
+        g_activeLevelFile = activeFile;
     } else {
         StartLevelOne(hwnd, scene.player.godMode);
     }

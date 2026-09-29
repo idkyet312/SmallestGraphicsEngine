@@ -201,6 +201,7 @@ static void FollowHostLevel(HWND hwnd) {
     if (!g_netSession.TakePendingLevel(kind, file)) return;
     // The host restarting the level it is on names the same level again.
     const bool restart = g_netSession.LevelRestartPending();
+    const net::RestartPlanMode restartPlan = g_netSession.LevelRestartPlan();
     if (!restart && kind == g_activeLevelKind && file == g_activeLevelFile)
         return;
     // A host sitting in its own menus is not a reason to tear this player's
@@ -213,10 +214,13 @@ static void FollowHostLevel(HWND hwnd) {
         g_netSession.RequeuePendingLevel();
         return;
     }
+    g_deploymentRestartPending = restart && CanReplayLastDeployment()
+        ? restartPlan : net::RestartPlanMode::None;
+    const bool godMode = restart ? scene.player.godMode : true;
     g_netSession.ClearLevelRestart();
     switch (kind) {
     case net::LevelKind::Level1:
-        StartLevelOne(hwnd, true);
+        StartLevelOne(hwnd, godMode);
         break;
     case net::LevelKind::TestLevel:
         StartLevelOne(hwnd, true, false, true, nullptr, true);
@@ -224,6 +228,7 @@ static void FollowHostLevel(HWND hwnd) {
     case net::LevelKind::LevelFile: {
         const std::filesystem::path path = FindNetworkLevelFile(file);
         if (path.empty()) {
+            g_deploymentRestartPending = net::RestartPlanMode::None;
             // Naming the file is the whole diagnostic: the host has a level
             // this machine does not, and no amount of retrying fixes that.
             SGE_LOG("LogNet", EngineLog::Level::Warning,
@@ -232,7 +237,7 @@ static void FollowHostLevel(HWND hwnd) {
                                     ", which is missing from Content/Levels.";
             return;
         }
-        StartCustomLevel(hwnd, path);
+        StartCustomLevel(hwnd, path, godMode);
         break;
     }
     default:
@@ -2259,7 +2264,7 @@ static void UpdateMultiplayerSession(float frameDelta,
         helicopter.centerX = g_blackHawkModelCenter.x;
         helicopter.minY = g_blackHawkModelMinY;
         helicopter.centerZ = g_blackHawkModelCenter.z;
-        helicopter.scale = g_blackHawkModelScale;
+        helicopter.scale = g_game.vehicles.BlackHawkDrawScale();
         // SGE_INSERTION_TRACE=1: this machine's insertion aircraft once a
         // second, so a squad ride can be checked for the two copies agreeing.
         static const bool trace =

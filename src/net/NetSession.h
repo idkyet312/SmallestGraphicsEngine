@@ -449,6 +449,7 @@ public:
         hasPendingLevel_ = false;
         levelRestartPending_ = false;
         levelRestartSerial_ = 0;
+        levelRestartPlan_ = RestartPlanMode::None;
         serverAddress_.clear();
         port_ = 0;
         overSteam_ = false;
@@ -673,6 +674,7 @@ public:
         if (kind == levelKind_ && trimmed == levelFile_) return;
         levelKind_ = kind;
         levelFile_ = std::move(trimmed);
+        levelRestartPlan_ = RestartPlanMode::None;
         // The craters belonged to the map being left. Replaying them to the
         // next player who joins would cut the new level's ground at the old
         // one's coordinates.
@@ -687,9 +689,10 @@ public:
     // back on their feet at full health -- the slots are the authority, so a
     // local reset alone would be overwritten by the next status pull -- and
     // clients are told to reload even though the level name has not changed.
-    void RestartHostLevel() {
+    void RestartHostLevel(RestartPlanMode plan = RestartPlanMode::None) {
         if (role_ != Role::Host) return;
         ++levelRestartSerial_;
+        levelRestartPlan_ = plan;
         terrainDeforms_.clear();
         activeCharges_.clear();
         chargeSticks_.clear();
@@ -718,6 +721,9 @@ public:
     // back behind a load in progress stays a restart.
     bool LevelRestartPending() const { return levelRestartPending_; }
     void ClearLevelRestart() { levelRestartPending_ = false; }
+    RestartPlanMode LevelRestartPlan() const {
+        return levelRestartPending_ ? levelRestartPlan_ : RestartPlanMode::None;
+    }
 
     LevelKind HostLevelKind() const { return levelKind_; }
     const std::string& HostLevelFile() const { return levelFile_; }
@@ -2326,6 +2332,7 @@ private:
         ServerLevelMessage message;
         message.kind = levelKind_;
         message.restartSerial = levelRestartSerial_;
+        message.restartPlan = levelRestartPlan_;
         // Bounded copy into a fixed field: the name came from a filesystem path
         // and nothing upstream promises it is short.
         const size_t length =
@@ -2343,6 +2350,9 @@ private:
         if (event.peer != serverPeer_) return;
         ServerLevelMessage message{};
         std::memcpy(&message, event.payload.data(), sizeof(message));
+        if (message.restartPlan != RestartPlanMode::None &&
+            message.restartPlan != RestartPlanMode::Quick &&
+            message.restartPlan != RestartPlanMode::ChangePlan) return;
         if (message.kind != LevelKind::None &&
             message.kind != LevelKind::Level1 &&
             message.kind != LevelKind::TestLevel &&
@@ -2368,6 +2378,7 @@ private:
         // player's first message carries whatever serial the host is on.
         if (sameLevel) levelRestartPending_ = true;
         levelRestartSerial_ = message.restartSerial;
+        levelRestartPlan_ = message.restartPlan;
         levelKind_ = message.kind;
         levelFile_ = file;
         chargeSticks_.clear();
@@ -3348,6 +3359,7 @@ private:
     bool hasPendingLevel_ = false;
     bool levelRestartPending_ = false;
     uint8_t levelRestartSerial_ = 0;
+    RestartPlanMode levelRestartPlan_ = RestartPlanMode::None;
     std::string serverAddress_;
     uint16_t port_ = 0;
     // Whether this session is riding Steam's relay rather than a UDP port.

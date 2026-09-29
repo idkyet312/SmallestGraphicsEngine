@@ -457,6 +457,8 @@ static bool g_deploymentDebugHideUI = false;
 static bool g_deploymentDebugShowGrass = false;
 
 static void CancelDeploymentPlanning() {
+    g_deploymentRestartPending = net::RestartPlanMode::None;
+    g_replayPlanActive = false;
     g_insertionChoicePending = false;
     g_deploymentPlanningVisible = false;
     g_insertionChoiceCursorReleased = false;
@@ -933,6 +935,7 @@ void ApplyLiveWeatherState(WeatherState state);
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 
 static void BeginDeploymentPlanning() {
+    g_replayPlanActive = false;
     // Keep the planning state prepared while the level finishes loading, but
     // let the main loop publish it only after the scene rebuilds are complete.
     g_deploymentPlanningVisible = false;

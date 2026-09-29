@@ -140,6 +140,8 @@ std::shared_ptr<SceneNode>  g_insertionBoatShadowModel;
 // Mirrors g_blackHawkInsertionRestartPending: aiming the run needs the settled
 // player spawn and terrain, which are not ready at model load time.
 static bool                 g_insertionBoatRestartPending = false;
+static net::RestartPlanMode g_deploymentRestartPending = net::RestartPlanMode::None;
+static bool                 g_replayPlanActive = false;
 // Which airframe flies the insertion. Both helicopter runs (landing and fast
 // rappel) can use either, so this is deliberately separate from
 // LevelInsertionMode rather than doubling that enum -- the aircraft and the

@@ -686,6 +686,47 @@ static void RenderDownedOverlay() {
         IM_COL32(120, 230, 150, 240), 2.0f);
 }
 
+struct LastDeployment {
+    bool valid = false;
+    std::string levelName;
+    std::string levelFile;
+    net::LevelKind levelKind = net::LevelKind::None;
+    MissionLoadout loadout{};
+    std::array<SGE::WeaponInstance, MissionLoadout::kWeaponCount> weapons{};
+    uint32_t ownedWeapons = 0;
+    uint32_t ownedGrenades = 0;
+    uint32_t ownedGear = 0;
+    std::unordered_set<std::string> ownedAttachments;
+    XMFLOAT3 target{};
+    int marines = 0;
+    LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
+    InsertionAirframe airframe = InsertionAirframe::NewBlackHawk;
+    bool leftSeat = false;
+    TimeOfDay timeOfDay = TimeOfDay::Afternoon;
+    WeatherState weather = WeatherState::Cloudy;
+    float enemyDamageMultiplier = 1.0f;
+};
+
+static LastDeployment g_lastDeployment;
+
+static bool CanReplayLastDeployment() {
+    return g_lastDeployment.valid &&
+        g_lastDeployment.levelName == g_activeCustomLevelName &&
+        g_lastDeployment.levelFile == g_activeLevelFile &&
+        g_lastDeployment.levelKind == g_activeLevelKind;
+}
+
+static void RestartWithPlan(HWND hwnd, net::RestartPlanMode requestedPlan) {
+    const net::RestartPlanMode plan = CanReplayLastDeployment()
+        ? requestedPlan : net::RestartPlanMode::None;
+    if (MultiplayerActive()) {
+        if (g_netSession.CurrentRole() != net::Role::Host) return;
+        g_netSession.RestartHostLevel(plan);
+    }
+    g_deploymentRestartPending = plan;
+    RestartActiveLevel(hwnd);
+}
+
 static void RenderDeathScreen(HWND hwnd) {
     if (!deathCursorReleased) {
         // First frame of this death: the latch is re-armed per level start,
@@ -701,7 +742,7 @@ static void RenderDeathScreen(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(25, 0, 0, 190));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(380.0f, 230.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(380.0f, 275.0f), ImGuiCond_Always);
     ImGui::Begin("Death Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
@@ -722,11 +763,15 @@ static void RenderDeathScreen(HWND hwnd) {
                                  IM_COL32(224, 62, 48, 235), 1.0f);
     }
     ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    // Restart carries the accent: on a death screen it is what the player
-    // almost always wants, and making them find it among equals costs a beat.
-    if (UIPrimaryButton(g_activeCustomLevelName.empty() ? "RESTART LEVEL 1" :
-            "RESTART CUSTOM LEVEL"))
-        RestartActiveLevel(hwnd);
+    if (!MultiplayerActive() ||
+        g_netSession.CurrentRole() == net::Role::Host) {
+        if (UIPrimaryButton("QUICK RESTART"))
+            RestartWithPlan(hwnd, net::RestartPlanMode::Quick);
+        if (UIMenuButton("CHANGE PLAN", 40.0f))
+            RestartWithPlan(hwnd, net::RestartPlanMode::ChangePlan);
+    } else {
+        ImGui::TextDisabled("Waiting for host...");
+    }
     if (UIMenuButton("MAIN MENU", 40.0f))
         OpenMainMenu();
     ImGui::End();
@@ -746,7 +791,7 @@ static void RenderSquadWipeScreen(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(30, 12, 9, 220));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(400.0f, 280.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(400.0f, 315.0f), ImGuiCond_Always);
     ImGui::Begin("Squad Wipe Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
@@ -768,15 +813,13 @@ static void RenderSquadWipeScreen(HWND hwnd) {
     }
     ImGui::Dummy(ImVec2(0.0f, 20.0f));
 
-    // Host gets restart, clients get waiting message
+    // The host restarts the shared level; each client replays its own kit.
     const bool isHost = g_netSession.CurrentRole() == net::Role::Host;
     if (isHost) {
-        if (UIPrimaryButton("RESTART LEVEL")) {
-            // Slots first: they own every player's health, and the clients
-            // need the restart order to reload a level whose name is unchanged.
-            g_netSession.RestartHostLevel();
-            RestartActiveLevel(hwnd);
-        }
+        if (UIPrimaryButton("QUICK RESTART"))
+            RestartWithPlan(hwnd, net::RestartPlanMode::Quick);
+        if (UIMenuButton("CHANGE PLAN", 40.0f))
+            RestartWithPlan(hwnd, net::RestartPlanMode::ChangePlan);
     } else {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                              (panelWidth - ImGui::CalcTextSize("Waiting for host...").x) * 0.5f);
@@ -938,9 +981,149 @@ static bool DrawArmoryRow(const char* name, const char* blurb, int price,
     return pressed && affordable;
 }
 
-// Deployment fly-through owns every decision that changes the run. Nothing is
-// applied until DEPLOY, so restarting always returns to one authoritative plan.
+static void SaveLastDeployment() {
+    LastDeployment& last = g_lastDeployment;
+    last.valid = true;
+    last.levelName = g_activeCustomLevelName;
+    last.levelFile = g_activeLevelFile;
+    last.levelKind = g_activeLevelKind;
+    last.loadout = g_game.mission.Loadout();
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon)
+        last.weapons[static_cast<size_t>(weapon)] =
+            *scene.player.weapons.Instance(weapon);
+    last.ownedWeapons = g_ownedWeapons;
+    last.ownedGrenades = g_ownedGrenades;
+    last.ownedGear = g_ownedGear;
+    last.ownedAttachments = g_ownedAttachments;
+    last.target = g_deploymentTarget;
+    last.marines = g_deploymentMarineCount;
+    last.insertion = g_playerInsertionChoice;
+    last.airframe = g_insertionAirframe;
+    last.leftSeat = g_playerRidesLeftSeat;
+    last.timeOfDay = g_selectedTimeOfDay;
+    last.weather = scene.weatherState;
+    last.enemyDamageMultiplier = scene.enemyDamageMultiplier;
+}
+
+static void RestoreLastDeployment() {
+    const LastDeployment& last = g_lastDeployment;
+    g_game.mission.Loadout() = last.loadout;
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon)
+        scene.player.weapons.SetInstance(
+            last.weapons[static_cast<size_t>(weapon)]);
+    g_ownedWeapons = last.ownedWeapons;
+    g_ownedGrenades = last.ownedGrenades;
+    g_ownedGear = last.ownedGear;
+    g_ownedAttachments = last.ownedAttachments;
+    g_deploymentMarineCount = last.marines;
+    g_playerInsertionChoice = last.insertion;
+    ApplyInsertionAirframe(last.airframe);
+    g_playerRidesLeftSeat = last.leftSeat;
+    g_selectedTimeOfDay = last.timeOfDay;
+    scene.enemyDamageMultiplier = last.enemyDamageMultiplier;
+    ApplyLiveWeatherState(last.weather);
+    // Usually the old zone is already in the rebuilt ring. Keep its original
+    // marker; add the exact world position only if the ring has moved.
+    g_selectedDeploymentZone = -1;
+    for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
+        const XMFLOAT3& zone = g_deploymentZones[index];
+        const float dx = zone.x - last.target.x;
+        const float dy = zone.y - last.target.y;
+        const float dz = zone.z - last.target.z;
+        if (dx * dx + dy * dy + dz * dz < 0.0001f) {
+            g_selectedDeploymentZone = static_cast<int>(index);
+            break;
+        }
+    }
+    if (g_selectedDeploymentZone < 0) {
+        g_deploymentZones.push_back(last.target);
+        g_selectedDeploymentZone = static_cast<int>(g_deploymentZones.size()) - 1;
+    }
+}
+
+static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
+    MissionLoadout& loadout = g_game.mission.Loadout();
+    if (replayPaidPlan) {
+        // The saved squad was paid for on the previous attempt. Only newly
+        // added marines need another purchase when the player changes plans.
+        const int extraMarines = g_deploymentMarineCount - g_lastDeployment.marines;
+        if (extraMarines > 0) {
+            if (ArmoryPurchase(extraMarines * kDeploymentMarinePrice))
+                SaveCareer();
+            else g_deploymentMarineCount = g_lastDeployment.marines;
+        }
+    } else {
+        char autoMarines[16] = {};
+        if (GetEnvironmentVariableA("SGE_AUTO_MARINES", autoMarines,
+                                    sizeof(autoMarines)) > 0) {
+            g_deploymentMarineCount = (std::clamp)(
+                std::atoi(autoMarines), 0, kMaxDeploymentMarines);
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Auto-marines: " + std::to_string(g_deploymentMarineCount));
+        } else if (g_deploymentMarineCount > 0) {
+            const int squadPrice =
+                g_deploymentMarineCount * kDeploymentMarinePrice;
+            if (ArmoryPurchase(squadPrice)) SaveCareer();
+            else g_deploymentMarineCount = 0;
+        }
+    }
+    for (size_t slot = 0; slot < loadout.weapons.size(); ++slot) {
+        if (GunModel::WeaponLoaded(loadout.weapons[slot])) continue;
+        for (int candidate = 0; candidate <= GunModel::kMaxWeapon;
+             ++candidate) {
+            if (!GunModel::WeaponLoaded(candidate) ||
+                loadout.ContainsWeapon(candidate)) continue;
+            loadout.SelectWeapon(slot, candidate);
+            break;
+        }
+    }
+    if (scene.player.godMode) {
+        GunModel::DisableLoadoutRestriction();
+        GunModel::SelectedWeapon() = loadout.weapons[0];
+    } else {
+        GunModel::ConfigureLoadout(loadout.weapons[0], loadout.weapons[1]);
+    }
+    scene.selectedGrenade = loadout.grenade;
+    ApplyTimeOfDay(g_selectedTimeOfDay);
+    g_deploymentTarget = g_deploymentZones[
+        static_cast<size_t>(g_selectedDeploymentZone)];
+    g_deploymentTargetValid = true;
+    g_insertionChoicePending = false;
+    g_insertionChoiceCursorReleased = false;
+    cameraLocked = false;
+    scene.camera.FPSMode = true;
+    scene.camera.Position = {
+        g_deploymentTarget.x,
+        g_deploymentTarget.y + scene.camera.PlayerHeight,
+        g_deploymentTarget.z };
+    scene.camera.FloorY = g_deploymentTarget.y;
+    scene.camera.VerticalVelocity = 0.0f;
+    scene.camera.IsGrounded = true;
+    g_game.session.ResetTimer(true);
+    g_game.mission.SetCommTowerCount(CountStandingCommTowers());
+    ArmObjectivePlanes();
+    visBuffer.InvalidateTemporalHistory();
+    g_game.commands.Request(GameCommand::ResetDDGIHistory);
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    firstMouse = true;
+    g_replayPlanActive = false;
+    SaveLastDeployment();
+}
+
+// Change Plan opens this map with the last committed choices restored. Quick
+// Restart commits those choices as soon as the level is ready.
 static void RenderInsertionChoiceScreen(HWND hwnd) {
+    if (g_deploymentRestartPending != net::RestartPlanMode::None) {
+        const net::RestartPlanMode mode = g_deploymentRestartPending;
+        g_deploymentRestartPending = net::RestartPlanMode::None;
+        RestoreLastDeployment();
+        g_replayPlanActive = true;
+        if (mode == net::RestartPlanMode::Quick) {
+            CommitDeployment(hwnd, true);
+            return;
+        }
+    }
     // Free the pointer so the buttons can be clicked, the way the death screen
     // does. Recaptured below once the choice is made.
     if (!g_insertionChoiceCursorReleased) {
@@ -2176,9 +2359,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // The slider stops where the wallet does, so the player cannot dial up a
     // squad they will only be told about at DEPLOY. Balance is re-read every
     // frame because the storefront above can spend it after this point.
-    const int affordableMarines = (std::min)(
-        kMaxDeploymentMarines,
-        static_cast<int>(g_game.money.Balance() / kDeploymentMarinePrice));
+    const int prepaidMarines = g_replayPlanActive
+        ? g_lastDeployment.marines : 0;
+    const int affordableMarines = (std::min)(kMaxDeploymentMarines,
+        prepaidMarines + static_cast<int>(
+            g_game.money.Balance() / kDeploymentMarinePrice));
     // Clamp before drawing, not after: an armory purchase made after the squad
     // was picked can put the count out of reach, and charging for marines the
     // player can no longer pay for is the one outcome this must never allow.
@@ -2194,8 +2379,8 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Marines loaded aboard your transport, $2,000 each.\n"
-            "Charged when you deploy, and spent for good -- they do\n"
-            "not carry over to the next mission like a weapon does.\n"
+            "Charged when you deploy. A restart reuses the paid squad;\n"
+            "only additional marines cost more on Change Plan.\n"
             "They only reach the ground if the transport does: a\n"
             "downed helicopter or a sunk boat takes the squad with it.");
     ImGui::EndDisabled();
@@ -2207,12 +2392,13 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::SetCursorPosX(45.0f);
         ImGui::TextColored(ImVec4(0.75f, 0.32f, 0.28f, 1.0f),
                            "Cannot afford a marine ($2,000 each)");
-    } else if (g_deploymentMarineCount > 0) {
+    } else if (g_deploymentMarineCount > prepaidMarines) {
         // Quote the total rather than the unit price: the decision being made
         // here is how big a cheque to write, not what one marine goes for.
         char squadCost[32];
         MoneySystem::Format(squadCost, sizeof(squadCost),
-                            g_deploymentMarineCount * kDeploymentMarinePrice);
+                            (g_deploymentMarineCount - prepaidMarines) *
+                            kDeploymentMarinePrice);
         ImGui::SetCursorPosX(45.0f);
         ImGui::TextColored(UITheme::kWarning, "%s on deploy", squadCost);
         ImGui::SetCursorPosX(45.0f);
@@ -2475,91 +2661,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         deployPressed = true;
     }
     ImGui::PopStyleColor(3);
-    if (deployPressed) {
-        // Pay for the squad. Charged here rather than on the slider because
-        // moving a slider is the player looking at a price, not agreeing to it;
-        // this press is the commitment. ArmoryPurchase re-checks the balance,
-        // so a squad that became unaffordable between the pick and the press is
-        // dropped to nothing rather than deploying for free.
-        //
-        // SGE_AUTO_MARINES=N: an unattended run takes N marines without
-        // touching the career wallet, so the drop path can be tested on a save
-        // that cannot afford them.
-        char autoMarines[16] = {};
-        if (GetEnvironmentVariableA("SGE_AUTO_MARINES", autoMarines,
-                                    sizeof(autoMarines)) > 0) {
-            g_deploymentMarineCount = (std::clamp)(
-                std::atoi(autoMarines), 0, kMaxDeploymentMarines);
-            SGE_LOG("LogGameplay", EngineLog::Level::Display,
-                "Auto-marines: " + std::to_string(g_deploymentMarineCount));
-        } else if (g_deploymentMarineCount > 0) {
-            const int squadPrice =
-                g_deploymentMarineCount * kDeploymentMarinePrice;
-            if (ArmoryPurchase(squadPrice)) {
-                SaveCareer();
-            } else {
-                g_deploymentMarineCount = 0;
-            }
-        }
-        // Repair a loadout that still names a weapon which is no longer
-        // selectable -- a debug weapon picked before the toggle was switched
-        // off, or a save carrying the retired AK-47. ConfigureLoadout rejects
-        // those outright, which would silently leave the previous mission's
-        // restriction in force, and the god-mode branch would hand the player a
-        // weapon with no viewmodel.
-        for (size_t slot = 0; slot < loadout.weapons.size(); ++slot) {
-            if (GunModel::WeaponLoaded(loadout.weapons[slot])) continue;
-            for (int candidate = 0; candidate <= GunModel::kMaxWeapon;
-                 ++candidate) {
-                if (!GunModel::WeaponLoaded(candidate) ||
-                    loadout.ContainsWeapon(candidate))
-                    continue;
-                loadout.SelectWeapon(slot, candidate);
-                break;
-            }
-        }
-        if (scene.player.godMode) {
-            GunModel::DisableLoadoutRestriction();
-            GunModel::SelectedWeapon() = loadout.weapons[0];
-        } else {
-            GunModel::ConfigureLoadout(loadout.weapons[0], loadout.weapons[1]);
-        }
-        scene.selectedGrenade = loadout.grenade;
-        // Re-applied on the way out even though picking already applied it: the
-        // planning screen is not the only thing that touches the lights, and
-        // this is the last point before the run where the choice is authoritative.
-        ApplyTimeOfDay(g_selectedTimeOfDay);
-        g_deploymentTarget = g_deploymentZones[
-            static_cast<size_t>(g_selectedDeploymentZone)];
-        g_deploymentTargetValid = true;
-        g_insertionChoicePending = false;
-        g_insertionChoiceCursorReleased = false;
-        cameraLocked = false;
-        scene.camera.FPSMode = true;
-        scene.camera.Position = {
-            g_deploymentTarget.x,
-            g_deploymentTarget.y + scene.camera.PlayerHeight,
-            g_deploymentTarget.z };
-        scene.camera.FloorY = g_deploymentTarget.y;
-        scene.camera.VerticalVelocity = 0.0f;
-        scene.camera.IsGrounded = true;
-        g_game.session.ResetTimer(true);
-        // Arm the objective against what this level actually spawned, after any
-        // prefab edits made during planning. Must follow ResetRun, which the
-        // level load already did -- doing it here means a restart re-counts.
-        g_game.mission.SetCommTowerCount(standingTowers);
-        // Arm the aircraft here rather than at level load: the countdown has to
-        // start when the player actually deploys, or the whole 20 seconds would
-        // burn while they were still choosing an insertion point.
-        ArmObjectivePlanes();
-        // The planning camera teleports to the selected insertion. None of the
-        // fly-through's temporal lighting or visibility history is valid there.
-        visBuffer.InvalidateTemporalHistory();
-        g_game.commands.Request(GameCommand::ResetDDGIHistory);
-        SetCapture(hwnd);
-        SetCursorVisible(false);
-        firstMouse = true;
-    }
+    if (deployPressed) CommitDeployment(hwnd, g_replayPlanActive);
     ImGui::EndDisabled();
     ImGui::End();
 }
@@ -3107,23 +3209,27 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     {
         const float rowWidth = ImGui::GetContentRegionAvail().x;
-        const float halfWidth =
-            (rowWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        const float buttonWidth =
+            (rowWidth - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+        ImGui::BeginDisabled(MultiplayerActive() &&
+            g_netSession.CurrentRole() != net::Role::Host);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.90f, 0.90f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.78f, 0.78f, 0.78f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.08f, 0.10f, 0.08f, 1.0f));
-        const bool replay = ImGui::Button(
-            g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1"
-                                            : "REPLAY CUSTOM LEVEL",
-            ImVec2(halfWidth, 46.0f));
+        const bool quick = ImGui::Button("QUICK RESTART",
+            ImVec2(buttonWidth, 46.0f));
         ImGui::PopStyleColor(4);
-        if (replay) RestartActiveLevel(hwnd);
+        if (quick) RestartWithPlan(hwnd, net::RestartPlanMode::Quick);
+        ImGui::SameLine();
+        if (ImGui::Button("CHANGE PLAN", ImVec2(buttonWidth, 46.0f)))
+            RestartWithPlan(hwnd, net::RestartPlanMode::ChangePlan);
+        ImGui::EndDisabled();
         ImGui::SameLine();
         // A finished run ends by flying home, not by dropping out to the menu.
         // The base is where the payout above is actually spent, so send the
         // player straight there; the menu is still one Escape away from it.
-        if (ImGui::Button("RETURN TO BASE", ImVec2(halfWidth, 46.0f)))
+        if (ImGui::Button("RETURN TO BASE", ImVec2(buttonWidth, 46.0f)))
             StartBase(hwnd);
     }
     ImGui::End();

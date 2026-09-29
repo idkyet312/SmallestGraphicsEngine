@@ -854,13 +854,20 @@ enum class LevelKind : uint8_t {
 // from one machine would name a directory the other does not have.
 inline constexpr uint8_t kMaxLevelFileName = 96;
 
+enum class RestartPlanMode : uint8_t {
+    None = 0,
+    Quick = 1,
+    ChangePlan = 2,
+};
+
 struct ServerLevelMessage {
     MessageHeader header{ MessageType::ServerLevel, {} };
     LevelKind kind = LevelKind::None;
     // Bumped by the host on a restart of the same level, which a kind/file
     // compare alone would read as "already there". Claimed from the padding.
     uint8_t restartSerial = 0;
-    uint8_t padding[2] = {};
+    RestartPlanMode restartPlan = RestartPlanMode::None;
+    uint8_t padding = 0;
     char file[kMaxLevelFileName] = {};
 };
 
