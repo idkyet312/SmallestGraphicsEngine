@@ -9,7 +9,8 @@ static void DesiredDLSSRenderSize(UINT& width, UINT& height) {
         DLSS::RayReconstructionAvailable();
     const bool eligible = DLSS::GetSettings().enabled &&
         !nativeRR && DLSS::Available() &&
-        scene.useVisibilityBuffer && !scene.useRaytracing &&
+        scene.useVisibilityBuffer && visBuffer.initialized &&
+        !scene.useRaytracing &&
         !visBuffer.validationMode && visBuffer.debugViewMode == 0 &&
         !(DeploymentPlanningActive() && g_deploymentDebugForceForward);
     static UINT cachedDisplayWidth = 0, cachedDisplayHeight = 0;

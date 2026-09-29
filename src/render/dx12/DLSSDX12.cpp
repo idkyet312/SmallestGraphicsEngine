@@ -64,6 +64,9 @@ struct State {
     uint32_t frameIndex = 0;
     bool havePrevious = false;
     XMFLOAT4X4 previousViewProjection = {};
+    // DLSS and DLSS-RR keep separate histories. Switching between them hands
+    // the incoming feature whatever it accumulated before it went idle.
+    bool lastEvaluatedRR = false;
 
     bool optionsSet = false;
     Preset appliedPreset = Preset::K;
@@ -531,15 +534,14 @@ bool Evaluate(const DLSSFrameInputs& in) {
     consts.depthInverted = sl::Boolean::eFalse;
     consts.cameraMotionIncluded = sl::Boolean::eTrue;
     consts.motionVectors3D = sl::Boolean::eFalse;
-    consts.reset = (in.reset || !s.havePrevious) ? sl::Boolean::eTrue
-                                                 : sl::Boolean::eFalse;
+    consts.reset = (in.reset || !s.havePrevious ||
+                    rr != s.lastEvaluatedRR) ? sl::Boolean::eTrue
+                                             : sl::Boolean::eFalse;
     consts.orthographicProjection = sl::Boolean::eFalse;
     consts.motionVectorsDilated = sl::Boolean::eFalse;
     // The resolve writes pixel-centre UV minus the unjittered previous
     // projection, so this frame's jitter is inside the vector.
     consts.motionVectorsJittered = sl::Boolean::eTrue;
-    XMStoreFloat4x4(&s.previousViewProjection, viewProjection);
-    s.havePrevious = true;
 
     if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
         Log("slSetConstants failed");
@@ -618,6 +620,11 @@ bool Evaluate(const DLSSFrameInputs& in) {
             std::to_string(static_cast<int>(result)));
         return false;
     }
+    // Only a frame DLSS consumed becomes the next frame's previous: a failed
+    // RR attempt followed by the DLAA fallback must not reproject onto itself.
+    XMStoreFloat4x4(&s.previousViewProjection, viewProjection);
+    s.havePrevious = true;
+    s.lastEvaluatedRR = rr;
 
     if (superResolution) {
         Transition(in.cmdList, in.output,

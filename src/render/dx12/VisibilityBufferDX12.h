@@ -439,6 +439,10 @@ public:
     // t86 updates away from descriptors an earlier frame may still consume.
     ComPtr<ID3D12DescriptorHeap> bentNormalComputeDescHeaps[FRAME_COUNT];
     D3D12_GPU_VIRTUAL_ADDRESS enhancedHeapTLASAddresses[FRAME_COUNT] = {};
+    // Bumped when the RR guides are (re)created; a slot whose descriptors
+    // predate it still holds null or freed guide UAVs.
+    UINT rrGuideGeneration = 0;
+    UINT enhancedHeapRRGeneration[FRAME_COUNT] = {};
     // Set per frame by the caller from scene.enhancedVisuals. Kept separate
     // from enhancedPipelineReady (a capability) so the UI can toggle freely
     // without rebuilding anything.
@@ -1136,6 +1140,24 @@ public:
     XMFLOAT2 GetTemporalJitterPixels() const {
         if (!(temporalEffectsEnabled || dlssActive) || validationMode)
             return { 0.0f, 0.0f };
+        // Super Resolution needs more phases than TAA: each output pixel sees
+        // ratio^2 fewer render samples. NVIDIA's guidance is 8 * ratio^2.
+        if (dlssActive && width && height && width < displayWidth) {
+            const float ratio = static_cast<float>(displayWidth) /
+                                static_cast<float>(width);
+            const UINT phases = std::clamp(
+                static_cast<UINT>(8.0f * ratio * ratio + 0.5f), 8u, 128u);
+            const auto halton = [](UINT index, UINT base) {
+                float f = 1.0f, r = 0.0f;
+                for (; index > 0; index /= base) {
+                    f /= static_cast<float>(base);
+                    r += f * static_cast<float>(index % base);
+                }
+                return r;
+            };
+            const UINT index = (postFrameIndex % phases) + 1u;
+            return { halton(index, 2u) - 0.5f, halton(index, 3u) - 0.5f };
+        }
         // Eight-sample Halton(2,3), centered on pixel. Sequence repeats only
         // after covering complementary sub-pixel locations.
         static constexpr XMFLOAT2 sequence[8] = {
@@ -2421,8 +2443,9 @@ public:
         svgfMotionVectorsEnabledLastFrame =
             motionVectorsRequired && enhancedVisualsActive &&
             enhancedRTReflectionsActive && svgfTemporalEnabled;
-        fc.edgeAAEnabled = (!rayReconstructionActive &&
-            (edgeAAEnabled || ScopeSurfaceBound())) ? 1u : 0u;
+        // RR replaces edge AA on the main view only; the scope has no DLSS.
+        fc.edgeAAEnabled = (ScopeSurfaceBound() ||
+            (!rayReconstructionActive && edgeAAEnabled)) ? 1u : 0u;
         fc.contactShadowStrength = contactShadowStrength;
         fc.contactShadowMaxDistance = contactShadowMaxDistance;
         fc.contactShadowLinearDepth = contactShadowLinearDepth ? 1u : 0u;
@@ -3560,7 +3583,9 @@ public:
         if (!create(rrDiffuseAlbedo) || !create(rrSpecularAlbedo))
             return false;
         desc.Format = DXGI_FORMAT_R16_FLOAT;
-        return create(rrSpecularHitDistance);
+        if (!create(rrSpecularHitDistance)) return false;
+        ++rrGuideGeneration;
+        return true;
     }
     ID3D12Resource* GetNormalRoughnessResource() const {
         return normalRoughnessTexture.Get();
@@ -5115,7 +5140,9 @@ private:
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
         constants.probeMissGIStrength = enhancedProbeMissGIStrength;
         constants.hitGeometryCount = hitGeometryCount;
+        // Guides are main-view sized; the scope resolve must not write them.
         constants.rrGuideEnable = (rayReconstructionActive &&
+            !ScopeSurfaceBound() &&
             rrDiffuseAlbedo && rrSpecularAlbedo &&
             rrSpecularHitDistance) ? 1u : 0u;
         const UINT64 constantOffset =
@@ -6456,6 +6483,7 @@ private:
                 rrResources[i], nullptr, &uav, h);
         }
         enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
+        enhancedHeapRRGeneration[frameSlot] = rrGuideGeneration;
     }
 
 public:
@@ -6527,7 +6555,8 @@ public:
         // so only its descriptors may be rewritten. Other slots refresh when
         // they become current rather than while the GPU may still read them.
         if (!enhancedComputeDescHeaps[frameSlot] ||
-            enhancedHeapTLASAddresses[frameSlot] != enhancedTLASAddress)
+            enhancedHeapTLASAddresses[frameSlot] != enhancedTLASAddress ||
+            enhancedHeapRRGeneration[frameSlot] != rrGuideGeneration)
             RefreshEnhancedDescriptors(frameSlot);
         enhancedVisualsActive = wantActive;
     }

@@ -1354,6 +1354,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 visBuffer.temporalEffectsEnabled = true;
             if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
                 DLSS::GetSettings().invertJitter = true;
+            // Walks the runtime DLSS toggles (off, DLAA, SR, RR, preset) every
+            // 40 frames, so the resize/feature-switch paths run unattended.
+            if (GetEnvironmentVariableA("SGE_DLSS_CYCLE", nullptr, 0) > 0 &&
+                poseCaptureFrames % 40u == 0u) {
+                struct Step { bool on; float pct; bool rr; int preset; };
+                static constexpr Step steps[] = {
+                    { false, 100.0f, false, 1 }, { true, 100.0f, false, 1 },
+                    { true, 50.0f, false, 1 },   { true, 50.0f, true, 1 },
+                    { true, 33.0f, false, 2 },   { true, 67.0f, false, 0 },
+                    { true, 100.0f, true, 1 },   { true, 58.0f, false, 1 },
+                    { false, 58.0f, false, 1 },  { true, 100.0f, false, 1 } };
+                const Step& step = steps[(poseCaptureFrames / 40u) %
+                    (sizeof(steps) / sizeof(steps[0]))];
+                DLSS::Settings& dlss = DLSS::GetSettings();
+                dlss.enabled = step.on;
+                dlss.screenPercentage = step.pct;
+                dlss.rayReconstruction = step.rr;
+                dlss.preset = static_cast<DLSS::Preset>(step.preset);
+                std::cout << "DLSS cycle: on=" << step.on << " pct="
+                          << step.pct << " rr=" << step.rr << " preset="
+                          << step.preset << std::endl;
+            }
             // Weapon index (GunModel::WeaponName). Every frame, since level
             // start applies the loadout after the capture is armed.
             char captureWeapon[8] = {};
@@ -4807,6 +4829,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 RefitDXRDDGIAccelerationScene();
             }
             if (!IsSceneScreen()) enhancedSceneBuilt = false;
+            // Create the RR guides before SetEnhancedVisuals writes this
+            // slot's descriptors, or their UAVs are written as null.
+            const bool rrGuidesReady =
+                rrRequested && visBuffer.EnsureRayReconstructionGuides();
             visBuffer.SetEnhancedVisuals(
                 wantEnhanced, scene.enhancedRTShadows,
                 scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
@@ -4816,8 +4842,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 visBuffer.enhancedVisualsActive &&
                 g_dx12.screenWidth == g_dx12.displayWidth &&
                 g_dx12.screenHeight == g_dx12.displayHeight &&
-                visBuffer.debugViewMode == 0 &&
-                visBuffer.EnsureRayReconstructionGuides();
+                visBuffer.debugViewMode == 0 && rrGuidesReady;
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
