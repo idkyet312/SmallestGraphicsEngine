@@ -124,7 +124,7 @@ int main() {
     {
         GameSettings written;
         written.dlssEnabled = true;
-        written.dlssRayReconstruction = true;
+        written.rayTracingQuality = GameSettings::kRayTracingUltra;
         written.dlssPreset = 2;
         written.extensionMotionVectors = true;
         written.dlssScreenPercentage = 67.0f;
@@ -133,7 +133,7 @@ int main() {
         GameSettings read;
         CHECK(LoadGameSettings(read));
         CHECK(read.dlssEnabled);
-        CHECK(read.dlssRayReconstruction);
+        CHECK(read.rayTracingQuality == GameSettings::kRayTracingUltra);
         CHECK(read.dlssPreset == 2);
         CHECK(read.extensionMotionVectors);
         CHECK(read.dlssScreenPercentage == 67.0f);
@@ -156,12 +156,35 @@ int main() {
 
         GameSettings defaults;
         CHECK(!defaults.dlssEnabled);
-        CHECK(!defaults.dlssRayReconstruction);
+        CHECK(defaults.rayTracingQuality == GameSettings::kRayTracingOff);
         CHECK(defaults.dlssPreset == GameSettings::kDefaultDLSSPreset);
         CHECK(defaults.extensionMotionVectors ==
               GameSettings::kDefaultExtensionMotionVectors);
         CHECK(defaults.dlssScreenPercentage ==
               GameSettings::kDefaultDLSSScreenPercentage);
+    }
+
+    // Legacy DLSSRayReconstruction key maps to rayTracingQuality.
+    {
+        WriteSettingsFile("DLSSRayReconstruction=1\n");
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.rayTracingQuality == GameSettings::kRayTracingUltra);
+    }
+
+    // RayTracingQuality round-trip.
+    {
+        GameSettings written;
+        written.rayTracingQuality = GameSettings::kRayTracingUltra;
+        CHECK(SaveGameSettings(written));
+
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.rayTracingQuality == GameSettings::kRayTracingUltra);
+
+        WriteSettingsFile("RayTracingQuality=0\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.rayTracingQuality == GameSettings::kRayTracingOff);
     }
 
     // Fullscreen round-trip and default.

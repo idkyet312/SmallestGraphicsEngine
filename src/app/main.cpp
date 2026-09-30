@@ -1350,6 +1350,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // DLSS A/B: off entirely, or with the jitter sign flipped.
             if (GetEnvironmentVariableA("SGE_CAPTURE_NODLSS", nullptr, 0) > 0)
                 DLSS::GetSettings().enabled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FXAA", nullptr, 0) > 0)
+                scene.enableFXAA = true;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NORR", nullptr, 0) > 0)
+                DLSS::GetSettings().rayReconstruction = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
                 visBuffer.temporalEffectsEnabled = true;
             if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
@@ -1382,10 +1386,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (GetEnvironmentVariableA("SGE_CAPTURE_WEAPON", captureWeapon,
                                         sizeof(captureWeapon)) > 0)
                 GunModel::SelectedWeapon() = atoi(captureWeapon);
+            if (poseCaptureFrames + 1 >= poseCaptureTarget)
+                std::cout << "Capture frame " << poseCaptureFrames + 1
+                          << ": render " << g_dx12.screenWidth << "x"
+                          << g_dx12.screenHeight << " display "
+                          << g_dx12.displayWidth << "x"
+                          << g_dx12.displayHeight << " dlss="
+                          << visBuffer.dlssActive << " rr="
+                          << visBuffer.rayReconstructionActive
+                          << " extMV=" << visBuffer.extensionMotionVectors
+                          << std::endl;
             if (++poseCaptureFrames == poseCaptureTarget) {
                 char path[MAX_PATH] = "capture.ppm";
                 GetEnvironmentVariableA("SGE_CAPTURE_PATH", path, sizeof(path));
                 g_frameCapturePath = path;
+            } else if (poseCaptureFrames == poseCaptureTarget + 1) {
+                // Optional next-frame dump: diffing two consecutive frames of a
+                // pinned camera shows sub-pixel jitter nothing resolved.
+                char path[MAX_PATH] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH2", path,
+                                            sizeof(path)) > 0)
+                    g_frameCapturePath = path;
             } else if (poseCaptureFrames > poseCaptureTarget + 2) {
                 PostQuitMessage(0);
             }
@@ -4833,9 +4854,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // slot's descriptors, or their UAVs are written as null.
             const bool rrGuidesReady =
                 rrRequested && visBuffer.EnsureRayReconstructionGuides();
+            // Ultra tier traces every pixel: RR is the denoiser, and
+            // classification would starve it of signal.
             visBuffer.SetEnhancedVisuals(
                 wantEnhanced, scene.enhancedRTShadows,
-                scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
+                scene.enhancedRayClassify && !rrRequested,
+                scene.enhancedConfidenceThreshold,
                 g_dxrDDGI.Scene().TLASAddress(),
                 scene.enhancedRTReflections || rrRequested);
             visBuffer.rayReconstructionActive = rrRequested &&
@@ -6071,7 +6095,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         XMConvertToRadians(scene.EffectiveCameraFOV());
                     inputs.reset = visBuffer.dlssHistoryReset;
                     rrEvaluated = DLSS::Evaluate(inputs);
-                    if (rrEvaluated) visBuffer.dlssHistoryReset = false;
+                    if (rrEvaluated) {
+                        visBuffer.dlssHistoryReset = false;
+                        // RR has already resolved the jitter, and nothing after
+                        // it does: extensions, viewmodel, water and sky drawn
+                        // jittered from here on would shake. Recomputed next
+                        // frame from the visibility buffer's sequence.
+                        scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
+                    }
                 }
                 visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
             }
@@ -6084,7 +6115,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             mainShader.SetHDRTargetEnabled(true);
             g_meshShader.SetHDRTargetEnabled(true);
             g_terrain.SetHDRTargetEnabled(true);
-            const bool jitterExtensions = visBuffer.extensionMotionVectors;
+            const bool jitterExtensions =
+                visBuffer.extensionMotionVectors && !rrEvaluated;
             // RenderForward draws terrain, floor and foliage, none of which
             // have motion PSOs, and only the colour RTV is bound here. Leaving
             // extension motion on would hand those draws a 2-RT PSO against 1

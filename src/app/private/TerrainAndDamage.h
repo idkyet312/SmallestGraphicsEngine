@@ -732,7 +732,8 @@ static void ApplyGameSettings() {
     // here so the menu and the file win over the editor panel's own sliders.
     scene.vsyncInterval = g_settings.vsync ? 1 : 0;
     DLSS::GetSettings().enabled = g_settings.dlssEnabled;
-    DLSS::GetSettings().rayReconstruction = g_settings.dlssRayReconstruction;
+    DLSS::GetSettings().rayReconstruction =
+        g_settings.rayTracingQuality == GameSettings::kRayTracingUltra;
     DLSS::GetSettings().preset = static_cast<DLSS::Preset>(g_settings.dlssPreset);
     DLSS::GetSettings().screenPercentage = g_settings.dlssScreenPercentage;
     scene.cameraFOV = g_settings.fieldOfView;

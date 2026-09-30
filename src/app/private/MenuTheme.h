@@ -586,14 +586,18 @@ static void VideoTab() {
         SaveGameSettings(g_settings);
     }
     ImGui::BeginDisabled(!DLSS::RayReconstructionAvailable());
-    if (ToggleRow("DLSS Ray Reconstruction",
-                  DLSS::RayReconstructionAvailable()
-                      ? "Denoises enhanced ray-traced reflections at native resolution."
-                      : DLSS::RayReconstructionStatus(),
-                  &g_settings.dlssRayReconstruction)) {
+    static const char* rtQualities[] = {"Off", "Ultra"};
+    if (ImGui::Combo("Ray Tracing Quality", &g_settings.rayTracingQuality,
+                     rtQualities, IM_ARRAYSIZE(rtQualities))) {
+        g_settings.Clamp();
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
+    if (DLSS::RayReconstructionAvailable())
+        ImGui::TextDisabled("Ultra: per-pixel ray tracing + DLSS Ray "
+                            "Reconstruction at native resolution.");
+    else
+        ImGui::TextDisabled("%s", DLSS::RayReconstructionStatus());
     ImGui::EndDisabled();
     if (g_settings.dlssEnabled)
         ImGui::TextDisabled("DLSS status: %s", DLSS::Status());
@@ -603,7 +607,8 @@ static void VideoTab() {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::BeginDisabled(g_settings.dlssRayReconstruction);
+    ImGui::BeginDisabled(
+        g_settings.rayTracingQuality == GameSettings::kRayTracingUltra);
     const SliderResult dlssPercentage = SliderRow(
         "DLSS Screen Percentage",
         "Internal render resolution per axis. 100% uses native DLAA.",

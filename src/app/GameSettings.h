@@ -102,7 +102,14 @@ struct GameSettings {
     // DLSS reconstructs a smaller visibility render into the display target;
     // at 100% it runs native DLAA. Keep it opt-in until measured.
     bool dlssEnabled = false;
-    bool dlssRayReconstruction = false;
+    // Ray-traced quality tier. Ultra traces every pixel (no confidence
+    // classification) and denoises with DLSS Ray Reconstruction at native
+    // resolution. Off leaves ray tracing to the editor's own toggles.
+    int rayTracingQuality = 0;
+    static constexpr int kRayTracingOff = 0;
+    static constexpr int kRayTracingUltra = 1;
+    static constexpr int kMinRayTracingQuality = kRayTracingOff;
+    static constexpr int kMaxRayTracingQuality = kRayTracingUltra;
     // Streamline DLSS preset: K=0, L=1, M=2. L is the SDK default.
     int dlssPreset = 1;
     static constexpr int kMinDLSSPreset = 0;
@@ -162,7 +169,7 @@ struct GameSettings {
 
     static constexpr bool  kDefaultVsync = false;
     static constexpr bool  kDefaultDLSS = false;
-    static constexpr bool  kDefaultDLSSRayReconstruction = false;
+    static constexpr int   kDefaultRayTracingQuality = kRayTracingOff;
     static constexpr bool  kDefaultExtensionMotionVectors = false;
     static constexpr bool  kDefaultFullscreen = true;
     static constexpr float kDefaultFieldOfView = 60.0f;
@@ -195,6 +202,8 @@ struct GameSettings {
                       (std::min)(kMaxFieldOfView, fieldOfView));
         dlssPreset = (std::max)(kMinDLSSPreset,
                      (std::min)(kMaxDLSSPreset, dlssPreset));
+        rayTracingQuality = (std::max)(kMinRayTracingQuality,
+                            (std::min)(kMaxRayTracingQuality, rayTracingQuality));
         dlssScreenPercentage = dlssScreenPercentage >=
             kMinDLSSScreenPercentage
             ? (std::min)(kMaxDLSSScreenPercentage, dlssScreenPercentage)
@@ -219,7 +228,7 @@ struct GameSettings {
         musicVolume = kDefaultMusicVolume;
         vsync = kDefaultVsync;
         dlssEnabled = kDefaultDLSS;
-        dlssRayReconstruction = kDefaultDLSSRayReconstruction;
+        rayTracingQuality = kDefaultRayTracingQuality;
         dlssPreset = kDefaultDLSSPreset;
         extensionMotionVectors = kDefaultExtensionMotionVectors;
         dlssScreenPercentage = kDefaultDLSSScreenPercentage;
@@ -323,9 +332,13 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.dlssEnabled =
                 value == "1" || value == "true" || value == "yes";
         }
+        else if (key == "RayTracingQuality") {
+            out.rayTracingQuality = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
+        }
         else if (key == "DLSSRayReconstruction") {
-            out.dlssRayReconstruction =
-                value == "1" || value == "true" || value == "yes";
+            // Legacy key from before the quality tier; RR alone now means Ultra.
+            const bool enabled = value == "1" || value == "true" || value == "yes";
+            if (enabled) out.rayTracingQuality = GameSettings::kRayTracingUltra;
         }
         else if (key == "DLSSPreset") {
             out.dlssPreset = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
@@ -388,8 +401,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << (settings.vsync ? 1 : 0) << "\n"
          << "DLSS="
          << (settings.dlssEnabled ? 1 : 0) << "\n"
-         << "DLSSRayReconstruction="
-         << (settings.dlssRayReconstruction ? 1 : 0) << "\n"
+         << "RayTracingQuality="
+         << settings.rayTracingQuality << "\n"
          << "DLSSPreset="
          << settings.dlssPreset << "\n"
          << "ExtensionMotionVectors="

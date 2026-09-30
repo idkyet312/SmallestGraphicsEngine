@@ -5122,7 +5122,9 @@ private:
         constants.confidenceThreshold = enhancedConfidenceThreshold;
         constants.rtReflections = enhancedRTReflectionsActive ? 1u : 0u;
         constants.reflectionRayLength = enhancedReflectionRayLength;
-        constants.reflectionRoughnessCut = enhancedReflectionRoughnessCut;
+        // Ultra: every roughness gets a reflection ray; RR resolves the noise.
+        constants.reflectionRoughnessCut = rayReconstructionActive
+            ? 1.0f : enhancedReflectionRoughnessCut;
         // Rotates the sampling sequence so consecutive frames draw different
         // samples; this is the variance a temporal denoiser resolves.
         constants.frameIndex = (ScopeSurfaceBound() ? enhancedReflectionFrameCounter : enhancedReflectionFrameCounter++);
