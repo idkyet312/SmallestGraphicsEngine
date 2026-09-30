@@ -1345,6 +1345,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         UpdateLightning(deltaTime);
         scene.Update(deltaTime, now);
         scene.burningTargets.clear();
+        if (g_debugTeleportPending && IsSceneScreen() &&
+            !g_game.loading.Active()) {
+            g_debugTeleportPending = false;
+            scene.camera.Position = { g_debugTeleportPose[0],
+                                      g_debugTeleportPose[1],
+                                      g_debugTeleportPose[2] };
+            scene.camera.SetViewAngles(g_debugTeleportPose[3],
+                                       g_debugTeleportPose[4]);
+            scene.camera.VerticalVelocity = 0.0f;
+            scene.camera.IsGrounded = false;
+            std::ofstream("debug_teleport.log", std::ios::app)
+                << "teleport pos=" << g_debugTeleportPose[0] << ","
+                << g_debugTeleportPose[1] << "," << g_debugTeleportPose[2]
+                << " yaw=" << g_debugTeleportPose[3]
+                << " pitch=" << g_debugTeleportPose[4] << " groundY="
+                << GroundHeightAt(g_debugTeleportPose[0],
+                                  g_debugTeleportPose[2])
+                << std::endl;
+        }
         if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
             scene.camera.Position = { capturePose[0], capturePose[1], capturePose[2] };
             scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
@@ -1432,6 +1451,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << visBuffer.EnhancedReflectionRayFraction()
                                 << " vbGpuMs="
                                 << g_profiler.GpuScopeMs("Visibility Buffer")
+                                << " lightPos=" << scene.lightPos.x << ","
+                                << scene.lightPos.y << "," << scene.lightPos.z
+                                << " lightType=" << scene.lightType
+                                << " sunLens=" << scene.enableSunLens
+                                << " sunDisc=" << scene.sunDiscIntensity
+                                << " sunHalo=" << scene.sunHaloIntensity
+                                << " cam=" << scene.camera.Position.x << ","
+                                << scene.camera.Position.y << ","
+                                << scene.camera.Position.z
                                 << std::endl;
             if (poseCaptureFrames + 1 >= poseCaptureTarget)
                 std::cout << "Capture frame " << poseCaptureFrames + 1
@@ -5450,7 +5478,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // into, so no transport is armed for it. This runs after
                 // StartLevelOne on a cold load, so without g_baseMode here the
                 // asset load would re-arm the run that level start stood down.
-                g_insertionBoatRestartPending = !g_emptyLevelMode && !g_baseMode;
+                g_insertionBoatRestartPending = !g_emptyLevelMode && !g_baseMode &&
+                    !g_debugTeleportLevel;
                 std::cout << "Insertion boat GLB ready\n";
             } else {
                 std::cerr << "Insertion boat GLB failed to load\n";
@@ -5490,7 +5519,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // Starting it here would aim at whatever the camera was mid-load.
                 // Not on the hub: it has no insertion, and this stage lands
                 // after StartLevelOne stood the run down on a cold load.
-                g_blackHawkInsertionRestartPending = !g_baseMode;
+                g_blackHawkInsertionRestartPending = !g_baseMode &&
+                    !g_debugTeleportLevel;
                 if (g_baseMode)
                     std::cout << "BlackHawk GLB ready, parked (no insertion)\n";
                 else

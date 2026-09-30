@@ -597,6 +597,25 @@ static void ReleaseAmmoPickupBodies() {
         g_destruction.DestroyPropBody(pickup.physicsHandle);
 }
 
+// SGE_DEBUG_TELEPORT="x,y,z,yawDeg,pitchDeg": debug start for unattended
+// captures and bug repros. The level opens with no deployment screen and no
+// insertion run, and once loading finishes the player is placed at that eye
+// position and view (yaw 0 looks +X, pitch -89 straight down). The applied
+// pose and the ground height under it go to debug_teleport.log.
+static bool  g_debugTeleportPending = false;
+// Whole-level flag: the cold-load asset stages re-arm the insertion after
+// level start, so they have to see that this level was teleported into.
+static bool  g_debugTeleportLevel = false;
+static float g_debugTeleportPose[5] = {};
+
+static bool ReadDebugTeleportPose(float pose[5]) {
+    char text[128] = {};
+    return GetEnvironmentVariableA("SGE_DEBUG_TELEPORT", text,
+                                   sizeof(text)) > 0 &&
+        sscanf_s(text, "%f,%f,%f,%f,%f", &pose[0], &pose[1], &pose[2],
+                 &pose[3], &pose[4]) == 5;
+}
+
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
@@ -745,12 +764,20 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // The base is walked into, not inserted into, so neither transport is armed
     // for it -- a helicopter run would fly in and try to drop the player who is
     // already standing in the hub.
-    g_blackHawkInsertionRestartPending = !g_emptyLevelMode && !g_baseMode;
-    g_insertionBoatRestartPending = !g_emptyLevelMode && !g_baseMode;
+    // A debug teleport starts on the ground like the base: no transport, no
+    // planning screen. Placement waits for loading -- see the main loop.
+    const bool debugTeleport = !g_emptyLevelMode &&
+        ReadDebugTeleportPose(g_debugTeleportPose);
+    g_debugTeleportPending = debugTeleport;
+    g_debugTeleportLevel = debugTeleport;
+    g_blackHawkInsertionRestartPending =
+        !g_emptyLevelMode && !g_baseMode && !debugTeleport;
+    g_insertionBoatRestartPending =
+        !g_emptyLevelMode && !g_baseMode && !debugTeleport;
     // Every playable map opens on the deployment fly-through. The authored mode
     // is the initial selection, but the player can pick any of the three routes
     // and one of the perimeter zones before the run and timer begin.
-    if (!g_emptyLevelMode && !g_baseMode) {
+    if (!g_emptyLevelMode && !g_baseMode && !debugTeleport) {
         BeginDeploymentPlanning();
         g_game.vehicles.DisableBlackHawkInsertion();
         g_game.vehicles.DisableInsertionBoat();
@@ -761,7 +788,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         // Shared with the empty level: no planning screen, so the transports
         // have to be stood down explicitly or a run armed by the previous level
         // would still be flying.
-        if (g_baseMode) {
+        if (g_baseMode || debugTeleport) {
             g_game.vehicles.DisableBlackHawkInsertion();
             g_game.vehicles.DisableInsertionBoat();
         }

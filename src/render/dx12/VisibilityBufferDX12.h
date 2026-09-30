@@ -5127,7 +5127,7 @@ private:
             UINT  lumenGI;
             float rrMotionJitterU;
             float rrMotionJitterV;
-            UINT  lumenPad2;
+            UINT  raySanitize;
         } constants;
         static_assert(sizeof(EnhancedConstants) == 96,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
@@ -5149,8 +5149,13 @@ private:
         // Off under RR, like shadow classification: jitter moves pixels across
         // the confidence threshold, flipping them between probe and ray shading
         // from frame to frame, and RR is the denoiser for the full signal.
+        // Capture A/B: SGE_RR_REFLECTION_CLASSIFY keeps classification on
+        // under RR.
+        static const bool kRRKeepReflectionClassify =
+            GetEnvironmentVariableA("SGE_RR_REFLECTION_CLASSIFY", nullptr,
+                                    0) > 0;
         constants.reflectionClassify = (enhancedReflectionClassifyActive &&
-            !rayReconstructionActive) ? 1u : 0u;
+            (!rayReconstructionActive || kRRKeepReflectionClassify)) ? 1u : 0u;
         constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
         constants.probeMissGI = enhancedProbeMissGIActive ? 1u : 0u;
         constants.svgfTemporalEnable = (svgfTemporalEnabled &&
@@ -5177,7 +5182,12 @@ private:
         constants.rrMotionJitterU = rrMotion
             ? rrMotionJitterPixels.x / static_cast<float>(width) : 0.0f;
         constants.rrMotionJitterV = rrMotion
-            ? rrMotionJitterPixels.y / static_cast<float>(height) : 0.0f;        constants.lumenPad2 = 0u;
+            ? rrMotionJitterPixels.y / static_cast<float>(height) : 0.0f;
+        // Firefly/NaN guard on traced samples; SGE_NO_RAY_SANITIZE is the
+        // capture A/B switch.
+        static const bool kNoRaySanitize =
+            GetEnvironmentVariableA("SGE_NO_RAY_SANITIZE", nullptr, 0) > 0;
+        constants.raySanitize = kNoRaySanitize ? 0u : 1u;
         const UINT64 constantOffset =
             static_cast<UINT64>(ViewFrameIndex()) * 256ull;
         memcpy(static_cast<BYTE*>(enhancedConstantMapped) + constantOffset,

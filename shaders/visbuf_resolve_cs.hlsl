@@ -346,7 +346,9 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // vectors (measured: static-camera frames kept moving at every edge until
     // the jitter was zeroed), so under RR it is subtracted before writing them.
     float2 rrMotionJitterUV;
-    uint  enhancedLumenPad2;
+    // SanitizeRaySample on/off. On by default; the capture switch
+    // SGE_NO_RAY_SANITIZE turns it off for A/B measurement.
+    uint  raySanitizeEnabled;
 };
 // Every motion write goes through this so the three sites (surfaces, sky,
 // terrain) cannot disagree about the jitter convention.
@@ -1233,9 +1235,25 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
 // Bound geometry is shaded from its real triangle, material factor, and albedo
 // map. Unbound geometry keeps the coarse environment fallback, preserving a
 // single ray with no recursive reflection path.
-float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
-                           float roughness, uint2 pixel, out bool hit,
-                           out float hitDistance) {
+// Traced samples reach RR (or SVGF) as single-sample estimates. One ray that
+// finds the sun disc in the environment probe, or a NaN from a degenerate hit,
+// is a firefly no denoiser averages away, and bloom then spreads it into a
+// glow. Non-finite values are rejected with a bit test (FXC folds isnan), and
+// luminance is capped at a multiple of the sun's, keeping the sample's hue.
+float3 SanitizeRaySample(float3 radiance) {
+    if (raySanitizeEnabled == 0) return radiance;
+    const uint3 bits = asuint(radiance);
+    if (any((bits & 0x7f800000u) == 0x7f800000u)) return 0.0;
+    radiance = max(radiance, 0.0);
+    const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+    const float luminance = dot(radiance, kLuma);
+    const float cap = max(2.0 * dot(max(lightColor, 0.0), kLuma), 4.0);
+    return luminance > cap ? radiance * (cap / luminance) : radiance;
+}
+
+float3 RayTracedReflectionRaw(float3 worldPos, float3 normal, float3 viewDir,
+                              float roughness, uint2 pixel, out bool hit,
+                              out float hitDistance) {
     hit = false;
     hitDistance = 0.0;
     if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
@@ -1304,6 +1322,13 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     // acceleration rebuild): fall back to darkening the probe along the ray --
     // an occluded reflection is strictly less bright than the open-sky value.
     return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
+}
+
+float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
+                           float roughness, uint2 pixel, out bool hit,
+                           out float hitDistance) {
+    return SanitizeRaySample(RayTracedReflectionRaw(
+        worldPos, normal, viewDir, roughness, pixel, hit, hitDistance));
 }
 
 float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
@@ -1380,7 +1405,7 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
         float3 shaded = ShadeRayHit(ReadGIHit(query), rayDir, resolved);
         incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
     }
-    return incoming * giIntensity;
+    return SanitizeRaySample(incoming) * giIntensity;
 }
 
 // SVGF temporal accumulation for the stochastic RT reflection signal.
