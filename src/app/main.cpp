@@ -160,6 +160,11 @@ using namespace DirectX;
 #include "private/Boot.h"
 #include "private/EnemyDeathSmoke.h"
 
+// Helper for MenuTheme.h: check if Lumen GI is supported on this GPU.
+static bool LumenGISupported() {
+    const auto& lumenRT = g_dxrDDGI.GetStatus();
+    return lumenRT.dxrSupported && lumenRT.inlineRaytracingSupported;
+}
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdShow) {
     SetUnhandledExceptionFilter(WriteCrashDump);
@@ -1354,6 +1359,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enableFXAA = true;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NORR", nullptr, 0) > 0)
                 DLSS::GetSettings().rayReconstruction = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
+                scene.enableVolumetricFog = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOAO", nullptr, 0) > 0)
+                scene.enableAmbientOcclusion = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSVGF", nullptr, 0) > 0)
+                visBuffer.svgfTemporalEnabled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOATROUS", nullptr, 0) > 0)
+                visBuffer.svgfAtrousEnabled = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
                 visBuffer.temporalEffectsEnabled = true;
             if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
@@ -1386,6 +1399,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (GetEnvironmentVariableA("SGE_CAPTURE_WEAPON", captureWeapon,
                                         sizeof(captureWeapon)) > 0)
                 GunModel::SelectedWeapon() = atoi(captureWeapon);
+            // A GUI-subsystem exe has no stdout to redirect, so the state line
+            // also goes to a file an unattended run can read back.
+            std::ofstream captureStateLog;
+            if (poseCaptureFrames + 60 >= poseCaptureTarget)
+                captureStateLog.open("capture_state.log", std::ios::app);
+            if (captureStateLog)
+                captureStateLog << "render=" << g_dx12.screenWidth << "x"
+                                << g_dx12.screenHeight << " display="
+                                << g_dx12.displayWidth << "x"
+                                << g_dx12.displayHeight
+                                << " dlss=" << visBuffer.dlssActive
+                                << " rr=" << visBuffer.rayReconstructionActive
+                                << " enhanced=" << visBuffer.enhancedVisualsActive
+                                << " enhancedReady="
+                                << visBuffer.EnhancedVisualsReady()
+                                << " hitGeometry=" << visBuffer.HitGeometryReady()
+                                << " vb=" << scene.useVisibilityBuffer
+                                << " dxr=" << g_dxrDDGI.GetStatus().dxrSupported
+                                << " inlineRT="
+                                << g_dxrDDGI.GetStatus().inlineRaytracingSupported
+                                << " tlas=" << (g_dxrDDGI.Scene().TLASAddress() != 0)
+                                << " lumenSetting=" << g_settings.lumenGI
+                                << " lumen=" << visBuffer.lumenGIActive
+                                << " useDDGI=" << scene.useDDGI
+                                << " giIntensity=" << scene.giIntensity
+                                << " ambient=" << scene.ambientLightingIntensity
+                                << " svgfValid=" << visBuffer.svgfHistoryValid
+                                << " giRays="
+                                << visBuffer.EnhancedGIRayFraction()
+                                << " reflRays="
+                                << visBuffer.EnhancedReflectionRayFraction()
+                                << " vbGpuMs="
+                                << g_profiler.GpuScopeMs("Visibility Buffer")
+                                << std::endl;
             if (poseCaptureFrames + 1 >= poseCaptureTarget)
                 std::cout << "Capture frame " << poseCaptureFrames + 1
                           << ": render " << g_dx12.screenWidth << "x"
@@ -1395,6 +1442,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                           << visBuffer.dlssActive << " rr="
                           << visBuffer.rayReconstructionActive
                           << " extMV=" << visBuffer.extensionMotionVectors
+                          << " lumen=" << visBuffer.lumenGIActive
+                          << " vbGpuMs="
+                          << g_profiler.GpuScopeMs("Visibility Buffer")
                           << std::endl;
             if (++poseCaptureFrames == poseCaptureTarget) {
                 char path[MAX_PATH] = "capture.ppm";
@@ -4818,6 +4868,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         scene.temporalJitterPixels = usingVisibility
             ? visBuffer.GetTemporalJitterPixels()
             : XMFLOAT2(0.0f, 0.0f);
+        // Capture A/B: zero jitter isolates whether frame-to-frame edge motion
+        // comes from the jitter sequence or from the temporal resolve itself.
+        if (poseCapture &&
+            GetEnvironmentVariableA("SGE_CAPTURE_NOJITTER", nullptr, 0) > 0)
+            scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
+        visBuffer.rrMotionJitterPixels = scene.temporalJitterPixels;
         // Enhanced visuals: ray-traced tier layered on the visibility buffer.
         // Needs the static TLAS, which is normally built as a side effect of
         // enabling probe GI -- build it here too so the two features are
@@ -4828,7 +4884,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const bool rrRequested = DLSS::GetSettings().enabled &&
                 DLSS::GetSettings().rayReconstruction &&
                 DLSS::RayReconstructionAvailable();
-            const bool wantEnhanced = (scene.enhancedVisuals || rrRequested) &&
+            const bool lumenRequested = g_settings.lumenGI;
+            const bool wantEnhanced = (scene.enhancedVisuals || rrRequested || lumenRequested) &&
                 usingVisibility &&
                 !visBuffer.validationMode && ddgiStatus.dxrSupported &&
                 ddgiStatus.inlineRaytracingSupported &&
@@ -4861,7 +4918,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enhancedRayClassify && !rrRequested,
                 scene.enhancedConfidenceThreshold,
                 g_dxrDDGI.Scene().TLASAddress(),
-                scene.enhancedRTReflections || rrRequested);
+                scene.enhancedRTReflections || rrRequested || lumenRequested);
+            // Apply Lumen GI when it is requested and enhanced visuals are active.
+            visBuffer.SetLumenGI(lumenRequested && visBuffer.enhancedVisualsActive);
+            visBuffer.settingsReflectionRoughnessCut =
+                g_settings.rtReflectionRoughnessCutoff;
             visBuffer.rayReconstructionActive = rrRequested &&
                 visBuffer.enhancedVisualsActive &&
                 g_dx12.screenWidth == g_dx12.displayWidth &&
@@ -6062,9 +6123,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 RenderVBDraw(scene, mainShader, visBuffer, geo, packed,
                     lightSpace, shadowResource, &occlusionDepth,
                     hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
-                    (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
+                    (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr,
+                    /*viewSlot=*/0, &g_prefabRenderBatches);
             }
+            // Under RR the sky must be in RR's input. Drawn after it, the sky is
+            // masked by the still-jittered depth buffer while the geometry has
+            // been de-jittered, so every silhouette against the sky moved each
+            // frame (measured: door frames, rotor and fence lit up the
+            // consecutive-frame diff; interior edges did not).
+            bool skyDrawnBeforeRR = false;
             if (visBuffer.rayReconstructionActive) {
+                if (lateSky) {
+                    drawSky();
+                    skyDrawnBeforeRR = true;
+                }
                 visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
                 {
                     ProfilerDX12::Scope profile(g_profiler,
@@ -6108,7 +6180,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             // RenderVBDraw has bound HDR colour and the populated depth buffer.
             // Fill the background before forward materials can blend over it.
-            if (lateSky) drawSky();
+            if (lateSky && !skyDrawnBeforeRR) drawSky();
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
             renderedScene = !visibilityDebugActive;

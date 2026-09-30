@@ -106,6 +106,14 @@ struct GameSettings {
     // classification) and denoises with DLSS Ray Reconstruction at native
     // resolution. Off leaves ray tracing to the editor's own toggles.
     int rayTracingQuality = 0;
+    // Lumen global illumination: ray-traced diffuse bounce lighting.
+    bool lumenGI = false;
+    // Surfaces rougher than this skip ray-traced reflections and use the
+    // reflection probe. Applies while Ray Reconstruction or Lumen GI is on;
+    // 1.0 traces every surface (the Ultra behaviour before this setting).
+    float rtReflectionRoughnessCutoff = 1.0f;
+    static constexpr float kMinRTReflectionRoughnessCutoff = 0.05f;
+    static constexpr float kMaxRTReflectionRoughnessCutoff = 1.0f;
     static constexpr int kRayTracingOff = 0;
     static constexpr int kRayTracingUltra = 1;
     static constexpr int kMinRayTracingQuality = kRayTracingOff;
@@ -170,6 +178,8 @@ struct GameSettings {
     static constexpr bool  kDefaultVsync = false;
     static constexpr bool  kDefaultDLSS = false;
     static constexpr int   kDefaultRayTracingQuality = kRayTracingOff;
+    static constexpr bool  kDefaultLumenGI = false;
+    static constexpr float kDefaultRTReflectionRoughnessCutoff = 1.0f;
     static constexpr bool  kDefaultExtensionMotionVectors = false;
     static constexpr bool  kDefaultFullscreen = true;
     static constexpr float kDefaultFieldOfView = 60.0f;
@@ -204,6 +214,10 @@ struct GameSettings {
                      (std::min)(kMaxDLSSPreset, dlssPreset));
         rayTracingQuality = (std::max)(kMinRayTracingQuality,
                             (std::min)(kMaxRayTracingQuality, rayTracingQuality));
+        rtReflectionRoughnessCutoff = (std::max)(
+            kMinRTReflectionRoughnessCutoff,
+            (std::min)(kMaxRTReflectionRoughnessCutoff,
+                       rtReflectionRoughnessCutoff));
         dlssScreenPercentage = dlssScreenPercentage >=
             kMinDLSSScreenPercentage
             ? (std::min)(kMaxDLSSScreenPercentage, dlssScreenPercentage)
@@ -229,6 +243,8 @@ struct GameSettings {
         vsync = kDefaultVsync;
         dlssEnabled = kDefaultDLSS;
         rayTracingQuality = kDefaultRayTracingQuality;
+        lumenGI = kDefaultLumenGI;
+        rtReflectionRoughnessCutoff = kDefaultRTReflectionRoughnessCutoff;
         dlssPreset = kDefaultDLSSPreset;
         extensionMotionVectors = kDefaultExtensionMotionVectors;
         dlssScreenPercentage = kDefaultDLSSScreenPercentage;
@@ -335,6 +351,14 @@ inline bool LoadGameSettings(GameSettings& out) {
         else if (key == "RayTracingQuality") {
             out.rayTracingQuality = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
         }
+        else if (key == "LumenGI") {
+            out.lumenGI =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "RTReflectionRoughnessCutoff") {
+            out.rtReflectionRoughnessCutoff =
+                std::strtof(value.c_str(), nullptr);
+        }
         else if (key == "DLSSRayReconstruction") {
             // Legacy key from before the quality tier; RR alone now means Ultra.
             const bool enabled = value == "1" || value == "true" || value == "yes";
@@ -403,6 +427,10 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << (settings.dlssEnabled ? 1 : 0) << "\n"
          << "RayTracingQuality="
          << settings.rayTracingQuality << "\n"
+         << "LumenGI="
+         << (settings.lumenGI ? 1 : 0) << "\n"
+         << "RTReflectionRoughnessCutoff="
+         << settings.rtReflectionRoughnessCutoff << "\n"
          << "DLSSPreset="
          << settings.dlssPreset << "\n"
          << "ExtensionMotionVectors="

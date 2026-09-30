@@ -199,6 +199,9 @@ static bool UIMenuRow(const char* label, float height = 34.0f) {
 // page has to warn that the world keeps running behind it.
 static bool MultiplayerActive();
 
+// Check DXR support for Lumen GI feature.
+static bool LumenGISupported();
+
 // The menu's typefaces, rasterized at the sizes they are actually drawn at.
 // Both stay null when no font file is found, and every use falls back to the
 // built-in font -- the menu is then exactly what it was before. Declared here
@@ -598,6 +601,32 @@ static void VideoTab() {
                             "Reconstruction at native resolution.");
     else
         ImGui::TextDisabled("%s", DLSS::RayReconstructionStatus());
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!LumenGISupported());
+    if (ToggleRow("Lumen Global Illumination",
+                  "Ray-traced bounce lighting with colour bleeding and multi-bounce via the probe cache, similar to Unreal's Lumen. Requires a DXR GPU.",
+                  &g_settings.lumenGI)) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    const SliderResult reflectionCutoff = SliderRow(
+        "Reflection Roughness Cutoff",
+        "Surfaces rougher than this skip ray-traced reflections and use the "
+        "reflection probe. Lower is faster and less noisy; 1.00 traces every "
+        "surface. Applies with Ray Tracing Ultra or Lumen.",
+        "##rtReflectionRoughnessCutoff",
+        &g_settings.rtReflectionRoughnessCutoff,
+        GameSettings::kMinRTReflectionRoughnessCutoff,
+        GameSettings::kMaxRTReflectionRoughnessCutoff, "%.2f",
+        ImGuiSliderFlags_AlwaysClamp, "Default  %.2f",
+        GameSettings::kDefaultRTReflectionRoughnessCutoff);
+    if (reflectionCutoff.released) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
     ImGui::EndDisabled();
     if (g_settings.dlssEnabled)
         ImGui::TextDisabled("DLSS status: %s", DLSS::Status());

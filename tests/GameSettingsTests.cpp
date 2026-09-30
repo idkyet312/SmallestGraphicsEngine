@@ -187,6 +187,51 @@ int main() {
         CHECK(read.rayTracingQuality == GameSettings::kRayTracingOff);
     }
 
+    // LumenGI round-trip and default.
+    {
+        GameSettings written;
+        written.lumenGI = true;
+        CHECK(SaveGameSettings(written));
+
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.lumenGI);
+
+        WriteSettingsFile("LumenGI=0\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(!read.lumenGI);
+
+        GameSettings defaults;
+        CHECK(defaults.lumenGI == GameSettings::kDefaultLumenGI);
+    }
+
+    // RT reflection roughness cutoff round-trip, default and clamp.
+    {
+        GameSettings written;
+        written.rtReflectionRoughnessCutoff = 0.4f;
+        CHECK(SaveGameSettings(written));
+
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(std::fabs(read.rtReflectionRoughnessCutoff - 0.4f) < 1e-4f);
+
+        GameSettings defaults;
+        CHECK(defaults.rtReflectionRoughnessCutoff ==
+              GameSettings::kDefaultRTReflectionRoughnessCutoff);
+
+        WriteSettingsFile("RTReflectionRoughnessCutoff=7\n");
+        CHECK(LoadGameSettings(read));
+        read.Clamp();
+        CHECK(read.rtReflectionRoughnessCutoff ==
+              GameSettings::kMaxRTReflectionRoughnessCutoff);
+
+        WriteSettingsFile("RTReflectionRoughnessCutoff=-1\n");
+        CHECK(LoadGameSettings(read));
+        read.Clamp();
+        CHECK(read.rtReflectionRoughnessCutoff ==
+              GameSettings::kMinRTReflectionRoughnessCutoff);
+    }
+
     // Fullscreen round-trip and default.
     {
         GameSettings written;

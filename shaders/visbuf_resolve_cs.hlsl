@@ -339,7 +339,18 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // approximation instead of reading a wrong triangle.
     uint  enhancedHitGeometryCount;
     uint  rrGuideEnable;
+    // Lumen-style GI (append only; C++ mirror EnhancedConstants).
+    uint  enhancedLumenGI;
+    // This frame's camera jitter in UV, non-zero only while Ray Reconstruction
+    // is the consumer: RR does not resolve jitter carried inside the motion
+    // vectors (measured: static-camera frames kept moving at every edge until
+    // the jitter was zeroed), so under RR it is subtracted before writing them.
+    float2 rrMotionJitterUV;
+    uint  enhancedLumenPad2;
 };
+// Every motion write goes through this so the three sites (surfaces, sky,
+// terrain) cannot disagree about the jitter convention.
+#define RR_UNJITTER(motion) ((motion) - rrMotionJitterUV)
 
 // Per-pixel record of where the rays went, for the debug view and the
 // ray-fraction readback. One uint per pixel: 0 = cheap tier resolved it,
@@ -973,6 +984,21 @@ float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
 // tinted by the hit albedo; the sky is the smaller ambient part of it.
 static const float kBounceSkyDamping = 0.25;
 
+// Ambient light arriving at a ray hit. Default: damped sky only (single
+// bounce). Lumen mode reads the probe grid at the hit as a world-space
+// radiance cache: probes already hold sky plus earlier bounces, so feeding
+// them back here gives multi-bounce GI at the cost of one probe lookup.
+// Outside the grid the probe sampler returns zero; fall back to the sky.
+float3 RayHitAmbient(float3 hitPos, float3 n) {
+    float3 sky = SampleSkyIrradiance(n) * kBounceSkyDamping;
+    if (enhancedLumenGI == 0 || ddgiEnabled == 0) return sky;
+    // SampleDDGIIrradiance already applies giIntensity; the GI caller
+    // applies it again, so undo it here.
+    float3 cache = SampleDDGIIrradiance(hitPos, n) /
+                   max(giIntensity, 1e-3);
+    return dot(cache, float3(0.2126, 0.7152, 0.0722)) > 1e-5 ? cache : sky;
+}
+
 // Radiance leaving a committed ray hit, shaded from the real surface.
 //
 // This is what the hit-geometry table buys. Without it a hit can only be
@@ -1026,13 +1052,12 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
         // toward me", and -rayDir is that direction. It is only approximate for
         // the sky term, which is the smaller part.
         float3 fallbackNormal = -rayDir;
-        float3 fallbackIncoming =
-            SampleSkyIrradiance(fallbackNormal) * kBounceSkyDamping;
+        float3 fallbackPos = hit.rayOrigin + rayDir * hit.rayT;
+        float3 fallbackIncoming = RayHitAmbient(fallbackPos, fallbackNormal);
         if (lightType == 0) {
             float3 sunDir = normalize(lightPos);
             float sunNdotL = saturate(dot(fallbackNormal, sunDir));
             if (sunNdotL > 0.0) {
-                float3 fallbackPos = hit.rayOrigin + rayDir * hit.rayT;
                 RayDesc fallbackShadow;
                 fallbackShadow.Origin = fallbackPos + fallbackNormal * 0.02;
                 fallbackShadow.Direction = sunDir;
@@ -1107,9 +1132,11 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
     uint hitMaterialID = binding.materialID;
 #endif
     float3 albedo = float3(0.72, 0.70, 0.66);
+    float3 hitEmissive = 0.0;
     if (hitMaterialID != 0) {
         MaterialData hitMaterial = materials[hitMaterialID];
         albedo = hitMaterial.baseColorFactor.rgb;
+        if (enhancedLumenGI != 0) hitEmissive = hitMaterial.emissiveOcclusion.rgb * emissiveIntensity;
 
         float2 uv0 = pv0.d1.zw;
         float2 uv1 = pv1.d1.zw;
@@ -1153,8 +1180,8 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
 
     float3 hitPos = hit.rayOrigin + rayDir * hit.rayT;
 
-    // Sky seen by the hit surface, damped -- see kBounceSkyDamping above.
-    float3 incoming = SampleSkyIrradiance(worldNormal) * kBounceSkyDamping;
+    // Ambient light at the hit: sky plus probes in Lumen mode.
+    float3 incoming = RayHitAmbient(hitPos, worldNormal);
 
     // Direct sun at the hit, shadowed by a second ray. Without this test every
     // bounce surface is lit as though unoccluded, which reads as light leaking
@@ -1184,8 +1211,9 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
 
     resolved = true;
     // Lambertian reflectance. The albedo is what makes this carry colour, and
-    // it is the whole point of the table.
-    return incoming * albedo;
+    // it is the whole point of the table. Emissive surfaces light the scene in
+    // Lumen mode.
+    return incoming * albedo + hitEmissive;
 }
 
 // One stochastic GGX-importance-sampled reflection ray against the static
@@ -2517,6 +2545,11 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     float ambientScale = surface.material.shadingParams.x;
     float3 diffuseIBL = SampleSkyIrradiance(ambientNormal) * diffuseAlbedo * ambientScale;
 #if SGE_ENHANCED_VISUALS
+    // Lumen: a traced ray that misses returns the sky, so the traced irradiance
+    // already carries sky light with real occlusion. Adding the unoccluded sky
+    // term on top double counts it and lights interiors as if they were
+    // outdoors -- measured: the hangar interior moved 0.4 luma with it kept.
+    if (enhancedLumenGI != 0) diffuseIBL = 0.0;
     // Probe-miss RT fallback: trace a bounce only where the sparse grid
     // reported it had nothing, so cost scales with the miss fraction rather
     // than with screen area. Falls back to the unclassified path whenever the
@@ -2529,11 +2562,18 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     // mistake reflectionEligible exists to prevent on the specular side.
     float3 tracedGIIrradiance = 0.0;
     bool giTraced = false;
-    if (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
-        sparseProbeCount > 0 && sparseCellCount > 0) {
+    const bool lumenGI = enhancedLumenGI != 0;
+    if (lumenGI || (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
+        sparseProbeCount > 0 && sparseCellCount > 0)) {
         bool probeResolved = false;
-        giIrradiance = SampleSparseDDGIClassified(
-            surface.fragPos, ambientNormal, probeResolved);
+        // Lumen mode traces every pixel and does not need the probe grid at
+        // the shading point (probes are only its radiance cache at hits), so
+        // it runs on levels with no probes at all.
+        giIrradiance = 0.0;
+        if (!lumenGI)
+            giIrradiance = SampleSparseDDGIClassified(
+                surface.fragPos, ambientNormal, probeResolved);
+        const float giStrength = lumenGI ? 1.0 : enhancedProbeMissGIStrength;
         // enhancedProbeMissGIStrength blends probe and traced irradiance:
         //   0   fill misses only -- rays where the grid has nothing
         //   1   full RT GI -- trace every pixel, probes unused
@@ -2550,21 +2590,21 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
         // everything. Paying full price for a converged result is the better
         // trade here.
         const bool traceThisPixel =
-            !probeResolved || enhancedProbeMissGIStrength > 0.0;
+            !probeResolved || giStrength > 0.0;
         if (traceThisPixel) {
             float3 traced = RayTracedProbeMissGI(
                 surface.fragPos, ambientNormal, pixel);
             // A miss has no probe value to blend against, so it takes the
             // traced result outright whatever the strength.
             giIrradiance = probeResolved
-                ? lerp(giIrradiance, traced, enhancedProbeMissGIStrength)
+                ? lerp(giIrradiance, traced, giStrength)
                 : traced;
             // The traced share of the blend above. A probe miss takes the ray
             // outright, so all of it is traced; a resolved probe contributes
             // only the lerp weight. Publishing exactly this much keeps the
             // denoised quantity equal to the noisy quantity.
             tracedGIIrradiance = probeResolved
-                ? traced * enhancedProbeMissGIStrength
+                ? traced * giStrength
                 : traced;
             giTraced = true;
             // Denoise the irradiance, not the final contribution. The
@@ -2776,12 +2816,18 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
                   ambientLightingIntensity;
     }
 #endif
+#if SGE_ENHANCED_VISUALS
+    // The flat fill stands in for bounce light; Lumen traces the real thing.
+    if (enhancedLumenGI == 0)
+#endif
+    {
     if (bentGTAOLightingActive) {
         result += ambientStrength * diffuseAlbedo * ambientScale *
                   diffuseAmbientOcclusion * ambientLightingIntensity;
     } else {
         result += ambientStrength * diffuseAlbedo * ambientScale *
                   ambientOcclusion * ambientLightingIntensity;
+    }
     }
     result += surface.material.emissiveOcclusion.rgb * emissiveIntensity;
     
@@ -2881,6 +2927,16 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     }
     
 #if SGE_ENHANCED_VISUALS
+    // debugViewMode 8/9: Lumen GI. 8 = the irradiance the lighting consumed
+    // (after temporal accumulation), 9 = its lit contribution. The specular
+    // signal is zeroed so the SVGF composite adds nothing on top.
+    if (debugViewMode == 8u || debugViewMode == 9u) {
+        result = debugViewMode == 8u
+            ? giIrradiance
+            : diffuseGI * ambientOcclusion * ambientLightingIntensity;
+        outSpecularIBL = 0.0;
+        outSpecularVariance = 0.0;
+    }
     ShadeResult shadeResult;
     shadeResult.color = result;
     shadeResult.specularIBL = outSpecularIBL;
@@ -2894,6 +2950,9 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
 
 // ---- Main ----
 
+#ifndef RR_UNJITTER
+#define RR_UNJITTER(motion) (motion)
+#endif
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID,
           uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID) {
@@ -2995,8 +3054,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {
-        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
-        // HDR sky was rasterized into outputColor before this compute pass.
+        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);        // HDR sky was rasterized into outputColor before this compute pass.
         // Preserve it instead of replacing it with a mismatched procedural sky.
         if (enableMotionVectors != 0u) {
             // Reproject a far-plane point so camera rotation moves sky history
@@ -3009,7 +3067,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
             if (previousClip.w > 0.001)
                 previousUV = (previousClip.xy / previousClip.w) *
                              float2(0.5, -0.5) + 0.5;
-            outputMotion[pixel] = currentUV - previousUV;
+            outputMotion[pixel] = RR_UNJITTER(currentUV - previousUV);
         }
         return;
     }
@@ -3038,7 +3096,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
                 terrainPreviousUV =
                     (terrainPreviousClip.xy / terrainPreviousClip.w) *
                     float2(0.5, -0.5) + 0.5;
-            outputMotion[pixel] = terrainCurrentUV - terrainPreviousUV;
+            outputMotion[pixel] =
+                RR_UNJITTER(terrainCurrentUV - terrainPreviousUV);
         }
         return;
     }
@@ -3071,7 +3130,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
                     (terrainPreviousClip.xy / terrainPreviousClip.w) *
                     float2(0.5, -0.5) + 0.5;
             terrainMotion = terrainCurrentUV - terrainPreviousUV;
-            outputMotion[pixel] = terrainMotion;
+            outputMotion[pixel] = RR_UNJITTER(terrainMotion);
         }
 
         TerrainVBPBR terrainPBR = SampleTerrainVBPBR(
@@ -3216,7 +3275,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
             previousUV = (previousClip.xy / previousClip.w) * float2(0.5, -0.5) + 0.5;
         }
         primaryMotion = currentUV - previousUV;
-        outputMotion[pixel] = primaryMotion;
+        outputMotion[pixel] = RR_UNJITTER(primaryMotion);
     }
     
 #if SGE_ENHANCED_VISUALS

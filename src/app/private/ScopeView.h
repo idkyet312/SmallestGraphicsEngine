@@ -139,7 +139,7 @@ static void RenderSniperScopeTexture(float now, bool hideFog) {
                 g_scopeShadowLightSpace, g_scopeShadowResource,
                 nullptr, false, XMMatrixIdentity(), floorMaterial,
                 (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr,
-                /*viewSlot=*/1);
+                /*viewSlot=*/1, &g_prefabRenderBatches);
         } else {
             RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
                 crateModel, floorMaterial,

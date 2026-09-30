@@ -477,6 +477,12 @@ bool Evaluate(const DLSSFrameInputs& in) {
         options.colorBuffersHDR = sl::Boolean::eTrue;
         options.normalRoughnessMode =
             sl::DLSSDNormalRoughnessMode::ePacked;
+        // Capture A/B only: SGE_RR_PRESET=<sl::DLSSDPreset value>.
+        char rrPresetText[8] = {};
+        if (GetEnvironmentVariableA("SGE_RR_PRESET", rrPresetText,
+                                    sizeof(rrPresetText)) > 0)
+            options.dlaaPreset =
+                static_cast<sl::DLSSDPreset>(atoi(rrPresetText));
         options.worldToCameraView = ToSL(in.view);
         const XMMATRIX viewMatrix = XMLoadFloat4x4(&in.view);
         options.cameraViewToWorld = ToSL(
@@ -540,8 +546,11 @@ bool Evaluate(const DLSSFrameInputs& in) {
     consts.orthographicProjection = sl::Boolean::eFalse;
     consts.motionVectorsDilated = sl::Boolean::eFalse;
     // The resolve writes pixel-centre UV minus the unjittered previous
-    // projection, so this frame's jitter is inside the vector.
-    consts.motionVectorsJittered = sl::Boolean::eTrue;
+    // projection, so this frame's jitter is inside the vector -- except under
+    // Ray Reconstruction, where the resolve subtracts it: RR left static-camera
+    // frames moving at every edge with jittered vectors (SR/DLAA did not).
+    consts.motionVectorsJittered = rr ? sl::Boolean::eFalse
+                                      : sl::Boolean::eTrue;
 
     if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
         Log("slSetConstants failed");

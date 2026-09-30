@@ -284,9 +284,29 @@ inline void AppendOpaqueSceneNodeDrawItems(
     }
 }
 
+// Draws the same node tree once per placement with a per-placement salt in the
+// instance key. The key is the primitive's address, and the visibility buffer
+// keeps one previous-model matrix per key: unsalted, two stationary copies of
+// one model overwrite each other's history every frame, so each reads the
+// other's matrix as its previous position and gets phantom motion vectors.
+inline void AppendOpaqueSceneNodeDrawItemsKeyed(
+    const std::shared_ptr<SceneNode>& node, const XMMATRIX& worldTransform,
+    uint64_t placementSalt, std::vector<VBDrawItem>& items) {
+    const size_t first = items.size();
+    AppendOpaqueSceneNodeDrawItems(node, worldTransform, items);
+    // splitmix64 finaliser: spreads small salts (indices) across all bits.
+    uint64_t z = placementSalt + 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    for (size_t i = first; i < items.size(); ++i)
+        items[i].instanceKey ^= z;
+}
+
 inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
                                 const std::shared_ptr<SceneMaterial>& floorMaterial,
-                                const std::shared_ptr<SceneNode>& importedScene) {
+                                const std::shared_ptr<SceneNode>& importedScene,
+                                const std::vector<PrefabRenderBatch>* prefabBatches) {
     items.clear();
 
     if (!scene.useMeshTerrain) {
@@ -300,6 +320,22 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
 
     if (!g_emptyLevelMode && importedScene && g_showH2Model)
         AppendOpaqueSceneNodeDrawItems(importedScene, XMMatrixIdentity(), items);
+
+    // Level prefabs (buildings, props). Registering them here is what hands
+    // ownership over: forward extensions skip any primitive that carries a
+    // visibility mesh ID, and one that fails to register keeps drawing
+    // forward. Without this every prefab was forward-shaded and never reached
+    // the resolve's ray-traced lighting.
+    if (!g_emptyLevelMode && prefabBatches) {
+        for (const PrefabRenderBatch& batch : *prefabBatches) {
+            if (!batch.model) continue;
+            for (size_t t = 0; t < batch.transforms.size(); ++t)
+                AppendOpaqueSceneNodeDrawItemsKeyed(batch.model,
+                    batch.transforms[t],
+                    t < batch.entityIds.size() ? batch.entityIds[t] : t + 1,
+                    items);
+        }
+    }
 
     if (!g_emptyLevelMode && scene.useDestruction && g_destruction.IsInitialized()) {
         const size_t destructionBegin = items.size();
@@ -363,8 +399,8 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
         g_levelPlacesHumvee) {
         for (size_t index = 0; index < LevelHumveeCount(); ++index) {
             PrepareHumveeModelForRender(index);
-            AppendOpaqueSceneNodeDrawItems(
-                g_humveeModel, HumveeWorldMatrix(index), items);
+            AppendOpaqueSceneNodeDrawItemsKeyed(
+                g_humveeModel, HumveeWorldMatrix(index), index + 1, items);
         }
         if (g_stressTestMode) {
             PrepareHumveeModelForRender(0);
@@ -383,11 +419,13 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
     }
 
     if (!g_emptyLevelMode && g_explosiveBarrelModel) {
-        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        for (size_t b = 0; b < scene.explosiveBarrels.size(); ++b) {
+            const ExplosiveBarrel& barrel = scene.explosiveBarrels[b];
             if (!barrel.active) continue;
-            AppendOpaqueSceneNodeDrawItems(g_explosiveBarrelModel,
+            AppendOpaqueSceneNodeDrawItemsKeyed(g_explosiveBarrelModel,
                 XMMatrixTranslation(barrel.position.x,
-                    barrel.position.y - 0.75f, barrel.position.z), items);
+                    barrel.position.y - 0.75f, barrel.position.z),
+                b + 1, items);
         }
     }
 
@@ -838,7 +876,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
                          const XMMATRIX& previousViewProjection,
                          const std::shared_ptr<SceneMaterial>& floorMaterial,
                          const std::shared_ptr<SceneNode>& importedScene = nullptr,
-                         UINT viewSlot = 0) {
+                         UINT viewSlot = 0,
+                         const std::vector<PrefabRenderBatch>* prefabBatches = nullptr) {
     // Per-view draw state. Defaults to slot 0, so every existing call site
     // keeps the exact buffers it had when these were function statics.
     VBViewDrawState& viewState = VBDrawStateForView(viewSlot);
@@ -848,7 +887,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
 
     // Build draw item list
     std::vector<VBDrawItem>& drawItems = viewState.drawItems;
-    BuildSceneDrawItems(scene, drawItems, floorMaterial, importedScene);
+    BuildSceneDrawItems(scene, drawItems, floorMaterial, importedScene,
+                        prefabBatches);
 
     // CPU retains only cheap material ordering/backface rejection. GPU decides
     // frustum, projected-size LOD, HZB visibility, and final indirect draw count.

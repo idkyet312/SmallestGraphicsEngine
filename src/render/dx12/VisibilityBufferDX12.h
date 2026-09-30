@@ -496,6 +496,17 @@ public:
     // and the single-sample ray less, which is the quieter image where the grid
     // has good data.
     float enhancedProbeMissGIStrength = 1.0f;
+    // Lumen-style GI: every pixel traces a diffuse bounce, probes act as the
+    // world radiance cache at hit points.
+    bool lumenGIActive = false;
+    // Player-facing reflection roughness cutoff (settings menu). Used instead
+    // of the editor's enhancedReflectionRoughnessCut while RR or Lumen GI is
+    // active -- the modes the menu drives.
+    float settingsReflectionRoughnessCut = 1.0f;
+    // Camera jitter the visibility pass rasterized with this frame, in render
+    // pixels. Set by the frame loop; the resolve strips it from the motion
+    // vectors while Ray Reconstruction is active.
+    XMFLOAT2 rrMotionJitterPixels = { 0.0f, 0.0f };
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
@@ -5113,8 +5124,12 @@ private:
             // rebuilt since this feature landed keeps the sky approximation.
             UINT  hitGeometryCount;
             UINT  rrGuideEnable;
+            UINT  lumenGI;
+            float rrMotionJitterU;
+            float rrMotionJitterV;
+            UINT  lumenPad2;
         } constants;
-        static_assert(sizeof(EnhancedConstants) == 80,
+        static_assert(sizeof(EnhancedConstants) == 96,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
@@ -5123,13 +5138,19 @@ private:
         constants.rtReflections = enhancedRTReflectionsActive ? 1u : 0u;
         constants.reflectionRayLength = enhancedReflectionRayLength;
         // Ultra: every roughness gets a reflection ray; RR resolves the noise.
-        constants.reflectionRoughnessCut = rayReconstructionActive
-            ? 1.0f : enhancedReflectionRoughnessCut;
+        constants.reflectionRoughnessCut =
+            (rayReconstructionActive || lumenGIActive)
+                ? settingsReflectionRoughnessCut
+                : enhancedReflectionRoughnessCut;
         // Rotates the sampling sequence so consecutive frames draw different
         // samples; this is the variance a temporal denoiser resolves.
         constants.frameIndex = (ScopeSurfaceBound() ? enhancedReflectionFrameCounter : enhancedReflectionFrameCounter++);
         constants.reflectionOcclusion = enhancedReflectionOcclusion;
-        constants.reflectionClassify = enhancedReflectionClassifyActive ? 1u : 0u;
+        // Off under RR, like shadow classification: jitter moves pixels across
+        // the confidence threshold, flipping them between probe and ray shading
+        // from frame to frame, and RR is the denoiser for the full signal.
+        constants.reflectionClassify = (enhancedReflectionClassifyActive &&
+            !rayReconstructionActive) ? 1u : 0u;
         constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
         constants.probeMissGI = enhancedProbeMissGIActive ? 1u : 0u;
         constants.svgfTemporalEnable = (svgfTemporalEnabled &&
@@ -5147,6 +5168,16 @@ private:
             !ScopeSurfaceBound() &&
             rrDiffuseAlbedo && rrSpecularAlbedo &&
             rrSpecularHitDistance) ? 1u : 0u;
+        constants.lumenGI = lumenGIActive ? 1u : 0u;
+        // Ray Reconstruction does not resolve jitter carried in the motion
+        // vectors, so under RR the resolve removes it (pixels -> UV; the
+        // projection's NDC y flip and the UV y flip cancel, so both are +).
+        const bool rrMotion = rayReconstructionActive && !ScopeSurfaceBound() &&
+                              width > 0 && height > 0;
+        constants.rrMotionJitterU = rrMotion
+            ? rrMotionJitterPixels.x / static_cast<float>(width) : 0.0f;
+        constants.rrMotionJitterV = rrMotion
+            ? rrMotionJitterPixels.y / static_cast<float>(height) : 0.0f;        constants.lumenPad2 = 0u;
         const UINT64 constantOffset =
             static_cast<UINT64>(ViewFrameIndex()) * 256ull;
         memcpy(static_cast<BYTE*>(enhancedConstantMapped) + constantOffset,
@@ -6561,6 +6592,11 @@ public:
             enhancedHeapRRGeneration[frameSlot] != rrGuideGeneration)
             RefreshEnhancedDescriptors(frameSlot);
         enhancedVisualsActive = wantActive;
+    }
+
+    void SetLumenGI(bool on) {
+        if (on != lumenGIActive) svgfHistoryValid = false;
+        lumenGIActive = on;
     }
 
     bool EnhancedVisualsReady() const { return enhancedPipelineReady; }

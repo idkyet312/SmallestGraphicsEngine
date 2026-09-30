@@ -2830,7 +2830,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 const char* debugViews[] = {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
                     "Edge mask", "RT reflection rays", "SVGF denoiser",
-                    "SVGF a-trous output", "Terrain layer weights"
+                    "SVGF a-trous output", "Terrain layer weights",
+                    "Lumen GI irradiance", "Lumen GI contribution"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
