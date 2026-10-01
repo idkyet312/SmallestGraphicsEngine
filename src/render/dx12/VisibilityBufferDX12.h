@@ -453,6 +453,9 @@ public:
     // predate it still holds null or freed guide UAVs.
     UINT rrGuideGeneration = 0;
     UINT enhancedHeapRRGeneration[FRAME_COUNT] = {};
+    // Owned by the scene-asset loader; kept so a heap rebuild rebinds them.
+    ID3D12Resource* environmentMapResource = nullptr;
+    ID3D12Resource* brdfLUTResource = nullptr;
     // Set per frame by the caller from scene.enhancedVisuals. Kept separate
     // from enhancedPipelineReady (a capability) so the UI can toggle freely
     // without rebuilding anything.
@@ -7695,26 +7698,13 @@ private:
         }
 
         // [72] t72 - HDR environment map for specular IBL.
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC environment = {};
-            environment.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            environment.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            environment.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            environment.Texture2D.MipLevels = 1;
-            g_dx12.device->CreateShaderResourceView(nullptr, &environment, cpuHandle);
-            cpuHandle.ptr += descSize;
-        }
-
         // [73] t73 - split-sum GGX BRDF integration LUT.
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC brdf = {};
-            brdf.Format = DXGI_FORMAT_R32G32_FLOAT;
-            brdf.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            brdf.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            brdf.Texture2D.MipLevels = 1;
-            g_dx12.device->CreateShaderResourceView(nullptr, &brdf, cpuHandle);
-            cpuHandle.ptr += descSize;
-        }
+        // Whatever UpdateEnvironmentMap last bound (null before then). Resize
+        // rebuilds this heap, and writing null here dropped both until the next
+        // level load: the zero LUT made the multiscatter term divide by zero,
+        // so every sun highlight blew out after a DLSS/RR resolution change.
+        WriteEnvironmentDescriptors(cpuHandle);
+        cpuHandle.ptr += 2u * descSize;
 
         // [74] t74 - DDGI irradiance atlas.
         {
@@ -8825,25 +8815,34 @@ public:
 
     void UpdateEnvironmentMap(ID3D12Resource* environmentResource,
                               ID3D12Resource* brdfResource) {
+        environmentMapResource = environmentResource;
+        brdfLUTResource = brdfResource;
         if (!computeDescHeap) return;
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
             computeDescHeap->GetCPUDescriptorHandleForHeapStart();
         handle.ptr += static_cast<SIZE_T>(g_dx12.cbvSrvUavDescriptorSize) * 72u;
+        WriteEnvironmentDescriptors(handle);
+    }
+
+    // t72 environment and t73 BRDF LUT, at `handle` and the slot after it.
+    void WriteEnvironmentDescriptors(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Format = environmentResource
-            ? environmentResource->GetDesc().Format : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        srv.Format = environmentMapResource
+            ? environmentMapResource->GetDesc().Format
+            : DXGI_FORMAT_R32G32B32A32_FLOAT;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Texture2D.MipLevels = environmentResource
-            ? environmentResource->GetDesc().MipLevels : 1;
-        g_dx12.device->CreateShaderResourceView(environmentResource, &srv, handle);
+        srv.Texture2D.MipLevels = environmentMapResource
+            ? environmentMapResource->GetDesc().MipLevels : 1;
+        g_dx12.device->CreateShaderResourceView(environmentMapResource, &srv,
+                                                handle);
         handle.ptr += g_dx12.cbvSrvUavDescriptorSize;
         D3D12_SHADER_RESOURCE_VIEW_DESC brdf = {};
         brdf.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         brdf.Format = DXGI_FORMAT_R32G32_FLOAT;
         brdf.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         brdf.Texture2D.MipLevels = 1;
-        g_dx12.device->CreateShaderResourceView(brdfResource, &brdf, handle);
+        g_dx12.device->CreateShaderResourceView(brdfLUTResource, &brdf, handle);
     }
 
     // Update the shadow map SRV in the compute descriptor heap

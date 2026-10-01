@@ -1464,6 +1464,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 visBuffer.temporalEffectsEnabled = true;
             if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
                 DLSS::GetSettings().invertJitter = true;
+            // "f1,f2,..." -> whether an odd number of those capture frames
+            // have passed, i.e. a setting flipped at each one is inverted.
+            const auto flippedAt = [&](const char* name, bool& present) {
+                char text[64] = {};
+                present = GetEnvironmentVariableA(name, text, sizeof(text)) > 0;
+                bool flipped = false;
+                for (const char* p = text; present && *p;) {
+                    char* end = nullptr;
+                    const long flipAt = std::strtol(p, &end, 10);
+                    if (end == p) break;
+                    if (static_cast<long>(poseCaptureFrames) >= flipAt)
+                        flipped = !flipped;
+                    p = *end ? end + 1 : end;
+                }
+                return flipped;
+            };
+            // Replays menu on/off/on runs. Lumen starts off; Ray Tracing
+            // Quality starts at the saved value and goes through the same
+            // ApplyGameSettings call as the menu combo.
+            bool togglePresent = false;
+            const bool lumenFlipped =
+                flippedAt("SGE_CAPTURE_LUMEN_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.lumenGI = lumenFlipped;
+            const bool rtFlipped =
+                flippedAt("SGE_CAPTURE_RT_TOGGLE", togglePresent);
+            static const int rtInitialQuality = g_settings.rayTracingQuality;
+            // SGE_CAPTURE_DLSS_PCT pins the screen percentage the toggle's
+            // ApplyGameSettings restores (100 = no resize on the RR switch).
+            char dlssPct[16] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_DLSS_PCT", dlssPct,
+                                        sizeof(dlssPct)) > 0)
+                g_settings.dlssScreenPercentage =
+                    static_cast<float>(atof(dlssPct));
+            if (togglePresent) {
+                const bool startUltra =
+                    rtInitialQuality == GameSettings::kRayTracingUltra;
+                const int quality = (startUltra != rtFlipped)
+                    ? GameSettings::kRayTracingUltra
+                    : GameSettings::kRayTracingOff;
+                if (quality != g_settings.rayTracingQuality) {
+                    g_settings.rayTracingQuality = quality;
+                    ApplyGameSettings();
+                }
+            }
             // Walks the runtime DLSS toggles (off, DLAA, SR, RR, preset) every
             // 40 frames, so the resize/feature-switch paths run unattended.
             if (GetEnvironmentVariableA("SGE_DLSS_CYCLE", nullptr, 0) > 0 &&
