@@ -254,6 +254,75 @@ static std::shared_ptr<SceneNode> LoadAATurretModel() {
     return root;
 }
 
+// Mi-24 Hind enemy gunship.
+//
+// UpdateHelicopter spins two child nodes of the airframe, "MainRotor" about +Y
+// and "TailRotor" about +X. The model arrives as three files cut by
+// scripts/split-hind.py, for the same reason as the AA gun -- the cook
+// flattens every node into one mesh:
+//
+//   Hind             airframe, nose down -Z like the OH-1 it replaced
+//   Hind_MainRotor   origin at the hub
+//   Hind_TailRotor   origin at the hub
+//
+// All three share the airframe's model space, so each rotor only has to be
+// hung at its hub. The offsets are the ones the split script prints. Size is
+// not set here: ConfigureHelicopterBounds scales the airframe's length to
+// kHelicopterLength. At 10 m that lands the main rotor at a 4.67 m radius and
+// the tail rotor at 1.12 m, which is what kHelicopterMainRotorReach and
+// kHelicopterTailRotorReach scale up from.
+static constexpr XMFLOAT3 kHindMainRotorHub{ 0.0f, -0.5792f, 0.1865f };
+static constexpr XMFLOAT3 kHindTailRotorHub{ -1.2860f, -0.3468f, 15.2163f };
+
+static std::shared_ptr<SceneNode> LoadHelicopterPart(
+        const std::filesystem::path& source) {
+    std::string cookedError;
+    std::shared_ptr<SceneNode> part = CookedAssetLoader::LoadForSource(
+        source, g_dx12.device, g_dx12.commandList, &cookedError);
+    if (part) return part;
+    // 24 textures that upload as uncompressed RGBA8 without the cook.
+    SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+        "Helicopter part not cooked (" + source.generic_string() + "): " +
+        cookedError + "; using source importer");
+    return GLBImporter::LoadGLB(source.string(), g_dx12.device,
+                                g_dx12.commandList);
+}
+
+static std::shared_ptr<SceneNode> LoadHelicopterModel() {
+    std::shared_ptr<SceneNode> airframe =
+        LoadHelicopterPart("Content/Models/HeliHind2/Hind.glb");
+    const std::shared_ptr<SceneNode> mainRotor =
+        LoadHelicopterPart("Content/Models/HeliHind2/Hind_MainRotor.glb");
+    const std::shared_ptr<SceneNode> tailRotor =
+        LoadHelicopterPart("Content/Models/HeliHind2/Hind_TailRotor.glb");
+    if (!airframe || !mainRotor || !tailRotor) {
+        for (const std::shared_ptr<SceneNode>& part :
+             { airframe, mainRotor, tailRotor })
+            if (part) g_rejectedUploadModels.push_back(part);
+        return nullptr;
+    }
+    // ConfigureHelicopterBounds measures the root's own mesh. The cooked
+    // airframe is one flat mesh; the source import is a node tree with none at
+    // the root, so fold it into one. The tree's uploads are still in flight.
+    if (!airframe->mesh) {
+        g_rejectedUploadModels.push_back(airframe);
+        airframe = GLBImporter::MergeSceneByMaterial(airframe, g_dx12.device);
+        if (!airframe) return nullptr;
+    }
+
+    mainRotor->name = "MainRotor";
+    mainRotor->translation = kHindMainRotorHub;
+    tailRotor->name = "TailRotor";
+    tailRotor->translation = kHindTailRotorHub;
+    airframe->AddChild(mainRotor);
+    airframe->AddChild(tailRotor);
+
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    airframe->UpdateGlobalTransform(identity);
+    return airframe;
+}
+
 static std::shared_ptr<SceneNode> g_aaTurretModel;
 // One posed copy per emplacement. Each turret aims independently, and a single
 // SceneNode can only hold one "Gun" transform, so sharing the model made every

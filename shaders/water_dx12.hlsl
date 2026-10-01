@@ -125,19 +125,32 @@ bool WaterBathymetryUV(float2 worldXZ, out float2 uv)
 // Ultra ignores it and always refracts fully.
 bool WaterUltraQuality() { return ultraSimulation.w > 0.5; }
 
+// How much of a train of this wavelength a mesh with `meshCell` spacing may
+// displace: all of it at 8+ vertices per wavelength, none at 4 or fewer.
+// meshCell 0 (per-pixel) keeps everything.
+float MeshBandLimit(float wavelength, float meshCell)
+{
+    return 1.0 - smoothstep(wavelength * 0.125, wavelength * 0.25, meshCell);
+}
+
 // One Gerstner train, scaled by `weight` so two fields can be crossfaded.
+// `positionScale` band-limits the displacement alone (see EvaluateOcean);
+// tangents, compression and fullHeight always carry the whole train.
 void AccumulateGerstner(float2 direction, float k, float phase,
                         float amplitude, float steepness, float weight,
+                        float positionScale,
                         inout float3 position, inout float3 tangentX,
-                        inout float3 tangentZ, inout float compression)
+                        inout float3 tangentZ, inout float compression,
+                        inout float fullHeight)
 {
     const float sine = sin(phase);
     const float cosine = cos(phase);
     const float weightedAmplitude = amplitude * weight;
     const float horizontal = steepness * weightedAmplitude;
 
-    position.xz += direction * horizontal * cosine;
-    position.y += weightedAmplitude * sine;
+    position.xz += direction * horizontal * cosine * positionScale;
+    position.y += weightedAmplitude * sine * positionScale;
+    fullHeight += weightedAmplitude * sine;
 
     const float common = horizontal * k * sine;
     tangentX += float3(
@@ -151,14 +164,33 @@ void AccumulateGerstner(float2 direction, float k, float phase,
     compression += common;
 }
 
-void EvaluateOcean(float2 baseXZ, float time, out float3 position,
-                   out float3 normal, out float crest)
+// `meshCell` is the spacing of the clipmap vertices sampling this point, or 0
+// for a per-pixel evaluation. It band-limits the returned position only.
+//
+// Every clipmap ring moves with one 0.25 m camera snap, which only ring 0's
+// 0.25 m cells absorb. Coarser rings land their vertices on new points of the
+// wave field each time the snap steps, and a train the ring cannot sample
+// interpolates to a different surface each time: the water wobbled in place
+// as the player walked. Measured with the camera frozen in time, a 2 cm step
+// across a snap boundary changed the mid and far water 4-9x more than the same
+// step inside one cell, in the pattern of the ring grid. Modelled against this
+// spectrum, the drawn height at a fixed point moved 3 cm at 30 m and 14 cm at
+// 60 m per step.
+//
+// So each train's displacement fades out once the cells are too coarse to
+// carry it: whole at 8 vertices per wavelength, gone at 4. That cut the
+// modelled wobble 3-10x while keeping 94-99% of the wave height inside 40 m.
+// Normals and crest still see every train -- the pixel shader rebuilds them
+// at full band, so the dropped chop stays in the shading.
+void EvaluateOcean(float2 baseXZ, float time, float meshCell,
+                   out float3 position, out float3 normal, out float crest)
 {
     const float gravity = 9.81;
     position = float3(baseXZ.x, volume0.y, baseXZ.y);
     float3 tangentX = float3(1.0, 0.0, 0.0);
     float3 tangentZ = float3(0.0, 0.0, 1.0);
     float compression = 0.0;
+    float fullHeight = volume0.y;
 
     // Without bathymetry this is unused: the High path keeps the authored
     // bearings and lets each train sweep across the world, which is what it has
@@ -398,7 +430,9 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
             const float phase = k * (travelDistance + wander * spread * 3.0 +
                                      noiseOffset) + omega * time;
             AccumulateGerstner(direction, k, phase, amplitude, steepness, 1.0,
-                               position, tangentX, tangentZ, compression);
+                               MeshBandLimit(wavelength, meshCell),
+                               position, tangentX, tangentZ, compression,
+                               fullHeight);
         } else {
             // High crossfades two whole fields instead of bending one. The
             // phase is k * dot(direction, worldXZ); turning `direction` or
@@ -413,7 +447,9 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
                 deepK * dot(authored, baseXZ) - omega * time;
             AccumulateGerstner(authored, deepK, deepPhase, amplitude,
                                steepness, 1.0 - bedInfluence,
-                               position, tangentX, tangentZ, compression);
+                               MeshBandLimit(deepWavelength, meshCell),
+                               position, tangentX, tangentZ, compression,
+                               fullHeight);
             if (bedInfluence > 0.001) {
                 // Shore field: fully refracted bearing and shoaled wavelength.
                 // `shoreward` is the uphill bed gradient and the bed is
@@ -427,14 +463,16 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
                     k * (dot(direction, baseXZ) + irregular) - omega * time;
                 AccumulateGerstner(direction, k, shorePhase, amplitude,
                                    steepness, bedInfluence,
-                                   position, tangentX, tangentZ, compression);
+                                   MeshBandLimit(wavelength, meshCell),
+                                   position, tangentX, tangentZ, compression,
+                                   fullHeight);
             }
         }
     }
 
     normal = normalize(cross(tangentZ, tangentX));
     crest = saturate(compression * 1.8 +
-        (position.y - volume0.y) * 1.25 + breakingEnergy * 0.42);
+        (fullHeight - volume0.y) * 1.25 + breakingEnergy * 0.42);
 }
 
 float4 SampleUltraSpectrum(float2 worldXZ, bool previous)
@@ -513,13 +551,19 @@ VSOutput VSMain(VSInput input)
             currentCrest = 0.0;
             previousCrest = 0.0;
         } else {
+            // Vertex spacing here, from the same distance/24 relation the wave
+            // fade below relies on. Continuous in position, so the shared
+            // vertices on a ring boundary get the same band limit from both
+            // rings and no crack opens between them.
+            const float meshCell = max(0.25, max(
+                abs(input.position.x), abs(input.position.z)) / 24.0);
             // Both times take the same speed scale, or the motion vectors
             // would be derived from a surface moving at a different rate than
             // the one being drawn and the reprojection would smear.
-            EvaluateOcean(currentXZ, cameraTime.w * highWaveParams.x,
+            EvaluateOcean(currentXZ, cameraTime.w * highWaveParams.x, meshCell,
                           currentPosition, currentNormal, currentCrest);
             EvaluateOcean(previousXZ,
-                          previousCameraTime.w * highWaveParams.x,
+                          previousCameraTime.w * highWaveParams.x, meshCell,
                           previousPosition,
                           previousNormal, previousCrest);
         }
@@ -677,20 +721,32 @@ static const float kViewmodelRejectDistance = 1.35f;
 bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
                           float2 pixel, out float2 hitUV, out float confidence)
 {
-    const uint maxSteps = 24;
-    uint stepCount = volume1.w > 0.5 ? maxSteps : 10;
+    // Steps grow with distance (quadratic in the step index) rather than a
+    // uniform stride. A uniform 85 m / 24 = 3.5 m stride stepped clean over a
+    // boat hull, so whether a pixel caught the reflector depended on its
+    // per-pixel jitter: a dotted, see-through reflection that shimmered as the
+    // waves moved. This pass runs after the upscaler, so nothing temporal
+    // averages that noise away. Fine steps near the origin, where a nearby
+    // reflector's image lives, make the hit deterministic.
+    const uint maxSteps = 32;
+    uint stepCount = volume1.w > 0.5 ? maxSteps : 12;
     float maxDistance = volume1.w > 0.5 ? 85.0 : 32.0;
-    float stride = maxDistance / stepCount;
     float previousDelta = -0.08;
     float previousT = 0.08;
-    float jitter = Hash21(pixel);
+    // No per-pixel jitter. White-noise jitter turned every hit/miss boundary
+    // into a sparkling fringe -- neighbours disagreed at random, and nothing
+    // after this pass resolves it temporally. A fixed mid-step offset gives
+    // every pixel the same samples; the residual step banding is stable, and
+    // the match fade below softens it.
+    const float jitter = 0.5;
     hitUV = 0.0;
     confidence = 0.0;
 
     [loop]
     for (uint rayStep = 1; rayStep <= maxSteps; ++rayStep) {
         if (rayStep > stepCount) break;
-        float t = stride * (rayStep - 0.72 + jitter);
+        float stepFraction = (rayStep - 1.0 + jitter) / stepCount;
+        float t = 0.08 + (maxDistance - 0.08) * stepFraction * stepFraction;
         float3 rayPosition = origin + direction * t;
         float4 clipPosition =
             mul(float4(rayPosition, 1.0), viewProjection);
@@ -718,6 +774,9 @@ bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
         if (delta >= 0.0 && previousDelta < 0.0) {
             float lo = previousT;
             float hi = t;
+            // Coarse bracket length: what "close to the surface" means at
+            // this distance along the ray, for the match fade below.
+            const float bracket = max(hi - lo, 0.05);
             [unroll]
             for (uint refine = 0; refine < 4; ++refine) {
                 float mid = (lo + hi) * 0.5;
@@ -757,9 +816,17 @@ bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
             }
             float edge = min(min(hitUV.x, hitUV.y),
                              min(1.0 - hitUV.x, 1.0 - hitUV.y));
+            // How well the refined point actually lands on the surface. At a
+            // silhouette the bisection converges onto a depth step (ray behind
+            // the object's edge, scene far beyond it) and the mismatch is large;
+            // fading those out turns the hard on/off edge into a gradient.
+            const float hitError = abs(
+                length(origin + direction * hi - cameraTime.xyz) - hitDistance);
+            const float match =
+                1.0 - smoothstep(0.35 * bracket, bracket, hitError);
             confidence = smoothstep(0.0, 0.075, edge) *
                 saturate(1.0 - hi / maxDistance) *
-                (1.0 - roughness * 0.7);
+                (1.0 - roughness * 0.7) * match;
             return confidence > 0.001;
         }
         previousDelta = delta;
@@ -936,36 +1003,28 @@ PSOutput PSMain(VSOutput input)
     // moves where it starts -- because the artifact is the interpolation itself,
     // not the ring boundaries.
     //
-    // Ramped in on pixel footprint, so near water keeps the cheaper vertex path
-    // and everything beyond it is analytic. There is no upper cutoff: the
-    // vertex displacement has been faded out by then, so this is the only thing
-    // still carrying wave detail, and dropping it would leave flat glass. The
-    // capillary term below does its own fade and handles aliasing.
+    // Every pixel, near water included. This used to ramp in on footprint
+    // (0.05-0.30 m) and leave the near field on interpolated vertex normals,
+    // but only ring 0 (inside 8 m) sits on a lattice the camera snap preserves.
+    // Between 8 and ~22 m the interpolated normal came from ring 1-2 vertices
+    // that resample the waves every 0.25 m of walking, swinging the normal at
+    // a fixed point by 1-4.5 degrees -- several sun-glint lobe widths at this
+    // roughness. There is no upper cutoff either: the vertex displacement has
+    // been faded out far away, so this is the only thing still carrying wave
+    // detail there. The capillary term below does its own fade and handles
+    // aliasing.
     const bool highOcean = volume0.w > 0.5 &&
                            volume1.w > 0.5 && volume1.w < 1.5;
     if (highOcean) {
-        const float pixelNormalWeight = volume1.z > 0.5
-            ? 1.0
-            : smoothstep(0.05, 0.30, footprint);
-        if (pixelNormalWeight > 0.001) {
-            float3 evaluatedPosition;
-            float3 evaluatedNormal;
-            float evaluatedCrest;
-            // Evaluate on the undisplaced clipmap plane. worldPosition.xz has
-            // already been displaced at the vertices, so using it here feeds a
-            // piecewise-linear triangle approximation back into the analytic
-            // wave field and stamps that topology into the foam.
-            EvaluateOcean(input.oceanBaseXZ,
-                          cameraTime.w * highWaveParams.x,
-                          evaluatedPosition, evaluatedNormal, evaluatedCrest);
-            normal = normalize(
-                lerp(normal, evaluatedNormal, pixelNormalWeight));
-            // Foam applies a narrow threshold to crest. Blending the analytic
-            // value with the interpolated vertex value preserves the very
-            // facets this path exists to remove, so switch crest outright once
-            // the coarse rings need per-pixel evaluation.
-            crest = evaluatedCrest;
-        }
+        float3 evaluatedPosition;
+        // Evaluate on the undisplaced clipmap plane. worldPosition.xz has
+        // already been displaced at the vertices, so using it here feeds a
+        // piecewise-linear triangle approximation back into the analytic wave
+        // field and stamps that topology into the foam. Full band (meshCell 0):
+        // the trains the mesh dropped from its displacement belong here.
+        EvaluateOcean(input.oceanBaseXZ,
+                      cameraTime.w * highWaveParams.x, 0.0,
+                      evaluatedPosition, normal, crest);
     }
 
     // Derivative-filtered capillary detail. Fine octaves disappear before they

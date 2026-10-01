@@ -203,6 +203,12 @@ inline void RenderMovementPad() {
     ImGui::End();
 }
 
+// ImGui texture handles for the blood overlays (Content/Textures/UI), set by
+// the app each frame -- UITextureFromFile lives on the app side. Zero means
+// the art is missing and the drawn vignette bands are used instead.
+inline uint64_t g_hurtBloodOverlay = 0;
+inline uint64_t g_lowHealthBloodOverlay = 0;
+
 inline void RenderPlayerHUD(const Scene& scene) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
@@ -627,7 +633,22 @@ inline void RenderPlayerHUD(const Scene& scene) {
         // and fading to nothing well before the crosshair. Keeping the middle
         // clear is what lets this be much stronger than the old flat wash
         // without blinding the player at the moment they most need to see.
-        if (player.damageFlash > 0.0f) {
+        // Blood splatter round the screen edge when the art is there: the
+        // bands below were flat red rectangles. Its own alpha keeps the centre
+        // clear. A graze pushes the image out past the screen edges so only
+        // the outermost splatter shows; a heavy hit pulls it fully in.
+        if (player.damageFlash > 0.0f && g_hurtBloodOverlay) {
+            const float fade = (std::min)(1.0f, player.damageFlash * 2.4f);
+            const float alpha =
+                (std::min)(1.0f, (0.17f + severity * 0.23f) * fade);
+            const float spread = (1.0f - severity) * 0.22f;
+            const ImVec2 pad(screen.x * spread, screen.y * spread);
+            draw->AddImage((ImTextureID)g_hurtBloodOverlay,
+                           ImVec2(-pad.x, -pad.y),
+                           ImVec2(screen.x + pad.x, screen.y + pad.y),
+                           ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                           ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, alpha)));
+        } else if (player.damageFlash > 0.0f) {
             const float fade = (std::min)(1.0f, player.damageFlash * 2.4f);
             const float peak = (0.30f + severity * 0.55f) * fade;
             constexpr int kBands = 7;
@@ -714,9 +735,19 @@ inline void RenderPlayerHUD(const Scene& scene) {
                 0.72f + 0.28f * std::sin(static_cast<float>(ImGui::GetTime()) *
                                          (4.2f + player.lowHealthPulse * 2.6f));
             const float peak = player.lowHealthPulse * 0.44f * beat;
+            if (g_lowHealthBloodOverlay) {
+                const float alpha =
+                    (std::min)(1.0f, player.lowHealthPulse * 0.40f * beat);
+                draw->AddImage((ImTextureID)g_lowHealthBloodOverlay,
+                               ImVec2(0.0f, 0.0f), screen, ImVec2(0.0f, 0.0f),
+                               ImVec2(1.0f, 1.0f),
+                               ImGui::GetColorU32(
+                                   ImVec4(1.0f, 1.0f, 1.0f, alpha)));
+            }
             constexpr int kBands = 6;
             const float depth = (std::min)(screen.x, screen.y) * 0.26f;
-            for (int band = 0; band < kBands; ++band) {
+            for (int band = 0; band < kBands && !g_lowHealthBloodOverlay;
+                 ++band) {
                 const float t = static_cast<float>(band) / (kBands - 1);
                 const float inset = depth * t;
                 const float alpha = peak * (1.0f - t) * (1.0f - t);

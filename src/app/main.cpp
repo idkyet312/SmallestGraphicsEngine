@@ -786,6 +786,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             sscanf_s(text, "%f,%f,%f", &captureSweep[0], &captureSweep[1],
                      &captureSweep[2]);
     }
+    // SGE_CAPTURE_WATER_TIME=<seconds> holds the ocean clock, so captures at
+    // two camera poses show only what the camera move changes in the water.
+    float captureWaterTime = -1.0f;
+    {
+        char text[32] = {};
+        if (poseCapture &&
+            GetEnvironmentVariableA("SGE_CAPTURE_WATER_TIME", text,
+                                    sizeof(text)) > 0)
+            captureWaterTime = static_cast<float>(atof(text));
+    }
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
     bool molotovSmokeInjected = false;
@@ -1383,6 +1393,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                       capturePose[2] + captureSweep[2] * sweepFrames };
             scene.camera.SetViewAngles(
                 capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
+            // SGE_CAPTURE_HELI="distance,rise,bearing" re-places the camera on
+            // the enemy gunship every frame instead -- it flies, so no fixed
+            // pose frames it. Bearing is degrees clockwise from its nose.
+            char captureHeli[64] = {};
+            float heliView[3] = {};
+            if (g_helicopterModel &&
+                GetEnvironmentVariableA("SGE_CAPTURE_HELI", captureHeli,
+                                        sizeof(captureHeli)) > 0 &&
+                sscanf_s(captureHeli, "%f,%f,%f", &heliView[0], &heliView[1],
+                         &heliView[2]) == 3) {
+                const float bearing =
+                    g_helicopterYaw + XMConvertToRadians(heliView[2]);
+                scene.camera.Position = {
+                    g_helicopterPosition.x + std::sin(bearing) * heliView[0],
+                    g_helicopterPosition.y + heliView[1],
+                    g_helicopterPosition.z + std::cos(bearing) * heliView[0] };
+                const float dx = g_helicopterPosition.x - scene.camera.Position.x;
+                const float dy = g_helicopterPosition.y - scene.camera.Position.y;
+                const float dz = g_helicopterPosition.z - scene.camera.Position.z;
+                scene.camera.SetViewAngles(
+                    XMConvertToDegrees(std::atan2(dz, dx)),
+                    XMConvertToDegrees(std::atan2(
+                        dy, std::sqrt(dx * dx + dz * dz))));
+            }
+            // A stray ESC during a long unattended run would park the capture
+            // behind the pause screen.
+            g_gamePaused = false;
             // SGE_CAPTURE_FIRE=N fires the player's weapon N frames before the
             // captured one, so a round's first rendered frames can be dumped.
             char captureFire[8] = {};
@@ -1391,6 +1428,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 poseCaptureFrames + 1u + static_cast<UINT>(atoi(captureFire)) ==
                     poseCaptureTarget)
                 ShootPlayerWeapon();
+            // SGE_CAPTURE_HURT=<severity 0..1> / SGE_CAPTURE_LOWHP=<pulse 0..1>
+            // hold the hit flash / low-health overlay on for the capture.
+            char captureHurt[16] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HURT", captureHurt,
+                                        sizeof(captureHurt)) > 0) {
+                scene.player.damageFlash = 0.4f;
+                scene.player.damageFlashSeverity =
+                    static_cast<float>(atof(captureHurt));
+            }
+            if (GetEnvironmentVariableA("SGE_CAPTURE_LOWHP", captureHurt,
+                                        sizeof(captureHurt)) > 0)
+                scene.player.lowHealthPulse =
+                    static_cast<float>(atof(captureHurt));
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOSSR", nullptr, 0) > 0)
                 scene.enableScreenSpaceReflections = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
@@ -1481,6 +1531,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << g_profiler.GpuScopeMs("VB Raster")
                                 << " terrainMs="
                                 << g_profiler.GpuScopeMs("VB Terrain")
+                                << " waterMs="
+                                << g_profiler.GpuScopeMs("Tropical Water")
                                 << " lightPos=" << scene.lightPos.x << ","
                                 << scene.lightPos.y << "," << scene.lightPos.z
                                 << " lightType=" << scene.lightType
@@ -2022,6 +2074,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     liveAircraftPositions.push_back(
                         g_secondaryHelicopterPosition);
             }
+            // The enemy patrol boat joins the same list: large, loud, out on
+            // open water -- spotted at the aircraft range, like the gunships.
+            // Marine rounds are friendly projectiles, which already test and
+            // damage the hull; only the aiming was missing. Aimed mid-hull:
+            // boatPosition is the deck, and the hull runs 1.1 m below it.
+            if (!g_emptyLevelMode && g_levelPatrolBoatEnabled && g_boatModel &&
+                !g_boatDead)
+                liveAircraftPositions.push_back({ g_boatPosition.x,
+                                                  g_boatPosition.y - 0.55f,
+                                                  g_boatPosition.z });
             XMFLOAT3 insertionVehicleTarget{};
             const bool insertionVehicleOccupied =
                 OccupiedInsertionVehicleTarget(insertionVehicleTarget);
@@ -2659,6 +2721,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (!g_emptyLevelMode) {
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
+        if (captureWaterTime >= 0.0f)
+            g_ocean.PinTime(captureWaterTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         const bool primaryHelicopterActive =
             scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed;
@@ -5426,26 +5490,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
 
             AdvanceLevelLoading(LevelLoadStage::Helicopter,
-                "OH-1 import, geometry LOD and rotor setup",
-                "Content/Models/OH-1_fbx/OH-1.fbx",
+                "Mi-24 Hind import and rotor setup",
+                "Content/Models/HeliHind2/Hind.glb",
                 g_baseMode || g_humveeModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::Helicopter) {
-          // Same reasoning as the Humvee stage above: the base parks no OH-1,
-          // and this stage carries the geometry LOD reduction, which was the
-          // single most expensive step in the base's load.
+          // Same reasoning as the Humvee stage above: the base parks no
+          // gunship, so it skips the import.
           if (!g_baseMode) {
-            const std::string helicopterModelPath =
-                ResolveTexturePath("Content/Models/OH-1_fbx/OH-1.fbx");
-            std::cout << "OH-1 asset: " << helicopterModelPath << "\n";
-            g_helicopterModel = FBXImporter::Load(
-                helicopterModelPath,
-                g_dx12.device, g_dx12.commandList, 1.0f, false, true, true);
+            g_helicopterModel = LoadHelicopterModel();
             if (g_helicopterModel) {
                 for (const auto& child : g_helicopterModel->children) {
                     if (!child) continue;
-                    if (child->name == "OH1MainRotor")
+                    if (child->name == "MainRotor")
                         g_helicopterMainRotorNode = child;
-                    else if (child->name == "OH1TailRotor")
+                    else if (child->name == "TailRotor")
                         g_helicopterTailRotorNode = child;
                 }
                 // Second airframe for the reinforcement dropship. Shares all
@@ -5458,16 +5516,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     for (const auto& child :
                              g_secondaryHelicopterModel->children) {
                         if (!child) continue;
-                        if (child->name == "OH1MainRotor")
+                        if (child->name == "MainRotor")
                             g_secondaryHelicopterMainRotorNode = child;
-                        else if (child->name == "OH1TailRotor")
+                        else if (child->name == "TailRotor")
                             g_secondaryHelicopterTailRotorNode = child;
                     }
                 }
                 ConfigureHelicopterBounds();
-                std::cout << "OH-1 helicopter ready above center\n";
+                std::cout << "Mi-24 Hind helicopter ready above center\n";
             } else {
-                std::cerr << "OH-1 helicopter FBX failed to load\n";
+                std::cerr << "Mi-24 Hind helicopter failed to load\n";
             }
             if (ApplyDarkGreenToHumvee())
                 std::cout << "Humvee dark green fallback applied to untextured materials\n";
@@ -6029,7 +6087,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (g_emptyLevelMode) {
                     emptyLevelAssetsLoaded = true;
                 } else if (g_baseMode) {
-                    // The base deliberately skips the Humvee, the OH-1 and the
+                    // The base deliberately skips the Humvee, the gunship and the
                     // bandit/marine skinned meshes, so its load leaves the full
                     // set incomplete. Latching fullLevelAssetsLoaded here would
                     // tell the next level those imports had already happened and
@@ -7197,6 +7255,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         g_thumbnailUploadedThisFrame = false;
+        // Hurt/low-health blood overlays for RenderPlayerHUD. Loaded once and
+        // cached by path; 0 (art missing) falls back to the drawn vignette.
+        g_hurtBloodOverlay =
+            UITextureFromFile("Content/Textures/UI/hurt_blood.png");
+        g_lowHealthBloodOverlay =
+            UITextureFromFile("Content/Textures/UI/low_health_blood.png");
         if (g_game.loading.Active() ||
             (g_insertionChoicePending && !g_deploymentPlanningVisible)) {
             RenderLoadingScreen();

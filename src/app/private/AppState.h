@@ -485,9 +485,38 @@ static float&               g_helicopterFireCooldown = g_game.vehicles.helicopte
 static float&               g_helicopterFireCycleTime = g_game.vehicles.helicopterFireCycleTime;
 static XMFLOAT3&            g_helicopterPosition = g_game.vehicles.helicopterPosition;
 static XMFLOAT3&            g_helicopterSpawn = g_game.vehicles.helicopterSpawn;
+static XMFLOAT3&            g_helicopterOrbitCenter =
+    g_game.vehicles.helicopterOrbitCenter;
+static XMFLOAT3&            g_helicopterVelocity = g_game.vehicles.helicopterVelocity;
+static float&               g_helicopterPlayerSightTime =
+    g_game.vehicles.helicopterPlayerSightTime;
 static XMFLOAT3&            g_secondaryHelicopterPosition =
     g_game.vehicles.secondaryHelicopterPosition;
+// Enemy gunship's nose-to-tail length in metres; ConfigureHelicopterBounds
+// scales the airframe to it whatever size the art was authored at. Everything
+// sized to the aircraft -- hit sphere, rotor reach, muzzle, wreck rest height,
+// damage smoke, searchlight -- follows kHelicopterSizeScale, so changing this
+// resizes the gunship as a whole.
+constexpr float             kHelicopterLength = 13.0f;
+// Those offsets were tuned on a 10 m airframe, so they are written as metres
+// at that size times this.
+constexpr float             kHelicopterSizeScale = kHelicopterLength / 10.0f;
+// Gun muzzle, ahead of and below the airframe centre.
+constexpr float             kHelicopterMuzzleForward = 3.75f * kHelicopterSizeScale;
+constexpr float             kHelicopterMuzzleDrop = 0.65f * kHelicopterSizeScale;
+// Hull hit sphere about the airframe centre.
+constexpr float             kHelicopterHitRadius = 5.0f * kHelicopterSizeScale;
+// Swept reach of the rotor discs, for the rotor kills.
+constexpr float             kHelicopterMainRotorReach = 4.75f * kHelicopterSizeScale;
+constexpr float             kHelicopterTailRotorReach = 1.10f * kHelicopterSizeScale;
+// Height of the centre above the ground once a wreck comes to rest. The wreck
+// lands at whatever roll the fall left it in, so this sits between the
+// half-height and the half-span rather than matching either.
+constexpr float             kHelicopterWreckRestHeight = 1.65f * kHelicopterSizeScale;
 constexpr float             kHelicopterPatrolRadius = 16.0f;
+// How far from a spotted player the gunship centres its patrol, on its own
+// side of them, rather than directly overhead.
+constexpr float             kHelicopterStandoffDistance = 20.0f;
 constexpr float             kHelicopterEngagementRange = 90.0f;
 static float&               g_secondaryHelicopterYaw = g_game.vehicles.secondaryHelicopterYaw;
 static float&               g_secondaryHelicopterPitch = g_game.vehicles.secondaryHelicopterPitch;

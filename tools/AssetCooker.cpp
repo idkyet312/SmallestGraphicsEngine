@@ -571,6 +571,11 @@ bool IsCookExcluded(const fs::path& path) {
     // it -- the model carries no embedded textures, so its cook saves 0 MB.
     if (generic.find("models/mainplayer/guns/r700/") != std::string::npos)
         return true;
+    // The Mi-24 source scripts/split-hind.py cuts the gunship from. Nothing
+    // loads it, but the cook list is per directory, so it would be cooked
+    // beside the parts: 24 4K textures, roughly 0.5 GB of BC for nothing.
+    if (generic.find("models/helihind2/mi-24v hind.glb") != std::string::npos)
+        return true;
     return false;
 }
 

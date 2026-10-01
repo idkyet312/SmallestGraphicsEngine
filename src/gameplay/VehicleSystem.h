@@ -271,6 +271,11 @@ struct VehicleSystem {
     float helicopterFireCycleTime = 0.0f;
     DirectX::XMFLOAT3 helicopterPosition{ 0.0f, 14.0f, 0.0f };
     DirectX::XMFLOAT3 helicopterSpawn{ 0.0f, 14.0f, 0.0f };
+    // Point the patrol circles. Starts at the spawn and slides to wherever the
+    // player was last seen.
+    DirectX::XMFLOAT3 helicopterOrbitCenter{ 0.0f, 14.0f, 0.0f };
+    DirectX::XMFLOAT3 helicopterVelocity{};
+    float helicopterPlayerSightTime = 0.0f;
     float helicopterHealth = HelicopterMaxHealth;
     bool helicopterDead = false;
     bool helicopterCrashed = false;
@@ -1674,10 +1679,12 @@ public:
         if (helicopterHealth > 0.0f) return result;
         helicopterDead = true;
         helicopterFireCooldown = 9999.0f;
+        // Plus the flight's own momentum: shot down mid-transit, it carries on
+        // along its path as it falls instead of stopping dead in the air.
         helicopterCrashVelocity = {
-            std::sin(helicopterYaw) * 2.2f,
+            std::sin(helicopterYaw) * 2.2f + helicopterVelocity.x,
             -0.8f,
-            std::cos(helicopterYaw) * 2.2f };
+            std::cos(helicopterYaw) * 2.2f + helicopterVelocity.z };
         result.destroyed = true;
         return result;
     }
@@ -1742,6 +1749,9 @@ public:
         helicopterFireCycleTime = 0.0f;
         helicopterPosition = { 0.0f, 14.0f, 0.0f };
         helicopterSpawn = helicopterPosition;
+        helicopterOrbitCenter = helicopterPosition;
+        helicopterVelocity = {};
+        helicopterPlayerSightTime = 0.0f;
         helicopterHealth = HelicopterMaxHealth;
         helicopterDead = false;
         helicopterCrashed = false;

@@ -80,7 +80,8 @@ static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
                                    float radius, XMFLOAT3& hit) {
     if (g_emptyLevelMode || !scene.showHelicopter ||
         !g_helicopterModel || dead) return false;
-    return HitSphereAtSegment(position, 5.0f, start, end, radius, hit);
+    return HitSphereAtSegment(position, kHelicopterHitRadius, start, end,
+                              radius, hit);
 }
 
 static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -380,10 +381,12 @@ static bool KillBanditsTouchingRotor(const std::shared_ptr<SceneNode>& rotor,
 static void UpdateHelicopterRotorKills() {
     if (!scene.showHelicopter) return;
     bool killed = KillBanditsTouchingRotor(
-        g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f,
+        g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0),
+        kHelicopterMainRotorReach,
         HelicopterWorldMatrix(), g_helicopterDead);
     killed |= KillBanditsTouchingRotor(
-        g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
+        g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0),
+        kHelicopterTailRotorReach,
         HelicopterWorldMatrix(), g_helicopterDead);
     if (SecondaryHelicopterPresent()) {
         // This craft's own rotor nodes -- they sit at a different angle than the
@@ -395,10 +398,10 @@ static void UpdateHelicopterRotorKills() {
             g_secondaryHelicopterTailRotorNode ? g_secondaryHelicopterTailRotorNode
                                                : g_helicopterTailRotorNode;
         killed |= KillBanditsTouchingRotor(
-            secondaryMain, XMVectorSet(0, 1, 0, 0), 4.75f,
+            secondaryMain, XMVectorSet(0, 1, 0, 0), kHelicopterMainRotorReach,
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
         killed |= KillBanditsTouchingRotor(
-            secondaryTail, XMVectorSet(1, 0, 0, 0), 1.10f,
+            secondaryTail, XMVectorSet(1, 0, 0, 0), kHelicopterTailRotorReach,
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
     }
     if (killed) PlayBanditDeathEvents();
@@ -424,9 +427,11 @@ static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
         const float radius = 0.35f + 0.95f * severity;
         const float intensity = 0.35f + 1.15f * severity;
         // Off the engine deck, just aft of the model origin.
-        const float backX = -std::sin(yaw) * 0.6f;
-        const float backZ = -std::cos(yaw) * 0.6f;
-        scene.SpawnSmokeBurst({ position.x + backX, position.y + 1.1f,
+        const float back = 0.6f * kHelicopterSizeScale;
+        const float backX = -std::sin(yaw) * back;
+        const float backZ = -std::cos(yaw) * back;
+        scene.SpawnSmokeBurst({ position.x + backX,
+                                position.y + 1.1f * kHelicopterSizeScale,
                                 position.z + backZ }, radius, intensity);
     };
 
@@ -557,12 +562,13 @@ static void UpdateHelicopter(float dt) {
             groundY = TerrainRendererDX12::HeightAt(
                 params, g_helicopterPosition.x, g_helicopterPosition.z);
         }
-        if (g_helicopterPosition.y <= groundY + 1.65f) {
-            g_helicopterPosition.y = groundY + 1.65f;
+        if (g_helicopterPosition.y <= groundY + kHelicopterWreckRestHeight) {
+            g_helicopterPosition.y = groundY + kHelicopterWreckRestHeight;
             g_helicopterCrashed = true;
             g_helicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
             scene.SpawnExplosionFX(
-                { g_helicopterPosition.x, g_helicopterPosition.y + 1.6f,
+                { g_helicopterPosition.x,
+                  g_helicopterPosition.y + 1.6f * kHelicopterSizeScale,
                   g_helicopterPosition.z }, 9.0f, 1.1f);
             scene.SpawnSmokeBurst(g_helicopterPosition, 2.8f, 3.0f);
             if (g_destruction.IsInitialized())
@@ -575,20 +581,56 @@ static void UpdateHelicopter(float dt) {
     }
     g_helicopterHoverTime += dt;
 
-    // Slow bounded patrol around spawn, with small independent hover drift.
-    // Horizontal distance never exceeds the configured patrol radius.
-    const float patrolPhase = g_helicopterHoverTime * 0.105f;
-    g_helicopterPosition.x =
-        g_helicopterSpawn.x +
-        std::sin(patrolPhase) * (kHelicopterPatrolRadius - 0.72f) +
-        std::sin(g_helicopterHoverTime * 0.31f) * 0.72f;
-    g_helicopterPosition.y = g_helicopterSpawn.y +
-        std::sin(g_helicopterHoverTime * 1.27f) * 0.26f +
-        std::sin(g_helicopterHoverTime * 0.43f) * 0.12f;
-    g_helicopterPosition.z =
-        g_helicopterSpawn.z +
-        std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
-        std::cos(g_helicopterHoverTime * 0.27f) * 0.55f;
+    // Slow bounded patrol around the orbit centre, with small independent hover
+    // drift. Horizontal distance never exceeds the configured patrol radius.
+    // This is only where the patrol WANTS the airframe -- the airframe flies
+    // after it below, so moving the centre reads as a flight, not a teleport.
+    auto patrolOffset = [](float t) {
+        const float phase = t * 0.105f;
+        return XMFLOAT3{
+            std::sin(phase) * (kHelicopterPatrolRadius - 0.72f) +
+                std::sin(t * 0.31f) * 0.72f,
+            std::sin(t * 1.27f) * 0.26f + std::sin(t * 0.43f) * 0.12f,
+            std::cos(phase) * (kHelicopterPatrolRadius * 0.68f) +
+                std::cos(t * 0.27f) * 0.55f };
+    };
+    const float stepDt = (std::max)(1e-4f, dt);
+    const XMFLOAT3 offsetNow = patrolOffset(g_helicopterHoverTime);
+    const XMFLOAT3 offsetPrev = patrolOffset(g_helicopterHoverTime - stepDt);
+    const XMVECTOR patrolPoint =
+        XMLoadFloat3(&g_helicopterOrbitCenter) + XMLoadFloat3(&offsetNow);
+    // Feed-forward of the orbit's own motion only. The centre jumping to a
+    // newly spotted player must not show up here as a huge target velocity.
+    const XMVECTOR patrolVelocity =
+        (XMLoadFloat3(&offsetNow) - XMLoadFloat3(&offsetPrev)) / stepDt;
+
+    // Arrive steering with a speed and acceleration cap: accelerates out,
+    // cruises, brakes in time to settle into the orbit without overshooting.
+    constexpr float kHelicopterMaxSpeed = 20.0f;   // m/s
+    constexpr float kHelicopterMaxAccel = 7.0f;    // m/s^2
+    const XMVECTOR position = XMLoadFloat3(&g_helicopterPosition);
+    const XMVECTOR oldVelocity = XMLoadFloat3(&g_helicopterVelocity);
+    const XMVECTOR toPatrol = patrolPoint - position;
+    const float patrolDistance = XMVectorGetX(XMVector3Length(toPatrol));
+    XMVECTOR desiredVelocity = patrolVelocity;
+    if (patrolDistance > 1e-3f) {
+        const float approachSpeed = (std::min)({ kHelicopterMaxSpeed,
+            std::sqrt(2.0f * kHelicopterMaxAccel * 0.6f * patrolDistance),
+            1.2f * patrolDistance });
+        desiredVelocity += toPatrol * (approachSpeed / patrolDistance);
+    }
+    XMVECTOR velocityChange = desiredVelocity - oldVelocity;
+    const float changeLength = XMVectorGetX(XMVector3Length(velocityChange));
+    const float maxChange = kHelicopterMaxAccel * stepDt;
+    if (changeLength > maxChange)
+        velocityChange *= maxChange / changeLength;
+    const XMVECTOR velocity = oldVelocity + velocityChange;
+    XMStoreFloat3(&g_helicopterVelocity, velocity);
+    XMStoreFloat3(&g_helicopterPosition, position + velocity * dt);
+    XMFLOAT3 flightVelocity;
+    XMStoreFloat3(&flightVelocity, velocity);
+    XMFLOAT3 flightAccel;
+    XMStoreFloat3(&flightAccel, velocityChange / stepDt);
 
     // The nose follows whatever the door gun is actually working on, not the
     // player unconditionally -- an airframe raking a squad while pointed at a
@@ -601,26 +643,142 @@ static void UpdateHelicopter(float dt) {
     const XMFLOAT3 gunForward{
         std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
     const XMFLOAT3 gunMuzzle{
-        g_helicopterPosition.x + gunForward.x * 3.75f,
-        g_helicopterPosition.y - 0.65f,
-        g_helicopterPosition.z + gunForward.z * 3.75f };
+        g_helicopterPosition.x + gunForward.x * kHelicopterMuzzleForward,
+        g_helicopterPosition.y - kHelicopterMuzzleDrop,
+        g_helicopterPosition.z + gunForward.z * kHelicopterMuzzleForward };
     const HelicopterGunTarget gunTarget = PickHelicopterGunTarget(gunMuzzle);
     const XMFLOAT3 facePoint =
         gunTarget.valid ? gunTarget.position : scene.camera.Position;
-    const float targetX = facePoint.x - g_helicopterPosition.x;
-    const float targetZ = facePoint.z - g_helicopterPosition.z;
-    const float desiredYaw = std::atan2(targetX, targetZ);
+    float faceX = facePoint.x - g_helicopterPosition.x;
+    float faceZ = facePoint.z - g_helicopterPosition.z;
+    // In transit the nose swings onto the flight path; back on the orbit it
+    // returns to the target. Blended on ground speed, so there is no snap.
+    const float groundSpeed = std::sqrt(flightVelocity.x * flightVelocity.x +
+                                        flightVelocity.z * flightVelocity.z);
+    const float transit = (std::min)(1.0f,
+        (std::max)(0.0f, (groundSpeed - 4.0f) / 8.0f));
+    if (transit > 0.0f) {
+        const float faceLength = std::sqrt(faceX * faceX + faceZ * faceZ);
+        const float faceScale = faceLength > 1e-3f ? 1.0f / faceLength : 0.0f;
+        faceX = faceX * faceScale * (1.0f - transit) +
+                flightVelocity.x / groundSpeed * transit;
+        faceZ = faceZ * faceScale * (1.0f - transit) +
+                flightVelocity.z / groundSpeed * transit;
+    }
+    const float desiredYaw = std::atan2(faceX, faceZ);
     const float yawDelta = std::atan2(
         std::sin(desiredYaw - g_helicopterYaw),
         std::cos(desiredYaw - g_helicopterYaw));
     const float yawLerp = 1.0f - std::exp(-1.65f * (std::max)(0.0f, dt));
     g_helicopterYaw += yawDelta * yawLerp;
-    const float desiredRoll = (std::max)(-0.10f, (std::min)(0.10f,
-        -yawDelta * 0.075f + std::sin(g_helicopterHoverTime * 0.71f) * 0.025f));
-    const float desiredPitch = std::sin(g_helicopterHoverTime * 0.47f) * 0.022f;
+
+    // A helicopter moves by tilting its rotor: nose down to go forward, nose up
+    // to flare and brake, rolled toward the side it slides or turns to. Tilt
+    // comes from velocity (holding against drag) plus acceleration.
+    // Left-handed, nose on local -Z: +pitch is nose up, +roll drops the right
+    // side. Right of the nose in world space is (cos yaw, 0, -sin yaw).
+    const float noseX = std::sin(g_helicopterYaw);
+    const float noseZ = std::cos(g_helicopterYaw);
+    const float forwardSpeed =
+        flightVelocity.x * noseX + flightVelocity.z * noseZ;
+    const float rightSpeed =
+        flightVelocity.x * noseZ - flightVelocity.z * noseX;
+    const float forwardAccel = flightAccel.x * noseX + flightAccel.z * noseZ;
+    const float rightAccel = flightAccel.x * noseZ - flightAccel.z * noseX;
+    const float desiredPitch = (std::max)(-0.30f, (std::min)(0.20f,
+        -(forwardSpeed * 0.012f + forwardAccel * 0.035f) +
+        std::sin(g_helicopterHoverTime * 0.47f) * 0.022f));
+    const float desiredRoll = (std::max)(-0.35f, (std::min)(0.35f,
+        rightSpeed * 0.012f + rightAccel * 0.035f +
+        std::sin(g_helicopterHoverTime * 0.71f) * 0.025f));
     const float attitudeLerp = 1.0f - std::exp(-2.4f * (std::max)(0.0f, dt));
     g_helicopterRoll += (desiredRoll - g_helicopterRoll) * attitudeLerp;
     g_helicopterPitch += (desiredPitch - g_helicopterPitch) * attitudeLerp;
+
+    // Spotting the player moves the patrol: the orbit centre jumps to a point
+    // kHelicopterStandoffDistance from the player, on the line from them to
+    // the airframe, and the airframe flies over to patrol there, then keeps
+    // holding off their last seen position after sight is lost. The bearing
+    // is re-read every frame, so it follows the airframe round rather than
+    // pinning it to the side it first approached from. Held at the spawn's
+    // clearance above the higher of the ground under the player and under the
+    // centre, so it neither dives into a valley floor nor clips a ridge.
+    //
+    // Only after a second of unbroken sight. DEPLOY parks the camera on the
+    // drop zone for a few frames before the insertion flight takes it, and a
+    // single-frame sighting there sent the airframe to the zone ahead of the
+    // player (measured with SGE_HELI_TRACE on Islandv10, zone 7).
+    const bool seesPlayer = gunTarget.valid && gunTarget.isPlayer &&
+                            !DeploymentPlanningActive();
+    g_helicopterPlayerSightTime = seesPlayer
+        ? g_helicopterPlayerSightTime + (std::max)(0.0f, dt) : 0.0f;
+    if (seesPlayer && g_helicopterPlayerSightTime >= 1.0f) {
+        auto groundAt = [](float x, float z) {
+            if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+            auto params = CurrentTerrainParams();
+            params.heightScale = scene.terrainHeightScale;
+            return TerrainRendererDX12::HeightAt(params, x, z);
+        };
+        const float clearance = (std::max)(6.0f,
+            g_helicopterSpawn.y - groundAt(g_helicopterSpawn.x, g_helicopterSpawn.z));
+        const XMFLOAT3& player = gunTarget.position;
+        // Player -> airframe on the ground plane. Directly overhead that has no
+        // direction, so keep the side the centre is already on, and failing
+        // that the side behind the nose (which faces the player).
+        float awayX = g_helicopterPosition.x - player.x;
+        float awayZ = g_helicopterPosition.z - player.z;
+        if (awayX * awayX + awayZ * awayZ < 1.0f) {
+            awayX = g_helicopterOrbitCenter.x - player.x;
+            awayZ = g_helicopterOrbitCenter.z - player.z;
+        }
+        if (awayX * awayX + awayZ * awayZ < 1.0f) {
+            awayX = -std::sin(g_helicopterYaw);
+            awayZ = -std::cos(g_helicopterYaw);
+        }
+        const float awayLength = std::sqrt(awayX * awayX + awayZ * awayZ);
+        const float centreX =
+            player.x + awayX / awayLength * kHelicopterStandoffDistance;
+        const float centreZ =
+            player.z + awayZ / awayLength * kHelicopterStandoffDistance;
+        const float groundY = (std::max)(groundAt(player.x, player.z),
+                                         groundAt(centreX, centreZ));
+        g_helicopterOrbitCenter = {
+            centreX,
+            (std::max)(groundY + clearance, player.y + 6.0f),
+            centreZ };
+    }
+
+    // SGE_HELI_TRACE=1 logs the flight four times a second to
+    // logs/heli_trace.log, so the relocation can be read as numbers.
+    static FILE* heliTrace = [] {
+        FILE* file = nullptr;
+        if (GetEnvironmentVariableA("SGE_HELI_TRACE", nullptr, 0) > 0)
+            fopen_s(&file, "logs/heli_trace.log", "w");
+        if (file) std::fprintf(file,
+            "t pos.x pos.y pos.z ctr.x ctr.y ctr.z speed yaw pitch roll "
+            "seesPlayer planning player.x player.y player.z\n");
+        return file;
+    }();
+    static float heliTraceTimer = 0.0f;
+    heliTraceTimer += dt;
+    // Every frame for the first second: the deploy hand-off lasts frames.
+    if (heliTrace &&
+        (heliTraceTimer >= 0.25f || g_helicopterHoverTime < 1.0f)) {
+        heliTraceTimer = 0.0f;
+        std::fprintf(heliTrace,
+            "%.2f %.1f %.1f %.1f %.1f %.1f %.1f %.2f %.3f %.3f %.3f %d %d "
+            "%.1f %.1f %.1f\n",
+            g_helicopterHoverTime, g_helicopterPosition.x,
+            g_helicopterPosition.y, g_helicopterPosition.z,
+            g_helicopterOrbitCenter.x, g_helicopterOrbitCenter.y,
+            g_helicopterOrbitCenter.z,
+            XMVectorGetX(XMVector3Length(velocity)), g_helicopterYaw,
+            g_helicopterPitch, g_helicopterRoll,
+            gunTarget.valid && gunTarget.isPlayer ? 1 : 0,
+            DeploymentPlanningActive() ? 1 : 0, scene.camera.Position.x,
+            scene.camera.Position.y, scene.camera.Position.z);
+        std::fflush(heliTrace);
+    }
 
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
@@ -1121,13 +1279,15 @@ static void UpdateSecondaryHelicopter(float dt) {
                 params, g_secondaryHelicopterPosition.x,
                 g_secondaryHelicopterPosition.z);
         }
-        if (g_secondaryHelicopterPosition.y <= groundY + 1.65f) {
-            g_secondaryHelicopterPosition.y = groundY + 1.65f;
+        if (g_secondaryHelicopterPosition.y <=
+                groundY + kHelicopterWreckRestHeight) {
+            g_secondaryHelicopterPosition.y =
+                groundY + kHelicopterWreckRestHeight;
             g_secondaryHelicopterCrashed = true;
             g_secondaryHelicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
             scene.SpawnExplosionFX(
                 { g_secondaryHelicopterPosition.x,
-                  g_secondaryHelicopterPosition.y + 1.6f,
+                  g_secondaryHelicopterPosition.y + 1.6f * kHelicopterSizeScale,
                   g_secondaryHelicopterPosition.z }, 9.0f, 1.1f);
             scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 2.8f, 3.0f);
             if (g_destruction.IsInitialized())
@@ -1159,9 +1319,11 @@ static void UpdateSecondaryHelicopter(float dt) {
         std::sin(g_secondaryHelicopterYaw), 0.0f,
         std::cos(g_secondaryHelicopterYaw) };
     const XMFLOAT3 gunMuzzle{
-        g_secondaryHelicopterPosition.x + gunForward.x * 3.75f,
-        g_secondaryHelicopterPosition.y - 0.65f,
-        g_secondaryHelicopterPosition.z + gunForward.z * 3.75f };
+        g_secondaryHelicopterPosition.x +
+            gunForward.x * kHelicopterMuzzleForward,
+        g_secondaryHelicopterPosition.y - kHelicopterMuzzleDrop,
+        g_secondaryHelicopterPosition.z +
+            gunForward.z * kHelicopterMuzzleForward };
     const HelicopterGunTarget gunTarget = PickHelicopterGunTarget(gunMuzzle);
     const XMFLOAT3 facePoint =
         gunTarget.valid ? gunTarget.position : scene.camera.Position;

@@ -188,9 +188,9 @@ XMFLOAT3 PrimaryHelicopterWeaponAimPoint() {
     const XMFLOAT3 forward{
         std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
     const XMFLOAT3 muzzle{
-        g_helicopterPosition.x + forward.x * 3.75f,
-        g_helicopterPosition.y - 0.65f,
-        g_helicopterPosition.z + forward.z * 3.75f };
+        g_helicopterPosition.x + forward.x * kHelicopterMuzzleForward,
+        g_helicopterPosition.y - kHelicopterMuzzleDrop,
+        g_helicopterPosition.z + forward.z * kHelicopterMuzzleForward };
     return LeadTargetPoint(
         muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
 }
@@ -200,9 +200,11 @@ XMFLOAT3 SecondaryHelicopterWeaponAimPoint() {
         std::sin(g_secondaryHelicopterYaw), 0.0f,
         std::cos(g_secondaryHelicopterYaw) };
     const XMFLOAT3 muzzle{
-        g_secondaryHelicopterPosition.x + forward.x * 3.75f,
-        g_secondaryHelicopterPosition.y - 0.65f,
-        g_secondaryHelicopterPosition.z + forward.z * 3.75f };
+        g_secondaryHelicopterPosition.x +
+            forward.x * kHelicopterMuzzleForward,
+        g_secondaryHelicopterPosition.y - kHelicopterMuzzleDrop,
+        g_secondaryHelicopterPosition.z +
+            forward.z * kHelicopterMuzzleForward };
     return LeadTargetPoint(
         muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
 }
@@ -232,6 +234,9 @@ bool SecondaryHelicopterVisible() {
 bool PrimaryHelicopterDestroyed() { return g_helicopterDead; }
 bool SecondaryHelicopterDestroyed() { return g_secondaryHelicopterDead; }
 
+XMFLOAT3 HelicopterModelCentre() { return g_helicopterModelCenter; }
+float HelicopterSizeScale() { return kHelicopterSizeScale; }
+
 static void ConfigureHelicopterBounds() {
     if (!g_helicopterModel || !g_helicopterModel->mesh) return;
     XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
@@ -253,7 +258,7 @@ static void ConfigureHelicopterBounds() {
         (minimum.x + maximum.x) * 0.5f,
         (minimum.y + maximum.y) * 0.5f,
         (minimum.z + maximum.z) * 0.5f };
-    g_helicopterModelScale = 10.0f / horizontalLength;
+    g_helicopterModelScale = kHelicopterLength / horizontalLength;
 }
 
 XMMATRIX BlackHawkWorldMatrix() {

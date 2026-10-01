@@ -2637,6 +2637,16 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         autoSquad = std::strcmp(autoRole, "squad") == 0 && !client &&
                     MultiplayerActive();
         if (autoDeploy || autoSquad) {
+            // SGE_AUTO_DEPLOY_ZONE=N picks zone N, numbered as the screen
+            // shows them (from 1).
+            char zoneText[16] = {};
+            if (GetEnvironmentVariableA("SGE_AUTO_DEPLOY_ZONE", zoneText,
+                                        sizeof(zoneText)) > 0) {
+                const int zone = std::atoi(zoneText) - 1;
+                if (zone >= 0 &&
+                    zone < static_cast<int>(g_deploymentZones.size()))
+                    g_selectedDeploymentZone = zone;
+            }
             if (g_selectedDeploymentZone < 0) g_selectedDeploymentZone = 0;
             autoDeployed = true;
             SGE_LOG("LogGameplay", EngineLog::Level::Display,

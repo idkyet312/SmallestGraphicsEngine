@@ -999,9 +999,9 @@ struct Scene {
     // Keep the legacy path behind the toggle for A/B diagnosis, but use the
     // distance-stable linear test by default.
     bool  contactShadowLinearDepth = true;
-    // Accumulate directional GTAO through motion/depth/normal history. Off by
-    // default so the established single-frame path remains the baseline.
-    bool  temporalBentNormalGTAO = false;
+    // Accumulate directional GTAO through motion/depth/normal history. On by
+    // default; the editor toggle keeps the single-frame path for A/B.
+    bool  temporalBentNormalGTAO = true;
     // A/B switch for the GTAO/contact-shadow arithmetic optimizations: hoisted
     // loop invariants, multiply chains in place of pow(), and rsqrt-based
     // distance math. Both variants are compiled from the same source behind

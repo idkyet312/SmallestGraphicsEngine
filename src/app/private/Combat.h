@@ -956,9 +956,9 @@ static void ApplyBarrelBlastToHostTargets(const XMFLOAT3& center,
         const float hy = g_helicopterPosition.y - center.y;
         const float hz = g_helicopterPosition.z - center.z;
         const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
-        // Hull hit-sphere is ~5 m, so a barrel bursting on the hull
-        // registers as a near-full-strength hit.
-        const float reach = 11.5f;
+        // The blast's 6.5 m on top of the hull hit-sphere, so a barrel
+        // bursting on the hull registers as a near-full-strength hit.
+        const float reach = kHelicopterHitRadius + 6.5f;
         if (distance < reach)
             ReportBarrelHelicopterDamage(
                 0, 120.0f * (1.0f - distance / reach),
@@ -970,7 +970,7 @@ static void ApplyBarrelBlastToHostTargets(const XMFLOAT3& center,
         const float hy = g_secondaryHelicopterPosition.y - center.y;
         const float hz = g_secondaryHelicopterPosition.z - center.z;
         const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
-        const float reach = 11.5f;
+        const float reach = kHelicopterHitRadius + 6.5f;
         if (distance < reach)
             ReportBarrelHelicopterDamage(
                 1, 120.0f * (1.0f - distance / reach),

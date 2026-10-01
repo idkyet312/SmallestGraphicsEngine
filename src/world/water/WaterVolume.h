@@ -400,6 +400,9 @@ public:
     XMFLOAT3 GetExtents() const { return m_extents; }
     float    GetSurfaceY() const { return m_surfaceY; }
     float    GetTime() const { return m_time; }
+    // Capture harness only: freeze the wave clock so two frames differ by
+    // nothing but what the test changes.
+    void     PinTime(float time) { m_time = time; }
     bool     IsInitialized() const { return m_meshReady || !B3_IS_NULL(m_world); }
 
     void ResetSurface() {

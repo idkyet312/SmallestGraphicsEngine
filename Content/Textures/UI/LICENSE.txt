@@ -13,3 +13,16 @@ taken as part of that person's official duties; as a work of the U.S.
 federal government it carries no copyright in the United States. No
 attribution required and no restriction on commercial use -- this file
 records the provenance rather than satisfying a licence condition.
+
+Hurt and low-health blood overlays.
+
+  hurt_blood.png        (Health_Acrylic_05.png, unchanged)
+  low_health_blood.png  (Health_Brush_3_1.png, scaled to 960x540)
+
+Source: "Health Overlay Images" by GreyFrogGames, OpenGameArt.
+https://opengameart.org/content/health-overlay-images
+https://opengameart.org/sites/default/files/health_overlay_gfg.zip
+
+License: Creative Commons Zero v1.0 Universal (CC0).
+https://creativecommons.org/publicdomain/zero/1.0/
+No attribution required.

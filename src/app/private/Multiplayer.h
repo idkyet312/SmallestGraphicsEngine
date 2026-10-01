@@ -752,6 +752,8 @@ static void PublishHostVehicles() {
     primary.y = vehicles.helicopterPosition.y;
     primary.z = vehicles.helicopterPosition.z;
     primary.yaw = vehicles.helicopterYaw;
+    primary.pitch = vehicles.helicopterPitch;
+    primary.roll = vehicles.helicopterRoll;
     primary.health = vehicles.helicopterHealth;
 
     net::EnemyHelicopterState& secondary = state[1];
@@ -803,6 +805,10 @@ static void ApplyNetworkEnemyHelicopters() {
     const net::EnemyHelicopterState& primary = state[0];
     vehicles.helicopterPosition = { primary.x, primary.y, primary.z };
     vehicles.helicopterYaw = primary.yaw;
+    // The tilt now carries the flight (nose down in transit, banked turns), so
+    // a client must take it from the host, not from its own local guess.
+    vehicles.helicopterPitch = primary.pitch;
+    vehicles.helicopterRoll = primary.roll;
     vehicles.helicopterHealth = primary.health;
     vehicles.helicopterDead = primary.dead;
     vehicles.helicopterCrashed = primary.crashed;

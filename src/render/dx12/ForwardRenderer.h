@@ -519,6 +519,11 @@ bool SecondaryHelicopterVisible();
 // through its fall and as a wreck afterwards, so the *Visible tests stay true.
 bool PrimaryHelicopterDestroyed();
 bool SecondaryHelicopterDestroyed();
+// Model-space centre of the gunship airframe, which the world matrices above
+// place at the aircraft's position. Their translation row is the model origin.
+DirectX::XMFLOAT3 HelicopterModelCentre();
+// Airframe length over the 10 m its offsets were tuned at (kHelicopterSizeScale).
+float HelicopterSizeScale();
 
 struct HelicopterSearchlightTracking {
     DirectX::XMFLOAT3 direction = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
@@ -594,28 +599,39 @@ inline int AddHelicopterSearchlight(
         HelicopterSearchlightTracking& tracking, float deltaTime) {
     if (scene.clusteredRenderer.lights.size() >= 64) return 0;
 
-    const XMVECTOR forward = XMVector3Normalize(body.r[2]);
+    // HelicopterWorldMatrix turns the model by yaw + PI, so the nose (model -Z)
+    // is -r[2]; r[2] is the tail. And r[3] is the model origin, which sits
+    // wherever the art put it -- the offsets below are from the airframe's
+    // centre. Measured on the Mi-24, r[2] and r[3] together put the lamp inside
+    // the tail boom. The OH-1's bounds were symmetric about its centre, so on
+    // that airframe the tail-side lamp happened to land in open air.
+    const XMVECTOR forward = XMVectorNegate(XMVector3Normalize(body.r[2]));
     const XMVECTOR up = XMVector3Normalize(body.r[1]);
-    const XMVECTOR origin = body.r[3];
+    const XMFLOAT3 modelCentre = HelicopterModelCentre();
+    const XMVECTOR origin =
+        XMVector3TransformCoord(XMLoadFloat3(&modelCentre), body);
 
     // Ahead of the nose and clear of the belly, so the lamp lights the ground
     // rather than the fuselage it is bolted to. Both offsets follow the
     // aircraft basis, so they stay put as it banks.
     //
-    // The numbers come from the OH-1's measured bounds. ConfigureHelicopterBounds
-    // normalises the longest horizontal axis to 10 m about the model centre, which
-    // puts the nose 5.0 m along forward and the belly skin at -0.85 m on up. A lamp
-    // inside those bounds sits in solid geometry: the shadow frustum then starts
-    // within the hull, the hull occludes its own beam, and the cone reads as dead
-    // from below -- the helicopter blocking its own light.
+    // The numbers come from the Mi-24's measured bounds, at the 10 m length its
+    // offsets are written for. ConfigureHelicopterBounds scales the longest
+    // horizontal axis to that length about the model centre, which puts the
+    // nose 5.0 m along forward and the lowest point -- the chin, right under
+    // the nose -- at -1.23 m on up. A lamp inside those bounds sits in solid
+    // geometry: the shadow frustum then starts within the hull, the hull
+    // occludes its own beam, and the cone reads as dead from below -- the
+    // helicopter blocking its own light.
     //
-    // 5.6 m clears the 5.0 m nose by 0.6 m; 1.35 m clears the -0.85 m belly by
-    // 0.5 m. Keep both offsets outside those extents if the airframe is ever
-    // swapped or rescaled.
+    // 5.6 m clears the 5.0 m nose by 0.6 m; 1.75 m clears the -1.23 m chin by
+    // 0.5 m. Both scale with the airframe. Keep them outside those extents if
+    // the airframe is ever swapped.
+    const float size = HelicopterSizeScale();
     const XMVECTOR lamp = XMVectorAdd(
         origin,
-        XMVectorAdd(XMVectorScale(forward, 5.6f),
-                    XMVectorScale(up, -1.35f)));
+        XMVectorAdd(XMVectorScale(forward, 5.6f * size),
+                    XMVectorScale(up, -1.75f * size)));
     // Track the player directly rather than inheriting the gun's velocity lead.
     // This keeps the searchlight readable as a deliberate sweep while the
     // projectiles remain free to lead a running target.

@@ -311,6 +311,9 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
                               helicopter.position[1],
                               helicopter.position[2] };
         g_helicopterPosition = g_helicopterSpawn;
+        g_helicopterOrbitCenter = g_helicopterSpawn;
+        g_helicopterVelocity = { 0.0f, 0.0f, 0.0f };
+        g_helicopterPlayerSightTime = 0.0f;
         g_helicopterLevelScale = helicopter.scale[0];
         g_helicopterYaw = XMConvertToRadians(helicopter.rotation[1]);
         scene.showHelicopter = true;
