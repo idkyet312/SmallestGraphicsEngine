@@ -31,6 +31,10 @@ struct DLSSFrameInputs {
     ID3D12Resource* specularAlbedo = nullptr;
     ID3D12Resource* specularHitDistance = nullptr;
     bool rayReconstruction = false;
+    // The resolve strips jitter from the motion vectors whenever RR was
+    // requested for the frame. Set on a Super Resolution fallback after a
+    // failed RR evaluate, so DLSS is not told those vectors carry jitter.
+    bool motionUnjittered = false;
     UINT width = 0;
     UINT height = 0;
     UINT outputWidth = 0;

@@ -2289,6 +2289,46 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
 }
 
 // Render the whole scene using the forward clustered path
+// Trims a tracer streak [tail, tail + dir * len] so no part lies within
+// `radius` of the eye. A round flying at the camera, or the player's own on its
+// first frame (previousPosition == muzzle, so the minimum streak reaches back
+// through the head), is seen end-on there: its box cross-section filled a big
+// part of the screen as a solid red or orange square. Keeps the longer piece
+// either side of the eye; false when nothing is left.
+inline bool ClipStreakAwayFromEye(XMVECTOR& tail, XMVECTOR dir, float& len,
+                                  XMVECTOR eye, float radius) {
+    const XMVECTOR toTail = tail - eye;
+    const float b = XMVectorGetX(XMVector3Dot(dir, toTail));
+    const float c = XMVectorGetX(XMVector3Dot(toTail, toTail)) - radius * radius;
+    const float disc = b * b - c;
+    if (disc <= 0.0f) return true;
+    const float root = sqrtf(disc);
+    const float enter = -b - root;
+    const float exit = -b + root;
+    if (exit <= 0.0f || enter >= len) return true;
+    const float before = (std::max)(0.0f, enter);
+    const float after = (std::max)(0.0f, len - exit);
+    if (before >= after) {
+        len = before;
+    } else {
+        tail = tail + dir * exit;
+        len = after;
+    }
+    return len > 0.05f;
+}
+
+// Half-width a streak may have so its nearest point to the eye stays within
+// `maxHalfAngle` radians. A box has one cross-section along its whole length,
+// so a round passing a metre or two from the head drew a beam that widened
+// into a screen-filling frustum at its near end.
+inline float CapStreakHalfWidth(float halfWidth, XMVECTOR tail, XMVECTOR dir,
+                                float len, XMVECTOR eye, float maxHalfAngle) {
+    const float along = (std::min)(len, (std::max)(0.0f,
+        XMVectorGetX(XMVector3Dot(eye - tail, dir))));
+    const float nearest = XMVectorGetX(XMVector3Length(tail + dir * along - eye));
+    return (std::min)(halfWidth, nearest * maxHalfAngle);
+}
+
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
                            const std::vector<PrefabRenderBatch>& prefabRenderBatches,
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
@@ -3415,6 +3455,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // meshlet SRVs bound. Procedural projectiles use the input assembler; without
     // this restore a grenade can execute the last rotor mesh state instead.
     shader.Use(scene.wireframeMode);
+    // Eye of whatever camera this pass draws for (the scope view reuses it).
+    const XMVECTOR tracerEye = XMMatrixInverse(nullptr, view).r[3];
+    constexpr float kTracerEyeClearance = 1.5f;
+    // ~3 px half-width at 1080p / 60 degree FOV, at the streak's nearest point.
+    constexpr float kTracerMaxHalfAngle = 0.003f;
     for (auto& p : scene.projectiles) {
         if (!p.active) continue;
         if (p.laser) continue; // laser owns its full-length beam above
@@ -3621,8 +3666,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const XMVECTOR current = XMLoadFloat3(&p.position);
         const XMVECTOR previous = XMLoadFloat3(&p.previousPosition);
         const float moved = XMVectorGetX(XMVector3Length(current - previous));
-        const float len = (std::min)(5.0f, (std::max)(1.2f, moved));
-        const XMVECTOR center = current - fwd * (len * 0.5f);
+        float len = (std::min)(5.0f, (std::max)(1.2f, moved));
+        XMVECTOR tail = current - fwd * len;
+        if (!ClipStreakAwayFromEye(tail, fwd, len, tracerEye,
+                                   kTracerEyeClearance))
+            continue;
+        const XMVECTOR center = tail + fwd * (len * 0.5f);
 
         XMMATRIX basis = XMMatrixIdentity();
         basis.r[0] = XMVectorSetW(right, 0.0f);
@@ -3633,7 +3682,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // Warm translucent envelope first, then a needle-thin white-hot core.
         // Additive unlit passes stay bright in shadow and stop looking like an
         // orange physical box tumbling through the scene.
-        const float haloR = (std::max)(0.012f, scene.projectileScale * 0.16f);
+        const float haloR = CapStreakHalfWidth(
+            (std::max)(0.012f, scene.projectileScale * 0.16f), tail, fwd, len,
+            tracerEye, kTracerMaxHalfAngle);
         shader.UseAdditive();
         model = XMMatrixScaling(haloR * 2.0f, haloR * 2.0f, len) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
@@ -3677,9 +3728,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // readable, so the same rule would draw a 2 m stub. Clipped to how far
         // the tracer has actually gone, so it emerges from the muzzle rather
         // than starting 7 m behind the gun.
-        const float len = (std::min)(RemoteTracerFX::kLength,
-                                     (std::max)(0.6f, tracer.distance));
-        const XMVECTOR center = head - fwd * (len * 0.5f);
+        float len = (std::min)(RemoteTracerFX::kLength,
+                               (std::max)(0.6f, tracer.distance));
+        XMVECTOR tail = head - fwd * len;
+        if (!ClipStreakAwayFromEye(tail, fwd, len, tracerEye,
+                                   kTracerEyeClearance))
+            continue;
+        const XMVECTOR center = tail + fwd * (len * 0.5f);
 
         XMMATRIX tracerBasis = XMMatrixIdentity();
         tracerBasis.r[0] = XMVectorSetW(right, 0.0f);
@@ -3707,9 +3762,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const XMVECTOR toCamera = XMLoadFloat3(&scene.camera.Position) - center;
         const float cameraDistance =
             XMVectorGetX(XMVector3Length(toCamera));
-        const float haloR = (std::max)(
+        const float haloR = CapStreakHalfWidth((std::max)(
             (std::max)(0.008f, scene.projectileScale * 0.10f),
-            cameraDistance * 0.0026f);
+            cameraDistance * 0.0026f), tail, fwd, len, tracerEye,
+            kTracerMaxHalfAngle);
         // Hostile fire is red, friendly orange. Same geometry and the same
         // brightness either way -- only the hue carries the distinction, so an
         // enemy streak is no more or less visible than an ally's.

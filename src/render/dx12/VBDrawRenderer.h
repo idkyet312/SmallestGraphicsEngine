@@ -856,6 +856,17 @@ struct VBViewDrawState {
     std::vector<UINT> dcIDs;
     std::vector<VBDrawItem> registeredItems;
     std::vector<UINT> directDraws;
+    // What the last raster recorded, so ReplayVBDepth can re-issue it.
+    bool replayValid = false;
+    UINT culledCount = 0;
+    UINT doubleSidedCount = 0;
+    bool useBindlessVisPass = false;
+    D3D12_GPU_VIRTUAL_ADDRESS frameMatrixCBV = 0;
+    bool terrainDrawn = false;
+    TerrainRendererDX12::Params terrainParams = {};
+    XMMATRIX view = XMMatrixIdentity();
+    XMMATRIX proj = XMMatrixIdentity();
+    XMMATRIX lightSpace = XMMatrixIdentity();
 };
 
 // Slot 0 is the main view, slot 1 the scope. Indexed rather than passed so the
@@ -863,6 +874,56 @@ struct VBViewDrawState {
 inline VBViewDrawState& VBDrawStateForView(UINT viewSlot) {
     static VBViewDrawState states[2];
     return states[viewSlot < 2 ? viewSlot : 0];
+}
+
+// Draws the visibility-pass items that are not in an indirect stream
+// (alpha-cutout, unindexed, or overflow). Shared by the raster and its replay.
+inline void RecordVBDirectDraws(VisibilityBufferDX12& vb,
+                                const GeometryBuffers& geo,
+                                const std::vector<VBDrawItem>& drawItems,
+                                const std::vector<UINT>& dcIDs,
+                                const std::vector<UINT>& directDraws,
+                                D3D12_GPU_VIRTUAL_ADDRESS frameMatrixCBV) {
+    // ExecuteIndirect clears the root arguments it changes. Direct draws share
+    // this frame CBV, so restore it after the indirect batches reset slot 0.
+    if (!directDraws.empty())
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
+    for (UINT i : directDraws) {
+            D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
+                ? drawItems[i].primitive->vbv
+                : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
+            // A null vertex address is a GPU page fault at VA 0 on the draw
+            // below, which surfaces only as DXGI_ERROR_DEVICE_HUNG with a DRED
+            // breadcrumb -- no CPU stack, no D3D debug error. Name the offender
+            // on the CPU side and skip it rather than losing the device.
+            if (vbv.BufferLocation == 0 || vbv.SizeInBytes == 0) {
+                static int loggedNullVBV = 0;
+                if (loggedNullVBV < 8) {
+                    ++loggedNullVBV;
+                    SGE_LOG("LogRender", EngineLog::Level::Warning,
+                        "VB direct draw skipped: null vertex buffer (item " +
+                        std::to_string(i) + ", primitive=" +
+                        (drawItems[i].primitive ? "yes" : "no") + ", isCube=" +
+                        (drawItems[i].isCube ? "yes" : "no") + ")");
+                }
+                continue;
+            }
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+            vb.SetVisPassDraw(g_dx12.commandList.Get(), dcIDs[i],
+                drawItems[i].materialId, drawItems[i].doubleSided,
+                drawItems[i].alphaCutout, drawItems[i].alphaFromLuminance);
+            if (drawItems[i].primitive &&
+                drawItems[i].primitive->ibv.BufferLocation != 0) {
+                g_dx12.commandList->IASetIndexBuffer(&drawItems[i].primitive->ibv);
+                g_dx12.commandList->DrawIndexedInstanced(
+                    drawItems[i].primitive->indexCount, 1, 0, 0, 0);
+            } else {
+                const UINT vertexCount = drawItems[i].primitive
+                    ? static_cast<UINT>(drawItems[i].primitive->vertices.size() / 12)
+                    : (drawItems[i].isCube ? 36u : 6u);
+                g_dx12.commandList->DrawInstanced(vertexCount, 1, 0, 0);
+            }
+    }
 }
 
 inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
@@ -1098,46 +1159,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         gpuDoubleSided.Execute(g_dx12.commandList.Get(), doubleSidedCount,
             useBindlessVisPass);
     }
-    // ExecuteIndirect clears the root arguments it changes. Direct draws share
-    // this frame CBV, so restore it after the indirect batches reset slot 0.
-    if (!directDraws.empty())
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
-    for (UINT i : directDraws) {
-            D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
-                ? drawItems[i].primitive->vbv
-                : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
-            // A null vertex address is a GPU page fault at VA 0 on the draw
-            // below, which surfaces only as DXGI_ERROR_DEVICE_HUNG with a DRED
-            // breadcrumb -- no CPU stack, no D3D debug error. Name the offender
-            // on the CPU side and skip it rather than losing the device.
-            if (vbv.BufferLocation == 0 || vbv.SizeInBytes == 0) {
-                static int loggedNullVBV = 0;
-                if (loggedNullVBV < 8) {
-                    ++loggedNullVBV;
-                    SGE_LOG("LogRender", EngineLog::Level::Warning,
-                        "VB direct draw skipped: null vertex buffer (item " +
-                        std::to_string(i) + ", primitive=" +
-                        (drawItems[i].primitive ? "yes" : "no") + ", isCube=" +
-                        (drawItems[i].isCube ? "yes" : "no") + ")");
-                }
-                continue;
-            }
-            g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
-            vb.SetVisPassDraw(g_dx12.commandList.Get(), dcIDs[i],
-                drawItems[i].materialId, drawItems[i].doubleSided,
-                drawItems[i].alphaCutout, drawItems[i].alphaFromLuminance);
-            if (drawItems[i].primitive &&
-                drawItems[i].primitive->ibv.BufferLocation != 0) {
-                g_dx12.commandList->IASetIndexBuffer(&drawItems[i].primitive->ibv);
-                g_dx12.commandList->DrawIndexedInstanced(
-                    drawItems[i].primitive->indexCount, 1, 0, 0, 0);
-            } else {
-                const UINT vertexCount = drawItems[i].primitive
-                    ? static_cast<UINT>(drawItems[i].primitive->vertices.size() / 12)
-                    : (drawItems[i].isCube ? 36u : 6u);
-                g_dx12.commandList->DrawInstanced(vertexCount, 1, 0, 0);
-            }
-    }
+    RecordVBDirectDraws(vb, geo, drawItems, dcIDs, directDraws, frameMatrixCBV);
 
     // Terrain rasterizes into the visibility buffer before the pass ends, using
     // the same amplification/mesh shaders the forward path uses -- so the
@@ -1200,8 +1222,10 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
             shader.SetCamera(scene.camera.VisualPosition());
             vb.SetTerrainProjection(proj);
-            if (g_terrain.DrawVisibility(shader, terrainParams))
+            if (g_terrain.DrawVisibility(shader, terrainParams)) {
                 vb.terrainVisibilityActiveThisFrame = true;
+                viewState.terrainParams = terrainParams;
+            }
             // SetMatrices writes the shader's current per-draw upload slot.
             // Keep later forward-extension draws from overwriting that memory
             // before this command list executes; a destruction chunk transform
@@ -1248,6 +1272,15 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
+    viewState.replayValid = true;
+    viewState.culledCount = culledCount;
+    viewState.doubleSidedCount = doubleSidedCount;
+    viewState.useBindlessVisPass = useBindlessVisPass;
+    viewState.frameMatrixCBV = frameMatrixCBV;
+    viewState.terrainDrawn = vb.terrainVisibilityActiveThisFrame;
+    viewState.view = view;
+    viewState.proj = proj;
+    viewState.lightSpace = lightSpace;
     }
 
     // Lighting setup
@@ -1362,6 +1395,53 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // where the copy expects them.
     if (isScopeView)
         vb.EndForwardExtensions(g_dx12.commandList.Get());
+}
+
+// Re-rasterises this frame's main-view visibility draws into the depth buffer
+// without the camera jitter, after RR has consumed the jittered one. See
+// VisibilityBufferDX12::BeginDepthReplay for why. Same culled streams, same
+// matrices, same terrain params: only the viewport moves. Call between
+// EndForwardExtensions and BeginForwardExtensions.
+//
+// replayTerrain: redraw terrain too. It fixes terrain silhouettes (measured
+// horizon band 0.84 -> 0.55 on BigIsland) but costs a whole terrain raster
+// (0.18 ms there, 1.39 ms on Base); when false, terrain is seeded from the
+// visibility pass's depth by a fullscreen pass instead.
+inline bool ReplayVBDepth(Scene& scene, ShaderDX12& shader,
+                          VisibilityBufferDX12& vb, const GeometryBuffers& geo,
+                          const XMFLOAT2& jitterPixels, bool replayTerrain) {
+    VBViewDrawState& state = VBDrawStateForView(0);
+    if (!state.replayValid) return false;
+    ID3D12GraphicsCommandList* cmd = g_dx12.commandList.Get();
+    bool terrainSeeded = false;
+    if (!vb.BeginDepthReplay(cmd, jitterPixels,
+                             state.terrainDrawn && !replayTerrain,
+                             terrainSeeded))
+        return false;
+    cmd->SetGraphicsRootConstantBufferView(0, state.frameMatrixCBV);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (state.culledCount > 0) {
+        vb.SetVisPassDraw(cmd, 0, 0, false, false, false);
+        state.gpuCulled.Execute(cmd, state.culledCount,
+                                state.useBindlessVisPass);
+    }
+    if (state.doubleSidedCount > 0) {
+        vb.SetVisPassDraw(cmd, 0, 0, true, false, false);
+        state.gpuDoubleSided.Execute(cmd, state.doubleSidedCount,
+                                     state.useBindlessVisPass);
+    }
+    RecordVBDirectDraws(vb, geo, state.drawItems, state.dcIDs,
+                        state.directDraws, state.frameMatrixCBV);
+    if (state.terrainDrawn && !terrainSeeded &&
+        g_terrain.PrepareVisibilityRootSignature(shader)) {
+        shader.SetMatrices(XMMatrixIdentity(), state.view, state.proj,
+                           state.lightSpace);
+        shader.SetCamera(scene.camera.VisualPosition());
+        g_terrain.DrawVisibility(shader, state.terrainParams);
+        shader.NextDrawCall();
+    }
+    vb.EndDepthReplay(cmd);
+    return true;
 }
 
 #endif // VBDRAW_RENDERER_H

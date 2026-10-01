@@ -301,6 +301,16 @@ public:
         BentNormalGTAODebugMode::Lit;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
+    // Throwaway ID target for the post-RR depth replay (see BeginDepthReplay).
+    // Created on first use, so it costs nothing unless RR runs.
+    ComPtr<ID3D12Resource> depthReplayRT;
+    ComPtr<ID3D12DescriptorHeap> depthReplayRtvHeap;
+    // Fullscreen pass that seeds the replay with terrain's jittered depth, so
+    // the (mesh-shader, most expensive) terrain draw is not replayed.
+    ComPtr<ID3D12RootSignature> depthSeedRootSig;
+    ComPtr<ID3D12PipelineState> depthSeedPSO;
+    ComPtr<ID3D12DescriptorHeap> depthSeedHeap;
+    bool depthSeedTried = false;
 
     // Depth buffer SRV for the compute pass (reads main depth)
     // We'll create a SRV for the engine's existing depth buffer
@@ -2169,6 +2179,14 @@ public:
             RasterViewHeap()->GetCPUDescriptorHandleForHeapStart(),
             computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        BindVisPassPipeline(cmdList);
+    }
+
+    // Root signature, heaps, bindings and default PSO shared by the visibility
+    // pass and its post-RR depth replay. The descriptor copy above stays with
+    // the pass: it is a CPU write, and repeating it mid-frame would change
+    // what the already-recorded raster reads when the GPU runs it.
+    void BindVisPassPipeline(ID3D12GraphicsCommandList* cmdList) {
         // Set pipeline
         const bool useBindless = BindlessVisPassActive();
         ID3D12DescriptorHeap* heaps[] = {
@@ -2189,6 +2207,238 @@ public:
         cmdList->SetGraphicsRootDescriptorTable(2, defaultTexture);
         cmdList->SetPipelineState(useBindless
             ? bindlessVisPassPSO.Get() : visPassPSO.Get());
+    }
+
+    // Post-RR depth replay. The visibility pass rasterises with the jittered
+    // projection; RR hands back colour with that jitter resolved, but every
+    // pass after it (forward extensions, grass, particles, water, fog, GTAO,
+    // SSR, sun lens, next frame's HZB) depth-tests or samples the jittered
+    // depth with unjittered matrices, so their silhouettes moved by the jitter
+    // every frame. The jitter is a pure screen-space offset (it is added to the
+    // projection's clip-space x/y in proportion to w), so re-rasterising the
+    // same recorded draws into a viewport shifted by -jitter produces the
+    // unjittered depth without touching any matrix or culled command stream.
+    // IDs go to a scratch target: the post pass still reads visBufferRT.
+    bool EnsureDepthSeedPipeline() {
+        if (depthSeedPSO) return true;
+        if (depthSeedTried) return false;
+        depthSeedTried = true;
+        std::ifstream file("shaders/visbuf_depth_seed.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream source;
+        source << file.rdbuf();
+        const std::string code = source.str();
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> vsBlob, psBlob, errorBlob;
+        if (FAILED(ShaderCacheDX12::CompileCached(code.c_str(), code.length(),
+                "shaders/visbuf_depth_seed.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "VSMain", "vs_5_0", flags,
+                0, &vsBlob, &errorBlob)) ||
+            FAILED(ShaderCacheDX12::CompileCached(code.c_str(), code.length(),
+                "shaders/visbuf_depth_seed.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "PSMain", "ps_5_0", flags,
+                0, &psBlob, &errorBlob))) {
+            if (errorBlob)
+                std::cerr << "Depth seed shader error: "
+                          << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE range = {};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 2;
+        D3D12_ROOT_PARAMETER param = {};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param.DescriptorTable.NumDescriptorRanges = 1;
+        param.DescriptorTable.pDescriptorRanges = &range;
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = 1;
+        rootDesc.pParameters = &param;
+        ComPtr<ID3DBlob> sigBlob;
+        errorBlob.Reset();
+        if (FAILED(D3D12SerializeRootSignature(&rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errorBlob)) ||
+            FAILED(g_dx12.device->CreateRootSignature(0,
+                sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                IID_PPV_ARGS(&depthSeedRootSig))))
+            return false;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = depthSeedRootSig.Get();
+        pso.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+        pso.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+        pso.DepthStencilState.DepthEnable = TRUE;
+        pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pso.SampleMask = UINT_MAX;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 0;
+        pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pso.SampleDesc.Count = 1;
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.NumDescriptors = 2 * FRAME_COUNT;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(&depthSeedPSO))) ||
+            FAILED(g_dx12.device->CreateDescriptorHeap(
+                &heapDesc, IID_PPV_ARGS(&depthSeedHeap)))) {
+            depthSeedPSO.Reset();
+            depthSeedHeap.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    // Writes terrain's jittered depth (and adjacent-terrain fill for object
+    // pixels) into the bound depth buffer; see visbuf_depth_seed.hlsl. Depth
+    // must be bound for writing and visibilityDepthTexture must still hold the
+    // visibility pass's depth.
+    void SeedDepthReplay(ID3D12GraphicsCommandList* cmdList,
+                         D3D12_CPU_DESCRIPTOR_HANDLE dsv) {
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        for (UINT i = 0; i < 2; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = i == 0
+                ? visBufferRT.Get() : visibilityDepthTexture.Get();
+            barriers[i].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[i].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barriers[i].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmdList->ResourceBarrier(2, barriers);
+
+        const UINT stride = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            depthSeedHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+            depthSeedHeap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(g_dx12.frameIndex) * 2u * stride;
+        gpu.ptr += static_cast<UINT64>(g_dx12.frameIndex) * 2u * stride;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R32G32_UINT;
+        g_dx12.device->CreateShaderResourceView(visBufferRT.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        g_dx12.device->CreateShaderResourceView(
+            visibilityDepthTexture.Get(), &srv, cpu);
+
+        ID3D12DescriptorHeap* heaps[] = { depthSeedHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetGraphicsRootSignature(depthSeedRootSig.Get());
+        cmdList->SetPipelineState(depthSeedPSO.Get());
+        cmdList->SetGraphicsRootDescriptorTable(0, gpu);
+        cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        cmdList->RSSetViewports(1, &ActiveViewport());
+        cmdList->RSSetScissorRects(1, &ActiveScissor());
+        cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmdList->DrawInstanced(3, 1, 0, 0);
+
+        for (UINT i = 0; i < 2; ++i) {
+            std::swap(barriers[i].Transition.StateBefore,
+                      barriers[i].Transition.StateAfter);
+        }
+        cmdList->ResourceBarrier(2, barriers);
+    }
+
+    // seedTerrain: fill terrain from the visibility pass's depth instead of
+    // expecting the caller to replay the terrain draw. Reports whether it did.
+    bool BeginDepthReplay(ID3D12GraphicsCommandList* cmdList,
+                          const XMFLOAT2& jitterPixels, bool seedTerrain,
+                          bool& terrainSeeded) {
+        terrainSeeded = false;
+        if (ScopeSurfaceBound()) return false;
+        if (!depthReplayRT) {
+            D3D12_HEAP_PROPERTIES heapProps = {};
+            heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = width;
+            desc.Height = height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = DXGI_FORMAT_R32G32_UINT;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE clearValue = {};
+            clearValue.Format = DXGI_FORMAT_R32G32_UINT;
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+            rtvHeapDesc.NumDescriptors = 1;
+            rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue,
+                    IID_PPV_ARGS(&depthReplayRT))) ||
+                FAILED(g_dx12.device->CreateDescriptorHeap(
+                    &rtvHeapDesc, IID_PPV_ARGS(&depthReplayRtvHeap)))) {
+                depthReplayRT.Reset();
+                depthReplayRtvHeap.Reset();
+                return false;
+            }
+            g_dx12.device->CreateRenderTargetView(depthReplayRT.Get(), nullptr,
+                depthReplayRtvHeap->GetCPUDescriptorHandleForHeapStart());
+        }
+
+        // EndForwardExtensions left depth readable for RR.
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = ActiveDepthBuffer();
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            depthReplayRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = ActiveDSV();
+        // The shifted viewport stops rasterising the last column/row on the
+        // side it moved away from (measured: the right column and bottom row
+        // flickered to far depth whenever the jitter was positive). Keep a
+        // one-pixel border of the visibility pass's depth instead of clearing
+        // it; the replay still overwrites it wherever it draws nearer.
+        if (seedTerrain && EnsureDepthSeedPipeline()) {
+            SeedDepthReplay(cmdList, dsv);
+            terrainSeeded = true;
+        } else {
+            const D3D12_RECT& scissor = ActiveScissor();
+            const D3D12_RECT interior = { scissor.left + 1, scissor.top + 1,
+                                          scissor.right - 1, scissor.bottom - 1 };
+            cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0,
+                                           1, &interior);
+        }
+        cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        D3D12_VIEWPORT viewport = ActiveViewport();
+        viewport.TopLeftX -= jitterPixels.x;
+        viewport.TopLeftY -= jitterPixels.y;
+        cmdList->RSSetViewports(1, &viewport);
+        cmdList->RSSetScissorRects(1, &ActiveScissor());
+        BindVisPassPipeline(cmdList);
+        return true;
+    }
+
+    // Returns depth to the state BeginForwardExtensions expects.
+    void EndDepthReplay(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = ActiveDepthBuffer();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+        cmdList->RSSetViewports(1, &ActiveViewport());
+        SnapshotVisibilityDepth(cmdList);
     }
 
     void SetVisPassDraw(ID3D12GraphicsCommandList* cmdList, UINT drawCallID,
@@ -3363,7 +3613,22 @@ public:
         }
 
         // Preserve primary depth for the post reactive mask.
-        if (!ScopeSurfaceBound()) {
+        if (!ScopeSurfaceBound()) SnapshotVisibilityDepth(cmdList);
+
+        // Hand the main view back its history flag. The scope forced it false
+        // for its own shading above and, having written no history, has no
+        // opinion on whether the shared textures are valid -- only the view
+        // that fills them does.
+        if (ScopeSurfaceBound()) svgfHistoryValid = savedSVGFHistoryValid;
+    }
+
+    // Copies the scene depth (NON_PIXEL_SHADER_RESOURCE, left there) into
+    // visibilityDepthTexture: GTAO's static-caster depth and the post
+    // reactive mask. Retaken after the post-RR depth replay, or those two
+    // compare jittered against unjittered depth and misclassify every pixel
+    // on a steep depth gradient.
+    void SnapshotVisibilityDepth(ID3D12GraphicsCommandList* cmdList) {
+        {
             // A full-screen depth CopyResource plus four transitions. Small per
             // pixel but not free at high resolution, and it ran inside the
             // aggregate "VB Resolve" with no scope of its own.
@@ -3388,12 +3653,6 @@ public:
             barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             cmdList->ResourceBarrier(2, barriers);
         }
-
-        // Hand the main view back its history flag. The scope forced it false
-        // for its own shading above and, having written no history, has no
-        // opinion on whether the shared textures are valid -- only the view
-        // that fills them does.
-        if (ScopeSurfaceBound()) svgfHistoryValid = savedSVGFHistoryValid;
     }
 
     void UpdateExposure(ID3D12GraphicsCommandList* cmdList) {
@@ -3924,6 +4183,8 @@ public:
         exposureReadable = false;
         visRtvHeap.Reset();
         outputRtvHeap.Reset();
+        depthReplayRT.Reset();
+        depthReplayRtvHeap.Reset();
         // Screen-sized like the rest; without this the enhanced resolve would
         // keep writing its mask at the old dimensions after a window resize.
         rayMaskTexture.Reset();

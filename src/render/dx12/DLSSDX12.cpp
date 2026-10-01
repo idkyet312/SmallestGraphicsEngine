@@ -549,8 +549,8 @@ bool Evaluate(const DLSSFrameInputs& in) {
     // projection, so this frame's jitter is inside the vector -- except under
     // Ray Reconstruction, where the resolve subtracts it: RR left static-camera
     // frames moving at every edge with jittered vectors (SR/DLAA did not).
-    consts.motionVectorsJittered = rr ? sl::Boolean::eFalse
-                                      : sl::Boolean::eTrue;
+    consts.motionVectorsJittered = (rr || in.motionUnjittered)
+        ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 
     if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
         Log("slSetConstants failed");

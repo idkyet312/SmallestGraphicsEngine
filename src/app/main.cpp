@@ -775,6 +775,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (GetEnvironmentVariableA("SGE_CAPTURE_VBDEBUG", text, sizeof(text)) > 0)
             visBuffer.debugViewMode = atoi(text);
     }
+    // SGE_CAPTURE_SWEEP="dyaw,dx,dz" moves the camera by that much per frame,
+    // arriving at SGE_CAPTURE_POSE on the captured frame. A still camera lets
+    // temporal denoisers converge, which hides noise the player sees in motion.
+    float captureSweep[3] = {};
+    {
+        char text[128] = {};
+        if (poseCapture &&
+            GetEnvironmentVariableA("SGE_CAPTURE_SWEEP", text, sizeof(text)) > 0)
+            sscanf_s(text, "%f,%f,%f", &captureSweep[0], &captureSweep[1],
+                     &captureSweep[2]);
+    }
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
     bool molotovSmokeInjected = false;
@@ -1365,8 +1376,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 << std::endl;
         }
         if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
-            scene.camera.Position = { capturePose[0], capturePose[1], capturePose[2] };
-            scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
+            const float sweepFrames = static_cast<float>(poseCaptureFrames) -
+                static_cast<float>(poseCaptureTarget - 1u);
+            scene.camera.Position = { capturePose[0] + captureSweep[1] * sweepFrames,
+                                      capturePose[1],
+                                      capturePose[2] + captureSweep[2] * sweepFrames };
+            scene.camera.SetViewAngles(
+                capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
+            // SGE_CAPTURE_FIRE=N fires the player's weapon N frames before the
+            // captured one, so a round's first rendered frames can be dumped.
+            char captureFire[8] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FIRE", captureFire,
+                                        sizeof(captureFire)) > 0 &&
+                poseCaptureFrames + 1u + static_cast<UINT>(atoi(captureFire)) ==
+                    poseCaptureTarget)
+                ShootPlayerWeapon();
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOSSR", nullptr, 0) > 0)
                 scene.enableScreenSpaceReflections = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
@@ -1451,6 +1475,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << visBuffer.EnhancedReflectionRayFraction()
                                 << " vbGpuMs="
                                 << g_profiler.GpuScopeMs("Visibility Buffer")
+                                << " replayMs="
+                                << g_profiler.GpuScopeMs("VB Depth Replay")
+                                << " rasterMs="
+                                << g_profiler.GpuScopeMs("VB Raster")
+                                << " terrainMs="
+                                << g_profiler.GpuScopeMs("VB Terrain")
                                 << " lightPos=" << scene.lightPos.x << ","
                                 << scene.lightPos.y << "," << scene.lightPos.z
                                 << " lightType=" << scene.lightType
@@ -4959,6 +4989,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
+        // SSR runs after RR, and nothing temporal follows it there: a moving
+        // step pattern would be fresh shimmer every frame. SR/DLAA and TAA run
+        // after SSR and average it, so they keep the animation; RR switches
+        // the built-in TAA off.
+        if (visBuffer.rayReconstructionActive)
+            screenSpaceReflections.animateNoise = false;
         const bool visibilityDebugActive =
             usingVisibility && visBuffer.debugViewMode != 0;
         const bool bentGTAODiagnosticActive = usingVisibility &&
@@ -6206,6 +6242,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
                     }
                 }
+                // Everything from here on is unjittered, but the depth it tests
+                // and samples was rasterised jittered: replay it without the
+                // jitter so post-RR silhouettes stop moving. SGE_NO_DEPTH_REPLAY
+                // is the capture A/B switch.
+                static const bool kNoDepthReplay =
+                    GetEnvironmentVariableA("SGE_NO_DEPTH_REPLAY", nullptr, 0) > 0;
+                // SGE_DEPTH_REPLAY_FLIP shifts the wrong way, to verify the sign.
+                static const bool kFlipDepthReplay =
+                    GetEnvironmentVariableA("SGE_DEPTH_REPLAY_FLIP", nullptr, 0) > 0;
+                // Terrain is redrawn while its raster is cheap and seeded from
+                // the jittered depth while it is not, with hysteresis so the
+                // choice does not flip frame to frame. SGE_DEPTH_REPLAY_TERRAIN
+                // =1 always redraws, =0 always seeds.
+                static bool replayTerrain = true;
+                {
+                    char mode[4] = {};
+                    const double terrainMs = g_profiler.GpuScopeMs("VB Terrain");
+                    if (GetEnvironmentVariableA("SGE_DEPTH_REPLAY_TERRAIN", mode,
+                                                sizeof(mode)) > 0)
+                        replayTerrain = mode[0] != '0';
+                    else if (terrainMs > 0.8)
+                        replayTerrain = false;
+                    else if (terrainMs < 0.5)
+                        replayTerrain = true;
+                }
+                if (rrEvaluated && !kNoDepthReplay) {
+                    ProfilerDX12::Scope profile(g_profiler, "VB Depth Replay",
+                                                g_dx12.commandList.Get());
+                    XMFLOAT2 replayJitter = visBuffer.rrMotionJitterPixels;
+                    if (kFlipDepthReplay) {
+                        replayJitter.x = -replayJitter.x;
+                        replayJitter.y = -replayJitter.y;
+                    }
+                    ReplayVBDepth(scene, mainShader, visBuffer, geo,
+                                  replayJitter, replayTerrain);
+                }
                 visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
             }
             // RenderVBDraw has bound HDR colour and the populated depth buffer.
@@ -6785,6 +6857,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 dlssInputs.screenPercentage =
                     DLSS::GetSettings().screenPercentage;
                 dlssInputs.jitterPixels = scene.temporalJitterPixels;
+                // RR was requested but did not evaluate: the resolve already
+                // stripped the jitter from this frame's motion vectors.
+                dlssInputs.motionUnjittered = visBuffer.rayReconstructionActive;
                 XMStoreFloat4x4(&dlssInputs.view, scene.GetViewMatrix());
                 XMStoreFloat4x4(&dlssInputs.projection,
                                 scene.GetUnjitteredProjectionMatrix());

@@ -1310,7 +1310,10 @@ float3 RayTracedReflectionRaw(float3 worldPos, float3 normal, float3 viewDir,
     }
 
     hit = true;
-    hitDistance = query.CommittedRayT();
+    // RR's hit-distance guide is measured from the primary surface, not from
+    // the biased origin (0.02-0.12 m off it, varying with the sampled
+    // direction).
+    hitDistance = length(ray.Origin + rayDir * query.CommittedRayT() - worldPos);
     // Shade the hit surface where its geometry is bound, so a reflection shows
     // what it actually reflects rather than a dimmed sky. Reflections are where
     // this matters most: they are high-contrast and directly visible, so a
