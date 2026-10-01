@@ -693,7 +693,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // The settings page is one level deep on whichever screen opened
             // it, so ESC backs out of it first -- on the main menu the branch
             // below would otherwise quit the game from inside Settings.
-            if (g_showSettingsMenu || g_showPauseSettings) {
+            // The Ray Tracing restart prompt sits one level deeper still:
+            // ESC there is GO BACK, not leaving Settings.
+            if (g_rtRestartChoice >= 0)
+                g_rtRestartChoice = -1;
+            else if (g_showSettingsMenu || g_showPauseSettings) {
                 SaveGameSettings(g_settings);
                 g_showSettingsMenu = false;
                 g_showPauseSettings = false;

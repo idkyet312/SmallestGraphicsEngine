@@ -8235,5 +8235,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // can leave the game showing as running for a while afterwards.
     ShutdownSteam();
     CleanupDX12();
+    // Settings that only take effect at boot (Ray Tracing Quality) ask for a
+    // restart; the new copy starts once this one has released the GPU.
+    if (g_relaunchAfterExit) RelaunchSelf();
     return (int)msg.wParam;
 }

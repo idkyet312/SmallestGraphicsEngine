@@ -209,6 +209,30 @@ static bool LumenGISupported();
 static ImFont* g_menuTitleFont = nullptr;
 static ImFont* g_menuBodyFont = nullptr;
 
+// Ray Tracing Quality the player picked but has not confirmed; -1 when no
+// restart prompt is up. ESC in WindowInput.h clears it, which is GO BACK.
+static int g_rtRestartChoice = -1;
+// Set by RESTART NOW. WinMain relaunches only after its own shutdown, so the
+// new instance never shares VRAM, the Steam client or the window with this one.
+static bool g_relaunchAfterExit = false;
+
+// Starts a fresh copy of this exe with the same command line and working
+// directory, so a -Level launch or a build/ run comes back the way it started.
+static void RelaunchSelf() {
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
+    // CreateProcessW may write into the command line, so it gets a copy.
+    std::wstring commandLine = GetCommandLineW();
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(exePath, commandLine.data(), nullptr, nullptr, FALSE, 0,
+                       nullptr, nullptr, &startup, &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+}
+
 namespace SettingsUI {
 constexpr float kRowHeight = 56.0f;
 constexpr float kRowGap = 6.0f;
@@ -590,15 +614,17 @@ static void VideoTab() {
     }
     ImGui::BeginDisabled(!DLSS::RayReconstructionAvailable());
     static const char* rtQualities[] = {"Off", "Ultra"};
-    if (ImGui::Combo("Ray Tracing Quality", &g_settings.rayTracingQuality,
-                     rtQualities, IM_ARRAYSIZE(rtQualities))) {
-        g_settings.Clamp();
-        ApplyGameSettings();
-        SaveGameSettings(g_settings);
-    }
+    // Edits a copy: the choice only lands in g_settings once the restart
+    // prompt drawn by RenderSettingsMenu is confirmed.
+    int rtChoice = g_settings.rayTracingQuality;
+    if (ImGui::Combo("Ray Tracing Quality", &rtChoice,
+                     rtQualities, IM_ARRAYSIZE(rtQualities)) &&
+        rtChoice != g_settings.rayTracingQuality)
+        g_rtRestartChoice = rtChoice;
     if (DLSS::RayReconstructionAvailable())
         ImGui::TextDisabled("Ultra: per-pixel ray tracing + DLSS Ray "
-                            "Reconstruction at native resolution.");
+                            "Reconstruction at native resolution. "
+                            "Requires a restart.");
     else
         ImGui::TextDisabled("%s", DLSS::RayReconstructionStatus());
     ImGui::EndDisabled();
@@ -802,7 +828,9 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
                         IM_COL32(255, 255, 255, 50));
 
     // ---- Tabs -------------------------------------------------------------
-    if (!ImGui::GetIO().WantTextInput) {
+    // Not under the restart prompt: switching away from Video would stop
+    // drawing the row the prompt is about.
+    if (!ImGui::GetIO().WantTextInput && g_rtRestartChoice < 0) {
         if (ImGui::IsKeyPressed(ImGuiKey_Q, false))
             s_tab = (s_tab + kTabCount - 1) % kTabCount;
         if (ImGui::IsKeyPressed(ImGuiKey_E, false))
@@ -971,6 +999,51 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
         openFlag = false;
     }
     ImGui::PopStyleColor(3);
+
+    // Ray Tracing Quality restart prompt. Opened here rather than in VideoTab
+    // so it shares this window's ID stack and keeps drawing whatever tab is
+    // showing. Driven by g_rtRestartChoice so an ESC that cleared it, or a
+    // settings page closed under it, takes the popup down on the next draw.
+    const char* restartPopup = "Restart Required";
+    if (g_rtRestartChoice >= 0 && !ImGui::IsPopupOpen(restartPopup))
+        ImGui::OpenPopup(restartPopup);
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal(restartPopup, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize |
+                               ImGuiWindowFlags_NoMove)) {
+        if (g_rtRestartChoice < 0) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            ImGui::TextUnformatted("Changing Ray Tracing Quality requires a "
+                                   "restart.");
+            ImGui::TextColored(UITheme::kTextDim,
+                               "The game will close and start again with "
+                               "the new setting.");
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
+            const ImVec2 choiceSize(200.0f, 44.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+            const bool restart = ImGui::Button("RESTART NOW", choiceSize);
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            const bool goBack = ImGui::Button("GO BACK", choiceSize);
+            if (restart) {
+                g_settings.rayTracingQuality = g_rtRestartChoice;
+                g_settings.Clamp();
+                SaveGameSettings(g_settings);
+                g_rtRestartChoice = -1;
+                g_relaunchAfterExit = true;
+                ImGui::CloseCurrentPopup();
+                PostQuitMessage(0);
+            } else if (goBack) {
+                g_rtRestartChoice = -1;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
 
     ImGui::End();
 }
