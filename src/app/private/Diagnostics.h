@@ -528,3 +528,186 @@ static void LogFrameSpike(float deltaTimeSeconds) {
     // Flushed per line so a crash still leaves the spikes that preceded it.
     log << "\n" << std::flush;
 }
+
+// Jitter / motion-vector contract readout, shown with the F7 motion overlay.
+// Everything is in render pixels and in the engine's motion convention
+// (current UV minus previous UV); DLSS receives it scaled by mvecScale.
+//
+// For a static surface under a still camera the resolve writes
+//     (jitterCurrent - jitterPrevious) - resolveStrip
+// when both projections carry their jitter. "expected" is that value; a
+// non-zero "residual" means the vectors hold something else (camera motion
+// while moving, or a convention mismatch while still). "vs DLSS" is the
+// measured vector minus what the DLSS flag implies it should be for a static
+// surface: jitterCurrent when flagged jittered, zero when flagged unjittered.
+// The probe lags the displayed frame by the frames in flight.
+static void DrawJitterDebug(VisibilityBufferDX12& vb) {
+    if (vb.motionDebugMode == 0) return;
+    const auto& f = vb.jitterProbeLatest;
+    static const char* kNames[VisibilityBufferDX12::kJitterProbeCount] = {
+        "centre", "right", "left", "low-left", "mid", "top", "low-right",
+        "mid-right" };
+
+    // Jitter sequence history, newest last.
+    static XMFLOAT2 history[32] = {};
+    static UINT historyCount = 0;
+    static UINT64 lastFrame = ~0ull;
+    const bool fresh = f.valid && f.frame != lastFrame;
+    if (fresh) {
+        lastFrame = f.frame;
+        history[historyCount % 32] = f.jitterCurrent;
+        ++historyCount;
+    }
+
+    const float rw = static_cast<float>((std::max)(1u, f.renderWidth));
+    const float rh = static_cast<float>((std::max)(1u, f.renderHeight));
+    const XMFLOAT2 strip = { f.resolveStripUV.x * rw, f.resolveStripUV.y * rh };
+    const XMFLOAT2 delta = { f.jitterCurrent.x - f.jitterPrevious.x,
+                             f.jitterCurrent.y - f.jitterPrevious.y };
+    const XMFLOAT2 expected = { delta.x - strip.x, delta.y - strip.y };
+    const XMFLOAT2 dlssStatic = f.dlss.motionVectorsJittered
+        ? f.jitterCurrent : XMFLOAT2(0.0f, 0.0f);
+    const char* path = !f.dlss.valid ? "DLSS off"
+        : f.dlss.rayReconstruction
+            ? (f.dlss.superResolution ? "RR upscale" : "RR native")
+            : (f.dlss.superResolution ? "Super Resolution" : "DLAA");
+
+    ImGui::SetNextWindowPos(ImVec2(12.0f, 140.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.8f);
+    ImGui::Begin("Jitter debug", nullptr,
+                 ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                 ImGuiWindowFlags_NoSavedSettings);
+    if (!f.valid) {
+        ImGui::TextUnformatted("waiting for probe readback...");
+        ImGui::End();
+        return;
+    }
+    ImGui::Text("frame %llu   %s   render %ux%u -> %ux%u   mode %d",
+                static_cast<unsigned long long>(f.frame), path,
+                f.renderWidth, f.renderHeight, f.dlss.outputWidth,
+                f.dlss.outputHeight, f.dlss.mode);
+    ImGui::Text("RR %d  upscale %d  fwd guides %d  SGE_RR_MV_MODE %u  mip bias %.2f",
+                f.rr, f.rrUpscale, f.forwardGuides, f.mvMode, vb.mipBiasApplied);
+    ImGui::Separator();
+    ImGui::Text("jitter current   % .4f % .4f px", f.jitterCurrent.x,
+                f.jitterCurrent.y);
+    ImGui::Text("jitter previous  % .4f % .4f px  (in previous VP)",
+                f.jitterPrevious.x, f.jitterPrevious.y);
+    ImGui::Text("cur - prev       % .4f % .4f px", delta.x, delta.y);
+    ImGui::Text("resolve strip    % .4f % .4f px", strip.x, strip.y);
+    ImGui::Text("sent to DLSS     % .4f % .4f px  %s", f.dlss.jitterX,
+                f.dlss.jitterY,
+                (std::fabs(f.dlss.jitterX - f.jitterCurrent.x) > 1e-4f ||
+                 std::fabs(f.dlss.jitterY - f.jitterCurrent.y) > 1e-4f)
+                    ? "!= rendered" : "== rendered");
+    ImGui::Text("MV flag %s   mvecScale %.1f %.1f   reset %d",
+                f.dlss.motionVectorsJittered ? "JITTERED" : "unjittered",
+                f.dlss.mvecScaleX, f.dlss.mvecScaleY, f.dlss.reset);
+    if (f.previousVPFresh)
+        ImGui::TextUnformatted("previous VP refreshed last frame");
+    else
+        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
+                           "previous VP STALE (HZB capture skipped)");
+    ImGui::Text("static expect    % .4f % .4f px   DLSS wants % .4f % .4f",
+                expected.x, expected.y, dlssStatic.x, dlssStatic.y);
+    ImGui::Separator();
+    // Every input is tagged with the render extent, the output with the
+    // display extent; a size that differs is read through the wrong window.
+    for (int i = 0; i < DLSS::EvalDebug::kResourceCount; ++i) {
+        const UINT w = f.dlss.resourceWidth[i], h = f.dlss.resourceHeight[i];
+        if (w == 0) continue;
+        const bool output = i == DLSS::EvalDebug::kResourceCount - 1;
+        const bool ok = output
+            ? (w == f.dlss.outputWidth && h == f.dlss.outputHeight)
+            : (w == f.dlss.inputWidth && h == f.dlss.inputHeight);
+        ImGui::TextColored(ok ? ImVec4(0.7f, 1, 0.7f, 1) : ImVec4(1, 0.3f, 0.3f, 1),
+                           "%-16s %5u x %-5u %s", DLSS::EvalDebugResourceName(i),
+                           w, h, ok ? "" : "SIZE MISMATCH");
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted(
+        "probe        measured px        residual px        vs DLSS px");
+    for (UINT i = 0; i < VisibilityBufferDX12::kJitterProbeCount; ++i) {
+        const XMFLOAT2 m = { f.motionUV[i].x * rw, f.motionUV[i].y * rh };
+        const bool marker = f.motionUV[i].x == 2.0f && f.motionUV[i].y == 2.0f;
+        if (marker) {
+            ImGui::Text("%-10s   (2,2) reactive marker", kNames[i]);
+            continue;
+        }
+        ImGui::Text("%-10s % 7.3f % 7.3f   % 7.3f % 7.3f   % 7.3f % 7.3f",
+                    kNames[i], m.x, m.y, m.x - expected.x, m.y - expected.y,
+                    m.x - dlssStatic.x, m.y - dlssStatic.y);
+    }
+
+    // One render pixel, centred: the jitter sequence (dots, newest brightest)
+    // and this frame's previous -> current step.
+    ImGui::Separator();
+    const float box = 120.0f;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRect(origin, ImVec2(origin.x + box, origin.y + box),
+                IM_COL32(200, 200, 200, 255));
+    dl->AddLine(ImVec2(origin.x + box * 0.5f, origin.y),
+                ImVec2(origin.x + box * 0.5f, origin.y + box),
+                IM_COL32(90, 90, 90, 255));
+    dl->AddLine(ImVec2(origin.x, origin.y + box * 0.5f),
+                ImVec2(origin.x + box, origin.y + box * 0.5f),
+                IM_COL32(90, 90, 90, 255));
+    const auto toBox = [&](const XMFLOAT2& j) {
+        return ImVec2(origin.x + (j.x + 0.5f) * box,
+                      origin.y + (j.y + 0.5f) * box);
+    };
+    const UINT shown = (std::min)(historyCount, 32u);
+    for (UINT i = 0; i < shown; ++i) {
+        const UINT index = (historyCount - shown + i) % 32;
+        const int alpha = 60 + static_cast<int>(195.0f * (i + 1) / shown);
+        dl->AddCircleFilled(toBox(history[index]), 2.5f,
+                            IM_COL32(120, 200, 255, alpha));
+    }
+    dl->AddLine(toBox(f.jitterPrevious), toBox(f.jitterCurrent),
+                IM_COL32(255, 200, 60, 255), 2.0f);
+    dl->AddCircleFilled(toBox(f.jitterCurrent), 4.0f, IM_COL32(255, 80, 60, 255));
+    ImGui::Dummy(ImVec2(box, box));
+    ImGui::SameLine();
+    ImGui::TextUnformatted("one render pixel\nblue: last 32 jitters\n"
+                           "orange: prev -> cur\nred: current");
+    ImGui::End();
+
+    // Probe markers on screen.
+    const ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+    for (UINT i = 0; i < VisibilityBufferDX12::kJitterProbeCount; ++i) {
+        const ImVec2 p(f.probeUV[i].x * io.DisplaySize.x,
+                       f.probeUV[i].y * io.DisplaySize.y);
+        fg->AddCircle(p, 7.0f, IM_COL32(255, 255, 0, 255), 12, 2.0f);
+        fg->AddText(ImVec2(p.x + 9.0f, p.y - 7.0f), IM_COL32(255, 255, 0, 255),
+                    kNames[i]);
+    }
+
+    // Same numbers, one line per probed frame, for unattended captures.
+    if (fresh) {
+        static std::ofstream log("jitter_debug.log", std::ios::trunc);
+        if (log) {
+            log << "frame=" << f.frame << " path=" << path
+                << " render=" << f.renderWidth << "x" << f.renderHeight
+                << " mvMode=" << f.mvMode << " fwdGuides=" << f.forwardGuides
+                << " jc=" << f.jitterCurrent.x << "," << f.jitterCurrent.y
+                << " jp=" << f.jitterPrevious.x << "," << f.jitterPrevious.y
+                << " strip=" << strip.x << "," << strip.y
+                << " sent=" << f.dlss.jitterX << "," << f.dlss.jitterY
+                << " mvJittered=" << f.dlss.motionVectorsJittered
+                << " reset=" << f.dlss.reset
+                << " prevVPFresh=" << f.previousVPFresh
+                << " expect=" << expected.x << "," << expected.y;
+            for (int i = 0; i < DLSS::EvalDebug::kResourceCount; ++i)
+                log << " size_" << i << "=" << f.dlss.resourceWidth[i] << "x"
+                    << f.dlss.resourceHeight[i];
+            for (UINT i = 0; i < VisibilityBufferDX12::kJitterProbeCount; ++i)
+                log << " " << kNames[i] << "=" << f.motionUV[i].x * rw << ","
+                    << f.motionUV[i].y * rh;
+            log << "\n";
+            log.flush();
+        }
+    }
+}

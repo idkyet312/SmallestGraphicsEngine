@@ -2,7 +2,46 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+// ?? cold-boot shader compile ????????????????????????????????????????????????
+//
+// On a cold shader cache the visibility resolve permutations are still on the
+// compile workers when boot reaches the menu. The menu comes up anyway, shows
+// a progress bar and greys out every row that would enter the game; the
+// visibility buffer is finished once the compiles land.
+static bool  g_shadersCompiling = false;
+static float g_shaderCompileProgress = 0.0f;
+static bool  g_bindlessHeapReady = false;
+
+// Builds what waited on the compiles. Main thread, between frames.
+static void FinishDeferredShaderCompiles() {
+    g_shadersCompiling = false;
+    g_shaderCompileProgress = 1.0f;
+    if (!visBuffer.FinishDeferredResolvePipeline())
+        scene.useVisibilityBuffer = false;
+    g_bindlessMaterialsReady = g_bindlessHeapReady && mainShader.BindlessReady() &&
+        visBuffer.BindlessResolveReady() &&
+        (!g_useMeshShader || g_meshShader.bindlessReady);
+}
+
+// Once per frame, before rendering: polls the workers and finishes when done.
+static void PumpDeferredShaderCompiles() {
+    if (!g_shadersCompiling) return;
+    if (ShaderCacheDX12::BootCompilesPending(&g_shaderCompileProgress)) return;
+    FinishDeferredShaderCompiles();
+}
+
+// A level start that never went through the greyed-out menu (--level, the
+// auto-host and capture hooks) blocks here until the compiles land.
+static void WaitForDeferredShaderCompiles() {
+    if (!g_shadersCompiling) return;
+    BootTimer::Log("Level start waiting for shader compiles");
+    while (ShaderCacheDX12::BootCompilesPending(&g_shaderCompileProgress))
+        Sleep(50);
+    FinishDeferredShaderCompiles();
+}
+
 static void BeginLevelLoading(bool armoryOnly = false) {
+    WaitForDeferredShaderCompiles();
     levelArmoryLoadOnly = armoryOnly;
     g_uploadHeapRelease.Reset();
     if (armoryOnly) {
@@ -92,6 +131,9 @@ struct PrefabThumbnailRuntime {
     UINT64 renderFence = 0;
     UINT descriptorSlot = ~0u;
     bool rendered = false;
+    // Camera from the side of the model's long axis instead of the elevated
+    // three-quarter view: weapons read by silhouette.
+    bool sideView = false;
     bool readbackProcessed = false;
 };
 static std::unordered_map<std::string, PrefabThumbnailRuntime> g_prefabThumbnails;

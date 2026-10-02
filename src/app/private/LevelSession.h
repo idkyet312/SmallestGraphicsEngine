@@ -399,6 +399,7 @@ static void OpenWinScreen() {
     g_winScreenRewardMultiplier = g_game.rank.RewardMultiplier();
     g_winScreenDifficulty = scene.enemyDamageMultiplier;
     g_winScreenAge = 0.0f;
+    g_winScreenTab = 0;
     // Banked to disk at extraction rather than per award: a career should not
     // survive only if the player quits from the menu, and writing on every kill
     // would put a file open/write in the middle of combat.
@@ -623,6 +624,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
                           bool startWithUIAndMobileControls = false) {
+    WaitForDeferredShaderCompiles();
     // Terrain textures, the HDRI sky and its IBL are no longer built at boot.
     // Queue them rather than building them here: this runs from the menu button
     // inside the ImGui frame, and the build needs the frame's command list
@@ -761,6 +763,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.showHelicopter = !g_emptyLevelMode;
     ApplyRuntimeLevelBasics(true);
     BakeRuntimeSplineEntities();
+    // The hub opens at sunset. Applied without touching g_selectedTimeOfDay:
+    // that is the mission's choice, and the next deployment screen re-applies
+    // it, so the base's light never leaks into the run planned from it.
+    if (g_baseMode) ApplyTimeOfDay(TimeOfDay::Dusk);
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
     // Re-aim the insertion at the spawn the player actually got. ResetLevelState

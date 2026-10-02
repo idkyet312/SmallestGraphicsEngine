@@ -179,6 +179,7 @@ public:
     }
 
     void Update(float dt) {
+        m_previousTime = m_time;
         m_time += dt;
 
         const XMFLOAT2 player(m_playerPosition.x, m_playerPosition.z);
@@ -297,8 +298,9 @@ public:
         return false;
     }
 
-    // The 19 root constants (b6) the grass vertex shader reads. Laid out to match
-    // grass_vs.hlsl's GrassParams exactly.
+    // The 20 root constants (b6) the grass vertex shader reads. Laid out to match
+    // grass_vs.hlsl's GrassParams exactly. grass_shadow_vs.hlsl reads only the
+    // first 19.
     struct Params {
         float time;
         float windStrength;
@@ -333,10 +335,14 @@ public:
         // player with a short delay so passed vegetation recovers gradually.
         float playerTrailX;
         float playerTrailZ;
+        // Last frame's wind clock, so the blade can report its own wind motion
+        // to Ray Reconstruction / DLSS (grass_vs.hlsl windMotion).
+        float previousTime;
     };
     Params GetParams(float verticalFovDegrees, float viewportHeight) const {
         Params p;
         p.time = m_time;
+        p.previousTime = m_previousTime;
         p.windStrength = m_windStrength;
         p.windSpeed = m_windSpeed;
         p.eyeX = m_eye.x;
@@ -492,6 +498,7 @@ public:
         m_runtimeExclusions.clear();
         m_ready = false;
         m_time = 0.0f;
+        m_previousTime = 0.0f;
     }
 
     ~GrassField() { Shutdown(); }
@@ -1130,6 +1137,7 @@ private:
     bool m_showAuthoredPaths = false;
 
     float m_time = 0.0f;
+    float m_previousTime = 0.0f;
     float m_waterY = 0.0f;
     float m_windStrength = 0.85f;
     float m_windSpeed = 1.1f;

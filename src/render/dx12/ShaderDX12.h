@@ -890,9 +890,10 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        // Grass uploads 19 (the 13 wind/fade fields plus the player interaction
-        // capsule); terrain uploads 16. Sized for the larger of the two.
-        rootParams[8].Constants.Num32BitValues = 19;
+        // Grass uploads 20 (the 13 wind/fade fields, the player interaction
+        // capsule and the previous wind clock); terrain uploads 16. Sized for
+        // the larger of the two.
+        rootParams[8].Constants.Num32BitValues = 20;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;
@@ -1093,6 +1094,25 @@ public:
             psoDesc.RasterizerState.MultisampleEnable = previousMultisample;
             return SUCCEEDED(result);
         };
+        // The 4x grass layer (GrassMSAADX12) binds a second target for the
+        // blades' wind motion. Every PSO drawn into it declares that target;
+        // only the grass writes it (palm crowns leave it at zero).
+        auto createGrassLayerPipeline = [&psoDesc, &createMSAAPipeline](
+                ComPtr<ID3D12PipelineState>& target, bool writesMotion) {
+            const D3D12_BLEND_DESC previousBlend = psoDesc.BlendState;
+            psoDesc.NumRenderTargets = 2;
+            psoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+            psoDesc.BlendState.IndependentBlendEnable = TRUE;
+            psoDesc.BlendState.RenderTarget[1] = psoDesc.BlendState.RenderTarget[0];
+            psoDesc.BlendState.RenderTarget[1].BlendEnable = FALSE;
+            psoDesc.BlendState.RenderTarget[1].RenderTargetWriteMask =
+                writesMotion ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+            const bool created = createMSAAPipeline(target);
+            psoDesc.BlendState = previousBlend;
+            psoDesc.NumRenderTargets = 1;
+            psoDesc.RTVFormats[1] = DXGI_FORMAT_UNKNOWN;
+            return created;
+        };
         
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
         if (FAILED(hr)) {
@@ -1103,8 +1123,9 @@ public:
         psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &psoDesc, IID_PPV_ARGS(&hdrPipelineState)))) return false;
+        // Only the grass layer's palm crowns draw with this one.
         const bool hdrMsaaMainSupported =
-            createMSAAPipeline(hdrMsaaPipelineState);
+            createGrassLayerPipeline(hdrMsaaPipelineState, false);
         psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
         psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         msaaSupported = hdrMsaaMainSupported &&
@@ -1278,12 +1299,19 @@ public:
             // full PS if it fails to compile -- the grass still draws.
             ComPtr<ID3DBlob> grassPsBlob;
             ComPtr<ID3DBlob> hdrGrassPsBlob;
+            ComPtr<ID3DBlob> hdrGrassMotionPsBlob;
             if (CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags, grassPsBlob))
                 psoDesc.PS = { grassPsBlob->GetBufferPointer(), grassPsBlob->GetBufferSize() };
             else
                 std::cerr << "grass_ps.hlsl failed to compile; grass uses the full shader\n";
             CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags,
                 hdrGrassPsBlob, hdrDefines);
+            const D3D_SHADER_MACRO grassMotionDefines[] = {
+                { "SGE_HDR_TARGET", "1" }, { "SGE_GRASS_MOTION", "1" },
+                { nullptr, nullptr }
+            };
+            CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags,
+                hdrGrassMotionPsBlob, grassMotionDefines);
             hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&grassPipelineState));
             if (FAILED(hr)) {
                 std::cerr << "Failed to create grass pipeline state" << std::endl;
@@ -1298,8 +1326,12 @@ public:
                 if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                         &psoDesc, IID_PPV_ARGS(&hdrGrassPipelineState))))
                     hdrGrassPipelineState.Reset();
+                if (hdrGrassMotionPsBlob)
+                    psoDesc.PS = { hdrGrassMotionPsBlob->GetBufferPointer(),
+                                   hdrGrassMotionPsBlob->GetBufferSize() };
                 if (msaaSupported &&
-                    !createMSAAPipeline(hdrMsaaGrassPipelineState))
+                    !createGrassLayerPipeline(hdrMsaaGrassPipelineState,
+                                              hdrGrassMotionPsBlob != nullptr))
                     hdrMsaaGrassPipelineState.Reset();
                 psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
                 psoDesc.PS = grassPsBlob

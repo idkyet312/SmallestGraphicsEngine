@@ -12,12 +12,18 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <cwctype>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -317,6 +323,158 @@ fs::path CookedAssetLoader::FindForSource(const fs::path& source) {
     return SGE::Cooked::FindAssetForSource(source);
 }
 
+namespace {
+
+// A cooked asset (and, when present, its source) whose hashes a prefetch
+// verified. Keyed by the cooked path; valid only while both files keep the
+// size and write time they had when they were hashed.
+struct VerifiedCooked {
+    uint64_t cookedSize = 0;
+    int64_t cookedTime = 0;
+    bool sourceVerified = false;
+    uint64_t sourceSize = 0;
+    int64_t sourceTime = 0;
+};
+
+struct PrefetchState {
+    std::mutex mutex;
+    std::unordered_map<std::wstring, VerifiedCooked> verified;
+    std::vector<std::shared_future<void>> pending;
+};
+// Leaked: a worker may still be reading when static destructors run at exit.
+PrefetchState& Prefetch() {
+    static PrefetchState* state = new PrefetchState;
+    return *state;
+}
+
+std::wstring PrefetchKey(const fs::path& path) {
+    std::error_code ec;
+    fs::path canonical = fs::weakly_canonical(path, ec);
+    std::wstring key = (ec ? path : canonical).wstring();
+    std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+    return key;
+}
+
+bool FileStamp(const fs::path& path, uint64_t& size, int64_t& time) {
+    std::error_code ec;
+    size = fs::file_size(path, ec);
+    if (ec) return false;
+    time = fs::last_write_time(path, ec).time_since_epoch().count();
+    return !ec;
+}
+
+// Sequential read of the whole file in large chunks, FNV-1a over the bytes in
+// [hashBegin, hashEnd). Same hash as CookedAssetLoader::HashBytes, but without
+// its window-message pump: this runs on a worker thread.
+bool StreamFile(const fs::path& path, uint64_t hashBegin, uint64_t hashEnd,
+                uint64_t& hash) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    std::vector<char> block(8u * 1024u * 1024u);
+    uint64_t offset = 0;
+    while (stream) {
+        stream.read(block.data(), static_cast<std::streamsize>(block.size()));
+        const uint64_t count = static_cast<uint64_t>(stream.gcount());
+        const uint64_t begin = (std::max)(offset, hashBegin);
+        const uint64_t end = (std::min)(offset + count, hashEnd);
+        for (uint64_t i = begin; i < end; ++i) {
+            hash ^= static_cast<uint8_t>(block[static_cast<size_t>(i - offset)]);
+            hash *= 1099511628211ull;
+        }
+        offset += count;
+    }
+    return true;
+}
+
+void PrefetchOne(const fs::path& source) {
+    const fs::path cooked = CookedAssetLoader::FindForSource(source);
+    uint64_t sourceSize = 0;
+    int64_t sourceTime = 0;
+    const bool sourceExists = FileStamp(source, sourceSize, sourceTime);
+    if (cooked.empty()) {
+        // No cooked asset: the importer reads the source itself, so warming
+        // the file cache is all a worker can do for it.
+        uint64_t ignored = 0;
+        if (sourceExists) StreamFile(source, 0, 0, ignored);
+        return;
+    }
+
+    uint64_t cookedSize = 0;
+    int64_t cookedTime = 0;
+    if (!FileStamp(cooked, cookedSize, cookedTime)) return;
+    Cooked::Header header{};
+    {
+        std::ifstream stream(cooked, std::ios::binary);
+        if (!stream.read(reinterpret_cast<char*>(&header), sizeof(header)))
+            return;
+    }
+    if (!Cooked::HeaderValid(header, cookedSize)) return;
+
+    uint64_t payloadHash = 1469598103934665603ull;
+    if (!StreamFile(cooked, header.payloadOffset,
+                    header.payloadOffset + header.payloadSize, payloadHash) ||
+        payloadHash != header.contentHash)
+        return;
+
+    VerifiedCooked entry;
+    entry.cookedSize = cookedSize;
+    entry.cookedTime = cookedTime;
+    if (sourceExists) {
+        uint64_t sourceHash = 1469598103934665603ull;
+        if (!StreamFile(source, 0, sourceSize, sourceHash) ||
+            header.sourceSize != sourceSize || header.sourceHash != sourceHash)
+            return;  // stale: the loader will reject it the normal way
+        entry.sourceVerified = true;
+        entry.sourceSize = sourceSize;
+        entry.sourceTime = sourceTime;
+    }
+    std::lock_guard<std::mutex> lock(Prefetch().mutex);
+    Prefetch().verified[PrefetchKey(cooked)] = entry;
+}
+
+// The verified record for `cooked`, if its files have not changed since.
+bool LookupVerified(const fs::path& cooked, VerifiedCooked& out) {
+    std::lock_guard<std::mutex> lock(Prefetch().mutex);
+    auto it = Prefetch().verified.find(PrefetchKey(cooked));
+    if (it == Prefetch().verified.end()) return false;
+    uint64_t size = 0;
+    int64_t time = 0;
+    if (!FileStamp(cooked, size, time) || size != it->second.cookedSize ||
+        time != it->second.cookedTime)
+        return false;
+    out = it->second;
+    return true;
+}
+
+} // namespace
+
+void CookedAssetLoader::PrefetchSources(std::vector<fs::path> sources) {
+    auto done = std::make_shared<std::promise<void>>();
+    {
+        std::lock_guard<std::mutex> lock(Prefetch().mutex);
+        Prefetch().pending.push_back(done->get_future().share());
+    }
+    std::thread([sources = std::move(sources), done] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const auto start = std::chrono::steady_clock::now();
+        for (const fs::path& source : sources) PrefetchOne(source);
+        std::cout << "Asset prefetch: " << sources.size() << " source(s) in "
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start).count()
+                  << " ms\n";
+        done->set_value();
+    }).detach();
+}
+
+void CookedAssetLoader::WaitForPrefetch() {
+    std::vector<std::shared_future<void>> pending;
+    {
+        std::lock_guard<std::mutex> lock(Prefetch().mutex);
+        pending = Prefetch().pending;
+    }
+    for (const auto& future : pending) future.wait();
+}
+
 // Bisect helper for the cooked-asset GPU hang.
 //
 //   SGE_NO_COOKED=1           -> no cooked assets at all
@@ -380,8 +538,21 @@ std::shared_ptr<SceneNode> CookedAssetLoader::LoadForSource(
             *reinterpret_cast<const Cooked::Header*>(headerMap.data);
         std::error_code ec;
         const uint64_t sourceSize = fs::file_size(source, ec);
-        if (ec || header.sourceSize != sourceSize ||
-            header.sourceHash != HashFile(source)) {
+        // A prefetch that already hashed this exact source saves re-reading it.
+        VerifiedCooked verified;
+        uint64_t stampSize = 0;
+        int64_t stampTime = 0;
+        const bool prefetched = LookupVerified(cooked, verified) &&
+            verified.sourceVerified && FileStamp(source, stampSize, stampTime) &&
+            stampSize == verified.sourceSize && stampTime == verified.sourceTime;
+        const auto tHash0 = std::chrono::steady_clock::now();  // TIMING
+        const bool stale = ec || header.sourceSize != sourceSize ||
+            (!prefetched && header.sourceHash != HashFile(source));
+        std::cout << "[TIMING] srcHash " << source.filename().string() << " "
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - tHash0).count()
+                  << " ms\n";
+        if (stale) {
             if (error) *error = "cooked asset is stale";
             return {};
         }
@@ -392,6 +563,11 @@ std::shared_ptr<SceneNode> CookedAssetLoader::LoadForSource(
 std::shared_ptr<SceneNode> CookedAssetLoader::Load(
     const fs::path& cookedPath, ComPtr<ID3D12Device> device,
     ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error) {
+    const auto tT0 = std::chrono::steady_clock::now();  // TIMING
+    const auto tMs = [](std::chrono::steady_clock::time_point at) {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - at).count();
+    };
     std::string localError;
     MappedFile map;
     if (!map.Open(cookedPath, localError)) {
@@ -408,7 +584,9 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
         if (error) *error = "invalid cooked asset header";
         return {};
     }
-    if (HashBytes(map.data + header.payloadOffset,
+    VerifiedCooked verified;
+    if (!LookupVerified(cookedPath, verified) &&
+        HashBytes(map.data + header.payloadOffset,
                   static_cast<size_t>(header.payloadSize)) !=
         header.contentHash) {
         if (error) *error = "cooked asset payload hash mismatch";
@@ -425,6 +603,9 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
         reinterpret_cast<const Cooked::Primitive*>(
             map.data + header.primitiveOffset);
 
+    std::cout << "[TIMING] cooked " << cookedPath.filename().string()
+              << " map+payloadHash " << tMs(tT0) << " ms\n";
+    const auto tTex0 = std::chrono::steady_clock::now();
     std::vector<ComPtr<ID3D12Resource>> textureUploads;
     std::vector<ComPtr<ID3D12Resource>> textures(header.textureCount);
     for (uint32_t i = 0; i < header.textureCount; ++i) {
@@ -438,6 +619,9 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
         PumpPendingWindowMessages();
     }
 
+    std::cout << "[TIMING] cooked textures " << header.textureCount << " in "
+              << tMs(tTex0) << " ms\n";
+    const auto tPrim0 = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<SceneMaterial>> materials;
     materials.reserve((std::max)(1u, header.materialCount));
     for (uint32_t i = 0; i < header.materialCount; ++i) {
@@ -656,6 +840,8 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
         root->mesh->primitives.push_back(std::move(primitive));
         PumpPendingWindowMessages();
     }
+    std::cout << "[TIMING] cooked primitives " << header.primitiveCount
+              << " in " << tMs(tPrim0) << " ms, total " << tMs(tT0) << " ms\n";
     root->UpdateGlobalTransform(root->localTransform);
     return root;
 }

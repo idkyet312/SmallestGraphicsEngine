@@ -21,10 +21,12 @@ public:
     bool Resize(UINT width, UINT height) {
         if (!initialized || width == 0 || height == 0) return false;
         colorTarget_.Reset();
+        motionTarget_.Reset();
         depthTarget_.Reset();
         combinedDepth_.Reset();
         combinedDepthTest_.Reset();
         coverageTarget_.Reset();
+        windMotion_.Reset();
         width_ = width;
         height_ = height;
         readable_ = true;
@@ -35,7 +37,7 @@ public:
     void Begin(ID3D12GraphicsCommandList* commandList) {
         if (!initialized) return;
         if (readable_) {
-            D3D12_RESOURCE_BARRIER barriers[2] = {};
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
             barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barriers[0].Transition.pResource = colorTarget_.Get();
             barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -44,18 +46,25 @@ public:
             barriers[1] = barriers[0];
             barriers[1].Transition.pResource = depthTarget_.Get();
             barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            commandList->ResourceBarrier(2, barriers);
+            barriers[2] = barriers[0];
+            barriers[2].Transition.pResource = motionTarget_.Get();
+            commandList->ResourceBarrier(3, barriers);
             readable_ = false;
         }
         const float clear[4] = {};
+        // Two contiguous RTVs: colour, then the blades' wind motion.
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
             rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE motionRtv = rtv;
+        motionRtv.ptr += g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             dsvHeap_->GetCPUDescriptorHandleForHeapStart();
         commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        commandList->ClearRenderTargetView(motionRtv, clear, 0, nullptr);
         commandList->ClearDepthStencilView(
             dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        commandList->OMSetRenderTargets(2, &rtv, TRUE, &dsv);
         commandList->RSSetViewports(1, &g_dx12.viewport);
         commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
     }
@@ -66,7 +75,7 @@ public:
                    ID3D12Resource* sceneDepth) {
         if (!initialized || !sceneColor || !sceneMotion || !sceneDepth) return;
 
-        D3D12_RESOURCE_BARRIER barriers[6] = {};
+        D3D12_RESOURCE_BARRIER barriers[8] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = colorTarget_.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -87,7 +96,11 @@ public:
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barriers[5] = barriers[4];
         barriers[5].Transition.pResource = coverageTarget_.Get();
-        commandList->ResourceBarrier(6, barriers);
+        barriers[6] = barriers[2];
+        barriers[6].Transition.pResource = windMotion_.Get();
+        barriers[7] = barriers[0];
+        barriers[7].Transition.pResource = motionTarget_.Get();
+        commandList->ResourceBarrier(8, barriers);
         readable_ = true;
 
         UpdateDescriptors(sceneColor, sceneMotion, sceneDepth);
@@ -101,15 +114,14 @@ public:
         commandList->SetComputeRoot32BitConstants(1, 2, size, 0);
         commandList->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
 
-        D3D12_RESOURCE_BARRIER uav[4] = {};
-        for (UINT i = 0; i < 4; ++i) {
+        D3D12_RESOURCE_BARRIER uav[5] = {};
+        ID3D12Resource* const written[5] = { sceneColor, sceneMotion,
+            combinedDepth_.Get(), coverageTarget_.Get(), windMotion_.Get() };
+        for (UINT i = 0; i < 5; ++i) {
             uav[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            uav[i].UAV.pResource =
-                i == 0 ? sceneColor :
-                (i == 1 ? sceneMotion :
-                 (i == 2 ? combinedDepth_.Get() : coverageTarget_.Get()));
+            uav[i].UAV.pResource = written[i];
         }
-        commandList->ResourceBarrier(4, uav);
+        commandList->ResourceBarrier(5, uav);
         std::swap(barriers[2].Transition.StateBefore,
                   barriers[2].Transition.StateAfter);
         std::swap(barriers[3].Transition.StateBefore,
@@ -118,7 +130,9 @@ public:
                   barriers[4].Transition.StateAfter);
         std::swap(barriers[5].Transition.StateBefore,
                   barriers[5].Transition.StateAfter);
-        commandList->ResourceBarrier(4, &barriers[2]);
+        std::swap(barriers[6].Transition.StateBefore,
+                  barriers[6].Transition.StateAfter);
+        commandList->ResourceBarrier(5, &barriers[2]);
 
         // A D3D12 texture cannot carry both UAV and depth-stencil flags. Keep
         // the compute output shader-readable for AO/water/fog, and mirror the
@@ -154,6 +168,12 @@ public:
         return coverageTarget_.Get();
     }
 
+    // Screen-UV motion the wind added to the nearest grass sample this frame
+    // (R16G16_FLOAT, zero where no blade). Rests in NON_PIXEL_SHADER_RESOURCE.
+    ID3D12Resource* GetWindMotionResource() const {
+        return windMotion_.Get();
+    }
+
     D3D12_CPU_DESCRIPTOR_HANDLE BeginCombinedDepthTest(
             ID3D12GraphicsCommandList* commandList) {
         D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
@@ -174,7 +194,7 @@ private:
     bool CreateDescriptorHeaps() {
         D3D12_DESCRIPTOR_HEAP_DESC rtv = {};
         rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv.NumDescriptors = 1;
+        rtv.NumDescriptors = 2;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &rtv, IID_PPV_ARGS(&rtvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC dsv = rtv;
@@ -184,7 +204,7 @@ private:
                 &dsv, IID_PPV_ARGS(&dsvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = 7;
+        descriptors.NumDescriptors = 9;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         return SUCCEEDED(g_dx12.device->CreateDescriptorHeap(
             &descriptors, IID_PPV_ARGS(&descriptorHeap_)));
@@ -224,6 +244,20 @@ private:
         g_dx12.device->CreateRenderTargetView(
             colorTarget_.Get(), &rtv,
             rtvHeap_->GetCPUDescriptorHandleForHeapStart());
+
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        colorClear.Format = desc.Format;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &colorClear,
+                IID_PPV_ARGS(&motionTarget_)))) return false;
+        rtv.Format = desc.Format;
+        D3D12_CPU_DESCRIPTOR_HANDLE motionRtv =
+            rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        motionRtv.ptr += g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_dx12.device->CreateRenderTargetView(
+            motionTarget_.Get(), &rtv, motionRtv);
 
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -269,6 +303,11 @@ private:
                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
                 IID_PPV_ARGS(&coverageTarget_)))) return false;
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&windMotion_)))) return false;
         readable_ = true;
         combinedDepthRead_ = false;
         return true;
@@ -293,13 +332,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 3;
+        ranges[0].NumDescriptors = 4;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 4;
+        ranges[1].NumDescriptors = 5;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 3;
+        ranges[1].OffsetInDescriptorsFromTableStart = 4;
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable.NumDescriptorRanges = 2;
@@ -345,6 +384,10 @@ private:
         srv.Texture2D.MipLevels = 1;
         g_dx12.device->CreateShaderResourceView(sceneDepth, &srv, handle);
         handle.ptr += stride;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(motionTarget_.Get(), &srv, handle);
+        handle.ptr += stride;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -360,6 +403,10 @@ private:
         uav.Format = DXGI_FORMAT_R8_UNORM;
         g_dx12.device->CreateUnorderedAccessView(
             coverageTarget_.Get(), nullptr, &uav, handle);
+        handle.ptr += stride;
+        uav.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateUnorderedAccessView(
+            windMotion_.Get(), nullptr, &uav, handle);
     }
 
     UINT width_ = 0;
@@ -367,10 +414,12 @@ private:
     bool readable_ = true;
     bool combinedDepthRead_ = false;
     ComPtr<ID3D12Resource> colorTarget_;
+    ComPtr<ID3D12Resource> motionTarget_;
     ComPtr<ID3D12Resource> depthTarget_;
     ComPtr<ID3D12Resource> combinedDepth_;
     ComPtr<ID3D12Resource> combinedDepthTest_;
     ComPtr<ID3D12Resource> coverageTarget_;
+    ComPtr<ID3D12Resource> windMotion_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     ComPtr<ID3D12DescriptorHeap> dsvHeap_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;

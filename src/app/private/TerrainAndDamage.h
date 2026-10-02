@@ -702,6 +702,8 @@ static float g_winScreenDifficulty = 1.0f;
 // NewFrame pair. Reset there; aged in RenderWinScreen off a clamped delta, the
 // same way the HUD ages its floating payouts.
 static float g_winScreenAge = 0.0f;
+// The report tab on show: 0 summary, 1 score, 2 payout. Reset per report.
+static int g_winScreenTab = 0;
 
 // Push the settings into the systems that actually consume them.
 //

@@ -241,7 +241,14 @@ static bool RenderThumbnailToTexture(PrefabThumbnailRuntime& entry) {
         entry.mesh->maximum[2] - entry.mesh->minimum[2], 0.001f });
     const XMMATRIX world = XMMatrixTranslation(-centerX, -centerY, -centerZ) *
         XMMatrixScaling(1.65f / span, 1.65f / span, 1.65f / span);
-    const XMMATRIX view = XMMatrixLookAtLH(XMVectorSet(2.4f, 1.8f, -2.4f, 1.0f),
+    // Side view: look across the longer horizontal axis, slightly from above,
+    // so a rifle fills the frame end to end.
+    const bool longAlongX = entry.mesh->maximum[0] - entry.mesh->minimum[0] >=
+                            entry.mesh->maximum[2] - entry.mesh->minimum[2];
+    const XMVECTOR eye = !entry.sideView ? XMVectorSet(2.4f, 1.8f, -2.4f, 1.0f)
+        : longAlongX ? XMVectorSet(0.0f, 0.35f, -3.4f, 1.0f)
+                     : XMVectorSet(3.4f, 0.35f, 0.0f, 1.0f);
+    const XMMATRIX view = XMMatrixLookAtLH(eye,
         XMVectorZero(), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
     const XMMATRIX projection = XMMatrixPerspectiveFovLH(
         XMConvertToRadians(32.0f), 1.0f, 0.1f, 20.0f);
@@ -355,7 +362,8 @@ static uint64_t ThumbnailGpuHandle(const PrefabThumbnailRuntime& entry) {
     return gpu.ptr;
 }
 
-static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
+static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab,
+                                       bool sideView = false) {
     if (!imguiSrvHeap || prefab.modelPath.empty()) return 0;
     if (g_prefabEditorSmokeEnabled) {
         std::error_code smokeError;
@@ -367,6 +375,7 @@ static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
         std::to_string(std::filesystem::file_size(prefab.modelPath, error)) + ':' +
         std::to_string(std::filesystem::last_write_time(prefab.modelPath, error)
             .time_since_epoch().count()) + ":dx12-rtt-v2" +
+        (sideView ? ":side" : "") +
         (g_prefabEditorSmokeEnabled
             ? (":smoke:" + std::to_string(GetCurrentProcessId())) : "");
     const uint64_t sourceHash = StableThumbnailHash(source);
@@ -374,6 +383,7 @@ static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
     if (entry.sourceHash != sourceHash) {
         entry = PrefabThumbnailRuntime{};
         entry.sourceHash = sourceHash;
+        entry.sideView = sideView;
         entry.pngPath = std::filesystem::path("assetcache/thumbs") /
             (std::to_string(sourceHash) + ".png");
     }

@@ -161,13 +161,17 @@ static bool UIPrimaryButton(const char* label, float height = 52.0f) {
 //
 // Hover is the selection: these menus are a single column with no keyboard
 // focus of their own, so whatever the mouse is over is what Enter would take.
-static bool UIMenuRow(const char* label, float height = 34.0f) {
+// `enabled` false greys the row out and ignores clicks.
+static bool UIMenuRow(const char* label, float height = 34.0f,
+                      bool enabled = true) {
     const float width = ImGui::GetContentRegionAvail().x;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     // InvisibleButton takes the input so the row stays one hit target the full
     // width of the column, rather than only where the glyphs happen to fall.
+    ImGui::BeginDisabled(!enabled);
     const bool pressed = ImGui::InvisibleButton(label, ImVec2(width, height));
-    const bool hovered = ImGui::IsItemHovered();
+    const bool hovered = enabled && ImGui::IsItemHovered();
+    ImGui::EndDisabled();
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     if (hovered) {
@@ -182,9 +186,10 @@ static bool UIMenuRow(const char* label, float height = 34.0f) {
     draw->AddText(ImVec2(origin.x + 14.0f,
                          origin.y + (height - textSize.y) * 0.5f),
                   hovered ? IM_COL32(12, 16, 14, 255)
-                          : IM_COL32(226, 232, 228, 236),
+                          : enabled ? IM_COL32(226, 232, 228, 236)
+                                    : IM_COL32(226, 232, 228, 80),
                   label, labelEnd);
-    return pressed;
+    return pressed && enabled;
 }
 
 // ---- Settings screen -------------------------------------------------------

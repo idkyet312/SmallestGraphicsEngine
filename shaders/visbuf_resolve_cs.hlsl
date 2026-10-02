@@ -341,16 +341,24 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     uint  rrGuideEnable;
     // Lumen-style GI (append only; C++ mirror EnhancedConstants).
     uint  enhancedLumenGI;
-    // This frame's camera jitter in UV, non-zero only while Ray Reconstruction
-    // is the consumer: RR does not resolve jitter carried inside the motion
-    // vectors (measured: static-camera frames kept moving at every edge until
-    // the jitter was zeroed), so under RR it is subtracted before writing them.
+    // Jitter carried inside the motion vectors, in UV, non-zero only while Ray
+    // Reconstruction is the consumer; subtracted so RR gets unjittered vectors.
+    // Native RR: this frame's jitter. Upscaling RR: current - previous jitter
+    // (its previous VP is jittered). See the C++ fill for the measurements.
     float2 rrMotionJitterUV;
     // SanitizeRaySample on/off. On by default; the capture switch
     // SGE_NO_RAY_SANITIZE turns it off for A/B measurement.
     uint  raySanitizeEnabled;
     uint  enhancedLumenHalfResolution;
-    uint3 enhancedHalfResolutionPadding;
+    // Texture LOD bias as a gradient multiplier, 2^bias. NVIDIA's DLSS rule
+    // is bias = log2(render / display) - 1, so textures resolve at display
+    // detail for the upscaler; 1.0 leaves sampling unchanged.
+    float enhancedMipGradScale;
+    // Same for normal, metal/roughness and the other detail maps. Kept apart:
+    // a negative bias on normals aliases the lighting, which RR then smears
+    // into a crawling pattern under camera motion.
+    float enhancedDetailMipGradScale;
+    uint  enhancedHalfResolutionPadding;
 };
 // Every motion write goes through this so the three sites (surfaces, sky,
 // terrain) cannot disagree about the jitter convention.
@@ -2379,6 +2387,15 @@ Surface EvaluateSurface(float3 fragPos,
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     float2 uvDx, uvDy;
     ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
+#if SGE_ENHANCED_VISUALS
+    const float2 albedoDx = uvDx * enhancedMipGradScale;
+    const float2 albedoDy = uvDy * enhancedMipGradScale;
+    uvDx *= enhancedDetailMipGradScale;
+    uvDy *= enhancedDetailMipGradScale;
+#else
+    const float2 albedoDx = uvDx;
+    const float2 albedoDy = uvDy;
+#endif
 
     // Material
     // The clamp bounds the fetch against the material table. The legacy tier
@@ -2401,7 +2418,7 @@ Surface EvaluateSurface(float3 fragPos,
         uint albedoTextureIndex = material.textureIndices.x;
         Texture2D<float4> albedoTexture = MAT_TEX(albedoTextureIndex);
         float4 authoredSample = albedoTexture.SampleGrad(
-            texSampler, texCoord, uvDx, uvDy);
+            texSampler, texCoord, albedoDx, albedoDy);
         if (isFoliage) {
             foliageCoverage = authoredSample.a;
             uint texWidth, texHeight, texLevels;
@@ -2409,13 +2426,13 @@ Surface EvaluateSurface(float3 fragPos,
                 0, texWidth, texHeight, texLevels);
             float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
             float4 neighbor0 = albedoTexture.SampleGrad(
-                texSampler, texCoord + float2(texel.x, 0.0), uvDx, uvDy);
+                texSampler, texCoord + float2(texel.x, 0.0), albedoDx, albedoDy);
             float4 neighbor1 = albedoTexture.SampleGrad(
-                texSampler, texCoord - float2(texel.x, 0.0), uvDx, uvDy);
+                texSampler, texCoord - float2(texel.x, 0.0), albedoDx, albedoDy);
             float4 neighbor2 = albedoTexture.SampleGrad(
-                texSampler, texCoord + float2(0.0, texel.y), uvDx, uvDy);
+                texSampler, texCoord + float2(0.0, texel.y), albedoDx, albedoDy);
             float4 neighbor3 = albedoTexture.SampleGrad(
-                texSampler, texCoord - float2(0.0, texel.y), uvDx, uvDy);
+                texSampler, texCoord - float2(0.0, texel.y), albedoDx, albedoDy);
             float totalCoverage = authoredSample.a + neighbor0.a + neighbor1.a +
                                   neighbor2.a + neighbor3.a;
             float3 coveredColor =
@@ -3162,6 +3179,17 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
                              float2(0.5, -0.5) + 0.5;
             outputMotion[pixel] = RR_UNJITTER(currentUV - previousUV);
         }
+#if SGE_ENHANCED_VISUALS
+        // NVIDIA's sky defaults (DLSS-RR Integration Guide 3.4.1 / 3.4.2 /
+        // 3.4.9): the zeros from the clear above read as a black, mirror-hit
+        // surface. The shared normal/roughness stay as they are; other passes
+        // read the zero normal as "no geometry".
+        if (rrGuideEnable != 0u) {
+            rrDiffuseAlbedo[pixel] = float4(0.5, 0.5, 0.5, 1.0);
+            rrSpecularAlbedo[pixel] = 0.0;
+            rrSpecularHitDistance[pixel] = 65504.0;
+        }
+#endif
         return;
     }
     

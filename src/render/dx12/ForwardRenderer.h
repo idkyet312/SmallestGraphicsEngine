@@ -2269,9 +2269,9 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
 
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
-            static_assert(sizeof(GrassField::Params) == 19 * sizeof(UINT),
-                          "GrassParams must match the 19 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 19, &gp, 0);
+            static_assert(sizeof(GrassField::Params) == 20 * sizeof(UINT),
+                          "GrassParams must match the 20 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 20, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
             g_dx12.commandList->SetPipelineState(grassPipeline);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
@@ -2847,9 +2847,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // same call, so sharing the slots is safe.)
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
-            static_assert(sizeof(GrassField::Params) == 19 * sizeof(UINT),
-                          "GrassParams must match the 19 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 19, &gp, 0);
+            static_assert(sizeof(GrassField::Params) == 20 * sizeof(UINT),
+                          "GrassParams must match the 20 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 20, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
 
             g_dx12.commandList->SetPipelineState(
@@ -3473,7 +3473,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.Use(scene.wireframeMode);
     // Eye of whatever camera this pass draws for (the scope view reuses it).
     const XMVECTOR tracerEye = XMMatrixInverse(nullptr, view).r[3];
-    constexpr float kTracerEyeClearance = 1.5f;
+    constexpr float kTracerEyeClearance = 0.5f;
     // ~3 px half-width at 1080p / 60 degree FOV, at the streak's nearest point.
     constexpr float kTracerMaxHalfAngle = 0.003f;
     for (auto& p : scene.projectiles) {

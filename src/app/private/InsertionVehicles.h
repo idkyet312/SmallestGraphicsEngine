@@ -481,11 +481,12 @@ static bool ModelHasSkinnedPrimitive(const std::shared_ptr<SceneNode>& node) {
 // bare swap would leave the new airframe flying with the old one's dimensions,
 // seating the player in mid-air beside it.
 //
-// Falls back to the BlackHawk when the requested airframe is not loaded, so a
-// missing optional asset costs the choice rather than the insertion.
+// Falls back to whichever airframe is loaded when the requested one is not,
+// so a missing asset costs the choice rather than the insertion.
 static void ApplyInsertionAirframe(InsertionAirframe airframe) {
     int slot = static_cast<int>(airframe);
-    if (slot < 0 || slot > 1 || !g_blackHawkAirframeModel[slot]) slot = 0;
+    if (slot < 0 || slot > 1) slot = 1;
+    if (!g_blackHawkAirframeModel[slot]) slot = 1 - slot;
     g_insertionAirframe = static_cast<InsertionAirframe>(slot);
 
     g_blackHawkModel = g_blackHawkAirframeModel[slot];

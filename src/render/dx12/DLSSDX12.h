@@ -76,6 +76,32 @@ struct Settings {
     bool invertJitter = false;
 };
 
+// What the last Evaluate handed DLSS / RR, for the jitter debug overlay.
+struct EvalDebug {
+    bool valid = false;
+    bool rayReconstruction = false;
+    bool superResolution = false;
+    bool motionVectorsJittered = false;
+    bool reset = false;
+    float jitterX = 0.0f, jitterY = 0.0f;   // consts.jitterOffset, render px
+    float mvecScaleX = 0.0f, mvecScaleY = 0.0f;
+    UINT inputWidth = 0, inputHeight = 0, outputWidth = 0, outputHeight = 0;
+    int mode = 0;                            // sl::DLSSMode
+    uint32_t frameIndex = 0;
+    // Real sizes of every tagged resource (0 = not tagged). Inputs are tagged
+    // with the render extent, so any that differ are read wrongly.
+    static constexpr int kResourceCount = 8;
+    UINT resourceWidth[kResourceCount] = {};
+    UINT resourceHeight[kResourceCount] = {};
+};
+// Order of EvalDebug::resourceWidth/Height.
+inline const char* EvalDebugResourceName(int i) {
+    static const char* names[EvalDebug::kResourceCount] = {
+        "colour", "depth", "motion", "normal+rough", "diffuse albedo",
+        "specular albedo", "spec hit dist", "output" };
+    return names[i];
+}
+
 #if defined(SGE_WITH_STREAMLINE)
 // Loads sl.interposer.dll from the exe directory, verifies its signature and
 // calls slInit. Call before the swapchain is created.
@@ -90,6 +116,7 @@ bool RayReconstructionAvailable();
 const char* RayReconstructionStatus();
 // Whether the last successful evaluate ran Ray Reconstruction.
 bool LastEvaluatedRR();
+const EvalDebug& LastEvalDebug();
 const char* Status();
 Settings& GetSettings();
 // Returns an SDK-supported render size for the requested percentage. False
@@ -116,6 +143,7 @@ inline const char* RayReconstructionStatus() {
 }
 inline const char* Status() { return "Built without the Streamline SDK"; }
 inline bool LastEvaluatedRR() { return false; }
+inline const EvalDebug& LastEvalDebug() { static EvalDebug d; return d; }
 inline Settings& GetSettings() { static Settings settings; return settings; }
 inline bool RenderSize(UINT width, UINT height, float, UINT& renderWidth,
                        UINT& renderHeight) {

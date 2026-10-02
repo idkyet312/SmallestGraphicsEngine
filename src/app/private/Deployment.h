@@ -448,6 +448,15 @@ static bool g_deploymentDebugHideAO = false;
 // one wasted ImGui pass and keeps every control live under the blank screen.
 // Toggled with F9, which is the only way back once the checkbox is invisible.
 static bool g_deploymentDebugHideUI = false;
+// Development controls on the planning screen: the DEBUG and FIRE SUPPORT
+// sections, the per-weapon camera shake slider and the layout seeds. Hidden
+// from players; Ctrl+Shift+D on the planning screen toggles them.
+static bool g_deploymentDevTools = false;
+// Loadout picker on the planning screen: which slot's full-screen chooser is
+// open (-1 none, 0 primary, 1 secondary, 2 ordnance, 3 gear) and which choice
+// in it is being previewed (-1 until the player picks one).
+static int g_loadoutPickerSlot = -1;
+static int g_loadoutPickerFocus = -1;
 // Draws the grass field on the planning overview, which normally skips it
 // entirely. Not free and not a default: covering that view means a draw
 // distance of a few hundred metres, i.e. every cell in the field submitted at

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 #include <wrl/client.h>
 
 class CookedAssetLoader {
@@ -24,6 +25,19 @@ public:
         Microsoft::WRL::ComPtr<ID3D12Device> device,
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
         std::string* error = nullptr);
+
+    // Background warm-up for assets that will be loaded soon. A worker thread
+    // reads each source file and its cooked asset sequentially -- pulling them
+    // into the OS file cache -- and verifies both hashes. A later LoadForSource
+    // of an unchanged file then skips the re-hash and maps memory that is
+    // already resident. Returns at once; safe to call from the main thread.
+    //
+    // Measured 2026-10-02 (game on a USB SSD): the armory's weapon set took
+    // 21.3 s through the memory-mapped, random-access loader on a cold cache
+    // and 5.8 s on a warm one.
+    static void PrefetchSources(std::vector<std::filesystem::path> sources);
+    // Blocks until every prefetch started so far has finished.
+    static void WaitForPrefetch();
 
     static bool LoadAnimationsForSource(
         const std::filesystem::path& source,

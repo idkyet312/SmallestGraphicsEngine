@@ -374,6 +374,8 @@ bool RayReconstructionAvailable() { return S().rrSupported; }
 const char* RayReconstructionStatus() { return S().rrStatus.c_str(); }
 const char* Status() { return S().status.c_str(); }
 bool LastEvaluatedRR() { return S().lastEvaluatedRR; }
+static EvalDebug g_evalDebug;
+const EvalDebug& LastEvalDebug() { return g_evalDebug; }
 Settings& GetSettings() { return S().settings; }
 
 bool RenderSize(UINT displayWidth, UINT displayHeight, float percentage,
@@ -550,11 +552,41 @@ bool Evaluate(const DLSSFrameInputs& in) {
     // projection, so this frame's jitter is inside the vector -- except under
     // Ray Reconstruction, where the resolve subtracts it: RR left static-camera
     // frames moving at every edge with jittered vectors (SR/DLAA did not).
-    // Upscaling RR takes jittered vectors like SR (measured steadier).
+    // Upscaling RR is handed unjittered vectors too (in.motionUnjittered).
     consts.motionVectorsJittered =
         ((rr && !superResolution) || in.motionUnjittered)
         ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 
+    g_evalDebug.valid = true;
+    g_evalDebug.rayReconstruction = rr;
+    g_evalDebug.superResolution = superResolution;
+    g_evalDebug.motionVectorsJittered =
+        consts.motionVectorsJittered == sl::Boolean::eTrue;
+    g_evalDebug.reset = consts.reset == sl::Boolean::eTrue;
+    g_evalDebug.jitterX = consts.jitterOffset.x;
+    g_evalDebug.jitterY = consts.jitterOffset.y;
+    g_evalDebug.mvecScaleX = consts.mvecScale.x;
+    g_evalDebug.mvecScaleY = consts.mvecScale.y;
+    g_evalDebug.inputWidth = in.width;
+    g_evalDebug.inputHeight = in.height;
+    g_evalDebug.outputWidth = outputWidth;
+    g_evalDebug.outputHeight = outputHeight;
+    g_evalDebug.mode = static_cast<int>(mode);
+    g_evalDebug.frameIndex = frameIndex;
+    {
+        ID3D12Resource* tagged[EvalDebug::kResourceCount] = {
+            in.color, in.depth, in.motion,
+            rr ? in.normalRoughness : nullptr, rr ? in.diffuseAlbedo : nullptr,
+            rr ? in.specularAlbedo : nullptr,
+            rr ? in.specularHitDistance : nullptr,
+            superResolution ? in.output : s.output.Get() };
+        for (int i = 0; i < EvalDebug::kResourceCount; ++i) {
+            const D3D12_RESOURCE_DESC desc = tagged[i]
+                ? tagged[i]->GetDesc() : D3D12_RESOURCE_DESC{};
+            g_evalDebug.resourceWidth[i] = static_cast<UINT>(desc.Width);
+            g_evalDebug.resourceHeight[i] = desc.Height;
+        }
+    }
     if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
         Log("slSetConstants failed");
         return false;

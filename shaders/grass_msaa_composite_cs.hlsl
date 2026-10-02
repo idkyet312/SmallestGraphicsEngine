@@ -1,10 +1,12 @@
 Texture2DMS<float4, 4> grassColor : register(t0);
 Texture2DMS<float, 4> grassDepth : register(t1);
 Texture2D<float> sceneDepth : register(t2);
+Texture2DMS<float2, 4> grassWindMotion : register(t3);
 RWTexture2D<float4> sceneColor : register(u0);
 RWTexture2D<float2> sceneMotion : register(u1);
 RWTexture2D<float> combinedDepth : register(u2);
 RWTexture2D<float> grassCoverage : register(u3);
+RWTexture2D<float2> windMotion : register(u4);
 
 cbuffer CompositeConstants : register(b0) {
     uint2 outputSize;
@@ -19,6 +21,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     float3 premultipliedGrass = 0.0;
     float coverage = 0.0;
     float nearestDepth = opaqueDepth;
+    float2 nearestWindMotion = 0.0;
 
     [unroll]
     for (uint sampleIndex = 0; sampleIndex < 4; ++sampleIndex) {
@@ -29,7 +32,10 @@ void main(uint3 threadId : SV_DispatchThreadID) {
         if (covered) {
             premultipliedGrass += sampleColor.rgb * 0.25;
             coverage += 0.25;
-            nearestDepth = min(nearestDepth, sampleDepth);
+            if (sampleDepth < nearestDepth) {
+                nearestDepth = sampleDepth;
+                nearestWindMotion = grassWindMotion.Load(pixel, sampleIndex);
+            }
         }
     }
 
@@ -40,6 +46,9 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     // weight a one-sample blade by 25% instead of treating its nearest depth as
     // though the blade filled the whole pixel.
     grassCoverage[pixel] = coverage;
+    // The wind's share of the nearest blade's motion, matching the depth kept
+    // above. rr_forward_guides_cs adds it to the camera reprojection.
+    windMotion[pixel] = nearestWindMotion;
 
     if (coverage > 0.0) {
         const float3 background = sceneColor[pixel].rgb;

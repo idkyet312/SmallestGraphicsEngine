@@ -115,6 +115,9 @@ static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 // the HUD: next frame's motion vectors and HZB test need the rendered matrix
 // (measured: storing the unjittered one put RR noise all over the terrain).
 static XMFLOAT2             g_dlssResolvedJitterPixels = { 0.0f, 0.0f };
+static XMFLOAT2             g_previousRenderedJitterPixels = { 0.0f, 0.0f };
+static bool                 g_previousVPUpdatedLastFrame = true;
+static UINT64               g_frameCounterForDebug = 0;
 static bool                 g_dlssResolvedJitterValid = false;
 static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;

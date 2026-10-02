@@ -8,12 +8,15 @@
 #include "SceneGraph.h"
 #include "ProfilerDX12.h"
 #include "VisibilityGeometryPool.h"
+#include "DLSSDX12.h"
+#include "BootTimer.h"
 #include <DirectXPackedVector.h>
 #include <stb_image.h>
 #include <algorithm>
 #include <memory>
 #include <cassert>
 #include <fstream>
+#include <future>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
@@ -317,6 +320,40 @@ public:
     ComPtr<ID3D12PipelineState> rrForwardGuidesPSO;
     ComPtr<ID3D12DescriptorHeap> rrForwardGuidesHeap;
     bool rrForwardGuidesTried = false;
+    // Motion-vector debug overlay (motion_debug_cs.hlsl). 0 off, 1 over the
+    // scene, 2 motion only. F7 cycles it; SGE_MOTION_DEBUG sets it at start.
+    UINT motionDebugMode = 0;
+    ComPtr<ID3D12RootSignature> motionDebugRootSig;
+    ComPtr<ID3D12PipelineState> motionDebugPSO;
+    ComPtr<ID3D12DescriptorHeap> motionDebugHeap;
+    bool motionDebugTried = false;
+
+    // Jitter debug (shown with the motion overlay). Eight motion pixels are
+    // copied right before DLSS / RR evaluates -- the vectors it actually
+    // received -- and read back once the GPU has finished that frame.
+    static constexpr UINT kJitterProbeCount = 8;
+    struct JitterProbeFrame {
+        bool valid = false;
+        UINT64 frame = 0;
+        UINT renderWidth = 0, renderHeight = 0;
+        XMFLOAT2 jitterCurrent = { 0.0f, 0.0f };   // render px
+        XMFLOAT2 jitterPrevious = { 0.0f, 0.0f };  // in the previous VP
+        XMFLOAT2 resolveStripUV = { 0.0f, 0.0f };  // subtracted by the resolve
+        bool previousVPFresh = true;
+        bool rr = false, rrUpscale = false, forwardGuides = false;
+        UINT mvMode = 0;
+        DLSS::EvalDebug dlss;
+        XMFLOAT2 probeUV[kJitterProbeCount] = {};    // where (0..1)
+        XMFLOAT2 motionUV[kJitterProbeCount] = {};   // what was read
+    };
+    static constexpr float kJitterProbePositions[kJitterProbeCount][2] = {
+        { 0.50f, 0.50f }, { 0.86f, 0.33f }, { 0.12f, 0.30f }, { 0.30f, 0.78f },
+        { 0.50f, 0.42f }, { 0.50f, 0.05f }, { 0.60f, 0.85f }, { 0.75f, 0.62f } };
+    ComPtr<ID3D12Resource> jitterProbeReadback[FRAME_COUNT];
+    JitterProbeFrame jitterProbePending[FRAME_COUNT];
+    JitterProbeFrame jitterProbeLatest;
+    XMFLOAT2 lastResolveStripUV = { 0.0f, 0.0f };
+    float mipBiasApplied = 0.0f;
 
     // Depth buffer SRV for the compute pass (reads main depth)
     // We'll create a SRV for the engine's existing depth buffer
@@ -534,6 +571,10 @@ public:
     // pixels. Set by the frame loop; the resolve strips it from the motion
     // vectors while Ray Reconstruction is active.
     XMFLOAT2 rrMotionJitterPixels = { 0.0f, 0.0f };
+    // Jitter of the previous frame's rendered projection (render pixels).
+    XMFLOAT2 rrPreviousJitterPixels = { 0.0f, 0.0f };
+    // Upscaling RR motion convention: 2 unjittered (default), 0 legacy.
+    UINT rrUpscaleMotionMode = 2;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
@@ -574,6 +615,7 @@ public:
     ComPtr<ID3D12Resource> svgfCompositeConstantBuffer;
     void* svgfCompositeConstantMapped = nullptr;
     bool svgfAtrousPipelineReady = false;
+    bool svgfAtrousPipelineTried = false;
     // Last-frame execution facts for the in-app RTX/SVGF self-test. These are
     // set where commands are recorded, so the UI can distinguish an enabled
     // checkbox from a pass that actually reached the command list.
@@ -1180,11 +1222,17 @@ public:
             return { 0.0f, 0.0f };
         // Super Resolution needs more phases than TAA: each output pixel sees
         // ratio^2 fewer render samples. NVIDIA's guidance is 8 * ratio^2.
-        if (dlssActive && width && height && width < displayWidth) {
+        // Ray Reconstruction wants at least 32 at any ratio, DLAA included
+        // (DLSS-RR Integration Guide 3.6). rayReconstructionActive is last
+        // frame's value here; a toggle settles one frame later.
+        if (dlssActive && width && height &&
+            (width < displayWidth || rayReconstructionActive)) {
             const float ratio = static_cast<float>(displayWidth) /
                                 static_cast<float>(width);
+            const UINT minimumPhases = rayReconstructionActive ? 32u : 8u;
             const UINT phases = std::clamp(
-                static_cast<UINT>(8.0f * ratio * ratio + 0.5f), 8u, 128u);
+                static_cast<UINT>(8.0f * ratio * ratio + 0.5f),
+                minimumPhases, 128u);
             const auto halton = [](UINT index, UINT base) {
                 float f = 1.0f, r = 0.0f;
                 for (; index > 0; index /= base) {
@@ -1290,12 +1338,28 @@ public:
             return false;
         if (!require(CreateStructuredBuffers(), "structured buffers")) return false;
         if (!require(CreateComputeDescriptorHeap(), "compute descriptors")) return false;
-        if (!require(CreateVisPassPipeline(), "visibility shaders")) return false;
-        if (!require(CreateResolvePipeline(), "resolve shader")) return false;
+        {
+            BootTimer::Scope step("VB: visibility pass shaders");
+            if (!require(CreateVisPassPipeline(), "visibility shaders")) return false;
+        }
+        if (deferResolvePipeline) {
+            // Cold boot: the resolve permutations are still on the shader
+            // compile workers. Everything else is built; the menu comes up and
+            // FinishDeferredResolvePipeline runs once the compiles land.
+            resolvePipelineDeferred = true;
+            BootTimer::Log("VB: resolve shaders deferred until compiled");
+        } else {
+            BootTimer::Scope step("VB: resolve shaders (all variants)");
+            if (!require(CreateResolvePipeline(), "resolve shader")) return false;
+        }
         // Best-effort: not wrapped in require(), because the split resolve is
         // correct without classification -- just full-screen.
-        if (CreateTileClassifyPipeline()) CreateTileClassifyResources();
-        if (!require(CreateBloomPipeline(), "bloom pyramid shaders")) return false;
+        {
+            BootTimer::Scope step("VB: tile classify + bloom shaders");
+            if (CreateTileClassifyPipeline()) CreateTileClassifyResources();
+            if (!require(CreateBloomPipeline(), "bloom pyramid shaders")) return false;
+        }
+        BootTimer::Scope postStep("VB: flare, post, exposure shaders");
         // Best-effort: the scene renders correctly without a flare, so a
         // missing or broken flare shader must not take the renderer down.
         if (!CreateFlarePipeline())
@@ -1597,16 +1661,13 @@ public:
         if (!terrainVisibilityRequested) return false;
         if (!terrainAlbedoArray || !terrainNormalArray ||
             !terrainMetalRoughArray) return false;
-        const bool willUseEnhanced = enhancedVisualsActive &&
-            enhancedPipelineReady && enhancedResolvePSO;
         // Mirrors Resolve exactly, including the enhanced qualifier: with
         // enhanced on, the bindless tier is chosen only when its *enhanced*
         // variant is ready, otherwise Resolve falls back to enhanced-only.
         // Dropping that clause here would let this claim a tier Resolve does
         // not select, and terrain would disappear rather than double-draw.
-        const bool willUseBindless = bindlessActive && BindlessResolveReady() &&
-            (!willUseEnhanced || BindlessEnhancedResolveReady()) &&
-            bindlessHeap && bindlessHeap->Initialized();
+        bool willUseBindless = false, willUseEnhanced = false;
+        SelectedResolveTier(willUseBindless, willUseEnhanced);
         // Both halves of the split dispatch are required. A tier with only the
         // generic half would rasterize terrain IDs that nothing ever shades,
         // leaving terrain-shaped holes; forward terrain is the correct fallback.
@@ -1703,6 +1764,154 @@ public:
                             : bindlessTerrainOnlyResolveTiledPSO.Get();
         return enhanced ? enhancedTerrainOnlyResolveTiledPSO.Get()
                         : terrainOnlyResolveTiledPSO.Get();
+    }
+
+    // ---- Resolve permutations: what boot builds, what waits for use ----
+    //
+    // Measured cold boot (2026-10-02, 6C/12T): 21 resolve permutations, 673 s
+    // of compile CPU across 11 workers, 86 s wall -- and the two slowest
+    // (FXC terrain-only, 86 s each under load) belong to a tier an RT session
+    // never selects. A frame only uses one tier's terrain set, so boot builds
+    // the base PSO of every tier (tier selection gates on those) plus the
+    // terrain set of the tier the settings predict. Any other tier's set is
+    // compiled in the background the first time that tier is selected; until
+    // it lands, that tier's terrain lookups return null and terrain draws
+    // forward -- the existing fallback for a missing terrain PSO.
+    enum ResolveTier : int {
+        ResolveTierFXC = 0,
+        ResolveTierEnhanced,
+        ResolveTierBindless,
+        ResolveTierBindlessEnhanced,
+        ResolveTierCount
+    };
+    static int ResolveTierIndex(bool bindless, bool enhanced) {
+        if (bindless)
+            return enhanced ? ResolveTierBindlessEnhanced : ResolveTierBindless;
+        return enhanced ? ResolveTierEnhanced : ResolveTierFXC;
+    }
+    static const char* ResolveTierName(int tier) {
+        static const char* names[ResolveTierCount] = {
+            "default", "enhanced", "bindless", "bindless enhanced" };
+        return tier >= 0 && tier < ResolveTierCount ? names[tier] : "?";
+    }
+
+    // Which tier the next frame resolves on. Mirrors Resolve's selection,
+    // including the enhanced qualifier on bindless: with enhanced on, the
+    // bindless tier is chosen only when its enhanced variant is ready.
+    void SelectedResolveTier(bool& bindless, bool& enhanced) const {
+        enhanced = enhancedVisualsActive && enhancedPipelineReady &&
+                   enhancedResolvePSO;
+        bindless = bindlessActive && BindlessResolveReady() &&
+                   (!enhanced || BindlessEnhancedResolveReady()) &&
+                   bindlessHeap && bindlessHeap->Initialized();
+    }
+
+    // Set before Init on a cold boot: Init skips the resolve pipeline, and the
+    // renderer must not select the visibility path until ResolvePipelineReady.
+    bool deferResolvePipeline = false;
+    bool ResolvePipelineReady() const {
+        return !resolvePipelineDeferred && resolvePSO;
+    }
+
+    // Builds the resolve pipeline Init skipped. Main thread, outside any
+    // command-list recording; with the compiles done these are cache hits plus
+    // driver PSO builds. On failure the visibility path stays unavailable.
+    bool FinishDeferredResolvePipeline() {
+        if (!resolvePipelineDeferred) return ResolvePipelineReady();
+        resolvePipelineDeferred = false;
+        BootTimer::Scope step("VB: resolve shaders (all variants, deferred)");
+        if (!CreateResolvePipeline()) {
+            std::cerr << "Visibility resolve pipeline failed; staying forward\n";
+            resolvePSO.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    // Boot hint from the player settings (RT quality, Lumen, RR, bindless),
+    // set before Init. A wrong guess costs a background compile, not a bug.
+    void SetPredictedResolveTier(bool enhanced, bool bindless) {
+        predictedResolveEnhanced = enhanced;
+        predictedResolveBindless = bindless;
+    }
+
+    // Queues every boot-critical resolve permutation on the shader compile
+    // workers. Called before Init so the compiles run while the boot screen
+    // shows progress; Init then reads them from the cache.
+    void QueueBootResolveCompiles() {
+        if (!PrepareResolveSources()) return;
+        const auto fxc = [](const std::string& source) {
+            ShaderCacheDX12::SubmitFXC(source, "shaders/visbuf_resolve_cs.hlsl",
+                                       "main", "cs_5_1", ResolveFxcFlags(), 0);
+        };
+        const std::wstring directory =
+            ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+        const auto dxc = [&directory](int tier, const std::string& source) {
+            ShaderCacheDX12::SubmitDXC(source, L"visbuf_resolve_cs.hlsl",
+                                       L"main", ResolveTierProfile(tier),
+                                       directory);
+        };
+        fxc(resolveBaseSource);
+        fxc(resolveSourceVSM);
+        const bool dxcAvailable = ShaderCacheDX12::DxcAvailable();
+        const bool bindlessSupported = bindlessHeap && bindlessHeap->Supported();
+        if (dxcAvailable) {
+            dxc(ResolveTierEnhanced, ResolveTierSource(ResolveTierEnhanced));
+            if (bindlessSupported) {
+                dxc(ResolveTierBindless, ResolveTierSource(ResolveTierBindless));
+                dxc(ResolveTierBindlessEnhanced,
+                    ResolveTierSource(ResolveTierBindlessEnhanced));
+            }
+        }
+        const int tier = ResolveTierIndex(
+            predictedResolveBindless && dxcAvailable && bindlessSupported,
+            predictedResolveEnhanced && dxcAvailable);
+        std::string terrain[4];
+        TerrainSetSources(ResolveTierSource(tier), terrain);
+        for (const std::string& source : terrain) {
+            if (tier == ResolveTierFXC) fxc(source);
+            else dxc(tier, source);
+        }
+    }
+
+    // Installs finished background terrain sets and requests the set of the
+    // tier now in use. Main thread, once per frame, before anything asks
+    // TerrainVisibilityReady -- so the forward-terrain decision and Resolve
+    // always see the same PSOs within a frame.
+    void PumpDeferredResolvePipelines() {
+        for (int tier = 0; tier < ResolveTierCount; ++tier) {
+            std::future<TerrainSetBuild>& pending = terrainSetPending[tier];
+            if (!pending.valid() ||
+                pending.wait_for(std::chrono::seconds(0)) !=
+                    std::future_status::ready)
+                continue;
+            TerrainSetBuild build = pending.get();
+            InstallTerrainSet(tier, build);
+            BootTimer::Log(std::string("Terrain resolve variants ready (") +
+                           ResolveTierName(tier) + ")" +
+                           (build.pso[0] ? "" : " -- unavailable, terrain stays forward"));
+        }
+        // A tier must want terrain for a second of consecutive resolves before
+        // it earns a build: the first frames of a level can pass through a
+        // tier (enhanced not yet active, say) that the session never settles on.
+        if (!initialized || missingTerrainTierFrames < 60) return;
+        const int tier = missingTerrainTier;
+        if (tier < 0 || tier >= ResolveTierCount || terrainSetRequested[tier])
+            return;
+        terrainSetRequested[tier] = true;
+        ID3D12RootSignature* rootSig = ResolveTierRootSig(tier);
+        if (!rootSig) return;
+        BootTimer::Log(std::string("Terrain resolve variants (") +
+                       ResolveTierName(tier) + ") requested; compiling in background");
+        // A detached thread holding its own references, so quitting mid-compile
+        // neither blocks on it nor leaves it reading a destroyed renderer.
+        auto promise = std::make_shared<std::promise<TerrainSetBuild>>();
+        terrainSetPending[tier] = promise->get_future();
+        std::thread([promise, tier, source = ResolveTierSource(tier),
+                     root = ComPtr<ID3D12RootSignature>(rootSig),
+                     device = g_dx12.device] {
+            promise->set_value(BuildTerrainSet(tier, source, root, device, true));
+        }).detach();
     }
 
     void SetBentNormalGTAOHistory(ID3D12Resource* history,
@@ -2390,17 +2599,17 @@ public:
         }
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 4;
+        ranges[0].NumDescriptors = 5;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 5;
-        ranges[1].OffsetInDescriptorsFromTableStart = 4;
+        ranges[1].OffsetInDescriptorsFromTableStart = 5;
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable.NumDescriptorRanges = 2;
         params[0].DescriptorTable.pDescriptorRanges = ranges;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[1].Constants.Num32BitValues = 36;
+        params[1].Constants.Num32BitValues = 40;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
         rootDesc.NumParameters = 2;
@@ -2418,7 +2627,7 @@ public:
         pso.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 9 * FRAME_COUNT;
+        heapDesc.NumDescriptors = 10 * FRAME_COUNT;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateComputePipelineState(
                 &pso, IID_PPV_ARGS(&rrForwardGuidesPSO))) ||
@@ -2431,21 +2640,240 @@ public:
         return true;
     }
 
+    bool EnsureMotionDebugPipeline() {
+        if (motionDebugPSO) return true;
+        if (motionDebugTried) return false;
+        motionDebugTried = true;
+        std::ifstream file("shaders/motion_debug_cs.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream source;
+        source << file.rdbuf();
+        const std::string code = source.str();
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> csBlob, errorBlob;
+        if (FAILED(ShaderCacheDX12::CompileCached(code.c_str(), code.length(),
+                "shaders/motion_debug_cs.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0", flags,
+                0, &csBlob, &errorBlob))) {
+            if (errorBlob)
+                std::cerr << "Motion debug shader error: "
+                          << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 1;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable.NumDescriptorRanges = 2;
+        params[0].DescriptorTable.pDescriptorRanges = ranges;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.Num32BitValues = 8;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = 2;
+        rootDesc.pParameters = params;
+        ComPtr<ID3DBlob> sigBlob;
+        errorBlob.Reset();
+        if (FAILED(D3D12SerializeRootSignature(&rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errorBlob)) ||
+            FAILED(g_dx12.device->CreateRootSignature(0,
+                sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                IID_PPV_ARGS(&motionDebugRootSig))))
+            return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = motionDebugRootSig.Get();
+        pso.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.NumDescriptors = 2 * FRAME_COUNT;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&motionDebugPSO))) ||
+            FAILED(g_dx12.device->CreateDescriptorHeap(
+                &heapDesc, IID_PPV_ARGS(&motionDebugHeap)))) {
+            motionDebugPSO.Reset();
+            motionDebugHeap.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    // Paints motionTexture over presentTexture, after PostProcess and before
+    // CopyToBackBuffer. Runs after DLSS / RR, so it shows the vectors they
+    // were given without switching them off.
+    void DrawMotionDebug(ID3D12GraphicsCommandList* cmdList) {
+        if (motionDebugMode == 0 || !motionTexture || !presentTexture ||
+            !EnsureMotionDebugPipeline())
+            return;
+        ProfilerDX12::Scope profile(g_profiler, "Motion Debug", cmdList);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = presentTexture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+
+        const UINT stride = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            motionDebugHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+            motionDebugHeap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(g_dx12.frameIndex) * 2u * stride;
+        gpu.ptr += static_cast<UINT64>(g_dx12.frameIndex) * 2u * stride;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(motionTexture.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g_dx12.device->CreateUnorderedAccessView(presentTexture.Get(), nullptr,
+                                                 &uav, cpu);
+
+        struct Constants {
+            float renderSize[2];
+            float displaySize[2];
+            UINT mode;
+            float arrowGain;
+            float tileSize;
+            float fullScalePixels;
+        } constants = {};
+        static_assert(sizeof(Constants) == 8 * 4, "Motion debug constants");
+        constants.renderSize[0] = static_cast<float>(width);
+        constants.renderSize[1] = static_cast<float>(height);
+        constants.displaySize[0] = static_cast<float>(displayWidth);
+        constants.displaySize[1] = static_cast<float>(displayHeight);
+        constants.mode = motionDebugMode;
+        constants.arrowGain = 8.0f;
+        constants.tileSize = 32.0f;
+        constants.fullScalePixels = 16.0f;
+
+        ID3D12DescriptorHeap* heaps[] = { motionDebugHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootSignature(motionDebugRootSig.Get());
+        cmdList->SetPipelineState(motionDebugPSO.Get());
+        cmdList->SetComputeRootDescriptorTable(0, gpu);
+        cmdList->SetComputeRoot32BitConstants(1, 8, &constants, 0);
+        cmdList->Dispatch((displayWidth + 7) / 8, (displayHeight + 7) / 8, 1);
+
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Records the motion probes for this frame and harvests the slot's
+    // previous use, which BeginFrame's fence wait has already completed.
+    // Call with motionTexture in NON_PIXEL_SHADER_RESOURCE.
+    void CaptureJitterProbe(ID3D12GraphicsCommandList* cmdList,
+                            JitterProbeFrame meta) {
+        const UINT slot = g_dx12.frameIndex % FRAME_COUNT;
+        ComPtr<ID3D12Resource>& readback = jitterProbeReadback[slot];
+        if (readback && jitterProbePending[slot].valid) {
+            JitterProbeFrame done = jitterProbePending[slot];
+            void* mapped = nullptr;
+            D3D12_RANGE range = { 0, kJitterProbeCount * 512u };
+            if (SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped) {
+                for (UINT i = 0; i < kJitterProbeCount; ++i) {
+                    const auto* half = reinterpret_cast<const uint16_t*>(
+                        static_cast<const uint8_t*>(mapped) + i * 512u);
+                    done.motionUV[i] = {
+                        DirectX::PackedVector::XMConvertHalfToFloat(half[0]),
+                        DirectX::PackedVector::XMConvertHalfToFloat(half[1]) };
+                }
+                D3D12_RANGE none = { 0, 0 };
+                readback->Unmap(0, &none);
+                jitterProbeLatest = done;
+            }
+        }
+        jitterProbePending[slot].valid = false;
+        if (!motionTexture || width == 0 || height == 0) return;
+        if (!readback) {
+            D3D12_HEAP_PROPERTIES heap = {};
+            heap.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = kJitterProbeCount * 512u;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&readback))))
+                return;
+        }
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = motionTexture.Get();
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+        for (UINT i = 0; i < kJitterProbeCount; ++i) {
+            const UINT x = (std::min)(width - 1, static_cast<UINT>(
+                kJitterProbePositions[i][0] * static_cast<float>(width)));
+            const UINT y = (std::min)(height - 1, static_cast<UINT>(
+                kJitterProbePositions[i][1] * static_cast<float>(height)));
+            meta.probeUV[i] = { (x + 0.5f) / static_cast<float>(width),
+                                (y + 0.5f) / static_cast<float>(height) };
+            D3D12_TEXTURE_COPY_LOCATION dst = {};
+            dst.pResource = readback.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = i * 512u;
+            dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16_FLOAT, 1, 1, 1,
+                                              D3D12_TEXTURE_DATA_PITCH_ALIGNMENT };
+            D3D12_TEXTURE_COPY_LOCATION src = {};
+            src.pResource = motionTexture.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            const D3D12_BOX box = { x, y, 0, x + 1, y + 1, 1 };
+            cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+        }
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmdList->ResourceBarrier(1, &barrier);
+        meta.valid = true;
+        meta.renderWidth = width;
+        meta.renderHeight = height;
+        meta.resolveStripUV = lastResolveStripUV;
+        meta.rr = rayReconstructionActive;
+        meta.rrUpscale = rayReconstructionUpscaleActive;
+        meta.mvMode = rrUpscaleMotionMode;
+        jitterProbePending[slot] = meta;
+    }
+    // DLSS::Evaluate runs after the probe copy; attach what it was handed.
+    void AnnotateJitterProbe(const DLSS::EvalDebug& dlss) {
+        jitterProbePending[g_dx12.frameIndex % FRAME_COUNT].dlss = dlss;
+    }
+
     // Upscaling RR only, right before it evaluates. `grassDepth` is the grass
-    // MSAA combined depth (PIXEL_SHADER_RESOURCE, left there) or null. The
+    // MSAA combined depth (PIXEL_SHADER_RESOURCE, left there) or null;
+    // `grassWindMotion` is GrassMSAADX12's wind motion (NON_PIXEL_SHADER_
+    // RESOURCE) or null. The
     // matrices are the ones this frame and the previous one rendered with.
     // Returns false when the pass is unavailable; RR then runs on the
     // resolve's guides alone.
     bool PrepareRRForwardGuides(ID3D12GraphicsCommandList* cmdList,
                                 ID3D12Resource* grassDepth,
+                                ID3D12Resource* grassWindMotion,
                                 const XMMATRIX& viewProjection,
                                 const XMMATRIX& previousViewProjection) {
         if (!rrForwardGuidesEnabled ||
             !rayReconstructionUpscaleActive || ScopeSurfaceBound() ||
             !rrDiffuseAlbedo || !rrSpecularAlbedo || !rrSpecularHitDistance)
             return false;
-        return PrepareForwardFixup(cmdList, grassDepth, viewProjection,
-                                   previousViewProjection, true);
+        return PrepareForwardFixup(cmdList, grassDepth, grassWindMotion,
+                                   viewProjection, previousViewProjection, true);
     }
 
     // Super Resolution: the same forward-pixel motion, no RR guides. The grass
@@ -2453,17 +2881,19 @@ public:
     // vector and every grass pixel loses its history.
     bool PrepareSRForwardMotion(ID3D12GraphicsCommandList* cmdList,
                                 ID3D12Resource* grassDepth,
+                                ID3D12Resource* grassWindMotion,
                                 const XMMATRIX& viewProjection,
                                 const XMMATRIX& previousViewProjection) {
         if (!srForwardMotionEnabled || !dlssActive ||
             rayReconstructionActive || ScopeSurfaceBound())
             return false;
-        return PrepareForwardFixup(cmdList, grassDepth, viewProjection,
-                                   previousViewProjection, false);
+        return PrepareForwardFixup(cmdList, grassDepth, grassWindMotion,
+                                   viewProjection, previousViewProjection, false);
     }
 
     bool PrepareForwardFixup(ID3D12GraphicsCommandList* cmdList,
                              ID3D12Resource* grassDepth,
+                             ID3D12Resource* grassWindMotion,
                              const XMMATRIX& viewProjection,
                              const XMMATRIX& previousViewProjection,
                              bool writeGuides) {
@@ -2506,8 +2936,8 @@ public:
             rrForwardGuidesHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu =
             rrForwardGuidesHeap->GetGPUDescriptorHandleForHeapStart();
-        cpu.ptr += static_cast<SIZE_T>(g_dx12.frameIndex) * 9u * stride;
-        gpu.ptr += static_cast<UINT64>(g_dx12.frameIndex) * 9u * stride;
+        cpu.ptr += static_cast<SIZE_T>(g_dx12.frameIndex) * 10u * stride;
+        gpu.ptr += static_cast<UINT64>(g_dx12.frameIndex) * 10u * stride;
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2521,6 +2951,11 @@ public:
         }
         srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        // Null when grass is not drawn: the shader then reads zero wind.
+        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(
+            grassDepth ? grassWindMotion : nullptr, &srv, cpu);
         cpu.ptr += stride;
         const DXGI_FORMAT uavFormats[5] = { DXGI_FORMAT_R16G16_FLOAT,
             DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -2539,8 +2974,14 @@ public:
             float resolution[2];
             float writeGuides;
             float padding;
+            float motionJitterUV[2];
+            float padding2[2];
         } constants = {};
-        static_assert(sizeof(Constants) == 36 * 4, "RR guide constants");
+        static_assert(sizeof(Constants) == 40 * 4, "RR guide constants");
+        // Same jitter the resolve stripped from its own vectors this frame,
+        // so forward and visibility-buffer pixels share one convention.
+        constants.motionJitterUV[0] = lastResolveStripUV.x;
+        constants.motionJitterUV[1] = lastResolveStripUV.y;
         constants.writeGuides = writeGuides ? 1.0f : 0.0f;
         XMStoreFloat4x4(&constants.invViewProj,
                         XMMatrixInverse(nullptr, viewProjection));
@@ -2553,7 +2994,7 @@ public:
         cmdList->SetComputeRootSignature(rrForwardGuidesRootSig.Get());
         cmdList->SetPipelineState(rrForwardGuidesPSO.Get());
         cmdList->SetComputeRootDescriptorTable(0, gpu);
-        cmdList->SetComputeRoot32BitConstants(1, 36, &constants, 0);
+        cmdList->SetComputeRoot32BitConstants(1, 40, &constants, 0);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
         for (UINT i = 0; i < uavCount; ++i)
@@ -3077,6 +3518,18 @@ public:
         // path unless this tier has the pair.
         const bool useTerrainResolve =
             terrainVisibilityActiveThisFrame && terrainPSO && terrainOnlyPSO;
+        // Terrain wanted on this tier but its set was never built: note it for
+        // PumpDeferredResolvePipelines. Only real resolve frames with terrain
+        // bound count, so menu and loading frames cannot trigger a build.
+        if (!ScopeSurfaceBound() && terrainVisibilityRequested &&
+            terrainAlbedoArray && terrainNormalArray && terrainMetalRoughArray &&
+            !(terrainPSO && terrainOnlyPSO)) {
+            const int tier = ResolveTierIndex(useBindless, useEnhanced);
+            if (tier == missingTerrainTier) ++missingTerrainTierFrames;
+            else { missingTerrainTier = tier; missingTerrainTierFrames = 1; }
+        } else {
+            missingTerrainTierFrames = 0;
+        }
         if (useTerrainResolve) {
             selectedPSO = terrainPSO;
             // The arrays are created once at level load and never reallocated,
@@ -3394,10 +3847,19 @@ public:
             svgfAtrousDescHeaps[frameSlot].Get();
         ID3D12DescriptorHeap* compositeDescHeap =
             svgfCompositeDescHeaps[frameSlot].Get();
-        const bool atrousRan =
+        const bool atrousWanted =
             !ScopeSurfaceBound() && useEnhanced && !rayReconstructionActive &&
             svgfTemporalEnabled && svgfAtrousEnabled &&
-            (debugViewMode == 0 || debugViewMode == 6) &&
+            (debugViewMode == 0 || debugViewMode == 6);
+        // First frame that needs the spatial filter compiles it; a failed
+        // build is not retried.
+        if (atrousWanted && !svgfAtrousPipelineTried) {
+            svgfAtrousPipelineTried = true;
+            CreateSVGFAtrousPipeline();
+            atrousDescHeap = svgfAtrousDescHeaps[frameSlot].Get();
+            compositeDescHeap = svgfCompositeDescHeaps[frameSlot].Get();
+        }
+        const bool atrousRan = atrousWanted &&
             svgfAtrousPipelineReady && svgfAtrousPSO && svgfAtrousRootSig &&
             atrousDescHeap && svgfCompositePSO && svgfCompositeRootSig &&
             compositeDescHeap;
@@ -5602,7 +6064,9 @@ private:
             float rrMotionJitterV;
             UINT  raySanitize;
             UINT  lumenGIHalfResolution;
-            UINT  halfResolutionPadding[3];
+            float mipGradScale;
+            float detailMipGradScale;
+            UINT  halfResolutionPadding[1];
         } constants;
         static_assert(sizeof(EnhancedConstants) == 112,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
@@ -5652,12 +6116,32 @@ private:
         constants.lumenGIHalfResolution =
             (lumenGIHalfResolutionActive && !ScopeSurfaceBound()) ? 1u : 0u;
         for (UINT& pad : constants.halfResolutionPadding) pad = 0u;
-        // Native (DLAA-mode) Ray Reconstruction does not resolve jitter
-        // carried in the motion vectors, so there the resolve removes it
+        // DLSS mip bias (DLSS Programming Guide 3.5): while DLSS / RR is the
+        // temporal resolve, textures are sampled at display detail with
+        // bias = log2(render / display) - 1 (-1 DLAA, -2 at 50%).
+        // SGE_MIP_BIAS=<bias> forces a value, SGE_MIP_BIAS=off disables it.
+        {
+            float bias = (dlssActive && displayWidth > 0 && width > 0)
+                ? std::log2(static_cast<float>(width) /
+                            static_cast<float>(displayWidth)) - 1.0f
+                : 0.0f;
+            char text[16] = {};
+            if (GetEnvironmentVariableA("SGE_MIP_BIAS", text, sizeof(text)) > 0)
+                bias = text[0] == 'o' ? 0.0f : static_cast<float>(atof(text));
+            constants.mipGradScale = std::exp2(bias);
+            mipBiasApplied = bias;
+            // Normal / roughness maps stay unbiased unless forced:
+            // SGE_MIP_BIAS_DETAIL=<bias> (A/B).
+            float detailBias = 0.0f;
+            if (GetEnvironmentVariableA("SGE_MIP_BIAS_DETAIL", text,
+                                        sizeof(text)) > 0)
+                detailBias = static_cast<float>(atof(text));
+            constants.detailMipGradScale = std::exp2(detailBias);
+        }
+        // Under Ray Reconstruction the resolve writes unjittered vectors
         // (pixels -> UV; the projection's NDC y flip and the UV y flip cancel,
-        // so both are +). Upscaling RR is the opposite: stripped vectors left
-        // every edge moving (top-half frame delta 0.54), jittered ones measured
-        // 0.09 -- steadier than native RR (0.15) and SR (0.23).
+        // so both are +). Native RR: the previous VP was stored unjittered, so
+        // only this frame's jitter is inside the vector.
         const bool rrMotion = rayReconstructionActive &&
                               !rayReconstructionUpscaleActive &&
                               !ScopeSurfaceBound() && width > 0 && height > 0;
@@ -5665,6 +6149,24 @@ private:
             ? rrMotionJitterPixels.x / static_cast<float>(width) : 0.0f;
         constants.rrMotionJitterV = rrMotion
             ? rrMotionJitterPixels.y / static_cast<float>(height) : 0.0f;
+        // Upscaling RR: the previous VP keeps its jitter (restored for the
+        // HZB), so the vector holds current - previous jitter. Flagged
+        // "jittered", DLSS subtracts only the current offset (DLSS PG 3.6.2),
+        // leaving -previous: up to half a pixel of random misregistration a
+        // frame, which RR accumulated as blur (door sharpness 42 -> 68 at
+        // 100%, still-frame delta 1.31 -> 0.11 once removed). Strip both and
+        // flag unjittered. SGE_RR_MV_MODE=0 restores the old vectors.
+        if (rayReconstructionUpscaleActive && rrUpscaleMotionMode != 0 &&
+            !ScopeSurfaceBound() && width > 0 && height > 0) {
+            constants.rrMotionJitterU =
+                (rrMotionJitterPixels.x - rrPreviousJitterPixels.x) /
+                static_cast<float>(width);
+            constants.rrMotionJitterV =
+                (rrMotionJitterPixels.y - rrPreviousJitterPixels.y) /
+                static_cast<float>(height);
+        }
+        lastResolveStripUV = { constants.rrMotionJitterU,
+                               constants.rrMotionJitterV };
         // Firefly/NaN guard on traced samples; SGE_NO_RAY_SANITIZE is the
         // capture A/B switch.
         static const bool kNoRaySanitize =
@@ -5688,6 +6190,231 @@ private:
     // (DXC at cs_6_6), the define, and the directly-indexed-heap root flag
     // differ. Failure leaves bindlessResolveReady false, which keeps the
     // bindless toggle unavailable rather than breaking the frame.
+    // ---- Resolve permutation sources and terrain sets ----
+    // See the notes above ResolveTier for why terrain sets are split out.
+
+    // visbuf_resolve_cs.hlsl as read once per process, optionally prefixed
+    // with SGE_TERRAIN_PACKED_REUSE; the default FXC permutation.
+    std::string resolveBaseSource;
+    // The base with SGE_VIRTUAL_SHADOWS: every other permutation builds on it.
+    std::string resolveSourceVSM;
+    bool resolveSourcesPrepared = false;
+    bool resolvePipelineDeferred = false;
+    bool predictedResolveEnhanced = false;
+    bool predictedResolveBindless = false;
+
+    // One tier's terrain set: [0] generic half, [1] terrain-only half,
+    // [2]/[3] their tile-classified twins.
+    struct TerrainSetBuild {
+        ComPtr<ID3D12PipelineState> pso[4];
+        std::string errors;
+    };
+    std::future<TerrainSetBuild> terrainSetPending[ResolveTierCount];
+    bool terrainSetRequested[ResolveTierCount] = {};
+    // Tier whose terrain set Resolve found missing, and for how many
+    // consecutive resolves.
+    int missingTerrainTier = -1;
+    unsigned missingTerrainTierFrames = 0;
+
+    static UINT ResolveFxcFlags() {
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#ifdef _DEBUG
+        flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+        flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+        return flags;
+    }
+
+    static const wchar_t* ResolveTierProfile(int tier) {
+        // ResourceDescriptorHeap needs 6.6; inline RayQuery needs 6.5.
+        return (tier == ResolveTierBindless ||
+                tier == ResolveTierBindlessEnhanced) ? L"cs_6_6" : L"cs_6_5";
+    }
+
+    bool PrepareResolveSources() {
+        if (resolveSourcesPrepared) return true;
+        std::ifstream csFile("shaders/visbuf_resolve_cs.hlsl");
+        if (!csFile.is_open()) return false;
+        std::stringstream csSS;
+        csSS << csFile.rdbuf();
+        resolveBaseSource = csSS.str();
+        if (GetEnvironmentVariableA("SGE_TERRAIN_PACKED_REUSE", nullptr, 0) > 0)
+            resolveBaseSource =
+                "#define SGE_TERRAIN_PACKED_REUSE 1\n" + resolveBaseSource;
+        resolveSourceVSM = "#define SGE_VIRTUAL_SHADOWS 1\n" + resolveBaseSource;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waveOptions = {};
+        lumenGIHalfResolutionSupported = SUCCEEDED(
+            g_dx12.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,
+                &waveOptions, sizeof(waveOptions))) && waveOptions.WaveOps;
+        resolveSourcesPrepared = true;
+        return true;
+    }
+
+    // Source of one tier's base permutation. The tier builders and the boot
+    // compile queue both take it from here, so they hash to the same blobs.
+    std::string ResolveTierSource(int tier) const {
+        if (tier == ResolveTierFXC) return resolveSourceVSM;
+        if (tier == ResolveTierBindless)
+            return "#define SGE_BINDLESS_MATERIALS 1\n" + resolveSourceVSM;
+        std::string source =
+            std::string("#define SGE_LUMEN_HALF_RES_SUPPORTED ") +
+            (lumenGIHalfResolutionSupported ? "1\n" : "0\n") +
+            "#define SGE_ENHANCED_VISUALS 1\n" + resolveSourceVSM;
+        if (tier == ResolveTierBindlessEnhanced)
+            source = "#define SGE_BINDLESS_MATERIALS 1\n" + source;
+        return source;
+    }
+
+    static void TerrainSetSources(const std::string& base, std::string out[4]) {
+        out[0] = "#define SGE_TERRAIN_VISIBILITY 1\n" + base;
+        out[1] = "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + out[0];
+        out[2] = "#define SGE_RESOLVE_TILE_LIST 1\n" + out[0];
+        out[3] = "#define SGE_RESOLVE_TILE_LIST 1\n" + out[1];
+    }
+
+    // Thread-safe: touches no members.
+    static bool CompileResolveVariant(int tier, const std::string& source,
+                                      ComPtr<ID3DBlob>& blob,
+                                      std::string& errors) {
+        if (tier == ResolveTierFXC) {
+            ComPtr<ID3DBlob> errorBlob;
+            const HRESULT hr = ShaderCacheDX12::CompileCached(
+                source.c_str(), source.size(), "shaders/visbuf_resolve_cs.hlsl",
+                nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
+                ResolveFxcFlags(), 0, &blob, &errorBlob);
+            if (FAILED(hr)) {
+                if (errorBlob)
+                    errors.assign(static_cast<const char*>(
+                                      errorBlob->GetBufferPointer()),
+                                  errorBlob->GetBufferSize());
+                return false;
+            }
+            return true;
+        }
+        return ShaderCacheDX12::CompileCachedDXC(
+            source, L"visbuf_resolve_cs.hlsl", L"main", ResolveTierProfile(tier),
+            ShaderCacheDX12::ExecutableDirectory() + L"shaders", &blob, &errors);
+    }
+
+    ID3D12RootSignature* ResolveTierRootSig(int tier) const {
+        switch (tier) {
+        case ResolveTierFXC:              return resolveRootSig.Get();
+        case ResolveTierEnhanced:         return enhancedResolveRootSig.Get();
+        case ResolveTierBindless:         return bindlessResolveRootSig.Get();
+        case ResolveTierBindlessEnhanced: return bindlessEnhancedResolveRootSig.Get();
+        default:                          return nullptr;
+        }
+    }
+
+    void TerrainSetSlots(int tier, ComPtr<ID3D12PipelineState>* slots[4]) {
+        switch (tier) {
+        case ResolveTierEnhanced:
+            slots[0] = &enhancedTerrainResolvePSO;
+            slots[1] = &enhancedTerrainOnlyResolvePSO;
+            slots[2] = &enhancedTerrainResolveTiledPSO;
+            slots[3] = &enhancedTerrainOnlyResolveTiledPSO;
+            break;
+        case ResolveTierBindless:
+            slots[0] = &bindlessTerrainResolvePSO;
+            slots[1] = &bindlessTerrainOnlyResolvePSO;
+            slots[2] = &bindlessTerrainResolveTiledPSO;
+            slots[3] = &bindlessTerrainOnlyResolveTiledPSO;
+            break;
+        case ResolveTierBindlessEnhanced:
+            slots[0] = &bindlessEnhancedTerrainResolvePSO;
+            slots[1] = &bindlessEnhancedTerrainOnlyResolvePSO;
+            slots[2] = &bindlessEnhancedTerrainResolveTiledPSO;
+            slots[3] = &bindlessEnhancedTerrainOnlyResolveTiledPSO;
+            break;
+        default:
+            slots[0] = &terrainResolvePSO;
+            slots[1] = &terrainOnlyResolvePSO;
+            slots[2] = &terrainResolveTiledPSO;
+            slots[3] = &terrainOnlyResolveTiledPSO;
+            break;
+        }
+    }
+
+    // The predicted tier, downgraded to what actually built: the same
+    // readiness checks SelectedResolveTier applies at run time.
+    int BootTerrainTier() const {
+        const bool enhanced = predictedResolveEnhanced && enhancedPipelineReady &&
+                              enhancedResolvePSO;
+        const bool bindless = predictedResolveBindless && BindlessResolveReady() &&
+                              (!enhanced || BindlessEnhancedResolveReady());
+        return ResolveTierIndex(bindless, enhanced);
+    }
+
+    // Compiles and builds one tier's terrain set, all four permutations
+    // concurrently. Static and fed by value, so a background build owns
+    // everything it reads. `background` drops the threads below normal
+    // priority and keeps their requests out of the boot-critical prewarm.
+    static TerrainSetBuild BuildTerrainSet(int tier, const std::string& base,
+                                           ComPtr<ID3D12RootSignature> rootSig,
+                                           ComPtr<ID3D12Device> device,
+                                           bool background) {
+        TerrainSetBuild result;
+        if (!rootSig || !device) {
+            result.errors = "tier has no root signature";
+            return result;
+        }
+        std::string sources[4];
+        TerrainSetSources(base, sources);
+        std::string errors[4];
+        std::thread threads[4];
+        for (int i = 0; i < 4; ++i) {
+            threads[i] = std::thread([&, i] {
+                if (background) {
+                    SetThreadPriority(GetCurrentThread(),
+                                      THREAD_PRIORITY_BELOW_NORMAL);
+                    ShaderCacheDX12::MarkBackgroundThread();
+                }
+                ComPtr<ID3DBlob> blob;
+                if (!CompileResolveVariant(tier, sources[i], blob, errors[i])) {
+                    if (errors[i].empty()) errors[i] = "compile failed";
+                    return;
+                }
+                D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+                desc.pRootSignature = rootSig.Get();
+                desc.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+                if (FAILED(device->CreateComputePipelineState(
+                        &desc, IID_PPV_ARGS(&result.pso[i])))) {
+                    result.pso[i].Reset();
+                    errors[i] = "PSO creation failed";
+                }
+            });
+        }
+        for (std::thread& thread : threads) thread.join();
+        // Both halves or neither: the generic half skips terrain IDs, so alone
+        // it would leave terrain unshaded. The tiled twins are only an
+        // optimisation of the pair and also come as a pair.
+        if (!result.pso[0] || !result.pso[1]) {
+            for (auto& pso : result.pso) pso.Reset();
+        } else if (!result.pso[2] || !result.pso[3]) {
+            result.pso[2].Reset();
+            result.pso[3].Reset();
+        }
+        static const char* names[4] = {
+            "terrain", "terrain-only", "tiled terrain", "tiled terrain-only" };
+        for (int i = 0; i < 4; ++i)
+            if (!errors[i].empty())
+                result.errors += std::string(ResolveTierName(tier)) + " " +
+                                 names[i] + " resolve: " + errors[i] + "\n";
+        return result;
+    }
+
+    void InstallTerrainSet(int tier, TerrainSetBuild& build) {
+        ComPtr<ID3D12PipelineState>* slots[4] = {};
+        TerrainSetSlots(tier, slots);
+        for (int i = 0; i < 4; ++i) *slots[i] = build.pso[i];
+        if (build.errors.empty()) return;
+        std::cerr << build.errors << "(non-fatal; terrain stays forward or "
+                                     "full-screen on this tier)\n";
+        std::ofstream log("terrain_resolve_shader_error.log", std::ios::trunc);
+        log << build.errors;
+    }
+
     void CreateBindlessResolvePipeline(const std::string& csCode,
                                        const D3D12_DESCRIPTOR_RANGE* ranges,
                                        const D3D12_STATIC_SAMPLER_DESC* samplers,
@@ -5698,14 +6425,11 @@ private:
             return;
         }
 
-        const std::string source = "#define SGE_BINDLESS_MATERIALS 1\n" + csCode;
-        const std::wstring shaderDirectory =
-            ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+        (void)csCode;
+        const std::string source = ResolveTierSource(ResolveTierBindless);
         ComPtr<ID3DBlob> csBlob;
         std::string errors;
-        if (!ShaderCacheDX12::CompileCachedDXC(
-                source, L"visbuf_resolve_cs.hlsl", L"main", L"cs_6_6",
-                shaderDirectory, &csBlob, &errors)) {
+        if (!CompileResolveVariant(ResolveTierBindless, source, csBlob, errors)) {
             std::cerr << "Bindless materials: resolve compile failed\n";
             if (!errors.empty()) {
                 std::cerr << errors << std::endl;
@@ -5747,110 +6471,8 @@ private:
             return;
         }
         bindlessResolveReady = true;
-
-        // Terrain twin of this tier, sharing the root signature just built.
-        // Non-fatal: without it terrain stays forward while bindless is active.
-        {
-            const std::string terrainSource =
-                "#define SGE_TERRAIN_VISIBILITY 1\n" + source;
-            ComPtr<ID3DBlob> terrainBlob;
-            std::string terrainErrors;
-            if (!ShaderCacheDX12::CompileCachedDXC(
-                    terrainSource, L"visbuf_resolve_cs.hlsl", L"main",
-                    L"cs_6_6", shaderDirectory, &terrainBlob,
-                    &terrainErrors)) {
-                std::cerr << "Bindless materials: terrain resolve compile "
-                             "failed (non-fatal; terrain stays forward)\n";
-                if (!terrainErrors.empty()) {
-                    std::ofstream log("terrain_resolve_shader_error.log",
-                                      std::ios::trunc);
-                    log << terrainErrors;
-                }
-                return;
-            }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC terrainDesc = {};
-            terrainDesc.pRootSignature = bindlessResolveRootSig.Get();
-            terrainDesc.CS = { terrainBlob->GetBufferPointer(),
-                               terrainBlob->GetBufferSize() };
-            if (FAILED(g_dx12.device->CreateComputePipelineState(
-                    &terrainDesc, IID_PPV_ARGS(&bindlessTerrainResolvePSO)))) {
-                std::cerr << "Bindless materials: terrain resolve PSO "
-                             "creation failed (non-fatal)\n";
-                bindlessTerrainResolvePSO.Reset();
-                return;
-            }
-
-            // Terrain-only half of the split dispatch. Both halves are needed
-            // before terrain can resolve on this tier, so a failure here drops
-            // the generic half too and terrain stays forward.
-            const std::string terrainOnlySource =
-                "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + terrainSource;
-            ComPtr<ID3DBlob> terrainOnlyBlob;
-            std::string terrainOnlyErrors;
-            if (!ShaderCacheDX12::CompileCachedDXC(
-                    terrainOnlySource, L"visbuf_resolve_cs.hlsl", L"main",
-                    L"cs_6_6", shaderDirectory, &terrainOnlyBlob,
-                    &terrainOnlyErrors)) {
-                std::cerr << "Bindless materials: terrain-only resolve compile "
-                             "failed (non-fatal; terrain stays forward)\n";
-                if (!terrainOnlyErrors.empty()) {
-                    std::ofstream log("terrain_resolve_shader_error.log",
-                                      std::ios::trunc);
-                    log << terrainOnlyErrors;
-                }
-                bindlessTerrainResolvePSO.Reset();
-                return;
-            }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC terrainOnlyDesc = {};
-            terrainOnlyDesc.pRootSignature = bindlessResolveRootSig.Get();
-            terrainOnlyDesc.CS = { terrainOnlyBlob->GetBufferPointer(),
-                                   terrainOnlyBlob->GetBufferSize() };
-            if (FAILED(g_dx12.device->CreateComputePipelineState(
-                    &terrainOnlyDesc,
-                    IID_PPV_ARGS(&bindlessTerrainOnlyResolvePSO)))) {
-                std::cerr << "Bindless materials: terrain-only resolve PSO "
-                             "creation failed (non-fatal)\n";
-                bindlessTerrainOnlyResolvePSO.Reset();
-                bindlessTerrainResolvePSO.Reset();
-                return;
-            }
-
-            // Tile-classified twins. Failure disables classification for this
-            // tier only; the split still runs full-screen.
-            const std::pair<std::string, ComPtr<ID3D12PipelineState>*>
-                tiledBuilds[] = {
-                    { terrainSource,     &bindlessTerrainResolveTiledPSO },
-                    { terrainOnlySource, &bindlessTerrainOnlyResolveTiledPSO },
-                };
-            for (const auto& build : tiledBuilds) {
-                const std::string tiledSource =
-                    "#define SGE_RESOLVE_TILE_LIST 1\n" + build.first;
-                ComPtr<ID3DBlob> tiledBlob;
-                std::string tiledErrors;
-                if (!ShaderCacheDX12::CompileCachedDXC(
-                        tiledSource, L"visbuf_resolve_cs.hlsl", L"main",
-                        L"cs_6_6", shaderDirectory, &tiledBlob, &tiledErrors)) {
-                    std::cerr << "Bindless materials: tiled resolve compile "
-                                 "failed (non-fatal; stays full-screen)\n";
-                    bindlessTerrainResolveTiledPSO.Reset();
-                    bindlessTerrainOnlyResolveTiledPSO.Reset();
-                    break;
-                }
-                D3D12_COMPUTE_PIPELINE_STATE_DESC tiledDesc = {};
-                tiledDesc.pRootSignature = bindlessResolveRootSig.Get();
-                tiledDesc.CS = { tiledBlob->GetBufferPointer(),
-                                 tiledBlob->GetBufferSize() };
-                if (FAILED(g_dx12.device->CreateComputePipelineState(
-                        &tiledDesc,
-                        IID_PPV_ARGS(build.second->GetAddressOf())))) {
-                    std::cerr << "Bindless materials: tiled resolve PSO "
-                                 "creation failed (non-fatal)\n";
-                    bindlessTerrainResolveTiledPSO.Reset();
-                    bindlessTerrainOnlyResolveTiledPSO.Reset();
-                    break;
-                }
-            }
-        }
+        // This tier's terrain set is built by BuildTerrainSet, at boot or on
+        // first use -- see the resolve permutation notes above it.
     }
 
     // `bindless` selects the SGE_BINDLESS_MATERIALS variant, which compiles at
@@ -5872,38 +6494,12 @@ private:
             return;
         }
 
-        // Prepend the define rather than passing -D so the cache key (which
-        // hashes the source text) separates the two variants automatically.
-        std::string enhancedSource =
-            "#define SGE_ENHANCED_VISUALS 1\n" + csCode;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waveOptions = {};
-        lumenGIHalfResolutionSupported = SUCCEEDED(
-            g_dx12.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,
-                &waveOptions, sizeof(waveOptions))) && waveOptions.WaveOps;
-        enhancedSource = std::string("#define SGE_LUMEN_HALF_RES_SUPPORTED ") +
-            (lumenGIHalfResolutionSupported ? "1\n" : "0\n") + enhancedSource;
-        if (bindless)
-            enhancedSource = "#define SGE_BINDLESS_MATERIALS 1\n" + enhancedSource;
-
-        const std::wstring shaderDirectory =
-            ShaderCacheDX12::ExecutableDirectory() + L"shaders";
-        ComPtr<ID3DBlob> csBlob;
-        std::string errors;
-        if (!ShaderCacheDX12::CompileCachedDXC(
-                enhancedSource, L"visbuf_resolve_cs.hlsl", L"main",
-                bindless ? L"cs_6_6" : L"cs_6_5",
-                shaderDirectory, &csBlob, &errors)) {
-            std::cerr << tierName << ": resolve compile failed\n";
-            if (!errors.empty()) {
-                std::cerr << errors << std::endl;
-                std::ofstream log(bindless
-                                      ? "bindless_enhanced_resolve_shader_error.log"
-                                      : "enhanced_resolve_shader_error.log",
-                                  std::ios::trunc);
-                log << errors;
-            }
-            return;
-        }
+        // Defines are prepended rather than passed as -D so the cache key (which
+        // hashes the source text) separates the variants automatically.
+        // ResolveTierSource is shared with the boot compile queue.
+        (void)csCode;
+        const std::string enhancedSource = ResolveTierSource(
+            bindless ? ResolveTierBindlessEnhanced : ResolveTierEnhanced);
 
         // The enhanced variant gets its OWN descriptor heap, mirroring the
         // default layout in slots [0..85] and appending the feature-specific
@@ -6092,140 +6688,44 @@ private:
                 IID_PPV_ARGS(&targetRootSig))))
             return;
 
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
-        psoDesc.pRootSignature = targetRootSig.Get();
-        psoDesc.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
-        if (FAILED(g_dx12.device->CreateComputePipelineState(
-                &psoDesc, IID_PPV_ARGS(&targetPSO)))) {
-            std::cerr << tierName << ": resolve PSO creation failed\n";
-            targetRootSig.Reset();
-            return;
-        }
-
-        // Terrain twin of this tier. Same root signature, same descriptor heap,
-        // same compiler and profile -- only SGE_TERRAIN_VISIBILITY is added, so
-        // the terrain branch becomes available without touching the PSO the
-        // frame already uses. Failure is non-fatal and simply leaves terrain on
-        // the forward path under this tier.
-        //
-        // Built here rather than in a third call because it depends on
-        // targetRootSig, which only exists once the tier above has succeeded.
+        // Only the base permutation is built here: the tier selection gates on
+        // it. This tier's terrain set (the two halves of the split dispatch and
+        // their tile-classified twins) comes from BuildTerrainSet -- at boot
+        // when the settings predict this tier, otherwise in the background the
+        // first time the tier is actually selected.
         {
-            const std::string terrainSource =
-                "#define SGE_TERRAIN_VISIBILITY 1\n" + enhancedSource;
-            ComPtr<ID3DBlob> terrainBlob;
-            std::string terrainErrors;
-            ComPtr<ID3D12PipelineState>& terrainTarget = bindless
-                ? bindlessEnhancedTerrainResolvePSO
-                : enhancedTerrainResolvePSO;
-            if (!ShaderCacheDX12::CompileCachedDXC(
-                    terrainSource, L"visbuf_resolve_cs.hlsl", L"main",
-                    bindless ? L"cs_6_6" : L"cs_6_5",
-                    shaderDirectory, &terrainBlob, &terrainErrors)) {
-                std::cerr << tierName << ": terrain resolve compile failed "
-                             "(non-fatal; terrain stays forward)\n";
-                if (!terrainErrors.empty()) {
-                    std::cerr << terrainErrors << std::endl;
-                    std::ofstream log("terrain_resolve_shader_error.log",
+            const int tier =
+                bindless ? ResolveTierBindlessEnhanced : ResolveTierEnhanced;
+            ComPtr<ID3DBlob> blob;
+            std::string errors;
+            if (!CompileResolveVariant(tier, enhancedSource, blob, errors)) {
+                std::cerr << tierName << ": resolve compile failed\n";
+                if (!errors.empty()) {
+                    std::cerr << errors << std::endl;
+                    std::ofstream log(bindless
+                                          ? "bindless_enhanced_resolve_shader_error.log"
+                                          : "enhanced_resolve_shader_error.log",
                                       std::ios::trunc);
-                    log << terrainErrors;
+                    log << errors;
                 }
-            } else {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC terrainDesc = {};
-                terrainDesc.pRootSignature = targetRootSig.Get();
-                terrainDesc.CS = { terrainBlob->GetBufferPointer(),
-                                   terrainBlob->GetBufferSize() };
-                if (FAILED(g_dx12.device->CreateComputePipelineState(
-                        &terrainDesc, IID_PPV_ARGS(&terrainTarget)))) {
-                    std::cerr << tierName << ": terrain resolve PSO creation "
-                                 "failed (non-fatal)\n";
-                    terrainTarget.Reset();
-                }
+                targetRootSig.Reset();
+                return;
             }
-
-            // Terrain-only half of the split dispatch for this tier. Same
-            // source and root signature; SGE_TERRAIN_ONLY_RESOLVE flips which
-            // pixels it keeps. Both halves must exist for terrain to resolve,
-            // so a failure here releases the half already built rather than
-            // leaving a pair that only covers ordinary geometry.
-            const std::string terrainOnlySource =
-                "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + terrainSource;
-            ComPtr<ID3DBlob> terrainOnlyBlob;
-            std::string terrainOnlyErrors;
-            ComPtr<ID3D12PipelineState>& terrainOnlyTarget = bindless
-                ? bindlessEnhancedTerrainOnlyResolvePSO
-                : enhancedTerrainOnlyResolvePSO;
-            if (!ShaderCacheDX12::CompileCachedDXC(
-                    terrainOnlySource, L"visbuf_resolve_cs.hlsl", L"main",
-                    bindless ? L"cs_6_6" : L"cs_6_5",
-                    shaderDirectory, &terrainOnlyBlob, &terrainOnlyErrors)) {
-                std::cerr << tierName << ": terrain-only resolve compile "
-                             "failed (non-fatal; terrain stays forward)\n";
-                if (!terrainOnlyErrors.empty()) {
-                    std::cerr << terrainOnlyErrors << std::endl;
-                    std::ofstream log("terrain_resolve_shader_error.log",
-                                      std::ios::trunc);
-                    log << terrainOnlyErrors;
-                }
-                terrainTarget.Reset();
-            } else {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC terrainOnlyDesc = {};
-                terrainOnlyDesc.pRootSignature = targetRootSig.Get();
-                terrainOnlyDesc.CS = { terrainOnlyBlob->GetBufferPointer(),
-                                       terrainOnlyBlob->GetBufferSize() };
-                if (FAILED(g_dx12.device->CreateComputePipelineState(
-                        &terrainOnlyDesc,
-                        IID_PPV_ARGS(&terrainOnlyTarget)))) {
-                    std::cerr << tierName << ": terrain-only resolve PSO "
-                                 "creation failed (non-fatal)\n";
-                    terrainOnlyTarget.Reset();
-                    terrainTarget.Reset();
-                }
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+            desc.pRootSignature = targetRootSig.Get();
+            desc.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+            const double start = BootTimer::MillisecondsNow();
+            if (FAILED(g_dx12.device->CreateComputePipelineState(
+                    &desc, IID_PPV_ARGS(&targetPSO)))) {
+                targetPSO.Reset();
+                std::cerr << tierName << ": resolve PSO creation failed\n";
+                targetRootSig.Reset();
+                return;
             }
-
-            // Tile-classified twins of both halves. Failure only disables
-            // classification for this tier -- the split still runs full-screen
-            // from the PSOs above -- so these never reset anything.
-            ComPtr<ID3D12PipelineState>& tiledGeneric = bindless
-                ? bindlessEnhancedTerrainResolveTiledPSO
-                : enhancedTerrainResolveTiledPSO;
-            ComPtr<ID3D12PipelineState>& tiledTerrain = bindless
-                ? bindlessEnhancedTerrainOnlyResolveTiledPSO
-                : enhancedTerrainOnlyResolveTiledPSO;
-            const std::pair<std::string, ComPtr<ID3D12PipelineState>*>
-                tiledBuilds[] = {
-                    { terrainSource,     &tiledGeneric },
-                    { terrainOnlySource, &tiledTerrain },
-                };
-            for (const auto& build : tiledBuilds) {
-                const std::string tiledSource =
-                    "#define SGE_RESOLVE_TILE_LIST 1\n" + build.first;
-                ComPtr<ID3DBlob> tiledBlob;
-                std::string tiledErrors;
-                if (!ShaderCacheDX12::CompileCachedDXC(
-                        tiledSource, L"visbuf_resolve_cs.hlsl", L"main",
-                        bindless ? L"cs_6_6" : L"cs_6_5",
-                        shaderDirectory, &tiledBlob, &tiledErrors)) {
-                    std::cerr << tierName << ": tiled resolve compile failed "
-                                 "(non-fatal; stays full-screen)\n";
-                    if (!tiledErrors.empty()) std::cerr << tiledErrors << "\n";
-                    tiledGeneric.Reset();
-                    tiledTerrain.Reset();
-                    break;
-                }
-                D3D12_COMPUTE_PIPELINE_STATE_DESC tiledDesc = {};
-                tiledDesc.pRootSignature = targetRootSig.Get();
-                tiledDesc.CS = { tiledBlob->GetBufferPointer(),
-                                 tiledBlob->GetBufferSize() };
-                if (FAILED(g_dx12.device->CreateComputePipelineState(
-                        &tiledDesc, IID_PPV_ARGS(build.second->GetAddressOf())))) {
-                    std::cerr << tierName << ": tiled resolve PSO creation "
-                                 "failed (non-fatal)\n";
-                    tiledGeneric.Reset();
-                    tiledTerrain.Reset();
-                    break;
-                }
-            }
+            char text[64];
+            std::snprintf(text, sizeof(text), "driver PSO build %6.0f ms  ",
+                          BootTimer::MillisecondsNow() - start);
+            BootTimer::Log(text + std::string(tierName) + " resolve");
         }
 
         // The bindless variant shares the enhanced tier's descriptor heap and
@@ -7380,24 +7880,12 @@ private:
 
     bool CreateResolvePipeline() {
         // Read and compile compute shader
-        std::ifstream csFile("shaders/visbuf_resolve_cs.hlsl");
-        if (!csFile.is_open()) {
+        if (!PrepareResolveSources()) {
             std::cerr << "Failed to open visbuf_resolve_cs.hlsl" << std::endl;
             return false;
         }
-
-        std::stringstream csSS;
-        csSS << csFile.rdbuf();
-        std::string csCode = csSS.str();
-        if (GetEnvironmentVariableA("SGE_TERRAIN_PACKED_REUSE", nullptr, 0) > 0)
-            csCode = "#define SGE_TERRAIN_PACKED_REUSE 1\n" + csCode;
-
-        UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
-#ifdef _DEBUG
-        compileFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-        compileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#endif
+        std::string csCode = resolveBaseSource;
+        const UINT compileFlags = ResolveFxcFlags();
 
         ComPtr<ID3DBlob> csBlob, errorBlob;
         HRESULT hr = ShaderCacheDX12::CompileCached(csCode.c_str(), csCode.length(),
@@ -7600,143 +8088,6 @@ private:
             return false;
         }
 
-        // ---- Terrain-enabled resolve variant ----
-        //
-        // Same source, same compiler, same flags, same root signature -- only
-        // SGE_TERRAIN_VISIBILITY differs. Compiling it separately rather than
-        // branching inside the default shader is what keeps the default DXBC
-        // unchanged; the canary test pins those bytes.
-        //
-        // Failure is non-fatal: the PSO stays null, so the tier lookup
-        // reports unavailable for this tier and terrain keeps rendering
-        // through the forward path.
-        {
-            const std::string terrainCode =
-                "#define SGE_TERRAIN_VISIBILITY 1\n" + csCode;
-            ComPtr<ID3DBlob> terrainBlob, terrainErrors;
-            const HRESULT terrainHr = ShaderCacheDX12::CompileCached(
-                terrainCode.c_str(), terrainCode.length(),
-                "shaders/visbuf_resolve_cs.hlsl",
-                nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
-                compileFlags, 0, &terrainBlob, &terrainErrors);
-            if (FAILED(terrainHr)) {
-                std::cerr << "Terrain visibility resolve compile failed "
-                             "(non-fatal; terrain stays forward)\n";
-                if (terrainErrors) {
-                    const char* message = static_cast<const char*>(
-                        terrainErrors->GetBufferPointer());
-                    std::cerr << message << std::endl;
-                    std::ofstream log("terrain_resolve_shader_error.log",
-                                      std::ios::trunc);
-                    log.write(message, static_cast<std::streamsize>(
-                        terrainErrors->GetBufferSize()));
-                }
-            } else {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC terrainDesc = {};
-                terrainDesc.pRootSignature = resolveRootSig.Get();
-                terrainDesc.CS = { terrainBlob->GetBufferPointer(),
-                                   terrainBlob->GetBufferSize() };
-                if (FAILED(g_dx12.device->CreateComputePipelineState(
-                        &terrainDesc, IID_PPV_ARGS(&terrainResolvePSO)))) {
-                    std::cerr << "Terrain visibility resolve PSO creation "
-                                 "failed (non-fatal)\n";
-                    terrainResolvePSO.Reset();
-                }
-            }
-
-            // Terrain-only half of the split dispatch. Still a separate
-            // compile of the same source against the same root signature, so
-            // the default (no-define) DXBC the canary pins is untouched.
-            if (terrainResolvePSO) {
-                const std::string terrainOnlyCode =
-                    "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + terrainCode;
-                ComPtr<ID3DBlob> terrainOnlyBlob, terrainOnlyErrors;
-                const HRESULT terrainOnlyHr = ShaderCacheDX12::CompileCached(
-                    terrainOnlyCode.c_str(), terrainOnlyCode.length(),
-                    "shaders/visbuf_resolve_cs.hlsl",
-                    nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main",
-                    "cs_5_1", compileFlags, 0, &terrainOnlyBlob,
-                    &terrainOnlyErrors);
-                if (FAILED(terrainOnlyHr)) {
-                    std::cerr << "Terrain-only visibility resolve compile "
-                                 "failed (non-fatal; terrain stays forward)\n";
-                    if (terrainOnlyErrors) {
-                        const char* message = static_cast<const char*>(
-                            terrainOnlyErrors->GetBufferPointer());
-                        std::cerr << message << std::endl;
-                        std::ofstream log("terrain_resolve_shader_error.log",
-                                          std::ios::trunc);
-                        log.write(message, static_cast<std::streamsize>(
-                            terrainOnlyErrors->GetBufferSize()));
-                    }
-                    // Both halves or neither: without the terrain half the
-                    // generic half would leave terrain pixels unshaded.
-                    terrainResolvePSO.Reset();
-                } else {
-                    D3D12_COMPUTE_PIPELINE_STATE_DESC terrainOnlyDesc = {};
-                    terrainOnlyDesc.pRootSignature = resolveRootSig.Get();
-                    terrainOnlyDesc.CS = {
-                        terrainOnlyBlob->GetBufferPointer(),
-                        terrainOnlyBlob->GetBufferSize() };
-                    if (FAILED(g_dx12.device->CreateComputePipelineState(
-                            &terrainOnlyDesc,
-                            IID_PPV_ARGS(&terrainOnlyResolvePSO)))) {
-                        std::cerr << "Terrain-only visibility resolve PSO "
-                                     "creation failed (non-fatal)\n";
-                        terrainOnlyResolvePSO.Reset();
-                        terrainResolvePSO.Reset();
-                    }
-                }
-            }
-
-            // Tile-classified twins of both halves, still separate compiles
-            // against the same root signature, so the canary-pinned default
-            // DXBC is untouched. Failure leaves the split full-screen.
-            if (terrainResolvePSO && terrainOnlyResolvePSO) {
-                const std::pair<std::string, ComPtr<ID3D12PipelineState>*>
-                    tiledBuilds[] = {
-                        { terrainCode,
-                          &terrainResolveTiledPSO },
-                        { "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + terrainCode,
-                          &terrainOnlyResolveTiledPSO },
-                    };
-                for (const auto& build : tiledBuilds) {
-                    const std::string tiledCode =
-                        "#define SGE_RESOLVE_TILE_LIST 1\n" + build.first;
-                    ComPtr<ID3DBlob> tiledBlob, tiledErrors;
-                    if (FAILED(ShaderCacheDX12::CompileCached(
-                            tiledCode.c_str(), tiledCode.length(),
-                            "shaders/visbuf_resolve_cs.hlsl", nullptr,
-                            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main",
-                            "cs_5_1", compileFlags, 0, &tiledBlob,
-                            &tiledErrors))) {
-                        std::cerr << "Tiled visibility resolve compile failed "
-                                     "(non-fatal; stays full-screen)\n";
-                        if (tiledErrors) {
-                            std::cerr << static_cast<const char*>(
-                                tiledErrors->GetBufferPointer()) << std::endl;
-                        }
-                        terrainResolveTiledPSO.Reset();
-                        terrainOnlyResolveTiledPSO.Reset();
-                        break;
-                    }
-                    D3D12_COMPUTE_PIPELINE_STATE_DESC tiledDesc = {};
-                    tiledDesc.pRootSignature = resolveRootSig.Get();
-                    tiledDesc.CS = { tiledBlob->GetBufferPointer(),
-                                     tiledBlob->GetBufferSize() };
-                    if (FAILED(g_dx12.device->CreateComputePipelineState(
-                            &tiledDesc,
-                            IID_PPV_ARGS(build.second->GetAddressOf())))) {
-                        std::cerr << "Tiled visibility resolve PSO creation "
-                                     "failed (non-fatal)\n";
-                        terrainResolveTiledPSO.Reset();
-                        terrainOnlyResolveTiledPSO.Reset();
-                        break;
-                    }
-                }
-            }
-        }
-
         // ---- Enhanced (SM 6.5) resolve variant ----
         //
         // Built alongside the FXC PSO above rather than replacing it. The
@@ -7748,8 +8099,12 @@ private:
         //
         // Failure here is non-fatal and simply leaves enhanced visuals
         // unavailable (no DXC, no Tier 1.1, or a compile error).
-        CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers);
-        CreateSVGFAtrousPipeline();
+        {
+            BootTimer::Scope step("VB: enhanced (RT) resolve variants");
+            CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers);
+        }
+        // The SVGF à-trous pipeline is built on first use (see the dispatch):
+        // Ray Reconstruction replaces it, so an RR session never compiles it.
 
         // ---- Bindless (SM 6.6) resolve variants ----
         //
@@ -7761,9 +8116,25 @@ private:
         // Gated on the adapter actually reporting SM 6.6 and Tier 3: without
         // both, ResourceDescriptorHeap[] is not merely slow but invalid.
         if (bindlessHeap && bindlessHeap->Supported()) {
+            BootTimer::Scope step("VB: bindless resolve variants");
             CreateBindlessResolvePipeline(csCode, ranges, staticSamplers,
                                           resolveParams);
             CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers, true);
+        }
+
+        // Terrain set of the tier the settings predict. The other tiers'
+        // sets are built in the background on first use (see
+        // PumpDeferredResolvePipelines); with the boot compile queue these
+        // are normally cache hits plus driver PSO builds.
+        {
+            const int tier = BootTerrainTier();
+            BootTimer::Scope step(std::string("VB: terrain resolve variants (") +
+                                  ResolveTierName(tier) + ")");
+            TerrainSetBuild build = BuildTerrainSet(
+                tier, ResolveTierSource(tier), ResolveTierRootSig(tier),
+                g_dx12.device, false);
+            InstallTerrainSet(tier, build);
+            terrainSetRequested[tier] = true;
         }
 
         // Create indirect dispatch command signature + args buffer

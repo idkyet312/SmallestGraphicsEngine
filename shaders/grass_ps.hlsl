@@ -84,6 +84,8 @@ struct PS_INPUT {
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
     float  colorVariation : TEXCOORD5;
+    float4 clipPosition : TEXCOORD6;
+    float4 previousWindClip : TEXCOORD7;
 };
 
 // One comparison tap: the linear-filtered comparison sampler gives hardware
@@ -160,7 +162,7 @@ float3 sampleSkyIrradiance(float3 normal) {
 // AgX (Punchy). Shared with clustered_dx12_ps and sky_ps.
 #include "agx_tonemap.hlsli"
 
-float4 main(PS_INPUT input) : SV_TARGET {
+float4 ShadeGrass(PS_INPUT input) {
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
     // Subtle stable blade-to-blade yellow/green and brightness variation.
@@ -261,3 +263,27 @@ float4 main(PS_INPUT input) : SV_TARGET {
 #endif
     return float4(result, 1.0);
 }
+
+#ifdef SGE_GRASS_MOTION
+// The MSAA grass layer's second target: screen-UV motion the wind added this
+// frame (current minus previous position, both under this frame's camera).
+// rr_forward_guides_cs adds it to the camera reprojection of the blade.
+struct GrassOutput {
+    float4 color : SV_Target0;
+    float2 windMotion : SV_Target1;
+};
+
+GrassOutput main(PS_INPUT input) {
+    GrassOutput output;
+    output.color = ShadeGrass(input);
+    const float2 current = input.clipPosition.xy / input.clipPosition.w;
+    const float2 previous = input.previousWindClip.w > 1e-4
+        ? input.previousWindClip.xy / input.previousWindClip.w : current;
+    output.windMotion = (current - previous) * float2(0.5, -0.5);
+    return output;
+}
+#else
+float4 main(PS_INPUT input) : SV_TARGET {
+    return ShadeGrass(input);
+}
+#endif

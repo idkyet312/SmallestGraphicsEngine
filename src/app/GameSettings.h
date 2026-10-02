@@ -113,7 +113,7 @@ struct GameSettings {
     // Ultra: Ray Reconstruction upscales from the DLSS screen percentage
     // instead of running at native resolution. Measured at 1080p, 50%:
     // RR 9.5 -> 2.9 ms, GPU frame 23.2 -> 10.5 ms.
-    bool rayReconstructionUpscale = false;
+    bool rayReconstructionUpscale = true;
     // Upscaling RR: rebuild RR's guides and motion for forward-drawn pixels
     // (grass, palms, props) instead of reusing the surface behind them.
     bool rrForwardGuides = true;
@@ -136,10 +136,10 @@ struct GameSettings {
     static constexpr int kMaxDLSSPreset = 2;
     static constexpr int kDefaultDLSSPreset = 1;
     bool extensionMotionVectors = false;
-    float dlssScreenPercentage = 100.0f;
+    float dlssScreenPercentage = 75.0f;
     static constexpr float kMinDLSSScreenPercentage = 33.0f;
     static constexpr float kMaxDLSSScreenPercentage = 100.0f;
-    static constexpr float kDefaultDLSSScreenPercentage = 100.0f;
+    static constexpr float kDefaultDLSSScreenPercentage = 75.0f;
 
     // Borderless fullscreen, the mode the game has always booted into. Read at
     // window creation; afterwards the main loop moves the window to match it,
@@ -192,7 +192,7 @@ struct GameSettings {
     static constexpr int   kDefaultRayTracingQuality = kRayTracingOff;
     static constexpr bool  kDefaultLumenGI = false;
     static constexpr bool  kDefaultLumenGIHalfResolution = false;
-    static constexpr bool  kDefaultRayReconstructionUpscale = false;
+    static constexpr bool  kDefaultRayReconstructionUpscale = true;
     static constexpr bool  kDefaultRRForwardGuides = true;
     static constexpr bool  kDefaultDLSSForwardMotion = true;
     static constexpr float kDefaultRTReflectionRoughnessCutoff = 1.0f;

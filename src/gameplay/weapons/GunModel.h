@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -716,6 +717,29 @@ public:
         }
     }
 
+    // Every model file Load() reads, for CookedAssetLoader::PrefetchSources.
+    // Must track the loaders below; a path missing here still loads, just
+    // from a cold file cache.
+    static std::vector<std::filesystem::path> AssetSources() {
+        static const char* const kSources[] = {
+            "Content/Models/HarpoonGun/HarpoonGun.glb",
+            "Content/Models/HarpoonSpear/Spear.glb",
+            "Content/Models/MainPlayer/Guns/Attachment/Red+Dot+Sight.glb",
+            "Content/Models/MainPlayer/Guns/m4/m4A1.glb",
+            "Content/Models/ak47/AK47.FBX",
+            "Content/Models/MainPlayer/Guns/Shotgun/remington870.glb",
+            "Content/Models/RPG7/RPG72.fbx",
+            "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb",
+            "Content/Models/MainPlayer/Guns/Ak74/ak74.glb",
+            "Content/Models/MainPlayer/Guns/m9/M9.glb",
+            "Content/Models/MainPlayer/Guns/Kriss/KRISS+VECTOR.glb",
+            "Content/Models/MainPlayer/Guns/M1Grand/m1grand.glb",
+        };
+        std::vector<std::filesystem::path> sources;
+        for (const char* source : kSources) sources.emplace_back(Resolve(source));
+        return sources;
+    }
+
     // Load and normalise the AK. Safe to call repeatedly; only the first call
     // does anything. Must run inside the model-loading command-list window --
     // it records texture uploads.
@@ -724,10 +748,20 @@ public:
         if (attempted) return;
         attempted = true;
 
-        LoadHarpoonGun();
-        LoadHarpoonSpear();
-        LoadRedDotSight();
-        LoadM4();
+        // TIMING (temporary): per-weapon wall time.
+        const auto timed = [](const char* name, void (*load)()) {
+            const auto start = std::chrono::steady_clock::now();
+            load();
+            std::cout << "[TIMING] weapon " << name << " "
+                      << std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start).count()
+                      << " ms\n";
+        };
+        timed("HarpoonGun", LoadHarpoonGun);
+        timed("HarpoonSpear", LoadHarpoonSpear);
+        timed("RedDot", LoadRedDotSight);
+        timed("M4", LoadM4);
+        const auto akStart = std::chrono::steady_clock::now();
 
         const std::string path = Resolve("Content/Models/ak47/AK47.FBX");
         std::cout << "Loading AK47 " << path << "...\n";
@@ -789,14 +823,18 @@ public:
                          s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
             std::fclose(f);
         }
-        LoadShotgun();
-        LoadRPG();
-        LoadR700();
+        std::cout << "[TIMING] weapon AK47 "
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - akStart).count()
+                  << " ms\n";
+        timed("Shotgun", LoadShotgun);
+        timed("RPG", LoadRPG);
+        timed("R700", LoadR700);
         // After the AK47 above, whose material this reuses.
-        LoadAK74();
-        LoadM9();
-        LoadKriss();
-        LoadGarand();
+        timed("AK74", LoadAK74);
+        timed("M9", LoadM9);
+        timed("Kriss", LoadKriss);
+        timed("Garand", LoadGarand);
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open

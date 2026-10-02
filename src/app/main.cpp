@@ -35,6 +35,7 @@
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
 #include "EngineLogger.h"
+#include "BootTimer.h"
 #include "GroundLevel.h"
 #include "ShaderDX12.h"
 #include "DDGI_DX12.h"
@@ -196,6 +197,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_assetWatcher.Start();
 
     std::cout << "GraphicEngine DX12 Starting..." << std::endl;
+    // Shader compile workers start on the variants recent runs asked for, so
+    // they compile while the device, audio and assets load.
+    ShaderCacheDX12::StartPrewarm();
 
     // Window
     WNDCLASSEXW wc = {};
@@ -274,6 +278,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
     // DX12
     try {
+        BootTimer::Log("Initialising D3D12 device + swapchain");
         if (!InitDX12(hwnd, SCR_WIDTH, SCR_HEIGHT)) {
             MessageBoxA(hwnd, "Failed to init DX12.", "Error", MB_OK | MB_ICONERROR);
             return -1;
@@ -288,6 +293,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ResizeSceneSurfaceDX12(renderWidth, renderHeight);
     }
 
+    BootTimer::Log("D3D12 ready; loading audio");
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_profileDumpEnabled =
@@ -468,6 +474,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // Career progression, in its own file so deleting a wallet to reset the
     // economy does not also wipe a rank that took twenty missions to earn.
     LoadProfile(g_game.rank);
+    BootTimer::Log("Audio loaded; loading fonts");
     LoadMenuFonts();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -503,6 +510,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     DumpDX12DebugMessages();
     std::cout << (bindlessHeapReady ? "Bindless material heap ready\n"
                                     : "Bindless material tier unavailable\n");
+
+    g_bindlessHeapReady = bindlessHeapReady;
+
+    // Queue the visibility-buffer resolve permutations on the shader compile
+    // workers. Only the predicted tier's terrain set is boot-critical; RT
+    // quality is a restart-only setting, so the settings predict it. Boot does
+    // not wait for them: on a cold cache the menu comes up with a progress bar
+    // (see g_shadersCompiling) and the resolve pipeline is built once they land.
+    visBuffer.SetBindlessHeap(&bindlessHeap);
+    visBuffer.SetPredictedResolveTier(
+        g_settings.rayTracingQuality == GameSettings::kRayTracingUltra ||
+            g_settings.lumenGI || scene.enhancedVisuals,
+        scene.bindlessMaterials && bindlessHeapReady);
+    visBuffer.QueueBootResolveCompiles();
 
     // Shaders - the DX12-specific pair supports albedo/normal/metal-roughness texture
     // sampling (needed for imported GLB materials); the plain "clustered_*" pair is
@@ -600,6 +621,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(
         g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    BootTimer::Log("Initialising visibility buffer");
+    visBuffer.deferResolvePipeline =
+        ShaderCacheDX12::BootCompilesPending(&g_shaderCompileProgress);
     const bool visibilityBufferReady = visBuffer.Init(
         g_dx12.screenWidth, g_dx12.screenHeight, SCR_WIDTH, SCR_HEIGHT);
     ThrowIfFailed(g_dx12.commandList->Close());
@@ -613,6 +637,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "VB init failed (non-fatal)\n";
         scene.useVisibilityBuffer = false;
     } else {
+        g_shadersCompiling = visBuffer.deferResolvePipeline;
         visBuffer.UpdateEnvironmentMap(
             g_specularEnvironmentResource, g_brdfIntegrationResource);
         // Reclaim mesh slots as destruction retires merged batch nodes.
@@ -801,6 +826,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             GetEnvironmentVariableA("SGE_CAPTURE_WATER_TIME", text,
                                     sizeof(text)) > 0)
             captureWaterTime = static_cast<float>(atof(text));
+    }
+    // SGE_CAPTURE_NOWIND stills grass and palm wind, so a frame pair at a
+    // pinned camera shows reconstruction shimmer instead of blade sway.
+    const bool captureNoWind = poseCapture &&
+        GetEnvironmentVariableA("SGE_CAPTURE_NOWIND", nullptr, 0) > 0;
+    // SGE_CAPTURE_WIND_STEP=<seconds> advances the grass clock by a fixed step
+    // per frame, so smooth sway is linear across a PATH/PATH2/PATH3 triple.
+    float captureWindStep = -1.0f;
+    {
+        char text[32] = {};
+        if (poseCapture &&
+            GetEnvironmentVariableA("SGE_CAPTURE_WIND_STEP", text,
+                                    sizeof(text)) > 0)
+            captureWindStep = static_cast<float>(atof(text));
     }
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
@@ -1048,7 +1087,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
     // ?? main loop ????????????????????????????????????????????????????????????
     MSG msg = {};
+    BootTimer::Log("Entering main loop");
+    ShaderCacheDX12::EndBootPhase();
+    {
+        const auto& stats = ShaderCacheDX12::Stats();
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "Shaders so far: %u cache hits, %u compiled (%.1f s compiling), %u failed",
+                      stats.hits.load(), stats.compiles.load(),
+                      stats.compileMicroseconds.load() / 1.0e6, stats.failures.load());
+        BootTimer::Log(text);
+    }
+    bool bootFirstFrameLogged = false;
     while (msg.message != WM_QUIT) {
+        PumpDeferredShaderCompiles();
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
@@ -1629,7 +1681,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (GetEnvironmentVariableA("SGE_CAPTURE_PATH2", path,
                                             sizeof(path)) > 0)
                     g_frameCapturePath = path;
-            } else if (poseCaptureFrames > poseCaptureTarget + 2) {
+            } else if (poseCaptureFrames == poseCaptureTarget + 2) {
+                char path[MAX_PATH] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH3", path,
+                                            sizeof(path)) > 0)
+                    g_frameCapturePath = path;
+            } else if (poseCaptureFrames > poseCaptureTarget + 3) {
                 PostQuitMessage(0);
             }
         }
@@ -2785,6 +2842,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_ocean.Update(deltaTime);
         if (captureWaterTime >= 0.0f)
             g_ocean.PinTime(captureWaterTime);
+        if (captureNoWind) g_grass.WindStrength() = 0.0f;
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         const bool primaryHelicopterActive =
             scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed;
@@ -2897,7 +2955,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             std::abs(playerFeetPosition.y - playerTerrainY) <= 0.45f;
         g_grass.SetPlayerPush(playerFeetPosition,
                               playerTouchesTerrain);
-        g_grass.Update(deltaTime);
+        g_grass.Update(captureWindStep >= 0.0f ? captureWindStep : deltaTime);
         }
         UpdatePlayerVelocity(scene.camera.Position, deltaTime);
         // Remote bodies only: the session itself is driven every frame from
@@ -4616,6 +4674,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     "Player reached the escape boat -- exfil complete");
                 OpenWinScreen();
             }
+            // Test hook: SGE_AUTO_WIN=<seconds> ends the run that long after
+            // the timer starts, so the report can be captured without playing.
+            static const float autoWinSeconds = [] {
+                char text[16] = {};
+                return GetEnvironmentVariableA("SGE_AUTO_WIN", text,
+                                               sizeof(text)) > 0
+                    ? static_cast<float>(std::atof(text)) : -1.0f;
+            }();
+            if (autoWinSeconds >= 0.0f &&
+                g_game.session.Screen() == GameScreen::Level1 &&
+                g_game.session.ElapsedSeconds() > autoWinSeconds) {
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Auto-win test hook fired");
+                OpenWinScreen();
+            }
         }
 
         // Clearing the field no longer ends the run on its own. The boat is the
@@ -4782,6 +4855,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (g_insertionChoicePending && !g_game.loading.Active() &&
             !g_pendingEnvironmentRebuild && !g_prefabRebuildRequested)
             g_deploymentPlanningVisible = true;
+        // The planning map is an overhead view, not the player's eyes: a
+        // pistol floating over the island reads as a stray render.
+        scene.drawViewmodel = !g_insertionChoicePending;
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.
@@ -4993,7 +5069,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             scene.useRaytracing && !deploymentForceForward,
             scene.useVisibilityBuffer && !deploymentForceForward,
             g_rt.initialized,
-            visBuffer.initialized
+            // Not until its resolve shaders exist: on a cold boot they are
+            // still compiling while the menu is up.
+            visBuffer.initialized && visBuffer.ResolvePipelineReady()
         });
         const bool usingRaytracing = renderPath == RenderPath::Raytracing;
         const bool usingVisibility =
@@ -5005,6 +5083,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // path. Left stale at true, the forward renderer would skip its terrain
         // draw on a frame where nothing rasterized terrain at all.
         if (!usingVisibility) g_terrainInVisibilityBuffer = false;
+        visBuffer.PumpDeferredResolvePipelines();
         visBuffer.PrepareBindlessFrame(g_dx12.frameIndex,
             scene.bindlessMaterials && g_bindlessMaterialsReady &&
             usingVisibility);
@@ -5063,7 +5142,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (poseCapture &&
             GetEnvironmentVariableA("SGE_CAPTURE_NOJITTER", nullptr, 0) > 0)
             scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
+        // The jitter last frame's previousHZBViewProjection was built with:
+        // restored after SR / upscaling RR, zeroed after native RR.
+        visBuffer.rrPreviousJitterPixels = g_previousRenderedJitterPixels;
         visBuffer.rrMotionJitterPixels = scene.temporalJitterPixels;
+        {
+            char text[8] = {};
+            visBuffer.rrUpscaleMotionMode =
+                GetEnvironmentVariableA("SGE_RR_MV_MODE", text, sizeof(text)) > 0
+                ? static_cast<UINT>(atoi(text)) : 2u; // 0: legacy A/B
+        }
+        // SGE_MOTION_DEBUG=<1|2> starts with the motion-vector overlay on, so
+        // a pose capture records it; F7 cycles it at runtime.
+        static const bool motionDebugEnvRead = [] {
+            char text[8] = {};
+            if (GetEnvironmentVariableA("SGE_MOTION_DEBUG", text, sizeof(text)) > 0)
+                visBuffer.motionDebugMode =
+                    static_cast<UINT>((std::min)(2, (std::max)(0, atoi(text))));
+            return true;
+        }();
+        (void)motionDebugEnvRead;
         // Enhanced visuals: ray-traced tier layered on the visibility buffer.
         // Needs the static TLAS, which is normally built as a side effect of
         // enabling probe GI -- build it here too so the two features are
@@ -5433,6 +5531,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_baseMode ? "PlayerArms.fbx + C4" : "AK47 + models/Barrel Explosive/barrel.FBX");
         } else if (g_game.loading.Stage() == LevelLoadStage::Weapons &&
                    levelArmoryLoadOnly) {
+            // Finish the spawn-time prefetch first rather than racing it for
+            // the same files; the loading screen is already up.
+            CookedAssetLoader::WaitForPrefetch();
             GunModel::Load();
             AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
                 "Finalize armory textures", "firearm models");
@@ -5673,14 +5774,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::cerr << "Insertion boat GLB failed to load\n";
             }
 
-            // Both airframes load here. The second is optional: a missing GLB
-            // leaves its slot null and ApplyInsertionAirframe falls back to the
-            // BlackHawk, so a content drop that omits it degrades to the
-            // historical single-aircraft behaviour instead of failing the load.
-            g_blackHawkAirframeModel[0] = GLBImporter::LoadGLBSkinned(
-                "Content/Models/BlackHawk/blackhawk.glb",
-                g_dx12.device, g_dx12.commandList,
-                g_blackHawkAirframeSkeleton[0]);
+            // The MH-60 is the only airframe offered. The old UH-60 loads only
+            // as a fallback when the MH-60 GLB is missing, so a content drop
+            // that omits it still has an aircraft to fly the insertion;
+            // ApplyInsertionAirframe takes whichever slot is loaded.
+            //
             // The static cooked cache flattens away the 'Bone' node that turns
             // this rotor. Request the authored hierarchy even though this
             // asset's skin binds no geometry; ApplyInsertionAirframe selects
@@ -5689,11 +5787,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Content/Models/NewBlackHawk/NewBlackHawk.glb",
                 g_dx12.device, g_dx12.commandList,
                 g_blackHawkAirframeSkeleton[1]);
-            if (g_blackHawkAirframeModel[1])
-                std::cout << "Second insertion airframe GLB ready\n";
-            else
-                std::cerr << "Second insertion airframe GLB missing; "
-                             "only the BlackHawk will be offered\n";
+            if (g_blackHawkAirframeModel[1]) {
+                std::cout << "Insertion airframe (MH-60) GLB ready\n";
+            } else {
+                std::cerr << "MH-60 GLB missing; falling back to the UH-60\n";
+                g_blackHawkAirframeModel[0] = GLBImporter::LoadGLBSkinned(
+                    "Content/Models/BlackHawk/blackhawk.glb",
+                    g_dx12.device, g_dx12.commandList,
+                    g_blackHawkAirframeSkeleton[0]);
+            }
 
             ApplyInsertionAirframe(g_insertionAirframe);
             InitializeRemoteInsertionVisuals();
@@ -6198,6 +6300,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 const bool armoryOnly = levelArmoryLoadOnly;
                 levelArmoryLoadOnly = false;
+                // The hub spawns with no firearms; the first armory visit loads
+                // them. Stream their files on a worker now, while the player
+                // walks over, so that load reads RAM instead of the disk.
+                if (!armoryOnly && g_baseMode && !firearmAssetsLoaded &&
+                    deviceStatus == S_OK)
+                    CookedAssetLoader::PrefetchSources(GunModel::AssetSources());
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     std::string(armoryOnly ? "Armory" : (g_baseMode ? "Base" : "Level")) +
                     " loading took " +
@@ -6387,7 +6495,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     inputs.verticalFovRadians =
                         XMConvertToRadians(scene.EffectiveCameraFOV());
                     inputs.reset = visBuffer.dlssHistoryReset;
+                    if (visBuffer.motionDebugMode != 0) {
+                        VisibilityBufferDX12::JitterProbeFrame meta;
+                        meta.frame = g_frameCounterForDebug;
+                        meta.jitterCurrent = visBuffer.rrMotionJitterPixels;
+                        meta.jitterPrevious = visBuffer.rrPreviousJitterPixels;
+                        meta.previousVPFresh = g_previousVPUpdatedLastFrame;
+                        visBuffer.CaptureJitterProbe(g_dx12.commandList.Get(),
+                                                     meta);
+                    }
                     rrEvaluated = DLSS::Evaluate(inputs);
+                    if (visBuffer.motionDebugMode != 0)
+                        visBuffer.AnnotateJitterProbe(DLSS::LastEvalDebug());
                     if (rrEvaluated) {
                         visBuffer.dlssHistoryReset = false;
                         // RR has already resolved the jitter, and nothing after
@@ -7016,7 +7135,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // stripped the jitter from this frame's motion vectors.
                 dlssInputs.motionUnjittered =
                     visBuffer.rayReconstructionActive &&
-                    !visBuffer.rayReconstructionUpscaleActive;
+                    (!visBuffer.rayReconstructionUpscaleActive ||
+                     visBuffer.rrUpscaleMotionMode != 0);
                 // Upscaling RR evaluates here, over the finished HDR scene.
                 ID3D12Resource* grassDepth = nullptr;
                 if (visBuffer.rayReconstructionUpscaleActive) {
@@ -7026,6 +7146,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         ? grassMSAA.GetCombinedDepthResource() : nullptr;
                     if (visBuffer.PrepareRRForwardGuides(
                             g_dx12.commandList.Get(), grassDepth,
+                            grassMSAA.GetWindMotionResource(),
                             scene.GetViewMatrix() * scene.GetProjectionMatrix(),
                             previousHZBViewProjection) && grassDepth) {
                         dlssInputs.depth = grassDepth;
@@ -7048,6 +7169,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         ? grassMSAA.GetCombinedDepthResource() : nullptr;
                     if (visBuffer.PrepareSRForwardMotion(
                             g_dx12.commandList.Get(), grassDepth,
+                            grassMSAA.GetWindMotionResource(),
                             scene.GetViewMatrix() * scene.GetProjectionMatrix(),
                             previousHZBViewProjection) && grassDepth) {
                         dlssInputs.depth = grassDepth;
@@ -7066,7 +7188,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 dlssInputs.verticalFovRadians =
                     XMConvertToRadians(scene.EffectiveCameraFOV());
                 dlssInputs.reset = visBuffer.dlssHistoryReset;
-                if (DLSS::Evaluate(dlssInputs)) {
+                if (visBuffer.motionDebugMode != 0) {
+                    VisibilityBufferDX12::JitterProbeFrame meta;
+                    meta.frame = g_frameCounterForDebug;
+                    meta.jitterCurrent = visBuffer.rrMotionJitterPixels;
+                    meta.jitterPrevious = visBuffer.rrPreviousJitterPixels;
+                    meta.previousVPFresh = g_previousVPUpdatedLastFrame;
+                    meta.forwardGuides = grassDepth != nullptr;
+                    visBuffer.CaptureJitterProbe(g_dx12.commandList.Get(), meta);
+                }
+                const bool dlssEvaluated = DLSS::Evaluate(dlssInputs);
+                if (visBuffer.motionDebugMode != 0)
+                    visBuffer.AnnotateJitterProbe(DLSS::LastEvalDebug());
+                if (dlssEvaluated) {
                     visBuffer.dlssHistoryReset = false;
                     dlssUpscaled = dlssInputs.output != nullptr;
                     // DLSS resolved the jitter; the HUD projections below
@@ -7096,6 +7230,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // HZB history is intentionally stricter and must not gate it.
             visBuffer.PostProcess(g_dx12.commandList.Get(), usingVisibility,
                                   dlssUpscaled);
+            if (usingVisibility)
+                visBuffer.DrawMotionDebug(g_dx12.commandList.Get());
             visBuffer.CopyToBackBuffer(g_dx12.commandList.Get());
             if (usingVisibility)
                 visBuffer.TransitionBuffersForUpload(g_dx12.commandList.Get());
@@ -7452,7 +7588,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         auto params = CurrentTerrainParams();
                         params.heightScale = scene.terrainHeightScale;
                         return TerrainRendererDX12::HeightAt(params, x, z);
-                    }, PrefabThumbnailTexture);
+                    }, [](const PrefabAsset& prefab) {
+                        return PrefabThumbnailTexture(prefab);
+                    });
             }
             g_game.commands.Set(
                 GameCommand::EditorBeginPlay, actions.beginPlay);
@@ -7596,6 +7734,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             } else {
                 if (showUI) RenderUI(scene, visBuffer);
                 DrawDestructionDebug(scene);
+                DrawJitterDebug(visBuffer);
                 DrawRagdollPhysicsDebug(scene);
                 DrawVirtualShadowPageDebug(scene);
                 RenderScoreboard();
@@ -7630,7 +7769,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // no longer active -- the row would never appear.
         std::optional<ProfilerDX12::CpuScope> endFrameProfile;
         endFrameProfile.emplace(g_profiler, "Render/EndFrame");
-        try { EndFrame(); }
+        try {
+            EndFrame();
+            if (!bootFirstFrameLogged) {
+                bootFirstFrameLogged = true;
+                BootTimer::Log("First frame presented");
+            }
+        }
         catch (const std::exception& e) {
             const HRESULT removedReason = g_dx12.device
                 ? g_dx12.device->GetDeviceRemovedReason() : S_OK;
@@ -7661,6 +7806,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (hzbCaptureActive)
             previousHZBViewProjection =
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
+        // Only meaningful alongside a refreshed previousHZBViewProjection;
+        // the jitter debug reports when that refresh was skipped.
+        if (hzbCaptureActive)
+            g_previousRenderedJitterPixels = scene.temporalJitterPixels;
+        g_previousVPUpdatedLastFrame = hzbCaptureActive;
+        ++g_frameCounterForDebug;
         msaaUsedLastFrame = msaaActive;
         endFrameProfile.reset();
         g_profiler.EndCpuFrame();
@@ -8305,6 +8456,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     WaitForGPU();
     g_assetWatcher.Stop();
     CollectRetiredNetworkActors();
+    ShaderCacheDX12::SaveManifest();
     waterRenderer.Shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();

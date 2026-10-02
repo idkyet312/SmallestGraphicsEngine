@@ -861,6 +861,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SGE_LOG("LogRender", EngineLog::Level::Display,
                 std::string("Meshlet cull isolation: ") + kNames[mode]);
         }
+        else if (wParam == 'P' && !(lParam & 0x40000000) &&
+                 (GetKeyState(VK_CONTROL) & 0x8000) &&
+                 (GetKeyState(VK_SHIFT) & 0x8000)) {
+            // Ctrl+Shift+P: where the player is standing, written as a
+            // player_spawn transform -- the inverse of how LevelSession places
+            // the camera from one (Yaw = rotation[1] - 90, Pitch = rotation[0])
+            // -- so a spawn can be moved to a spot found by walking there.
+            char text[192];
+            std::snprintf(text, sizeof(text),
+                "\"position\": [%.3f, %.3f, %.3f], "
+                "\"rotation\": [%.2f, %.2f, 0.0]",
+                scene.camera.Position.x, scene.camera.Position.y,
+                scene.camera.Position.z, scene.camera.Pitch,
+                scene.camera.Yaw + 90.0f);
+            std::ofstream("player_pose.log", std::ios::app)
+                << g_activeCustomLevelName << ": " << text << '\n';
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                std::string("Player pose: ") + text);
+        }
+        else if (wParam == VK_F7 && !(lParam & 0x40000000)) {
+            // Motion-vector overlay: the buffer DLSS / RR actually received,
+            // drawn after them so RR stays on. Off -> over scene -> only.
+            visBuffer.motionDebugMode = (visBuffer.motionDebugMode + 1) % 3;
+            static const char* kNames[3] = {
+                "off", "over scene", "motion only" };
+            SGE_LOG("LogRender", EngineLog::Level::Display,
+                std::string("Motion vector debug: ") +
+                kNames[visBuffer.motionDebugMode]);
+        }
         else if (wParam == VK_F8 && !(lParam & 0x40000000)) {
             // Unreal-style eject: detach the camera from the player so the view
             // model can be flown around and inspected from outside.

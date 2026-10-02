@@ -49,6 +49,7 @@ cbuffer GrassParams : register(b6) {
     float gPlayerPushRadius;
     float gPlayerTrailX;
     float gPlayerTrailZ;
+    float gPreviousTime;   // last frame's gTime, for the blade's wind motion
 };
 
 // Distance to the player's recent ground-plane path makes a swept capsule rather
@@ -103,17 +104,77 @@ struct VS_OUTPUT {
     float4 tangent           : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
     float  colorVariation    : TEXCOORD5;
+    // This frame's clip position, and where last frame's wind put the same
+    // blade point under this frame's camera. Their difference is the motion
+    // the wind alone added; grass_ps writes it for Ray Reconstruction / DLSS,
+    // which otherwise see swaying blades as static geometry.
+    float4 clipPosition      : TEXCOORD6;
+    float4 previousWindClip  : TEXCOORD7;
 };
 
 // Gusts travelling across the field. Two crossing waves, so the wind sweeps over
 // the grass instead of every blade pulsing in unison. Mirrors GrassField::WindAt.
-float WindAt(float x, float z, float phase) {
-    float t = gTime * gWindSpeed;
+float WindAt(float x, float z, float phase, float time) {
+    float t = time * gWindSpeed;
     float a = sin((x + z) * 0.18 + t + phase);
     float b = sin((x * 0.31 - z * 0.13) + t * 0.63);
     // Biased positive: real wind blows one way and gusts on top of that, rather
     // than swinging symmetrically back and forth.
     return (0.55 + 0.45 * a) * (0.7 + 0.3 * b);
+}
+
+// The blade's tip displacement at a given wind clock, as a FRACTION of blade
+// height: the resting lean plus the wind pushing along the prevailing
+// direction. Clamped, because a tip that travels further than the blade is long
+// has nowhere to bend to, and the droop term would fold it through its own root.
+float2 BladeTip(BladeInstance b, float time) {
+    // Prevailing wind direction, wandering slowly so the field never settles into
+    // an obviously repeating pattern.
+    const float dirAng = sin(time * 0.07) * 0.5;
+    const float2 windDir = float2(cos(dirAng), sin(dirAng));
+
+    const float bend = WindAt(b.root.x, b.root.z, b.phase, time) * gWindStrength;
+    const float2 fromHelicopter = b.root.xz - float2(gHelicopterX, gHelicopterZ);
+    const float helicopterDistance = length(fromHelicopter);
+    const float helicopterFalloff = pow(saturate(
+        1.0 - helicopterDistance / max(gHelicopterWindRadius, 1e-3)), 0.65);
+    const float2 helicopterDirection = helicopterDistance > 1e-3
+        ? fromHelicopter / helicopterDistance : float2(1.0, 0.0);
+    const float rotorPulse = 0.88 + 0.12 * sin(
+        time * 22.0 + helicopterDistance * 1.7 + b.phase);
+
+    const float2 playerPush = PlayerPush(b.root.xz);
+    // Contact dominates the broad wind close to the body, so the field parts
+    // around the path instead of occasionally being blown back through it.
+    const float contactInfluence = saturate(dot(playerPush, playerPush) * 2.0);
+    float2 tip = b.lean + windDir * bend * (1.0 - contactInfluence * 0.8) +
+        helicopterDirection *
+        (helicopterFalloff * gHelicopterWindStrength * rotorPulse) +
+        playerPush;
+    const float tipLen = length(tip);
+    const float kMaxBend = 0.97;
+    if (tipLen > kMaxBend) tip *= kMaxBend / tipLen;
+    return tip;
+}
+
+// World position of one blade vertex for a given tip displacement.
+float3 BladePoint(BladeInstance b, float2 tip, float t, float side,
+                  float authoredForward, float w, float h) {
+    // Hinged at the root: displacement grows as t^2, so the base stays planted and
+    // the blade curves over rather than shearing rigidly.
+    const float2 forwardDir = float2(-b.dir.y, b.dir.x);
+    const float2 dynamicOff = tip * (t * t);
+    const float2 off = forwardDir * authoredForward + dynamicOff;
+
+    // Bending shortens the blade's vertical reach -- without this the grass
+    // stretches as it leans.
+    const float droop = sqrt(max(0.0, 1.0 - dot(dynamicOff, dynamicOff)));
+
+    float3 pos;
+    pos.x = b.root.x + b.dir.x * w * side + off.x * h;
+    pos.z = b.root.z + b.dir.y * w * side + off.y * h;
+    pos.y = b.root.y + h * t * droop;
+    return pos;
 }
 
 VS_OUTPUT main(VS_INPUT input) {
@@ -136,46 +197,8 @@ VS_OUTPUT main(VS_INPUT input) {
     const float2 toEye = b.root.xz - float2(gEyeX, gEyeZ);
     const float fade = saturate((gDrawDistance - length(toEye)) / max(gFadeBand, 1e-3));
 
-    // Prevailing wind direction, wandering slowly so the field never settles into
-    // an obviously repeating pattern.
-    const float dirAng = sin(gTime * 0.07) * 0.5;
-    const float2 windDir = float2(cos(dirAng), sin(dirAng));
-
-    const float bend = WindAt(b.root.x, b.root.z, b.phase) * gWindStrength;
-    const float2 fromHelicopter = b.root.xz - float2(gHelicopterX, gHelicopterZ);
-    const float helicopterDistance = length(fromHelicopter);
-    const float helicopterFalloff = pow(saturate(
-        1.0 - helicopterDistance / max(gHelicopterWindRadius, 1e-3)), 0.65);
-    const float2 helicopterDirection = helicopterDistance > 1e-3
-        ? fromHelicopter / helicopterDistance : float2(1.0, 0.0);
-    const float rotorPulse = 0.88 + 0.12 * sin(
-        gTime * 22.0 + helicopterDistance * 1.7 + b.phase);
-
-    // Total tip displacement, as a FRACTION of blade height: the resting lean plus
-    // the wind pushing along the prevailing direction. Clamped, because a tip that
-    // travels further than the blade is long has nowhere to bend to, and the droop
-    // term below would fold it through its own root.
-    const float2 playerPush = PlayerPush(b.root.xz);
-    // Contact dominates the broad wind close to the body, so the field parts
-    // around the path instead of occasionally being blown back through it.
-    const float contactInfluence = saturate(dot(playerPush, playerPush) * 2.0);
-    float2 tip = b.lean + windDir * bend * (1.0 - contactInfluence * 0.8) +
-        helicopterDirection *
-        (helicopterFalloff * gHelicopterWindStrength * rotorPulse) +
-        playerPush;
-    const float tipLen = length(tip);
-    const float kMaxBend = 0.97;
-    if (tipLen > kMaxBend) tip *= kMaxBend / tipLen;
-
-    // Hinged at the root: displacement grows as t^2, so the base stays planted and
-    // the blade curves over rather than shearing rigidly.
-    const float2 forwardDir = float2(-b.dir.y, b.dir.x);
-    const float2 dynamicOff = tip * (t * t);
-    const float2 off = forwardDir * authoredForward + dynamicOff;
-
-    // Bending shortens the blade's vertical reach -- without this the grass
-    // stretches as it leans.
-    const float droop = sqrt(max(0.0, 1.0 - dot(dynamicOff, dynamicOff)));
+    const float2 tip = BladeTip(b, gTime);
+    const float2 previousTip = BladeTip(b, gPreviousTime);
 
     const float h = b.height * fade;
     // MSAA resolves sample coverage; it cannot recover animated geometry that
@@ -185,10 +208,10 @@ VS_OUTPUT main(VS_INPUT input) {
     const float rasterHalfWidth = max(b.width, minHalfWidth);
     const float w = rasterHalfWidth * authoredWidth;
 
-    float3 pos;
-    pos.x = b.root.x + b.dir.x * w * side + off.x * h;
-    pos.z = b.root.z + b.dir.y * w * side + off.y * h;
-    pos.y = b.root.y + h * t * droop;
+    const float3 pos = BladePoint(b, tip, t, side, authoredForward, w, h);
+    const float3 previousPos =
+        BladePoint(b, previousTip, t, side, authoredForward, w, h);
+    const float2 forwardDir = float2(-b.dir.y, b.dir.x);
 
     // The blade's normal has to follow the bend, or a field that is visibly leaning
     // stays lit as though it were standing straight up. Crossing the blade's facing
@@ -212,6 +235,9 @@ VS_OUTPUT main(VS_INPUT input) {
 
     float4 viewPos = mul(worldPos, view);
     output.position = mul(viewPos, projection);
+    output.clipPosition = output.position;
+    output.previousWindClip =
+        mul(mul(float4(previousPos, 1.0), view), projection);
     output.fragPosLightSpace = mul(worldPos, lightSpaceMatrix);
 
     return output;

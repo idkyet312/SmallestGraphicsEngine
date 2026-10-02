@@ -507,7 +507,7 @@ struct Scene {
     // coverage guarantee, so ground the viewer stands on can fall outside a
     // resident page and read as unshadowed -- that is the accepted trade here,
     // not a bug. The editor slider and the deployment panel raise it live.
-    static constexpr int kDefaultVirtualShadowPageBudget = 2;
+    static constexpr int kDefaultVirtualShadowPageBudget = 3;
     int   virtualShadowPageBudget = kDefaultVirtualShadowPageBudget;
     bool  showVirtualShadowPages = false;
     bool  cacheFarShadowCascades = false;

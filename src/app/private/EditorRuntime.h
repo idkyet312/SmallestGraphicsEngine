@@ -217,6 +217,7 @@ static void SynchronizeEditorRuntime(bool play) {
 // built from the level the user actually chose, not from the template it would
 // otherwise have to reconcile away a frame later.
 static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) {
+    WaitForDeferredShaderCompiles();
     // The editor is a scene screen, so it needs the same terrain and sky the
     // boot path used to build. StartLevelOne is not on this route. Queued for
     // the same reason as there: this can be reached from inside an ImGui frame.

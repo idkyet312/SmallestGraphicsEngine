@@ -269,9 +269,6 @@ static bool CollectNearbyAmmoPickup() {
 static bool g_armoryShopOpen = false;
 static size_t g_armoryShopIndex = 0;
 static bool g_armoryShopCursorReleased = false;
-// Which of the two carried slots a purchase racks into. Kept across opens so a
-// player working through a shopping list does not reset to slot 1 every time.
-static int g_armoryShopSlot = 0;
 
 // The counter the player is standing at, or null. Nearest wins, so the prompt
 // and the E handler can never disagree about which one is being offered.
@@ -303,6 +300,9 @@ static void CloseArmoryShop(HWND hwnd) {
     if (!g_armoryShopOpen) return;
     g_armoryShopOpen = false;
     g_armoryShopCursorReleased = false;
+    // A picker left open would reappear on the next counter or deploy screen.
+    g_loadoutPickerSlot = -1;
+    g_loadoutPickerFocus = -1;
     // Hand mouse-look back exactly the way the deployment screen does on DEPLOY,
     // or the player leaves the counter unable to turn.
     cameraLocked = false;
@@ -321,6 +321,9 @@ static bool OpenNearbyArmoryShop() {
     g_armoryShopOpen = true;
     g_armoryShopIndex = index;
     g_armoryShopCursorReleased = false;
+    // A picker left open would reappear on the next counter or deploy screen.
+    g_loadoutPickerSlot = -1;
+    g_loadoutPickerFocus = -1;
     if (!firearmAssetsLoaded) {
         // The hub needs its counter and travel board before it needs the stock.
         // Reuse the loader's upload/finalization stages on the first visit.
@@ -464,73 +467,18 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     }
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2((std::min)(640.0f, display.x - 32.0f),
-                                   (std::min)(720.0f, display.y - 32.0f)),
-                             ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
-    ImGui::Begin("##armory_shop", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoSavedSettings);
-
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "// ARMOURY  /  %s", shop.displayName.c_str());
-    ImGui::TextColored(UITheme::kTextDim, "AVAILABLE FUNDS");
-    ImGui::SameLine();
-    char balanceText[32];
-    MoneySystem::Format(balanceText, sizeof(balanceText),
-                        g_game.money.Balance());
-    const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", balanceText);
-    ImGui::Separator();
-    ImGui::TextWrapped("FIELD ISSUE COUNTER // SELECT SLOT, THEN SELECT STOCK");
-
-    // Which carried slot a purchase racks into. Same idea as the deploy
-    // screen's slot tabs: a row cannot know whether the player means it as a
-    // primary or a secondary, so the slot is a mode set first.
     auto& carried = GunModel::LoadoutWeapons();
-    const float slotWidth = (ImGui::GetContentRegionAvail().x -
-                             ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    for (int slot = 0; slot < 2; ++slot) {
-        const bool active = g_armoryShopSlot == slot;
-        if (active) {
-            ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
-        }
-        char tabText[96];
-        std::snprintf(tabText, sizeof(tabText), "SLOT %d: %s", slot + 1,
-                      GunModel::WeaponName(carried[static_cast<size_t>(slot)]));
-        if (ImGui::Button(tabText, ImVec2(slotWidth, 0.0f)))
-            g_armoryShopSlot = slot;
-        if (active) ImGui::PopStyleColor(2);
-        if (slot == 0) ImGui::SameLine();
-    }
-    const size_t slotIndex = static_cast<size_t>(g_armoryShopSlot);
-    const size_t otherIndex = slotIndex == 0 ? 1 : 0;
-    DrawWeaponCameraShakeSlider(carried[slotIndex]);
 
-    // Reserve room for the manifest line and the leave-counter action below;
-    // the stock list scrolls once the catalogue exceeds this viewport.
-    ImGui::BeginChild("##armory_stock", ImVec2(0.0f,
-        (std::max)(80.0f, ImGui::GetContentRegionAvail().y - 100.0f)));
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "01  SMALL ARMS");
-    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
-        // Same gate the deploy screen uses: hidden and debug weapons are not
-        // stock unless the debug toggle put them there.
-        if (!GunModel::WeaponLoaded(weapon)) continue;
-        const int price = ArmoryCatalog::WeaponPrice(weapon);
-        const bool owned = ArmoryWeaponOwned(weapon);
-        const bool equipped = carried[slotIndex] == weapon;
-        const char* note =
-            (carried[otherIndex] == weapon && !equipped)
-                ? "Racked in the other slot."
-                : ArmoryCatalog::WeaponBlurb(weapon);
-        if (DrawArmoryRow(GunModel::WeaponName(weapon), note, price, owned,
-                          equipped, "Racked in this slot.")) {
+    // A slot opened from the card below: the same full-screen picker the
+    // deploy screen uses, pointed at the kit the player is carrying.
+    if (g_loadoutPickerSlot >= 0) {
+        LoadoutPickerTarget target;
+        target.weapons[0] = carried[0];
+        target.weapons[1] = carried[1];
+        target.top = 40.0f;
+        target.equipWeapon = [&carried](int slot, int weapon, bool bought) {
+            const size_t slotIndex = static_cast<size_t>(slot);
+            const size_t otherIndex = slotIndex == 0 ? 1 : 0;
             // Taking the weapon already in the other slot would leave the
             // player holding two of the same gun, which stalls the weapon
             // cycle between duplicates. Swap the two instead.
@@ -539,80 +487,82 @@ static void RenderArmoryShopPanel(HWND hwnd) {
                 carried[slotIndex] = weapon;
                 GunModel::SelectedWeapon() = weapon;
                 RecordBaseArmoryKit();
-            } else if (owned || ArmoryPurchase(price)) {
-                g_ownedWeapons |= (1u << static_cast<uint32_t>(weapon));
-                carried[slotIndex] = weapon;
-                GunModel::LoadoutRestricted() = true;
-                GunModel::SelectedWeapon() = weapon;
-                // A weapon actually bought here is issued full, the way the
-                // deploy screen issues one. `owned` is the pre-purchase flag,
-                // so this seeds a fresh magazine only on the trip that paid for
-                // the weapon -- re-racking a rifle already carried keeps the
-                // ammo it has rather than being a free reload.
-                if (!owned)
-                    scene.player.weapons.SetInstance(
-                        scene.player.weapons.CreateInstance(weapon));
-                // A reload in flight belonged to the weapon just racked out;
-                // letting it finish would top up a gun no longer carried.
-                scene.player.reloadTimer = 0.0f;
-                scene.player.reloadingSlot = -1;
-                g_reloadAudio.Play(0.9f, 0.85f);
-                RecordBaseArmoryKit();
+                return;
             }
-        }
-
-        // The parts that fit this weapon, indented under it. Listing them on
-        // the rifle they belong to is what makes the table readable: the
-        // alternative is one flat parts bin the player has to cross-reference.
-        ImGui::Indent(18.0f);
-        for (const SGE::AttachmentDefinition& attachment :
-             scene.player.weapons.Attachments()) {
-            if (!attachment.CompatibleWith(weapon)) continue;
-            const int partPrice = ArmoryCatalog::AttachmentPrice(
-                attachment.suppressesWeapon, attachment.providesRedDot,
-                attachment.providesLaser);
-            const bool partOwned = ArmoryAttachmentOwned(attachment.id);
-            const bool installed = scene.player.weapons.AttachmentInstalled(
-                weapon, attachment.id);
-            const char* blurb =
-                attachment.suppressesWeapon
-                    ? "Quieter report, smaller flash, slightly less recoil."
-                : attachment.providesRedDot
-                    ? "Clear red aiming point and a tighter sight picture."
-                : attachment.providesLaser
-                    ? "Visible designator and tighter hip-fire spread."
-                    : "Fitted accessory.";
-            // The id is unique per attachment but the display name repeats
-            // across weapons, and DrawArmoryRow keys its ImGui id off the
-            // name -- so scope the row to this weapon or every rifle's
-            // suppressor row would share one id and one click state.
-            ImGui::PushID(weapon);
-            if (DrawArmoryRow(attachment.displayName.c_str(), blurb, partPrice,
-                              partOwned, installed, "Fitted. Select to remove.")) {
-                if (installed) {
-                    // Removal is free and does not refund: the part is owned,
-                    // and taking it off a rail is not selling it back.
-                    scene.player.weapons.RemoveAttachment(weapon,
-                                                          attachment.slot);
-                    RecordBaseArmoryKit();
-                } else if (partOwned || ArmoryPurchase(partPrice)) {
-                    g_ownedAttachments.insert(attachment.id);
-                    scene.player.weapons.EquipAttachment(weapon, attachment.id);
-                    RecordBaseArmoryKit();
-                }
-            }
-            ImGui::PopID();
-        }
-        ImGui::Unindent(18.0f);
-        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            carried[slotIndex] = weapon;
+            GunModel::LoadoutRestricted() = true;
+            GunModel::SelectedWeapon() = weapon;
+            // A weapon actually bought here is issued full, the way the deploy
+            // screen issues one; re-racking a rifle already owned keeps the
+            // ammo it has rather than being a free reload.
+            if (bought)
+                scene.player.weapons.SetInstance(
+                    scene.player.weapons.CreateInstance(weapon));
+            // A reload in flight belonged to the weapon just racked out;
+            // letting it finish would top up a gun no longer carried.
+            scene.player.reloadTimer = 0.0f;
+            scene.player.reloadingSlot = -1;
+            g_reloadAudio.Play(0.9f, 0.85f);
+            RecordBaseArmoryKit();
+        };
+        target.kitChanged = [] { RecordBaseArmoryKit(); };
+        RenderLoadoutPicker(target, display);
+        return;
     }
-    ImGui::EndChild();
 
+    // The counter itself: the loadout card from the deploy screen, on a
+    // translucent plate. Clicking a weapon opens its picker above.
+    constexpr float kCardWidth = 460.0f;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(kCardWidth, 0.0f), ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.030f, 0.045f, 0.050f, 0.82f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.47f, 0.52f, 0.49f, 0.6f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 18.0f));
+    ImGui::Begin("##armory_shop", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_AlwaysAutoResize);
+
+    // Accent rule along the top edge, as on the deploy screen's plates.
+    {
+        const ImVec2 windowMin = ImGui::GetWindowPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(windowMin,
+            ImVec2(windowMin.x + ImGui::GetWindowSize().x, windowMin.y + 3.0f),
+            IM_COL32(120, 132, 124, 160));
+    }
+    ImGui::TextColored(UITheme::kTextDim, "QUARTERMASTER  //  %s",
+                       shop.displayName.c_str());
+    ImGui::TextColored(UITheme::kText, "LOADOUT");
+    ImGui::SameLine();
+    char balanceText[32];
+    MoneySystem::Format(balanceText, sizeof(balanceText),
+                        g_game.money.Balance());
+    const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", balanceText);
     ImGui::Separator();
-    if (ImGui::Button("LEAVE COUNTER  [E]", ImVec2(-1.0f, 32.0f)))
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    const float width = kCardWidth - 40.0f;
+    DrawLoadoutWeaponTile(0, carried[0], width);
+    DrawLoadoutWeaponTile(1, carried[1], width);
+    ImGui::TextDisabled("Select a weapon to change it or fit attachments.");
+    // Per-weapon kick tuning is a development control, as on the deploy screen.
+    if (g_deploymentDevTools) {
+        DrawWeaponCameraShakeSlider(carried[0]);
+        DrawWeaponCameraShakeSlider(carried[1]);
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    if (ImGui::Button("LEAVE COUNTER  [E]", ImVec2(width, 40.0f)))
         CloseArmoryShop(hwnd);
     ImGui::End();
     ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
 }
 
 // ---- Island travel --------------------------------------------------------

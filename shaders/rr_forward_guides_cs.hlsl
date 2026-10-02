@@ -8,13 +8,18 @@
 // drawn after RR there).
 //
 // A pixel is forward-covered when the scene depth is nearer than the
-// visibility pass's own depth. For those pixels:
+// visibility pass's own depth, or when the grass composite marked it. Depth
+// alone missed blade roots: kCoveredBias is metres of depth at 150 m, so far
+// roots kept the (2, 2) marker, RR dropped their history every frame and the
+// root line sparkled. For those pixels:
 //   - motion: camera reprojection of the real depth, the resolve's convention
 //     (pixel-centre UV minus the previous frame's rendered projection). Grass
 //     included: its MSAA composite writes motion (2, 2), a reactive marker for
 //     the built-in TAA. RR read it as a two-screen move, rejected the history
 //     of every grass pixel each frame and showed raw jittered blades -- the
-//     distant grass shake.
+//     distant grass shake. Grass then adds the wind's own motion (grass_ps
+//     SGE_GRASS_MOTION): with camera motion alone RR reprojected a swaying
+//     blade to where it no longer was and its history jittered.
 //   - normal: reconstructed from depth; roughness 1.
 //   - diffuse albedo: the pixel's own colour, so RR keeps the texture detail in
 //     the guide instead of treating it as noisy lighting to smooth away.
@@ -26,12 +31,15 @@ cbuffer RRForwardConstants : register(b0) {
     float2 resolution;
     float  writeGuides;  // 0: Super Resolution, motion only
     float  padding;
+    float2 motionJitterUV; // subtracted, as the resolve does (RR_UNJITTER)
+    float2 padding2;
 };
 
 Texture2D<float>  visibilityDepth : register(t0); // VB pass only
 Texture2D<float>  forwardDepth    : register(t1); // + forward geometry
 Texture2D<float>  sceneDepth      : register(t2); // + MSAA grass
 Texture2D<float4> sceneColor      : register(t3);
+Texture2D<float2> grassWindMotion : register(t4); // GrassMSAADX12, or null
 
 RWTexture2D<float2> outputMotion          : register(u0);
 RWTexture2D<float4> outputNormalRoughness : register(u1);
@@ -62,7 +70,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     float propDepth = forwardDepth.Load(int3(pixel, 0));
     float depth = sceneDepth.Load(int3(pixel, 0));
     bool prop = propDepth < vbDepth - kCoveredBias;
-    bool grass = depth < propDepth - kCoveredBias;
+    // grass_msaa_composite_cs writes (2, 2) wherever a blade sample covers
+    // the pixel; nothing else writes it. (Typed UAV load of R16G16_FLOAT:
+    // fine on the RTX parts DLSS runs on.)
+    bool grass = depth < propDepth - kCoveredBias ||
+                 all(outputMotion[pixel] == float2(2.0, 2.0));
     if (!prop && !grass) return;
 
     float3 world = WorldPosition(pixel, depth);
@@ -73,7 +85,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (previousClip.w > 0.001)
             previousUV = previousClip.xy / previousClip.w *
                          float2(0.5, -0.5) + 0.5;
-        outputMotion[pixel] = currentUV - previousUV;
+        float2 motion = currentUV - previousUV;
+        if (grass) motion += grassWindMotion.Load(int3(pixel, 0));
+        outputMotion[pixel] = motion - motionJitterUV;
     }
     if (writeGuides < 0.5) return;
 
