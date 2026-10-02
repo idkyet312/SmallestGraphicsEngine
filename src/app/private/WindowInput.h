@@ -6,6 +6,7 @@ static void DesiredDLSSRenderSize(UINT& width, UINT& height) {
     const UINT displayWidth = g_dx12.displayWidth;
     const UINT displayHeight = g_dx12.displayHeight;
     const bool nativeRR = DLSS::GetSettings().rayReconstruction &&
+        !DLSS::GetSettings().rayReconstructionUpscale &&
         DLSS::RayReconstructionAvailable();
     const bool eligible = DLSS::GetSettings().enabled &&
         !nativeRR && DLSS::Available() &&

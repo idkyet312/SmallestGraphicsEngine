@@ -205,6 +205,72 @@ int main() {
         CHECK(defaults.lumenGI == GameSettings::kDefaultLumenGI);
     }
 
+    // Older settings keep the full-resolution reference; the opt-in survives
+    // restarts independently of the main Lumen toggle; reset restores it.
+    {
+        WriteSettingsFile("LumenGI=1\n");
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.lumenGI);
+        CHECK(!read.lumenGIHalfResolution);
+        read.lumenGIHalfResolution = true;
+        CHECK(SaveGameSettings(read));
+        GameSettings restored;
+        CHECK(LoadGameSettings(restored));
+        CHECK(restored.lumenGI && restored.lumenGIHalfResolution);
+        restored.ResetToDefaults();
+        CHECK(restored.lumenGIHalfResolution ==
+              GameSettings::kDefaultLumenGIHalfResolution);
+    }
+
+    // RR upscaling: off in older files, survives a round trip, resets.
+    {
+        WriteSettingsFile("RayTracingQuality=1\n");
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(!read.rayReconstructionUpscale);
+        read.rayReconstructionUpscale = true;
+        CHECK(SaveGameSettings(read));
+        GameSettings restored;
+        CHECK(LoadGameSettings(restored));
+        CHECK(restored.rayReconstructionUpscale);
+        restored.ResetToDefaults();
+        CHECK(restored.rayReconstructionUpscale ==
+              GameSettings::kDefaultRayReconstructionUpscale);
+    }
+
+    // RR forward guides: on in older files, survives being turned off, resets.
+    {
+        WriteSettingsFile("RayReconstructionUpscale=1\n");
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.rrForwardGuides);
+        read.rrForwardGuides = false;
+        CHECK(SaveGameSettings(read));
+        GameSettings restored;
+        CHECK(LoadGameSettings(restored));
+        CHECK(!restored.rrForwardGuides);
+        restored.ResetToDefaults();
+        CHECK(restored.rrForwardGuides ==
+              GameSettings::kDefaultRRForwardGuides);
+    }
+
+    // DLSS forward motion: on in older files, survives being turned off.
+    {
+        WriteSettingsFile("DLSS=1\n");
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.dlssForwardMotion);
+        read.dlssForwardMotion = false;
+        CHECK(SaveGameSettings(read));
+        GameSettings restored;
+        CHECK(LoadGameSettings(restored));
+        CHECK(!restored.dlssForwardMotion);
+        restored.ResetToDefaults();
+        CHECK(restored.dlssForwardMotion ==
+              GameSettings::kDefaultDLSSForwardMotion);
+    }
+
     // RT reflection roughness cutoff round-trip, default and clamp.
     {
         GameSettings written;

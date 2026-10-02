@@ -175,6 +175,25 @@ int main() {
     CHECK(loading.Progress() == 1.0f);
     CHECK(loading.Records().size() == 2);
 
+    // Loading deferred stock must enter at Weapons and finish through the
+    // existing upload stages, without replaying the level/world setup.
+    loading.Begin({ 4, "Armory stock", "firearms", LevelLoadStage::Weapons }, loadStart);
+    CHECK(loading.Active());
+    CHECK(loading.Stage() == LevelLoadStage::Weapons);
+    CHECK(loading.TaskCount() == 4);
+    CHECK(loading.SubmittedUploads() == 0);
+    loading.Advance(LevelLoadStage::GPUFinalize, "Finalize", "textures", true,
+        loadStart + std::chrono::milliseconds(4));
+    loading.Advance(LevelLoadStage::SubmitUploads, "Submit", "copies", true,
+        loadStart + std::chrono::milliseconds(5));
+    loading.Advance(LevelLoadStage::ReleaseUploads, "Release", "staging", true,
+        loadStart + std::chrono::milliseconds(6));
+    CHECK(loading.TaskIndex() == loading.TaskCount());
+    loading.Complete(true, loadStart + std::chrono::milliseconds(7));
+    CHECK(!loading.Active());
+    CHECK(loading.Stage() == LevelLoadStage::Complete);
+    CHECK(loading.Records().size() == 4);
+
     GameRuntime runtime;
     runtime.combat.heldBarrelIndex = 9;
     runtime.vehicles.drivingHumvee = true;

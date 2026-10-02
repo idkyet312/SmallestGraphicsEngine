@@ -734,6 +734,8 @@ static void ApplyGameSettings() {
     DLSS::GetSettings().enabled = g_settings.dlssEnabled;
     DLSS::GetSettings().rayReconstruction =
         g_settings.rayTracingQuality == GameSettings::kRayTracingUltra;
+    DLSS::GetSettings().rayReconstructionUpscale =
+        g_settings.rayReconstructionUpscale;
     DLSS::GetSettings().preset = static_cast<DLSS::Preset>(g_settings.dlssPreset);
     DLSS::GetSettings().screenPercentage = g_settings.dlssScreenPercentage;
     scene.cameraFOV = g_settings.fieldOfView;

@@ -311,6 +311,12 @@ public:
     ComPtr<ID3D12PipelineState> depthSeedPSO;
     ComPtr<ID3D12DescriptorHeap> depthSeedHeap;
     bool depthSeedTried = false;
+    // Upscaling RR: guides and motion for forward-drawn pixels; see
+    // rr_forward_guides_cs.hlsl.
+    ComPtr<ID3D12RootSignature> rrForwardGuidesRootSig;
+    ComPtr<ID3D12PipelineState> rrForwardGuidesPSO;
+    ComPtr<ID3D12DescriptorHeap> rrForwardGuidesHeap;
+    bool rrForwardGuidesTried = false;
 
     // Depth buffer SRV for the compute pass (reads main depth)
     // We'll create a SRV for the engine's existing depth buffer
@@ -327,6 +333,12 @@ public:
     ComPtr<ID3D12Resource> rrSpecularAlbedo;
     ComPtr<ID3D12Resource> rrSpecularHitDistance;
     bool rayReconstructionActive = false;
+    // RR runs as the upscaler at the end of the HDR scene rather than native
+    // mid-frame; selects the jittered motion-vector convention.
+    bool rayReconstructionUpscaleActive = false;
+    // Settings toggles for PrepareRRForwardGuides / PrepareSRForwardMotion.
+    bool rrForwardGuidesEnabled = true;
+    bool srForwardMotionEnabled = true;
     ComPtr<ID3D12Resource> bloomTexture;
     // Two half-res targets: the flare passes ping-pong between them, because a
     // single texture cannot be bound as SRV and UAV in the same dispatch.
@@ -509,9 +521,11 @@ public:
     // and the single-sample ray less, which is the quieter image where the grid
     // has good data.
     float enhancedProbeMissGIStrength = 1.0f;
-    // Lumen-style GI: every pixel traces a diffuse bounce, probes act as the
-    // world radiance cache at hit points.
+    // Full-resolution Lumen traces each pixel; probes are its radiance cache
+    // at hits. The opt-in shares irradiance on continuous surfaces.
     bool lumenGIActive = false;
+    bool lumenGIHalfResolutionActive = false;
+    bool lumenGIHalfResolutionSupported = false;
     // Player-facing reflection roughness cutoff (settings menu). Used instead
     // of the editor's enhancedReflectionRoughnessCut while RR or Lumen GI is
     // active -- the modes the menu drives.
@@ -2352,6 +2366,201 @@ public:
                       barriers[i].Transition.StateAfter);
         }
         cmdList->ResourceBarrier(2, barriers);
+    }
+
+    bool EnsureRRForwardGuidesPipeline() {
+        if (rrForwardGuidesPSO) return true;
+        if (rrForwardGuidesTried) return false;
+        rrForwardGuidesTried = true;
+        std::ifstream file("shaders/rr_forward_guides_cs.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream source;
+        source << file.rdbuf();
+        const std::string code = source.str();
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> csBlob, errorBlob;
+        if (FAILED(ShaderCacheDX12::CompileCached(code.c_str(), code.length(),
+                "shaders/rr_forward_guides_cs.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0", flags,
+                0, &csBlob, &errorBlob))) {
+            if (errorBlob)
+                std::cerr << "RR forward guides shader error: "
+                          << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 4;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 5;
+        ranges[1].OffsetInDescriptorsFromTableStart = 4;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable.NumDescriptorRanges = 2;
+        params[0].DescriptorTable.pDescriptorRanges = ranges;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.Num32BitValues = 36;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = 2;
+        rootDesc.pParameters = params;
+        ComPtr<ID3DBlob> sigBlob;
+        errorBlob.Reset();
+        if (FAILED(D3D12SerializeRootSignature(&rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errorBlob)) ||
+            FAILED(g_dx12.device->CreateRootSignature(0,
+                sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                IID_PPV_ARGS(&rrForwardGuidesRootSig))))
+            return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = rrForwardGuidesRootSig.Get();
+        pso.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.NumDescriptors = 9 * FRAME_COUNT;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&rrForwardGuidesPSO))) ||
+            FAILED(g_dx12.device->CreateDescriptorHeap(
+                &heapDesc, IID_PPV_ARGS(&rrForwardGuidesHeap)))) {
+            rrForwardGuidesPSO.Reset();
+            rrForwardGuidesHeap.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    // Upscaling RR only, right before it evaluates. `grassDepth` is the grass
+    // MSAA combined depth (PIXEL_SHADER_RESOURCE, left there) or null. The
+    // matrices are the ones this frame and the previous one rendered with.
+    // Returns false when the pass is unavailable; RR then runs on the
+    // resolve's guides alone.
+    bool PrepareRRForwardGuides(ID3D12GraphicsCommandList* cmdList,
+                                ID3D12Resource* grassDepth,
+                                const XMMATRIX& viewProjection,
+                                const XMMATRIX& previousViewProjection) {
+        if (!rrForwardGuidesEnabled ||
+            !rayReconstructionUpscaleActive || ScopeSurfaceBound() ||
+            !rrDiffuseAlbedo || !rrSpecularAlbedo || !rrSpecularHitDistance)
+            return false;
+        return PrepareForwardFixup(cmdList, grassDepth, viewProjection,
+                                   previousViewProjection, true);
+    }
+
+    // Super Resolution: the same forward-pixel motion, no RR guides. The grass
+    // composite's (2, 2) reactive marker otherwise reaches DLSS as a real
+    // vector and every grass pixel loses its history.
+    bool PrepareSRForwardMotion(ID3D12GraphicsCommandList* cmdList,
+                                ID3D12Resource* grassDepth,
+                                const XMMATRIX& viewProjection,
+                                const XMMATRIX& previousViewProjection) {
+        if (!srForwardMotionEnabled || !dlssActive ||
+            rayReconstructionActive || ScopeSurfaceBound())
+            return false;
+        return PrepareForwardFixup(cmdList, grassDepth, viewProjection,
+                                   previousViewProjection, false);
+    }
+
+    bool PrepareForwardFixup(ID3D12GraphicsCommandList* cmdList,
+                             ID3D12Resource* grassDepth,
+                             const XMMATRIX& viewProjection,
+                             const XMMATRIX& previousViewProjection,
+                             bool writeGuides) {
+        if (!EnsureRRForwardGuidesPipeline()) return false;
+        ProfilerDX12::Scope profile(g_profiler, writeGuides
+            ? "RR Forward Guides" : "DLSS Forward Motion", cmdList);
+        // Motion-only binds null views for the guides; they are not written.
+        ID3D12Resource* uavs[5] = { motionTexture.Get(),
+            normalRoughnessTexture.Get(), rrDiffuseAlbedo.Get(),
+            rrSpecularAlbedo.Get(), rrSpecularHitDistance.Get() };
+        if (!writeGuides)
+            for (UINT i = 1; i < 5; ++i) uavs[i] = nullptr;
+        const UINT uavCount = writeGuides ? 5u : 1u;
+        D3D12_RESOURCE_BARRIER barriers[6] = {};
+        for (UINT i = 0; i < uavCount; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = uavs[i];
+            barriers[i].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[i].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            barriers[i].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        UINT barrierCount = uavCount;
+        if (grassDepth) {
+            barriers[barrierCount] = barriers[0];
+            barriers[barrierCount].Transition.pResource = grassDepth;
+            barriers[barrierCount].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barriers[barrierCount].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            ++barrierCount;
+        }
+        cmdList->ResourceBarrier(barrierCount, barriers);
+
+        const UINT stride = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            rrForwardGuidesHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+            rrForwardGuidesHeap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(g_dx12.frameIndex) * 9u * stride;
+        gpu.ptr += static_cast<UINT64>(g_dx12.frameIndex) * 9u * stride;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        ID3D12Resource* depths[3] = { visibilityDepthTexture.Get(),
+            ActiveDepthBuffer(), grassDepth ? grassDepth : ActiveDepthBuffer() };
+        for (ID3D12Resource* depth : depths) {
+            g_dx12.device->CreateShaderResourceView(depth, &srv, cpu);
+            cpu.ptr += stride;
+        }
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        const DXGI_FORMAT uavFormats[5] = { DXGI_FORMAT_R16G16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16_FLOAT };
+        for (UINT i = 0; i < 5; ++i) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Format = uavFormats[i];
+            g_dx12.device->CreateUnorderedAccessView(uavs[i], nullptr, &uav, cpu);
+            cpu.ptr += stride;
+        }
+
+        struct Constants {
+            XMFLOAT4X4 invViewProj;
+            XMFLOAT4X4 previousViewProj;
+            float resolution[2];
+            float writeGuides;
+            float padding;
+        } constants = {};
+        static_assert(sizeof(Constants) == 36 * 4, "RR guide constants");
+        constants.writeGuides = writeGuides ? 1.0f : 0.0f;
+        XMStoreFloat4x4(&constants.invViewProj,
+                        XMMatrixInverse(nullptr, viewProjection));
+        XMStoreFloat4x4(&constants.previousViewProj, previousViewProjection);
+        constants.resolution[0] = static_cast<float>(width);
+        constants.resolution[1] = static_cast<float>(height);
+
+        ID3D12DescriptorHeap* heaps[] = { rrForwardGuidesHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootSignature(rrForwardGuidesRootSig.Get());
+        cmdList->SetPipelineState(rrForwardGuidesPSO.Get());
+        cmdList->SetComputeRootDescriptorTable(0, gpu);
+        cmdList->SetComputeRoot32BitConstants(1, 36, &constants, 0);
+        cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+        for (UINT i = 0; i < uavCount; ++i)
+            std::swap(barriers[i].Transition.StateBefore,
+                      barriers[i].Transition.StateAfter);
+        cmdList->ResourceBarrier(uavCount, barriers);
+        return true;
     }
 
     // seedTerrain: fill terrain from the visibility pass's depth instead of
@@ -5392,8 +5601,10 @@ private:
             float rrMotionJitterU;
             float rrMotionJitterV;
             UINT  raySanitize;
+            UINT  lumenGIHalfResolution;
+            UINT  halfResolutionPadding[3];
         } constants;
-        static_assert(sizeof(EnhancedConstants) == 96,
+        static_assert(sizeof(EnhancedConstants) == 112,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
@@ -5438,11 +5649,18 @@ private:
             rrDiffuseAlbedo && rrSpecularAlbedo &&
             rrSpecularHitDistance) ? 1u : 0u;
         constants.lumenGI = lumenGIActive ? 1u : 0u;
-        // Ray Reconstruction does not resolve jitter carried in the motion
-        // vectors, so under RR the resolve removes it (pixels -> UV; the
-        // projection's NDC y flip and the UV y flip cancel, so both are +).
-        const bool rrMotion = rayReconstructionActive && !ScopeSurfaceBound() &&
-                              width > 0 && height > 0;
+        constants.lumenGIHalfResolution =
+            (lumenGIHalfResolutionActive && !ScopeSurfaceBound()) ? 1u : 0u;
+        for (UINT& pad : constants.halfResolutionPadding) pad = 0u;
+        // Native (DLAA-mode) Ray Reconstruction does not resolve jitter
+        // carried in the motion vectors, so there the resolve removes it
+        // (pixels -> UV; the projection's NDC y flip and the UV y flip cancel,
+        // so both are +). Upscaling RR is the opposite: stripped vectors left
+        // every edge moving (top-half frame delta 0.54), jittered ones measured
+        // 0.09 -- steadier than native RR (0.15) and SR (0.23).
+        const bool rrMotion = rayReconstructionActive &&
+                              !rayReconstructionUpscaleActive &&
+                              !ScopeSurfaceBound() && width > 0 && height > 0;
         constants.rrMotionJitterU = rrMotion
             ? rrMotionJitterPixels.x / static_cast<float>(width) : 0.0f;
         constants.rrMotionJitterV = rrMotion
@@ -5658,6 +5876,12 @@ private:
         // hashes the source text) separates the two variants automatically.
         std::string enhancedSource =
             "#define SGE_ENHANCED_VISUALS 1\n" + csCode;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waveOptions = {};
+        lumenGIHalfResolutionSupported = SUCCEEDED(
+            g_dx12.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,
+                &waveOptions, sizeof(waveOptions))) && waveOptions.WaveOps;
+        enhancedSource = std::string("#define SGE_LUMEN_HALF_RES_SUPPORTED ") +
+            (lumenGIHalfResolutionSupported ? "1\n" : "0\n") + enhancedSource;
         if (bindless)
             enhancedSource = "#define SGE_BINDLESS_MATERIALS 1\n" + enhancedSource;
 

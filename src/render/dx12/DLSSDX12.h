@@ -20,8 +20,9 @@ struct DLSSFrameInputs {
     // DLAA result is copied back here; Super Resolution writes output instead.
     // Expected in NON_PIXEL_SHADER_RESOURCE and left there.
     ID3D12Resource* color = nullptr;
-    // Scene depth, standard Z (near 0, far 1), NON_PIXEL_SHADER_RESOURCE.
+    // Scene depth, standard Z (near 0, far 1), in depthState.
     ID3D12Resource* depth = nullptr;
+    UINT depthState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     // UV-space motion, current minus previous, NON_PIXEL_SHADER_RESOURCE.
     ID3D12Resource* motion = nullptr;
     // RR guides, all current-frame and at input resolution. Required only
@@ -67,6 +68,9 @@ struct Settings {
     Preset preset = Preset::L;
     float screenPercentage = 100.0f;
     bool rayReconstruction = false;
+    // RR upscales at the end of the HDR scene (where Super Resolution runs)
+    // from the screen-percentage render size, instead of native mid-frame.
+    bool rayReconstructionUpscale = false;
     // Flips the jitter sign handed to DLSS. Only for diagnosing a convention
     // mismatch: a wrong sign reads as a soft, wobbling image on a still view.
     bool invertJitter = false;
@@ -84,6 +88,8 @@ IDXGIFactory2* SwapChainFactory(IDXGIFactory2* nativeFactory);
 bool Available();
 bool RayReconstructionAvailable();
 const char* RayReconstructionStatus();
+// Whether the last successful evaluate ran Ray Reconstruction.
+bool LastEvaluatedRR();
 const char* Status();
 Settings& GetSettings();
 // Returns an SDK-supported render size for the requested percentage. False
@@ -109,6 +115,7 @@ inline const char* RayReconstructionStatus() {
     return "Built without the Streamline SDK";
 }
 inline const char* Status() { return "Built without the Streamline SDK"; }
+inline bool LastEvaluatedRR() { return false; }
 inline Settings& GetSettings() { static Settings settings; return settings; }
 inline bool RenderSize(UINT width, UINT height, float, UINT& renderWidth,
                        UINT& renderHeight) {

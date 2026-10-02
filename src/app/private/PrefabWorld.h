@@ -385,7 +385,7 @@ static void ReleasePrefabRigidBodies() {
     g_prefabRigidBodies.clear();
 }
 
-static void RebuildPrefabRenderBatches() {
+static void RebuildPrefabRenderBatches(bool refreshAssets = true) {
     ProfilerDX12::CpuScope prefabBatchProfile(g_profiler, "Editor/PrefabBatches");
     ReleasePrefabRigidBodies();
     // Same reasoning as the rigid bodies: the batches and colliders the tanks
@@ -399,8 +399,10 @@ static void RebuildPrefabRenderBatches() {
     // Same reasoning: a reused entity id would otherwise make a fresh building
     // skip its clone and cut the shared cached model every instance draws.
     g_blastHoleEntities.clear();
-    g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+    if (refreshAssets) {
+        g_assetRegistry.Refresh();
+        g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+    }
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;
     // Entity ids of the aircraft this pass actually registered, so the ones it

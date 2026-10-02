@@ -716,8 +716,12 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_commTowerMusicSwell = false;
     g_plantC4TowerDelay = -1.0f;
     g_exfilHereDelay = -1.0f;
-    const bool modeAssetsLoaded = g_emptyLevelMode
-        ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded;
+    // A hub load omits mission assets. Reuse it for another hub visit without
+    // treating it as a complete mission/test-level load.
+    const bool modeAssetsLoaded = g_baseMode
+        ? ((baseLevelAssetsLoaded || fullLevelAssetsLoaded) &&
+           (!MultiplayerActive() || g_marineModel.valid))
+        : (g_emptyLevelMode ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded);
     if (modeAssetsLoaded)
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     // The base is not a run, so its clock never starts -- a mission timer

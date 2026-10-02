@@ -108,6 +108,18 @@ struct GameSettings {
     int rayTracingQuality = 0;
     // Lumen global illumination: ray-traced diffuse bounce lighting.
     bool lumenGI = false;
+    // Opt-in sample sharing; full-resolution GI remains the parity reference.
+    bool lumenGIHalfResolution = false;
+    // Ultra: Ray Reconstruction upscales from the DLSS screen percentage
+    // instead of running at native resolution. Measured at 1080p, 50%:
+    // RR 9.5 -> 2.9 ms, GPU frame 23.2 -> 10.5 ms.
+    bool rayReconstructionUpscale = false;
+    // Upscaling RR: rebuild RR's guides and motion for forward-drawn pixels
+    // (grass, palms, props) instead of reusing the surface behind them.
+    bool rrForwardGuides = true;
+    // DLSS Super Resolution: real motion vectors for grass and forward props
+    // (the grass composite otherwise hands DLSS a reactive marker).
+    bool dlssForwardMotion = true;
     // Surfaces rougher than this skip ray-traced reflections and use the
     // reflection probe. Applies while Ray Reconstruction or Lumen GI is on;
     // 1.0 traces every surface (the Ultra behaviour before this setting).
@@ -179,6 +191,10 @@ struct GameSettings {
     static constexpr bool  kDefaultDLSS = false;
     static constexpr int   kDefaultRayTracingQuality = kRayTracingOff;
     static constexpr bool  kDefaultLumenGI = false;
+    static constexpr bool  kDefaultLumenGIHalfResolution = false;
+    static constexpr bool  kDefaultRayReconstructionUpscale = false;
+    static constexpr bool  kDefaultRRForwardGuides = true;
+    static constexpr bool  kDefaultDLSSForwardMotion = true;
     static constexpr float kDefaultRTReflectionRoughnessCutoff = 1.0f;
     static constexpr bool  kDefaultExtensionMotionVectors = false;
     static constexpr bool  kDefaultFullscreen = true;
@@ -244,6 +260,10 @@ struct GameSettings {
         dlssEnabled = kDefaultDLSS;
         rayTracingQuality = kDefaultRayTracingQuality;
         lumenGI = kDefaultLumenGI;
+        lumenGIHalfResolution = kDefaultLumenGIHalfResolution;
+        rayReconstructionUpscale = kDefaultRayReconstructionUpscale;
+        rrForwardGuides = kDefaultRRForwardGuides;
+        dlssForwardMotion = kDefaultDLSSForwardMotion;
         rtReflectionRoughnessCutoff = kDefaultRTReflectionRoughnessCutoff;
         dlssPreset = kDefaultDLSSPreset;
         extensionMotionVectors = kDefaultExtensionMotionVectors;
@@ -355,6 +375,22 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.lumenGI =
                 value == "1" || value == "true" || value == "yes";
         }
+        else if (key == "LumenGIHalfResolution") {
+            out.lumenGIHalfResolution =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "RayReconstructionUpscale") {
+            out.rayReconstructionUpscale =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "RRForwardGuides") {
+            out.rrForwardGuides =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "DLSSForwardMotion") {
+            out.dlssForwardMotion =
+                value == "1" || value == "true" || value == "yes";
+        }
         else if (key == "RTReflectionRoughnessCutoff") {
             out.rtReflectionRoughnessCutoff =
                 std::strtof(value.c_str(), nullptr);
@@ -429,6 +465,14 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << settings.rayTracingQuality << "\n"
          << "LumenGI="
          << (settings.lumenGI ? 1 : 0) << "\n"
+         << "LumenGIHalfResolution="
+         << (settings.lumenGIHalfResolution ? 1 : 0) << "\n"
+         << "RayReconstructionUpscale="
+         << (settings.rayReconstructionUpscale ? 1 : 0) << "\n"
+         << "RRForwardGuides="
+         << (settings.rrForwardGuides ? 1 : 0) << "\n"
+         << "DLSSForwardMotion="
+         << (settings.dlssForwardMotion ? 1 : 0) << "\n"
          << "RTReflectionRoughnessCutoff="
          << settings.rtReflectionRoughnessCutoff << "\n"
          << "DLSSPreset="

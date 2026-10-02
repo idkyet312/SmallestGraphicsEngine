@@ -201,6 +201,7 @@ static bool MultiplayerActive();
 
 // Check DXR support for Lumen GI feature.
 static bool LumenGISupported();
+static bool LumenHalfResolutionSupported();
 
 // The menu's typefaces, rasterized at the sizes they are actually drawn at.
 // Both stay null when no font file is found, and every use falls back to the
@@ -605,6 +606,12 @@ static void VideoTab() {
     ImGui::EndDisabled();
 
     ImGui::BeginDisabled(!dlssAvailable || !g_settings.dlssEnabled);
+    if (ToggleRow("DLSS Foliage Motion Fix",
+                  "DLSS Super Resolution: gives grass and props real motion vectors, so distant grass stops shimmering.",
+                  &g_settings.dlssForwardMotion)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
     static const char* dlssPresets[] = {"K", "L", "M"};
     if (ImGui::Combo("DLSS Model Preset", &g_settings.dlssPreset,
                      dlssPresets, IM_ARRAYSIZE(dlssPresets))) {
@@ -623,10 +630,26 @@ static void VideoTab() {
         g_rtRestartChoice = rtChoice;
     if (DLSS::RayReconstructionAvailable())
         ImGui::TextDisabled("Ultra: per-pixel ray tracing + DLSS Ray "
-                            "Reconstruction at native resolution. "
-                            "Requires a restart.");
+                            "Reconstruction. Requires a restart.");
     else
         ImGui::TextDisabled("%s", DLSS::RayReconstructionStatus());
+    ImGui::BeginDisabled(
+        g_settings.rayTracingQuality != GameSettings::kRayTracingUltra);
+    if (ToggleRow("Ray Reconstruction Upscaling",
+                  "Ultra renders at the DLSS screen percentage and Ray Reconstruction upscales to the display, instead of denoising at native resolution. Much faster; slightly softer.",
+                  &g_settings.rayReconstructionUpscale)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::BeginDisabled(!g_settings.rayReconstructionUpscale);
+    if (ToggleRow("RR Foliage and Prop Fix",
+                  "With Ray Reconstruction Upscaling: gives grass, trees and props their own motion and material guides, so RR does not smear them using the ground behind.",
+                  &g_settings.rrForwardGuides)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
 
     ImGui::BeginDisabled(!LumenGISupported());
@@ -637,6 +660,14 @@ static void VideoTab() {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
+    ImGui::BeginDisabled(!g_settings.lumenGI || !LumenHalfResolutionSupported());
+    if (ToggleRow("Experimental Half Resolution Lumen GI",
+                  "Reduces bounce samples while keeping surface edges separate. May be noisier in motion; performance depends on the scene.",
+                  &g_settings.lumenGIHalfResolution)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
     const SliderResult reflectionCutoff = SliderRow(
         "Reflection Roughness Cutoff",
         "Surfaces rougher than this skip ray-traced reflections and use the "
@@ -662,8 +693,10 @@ static void VideoTab() {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
+    // Native RR ignores the percentage; upscaling RR uses it.
     ImGui::BeginDisabled(
-        g_settings.rayTracingQuality == GameSettings::kRayTracingUltra);
+        g_settings.rayTracingQuality == GameSettings::kRayTracingUltra &&
+        !g_settings.rayReconstructionUpscale);
     const SliderResult dlssPercentage = SliderRow(
         "DLSS Screen Percentage",
         "Internal render resolution per axis. 100% uses native DLAA.",

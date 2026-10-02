@@ -349,6 +349,8 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // SanitizeRaySample on/off. On by default; the capture switch
     // SGE_NO_RAY_SANITIZE turns it off for A/B measurement.
     uint  raySanitizeEnabled;
+    uint  enhancedLumenHalfResolution;
+    uint3 enhancedHalfResolutionPadding;
 };
 // Every motion write goes through this so the three sites (surfaces, sky,
 // terrain) cannot disagree about the jitter convention.
@@ -1409,6 +1411,63 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
         incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
     }
     return SanitizeRaySample(incoming) * giIntensity;
+}
+
+// Share irradiance before albedo/AO, so primary material boundaries remain sharp.
+// Matching active lanes by pixel block avoids assuming a vendor's wave layout,
+// and handles sky holes, split terrain dispatches, and edge-AA sub-samples.
+float3 SampleLumenGI(float3 worldPos, float3 normal, uint2 pixel,
+                     uint surfaceNamespace, out bool tracedRay) {
+    tracedRay = true;
+#if SGE_LUMEN_HALF_RES_SUPPORTED
+    [branch] if (enhancedLumenHalfResolution != 0u) {
+        uint block = (pixel.y >> 1u) * (((uint)screenWidth + 1u) >> 1u) +
+                     (pixel.x >> 1u);
+        uint4 matching = WaveMatch(block);
+        // Rotate the sample within the block rather than always sampling its
+        // top-left corner; the existing temporal denoiser consumes every pixel.
+        uint phase = (pixel.x & 1u) | ((pixel.y & 1u) << 1u);
+        uint4 preferred = matching &
+            WaveActiveBallot(phase == (enhancedFrameIndex & 3u));
+        uint4 selected = all(preferred == 0u) ? matching : preferred;
+        uint representative = selected.x != 0u ? (uint)firstbitlow(selected.x)
+            : selected.y != 0u ? 32u + (uint)firstbitlow(selected.y)
+            : selected.z != 0u ? 64u + (uint)firstbitlow(selected.z)
+                              : 96u + (uint)firstbitlow(selected.w);
+        float3 samplePos = WaveReadLaneAt(worldPos, representative);
+        float3 sampleNormal = WaveReadLaneAt(normal, representative);
+        uint sampleNamespace = WaveReadLaneAt(surfaceNamespace, representative);
+        float viewDepth = max(abs(mul(float4(worldPos, 1.0), viewMatrix).z),
+                              nearPlane);
+        float pixelFootprint = 2.0 * viewDepth /
+            max(screenHeight * abs(projMatrix[1][1]), 1.0);
+        float3 delta = worldPos - samplePos;
+        // A thin foreground object or a different-facing surface must never
+        // borrow a background bounce. Grazing planes fall back conservatively.
+        bool compatible = sampleNamespace == surfaceNamespace &&
+            dot(normal, sampleNormal) >= 0.95 &&
+            abs(dot(delta, sampleNormal)) <= max(pixelFootprint * 0.2, 0.005) &&
+            dot(delta, delta) <= pixelFootprint * pixelFootprint * 64.0;
+        bool representativeLane = WaveGetLaneIndex() == representative;
+        // Representatives and incompatible lanes trace in ONE call. Two calls
+        // serialize: nearly every wave has an incompatible lane, so it paid a
+        // second full trace latency and half resolution measured slower than
+        // full (3.20 vs 3.13 ms generic resolve).
+        tracedRay = representativeLane || !compatible;
+        float3 sample = 0.0;
+        // A block keeps one seed while its representative rotates. Seeding by
+        // that pixel would visit only every fourth sample of each sequence.
+        [branch] if (tracedRay)
+            sample = RayTracedProbeMissGI(worldPos, normal,
+                                          representativeLane ? pixel >> 1u
+                                                             : pixel);
+        // All participating lanes reconverge here. The selected lane came from
+        // WaveMatch's active mask, so this never reads an inactive source lane.
+        float3 sharedIrradiance = WaveReadLaneAt(sample, representative);
+        return compatible ? sharedIrradiance : sample;
+    }
+#endif
+    return RayTracedProbeMissGI(worldPos, normal, pixel);
 }
 
 // SVGF temporal accumulation for the stochastic RT reflection signal.
@@ -2620,8 +2679,14 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
         const bool traceThisPixel =
             !probeResolved || giStrength > 0.0;
         if (traceThisPixel) {
-            float3 traced = RayTracedProbeMissGI(
-                surface.fragPos, ambientNormal, pixel);
+            bool giRayExecuted = true;
+            float3 traced;
+            if (lumenGI)
+                traced = SampleLumenGI(surface.fragPos, ambientNormal, pixel,
+                                       stableSurfaceID.x, giRayExecuted);
+            else
+                traced = RayTracedProbeMissGI(
+                    surface.fragPos, ambientNormal, pixel);
             // A miss has no probe value to blend against, so it takes the
             // traced result outright whatever the strength.
             giIrradiance = probeResolved
@@ -2647,7 +2712,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
             // texel, and the second would clobber the first.
             // Bit 2 = probe-miss GI ray, distinct from shadow and reflection
             // so the statistic shows what each tier costs.
-            outputRayMask[pixel] |= 4u;
+            if (giRayExecuted) outputRayMask[pixel] |= 4u;
         }
     } else {
         giIrradiance = SampleDDGIIrradiance(surface.fragPos, ambientNormal);

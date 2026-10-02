@@ -315,12 +315,21 @@ static void CloseArmoryShop(HWND hwnd) {
 // Opens the counter the player is standing at on E. Returns false when there is
 // none, so the E handler can fall through to its other jobs.
 static bool OpenNearbyArmoryShop() {
-    if (g_armoryShopOpen) return false;
+    if (g_armoryShopOpen || g_game.loading.Active()) return false;
     size_t index = 0;
     if (!NearbyArmoryShop(&index)) return false;
     g_armoryShopOpen = true;
     g_armoryShopIndex = index;
     g_armoryShopCursorReleased = false;
+    if (!firearmAssetsLoaded) {
+        // The hub needs its counter and travel board before it needs the stock.
+        // Reuse the loader's upload/finalization stages on the first visit.
+        BeginLevelLoading(true);
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        g_armoryShopCursorReleased = true;
+    }
     return true;
 }
 

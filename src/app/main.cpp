@@ -166,6 +166,10 @@ static bool LumenGISupported() {
     return lumenRT.dxrSupported && lumenRT.inlineRaytracingSupported;
 }
 
+static bool LumenHalfResolutionSupported() {
+    return LumenGISupported() && visBuffer.lumenGIHalfResolutionSupported;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdShow) {
     SetUnhandledExceptionFilter(WriteCrashDump);
     // std::rand() defaults to seed 1, so every launch replayed the identical
@@ -763,6 +767,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         sscanf_s(capturePoseText, "%f,%f,%f,%f,%f", &capturePose[0],
                  &capturePose[1], &capturePose[2], &capturePose[3],
                  &capturePose[4]) == 5;
+    const bool captureAllStates = poseCapture &&
+        GetEnvironmentVariableA("SGE_CAPTURE_ALL_STATES", nullptr, 0) > 0;
     UINT poseCaptureFrames = 0;
     UINT poseCaptureTarget = 180;
     if (poseCapture) {
@@ -1487,6 +1493,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const bool lumenFlipped =
                 flippedAt("SGE_CAPTURE_LUMEN_TOGGLE", togglePresent);
             if (togglePresent) g_settings.lumenGI = lumenFlipped;
+            const bool halfGIFlipped =
+                flippedAt("SGE_CAPTURE_HALF_GI_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.lumenGIHalfResolution = halfGIFlipped;
             const bool rtFlipped =
                 flippedAt("SGE_CAPTURE_RT_TOGGLE", togglePresent);
             static const int rtInitialQuality = g_settings.rayTracingQuality;
@@ -1539,7 +1548,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // A GUI-subsystem exe has no stdout to redirect, so the state line
             // also goes to a file an unattended run can read back.
             std::ofstream captureStateLog;
-            if (poseCaptureFrames + 60 >= poseCaptureTarget)
+            if (captureAllStates || poseCaptureFrames + 60 >= poseCaptureTarget)
                 captureStateLog.open("capture_state.log", std::ios::app);
             if (captureStateLog)
                 captureStateLog << "render=" << g_dx12.screenWidth << "x"
@@ -1559,6 +1568,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " tlas=" << (g_dxrDDGI.Scene().TLASAddress() != 0)
                                 << " lumenSetting=" << g_settings.lumenGI
                                 << " lumen=" << visBuffer.lumenGIActive
+                                << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
+                                << " captureFrame=" << poseCaptureFrames
                                 << " useDDGI=" << scene.useDDGI
                                 << " giIntensity=" << scene.giIntensity
                                 << " ambient=" << scene.ambientLightingIntensity
@@ -1569,8 +1580,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << visBuffer.EnhancedReflectionRayFraction()
                                 << " vbGpuMs="
                                 << g_profiler.GpuScopeMs("Visibility Buffer")
+                                << " gpuFrameMs=" << g_profiler.GpuFrameMs()
+                                << " genericMs=" << g_profiler.GpuScopeMs("VB Shade Generic")
+                                << " terrainResolveMs=" << g_profiler.GpuScopeMs("VB Terrain Resolve")
                                 << " replayMs="
                                 << g_profiler.GpuScopeMs("VB Depth Replay")
+                                << " rrMs="
+                                << g_profiler.GpuScopeMs("DLSS Ray Reconstruction")
+                                << " dlssMs=" << g_profiler.GpuScopeMs("DLSS")
+                                << " rrLastEval=" << DLSS::LastEvaluatedRR()
                                 << " rasterMs="
                                 << g_profiler.GpuScopeMs("VB Raster")
                                 << " terrainMs="
@@ -4740,7 +4758,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             {
                 ProfilerDX12::CpuScope rebuildProfile(
                     g_profiler, "PrefabRebuild/Batches");
-                RebuildPrefabRenderBatches();
+                // The second cold-load rebuild registers physics after the
+                // world exists; the asset catalogue was scanned on the first.
+                RebuildPrefabRenderBatches(!g_game.loading.Active() ||
+                    g_game.loading.Stage() == LevelLoadStage::WorldAssets ||
+                    g_prefabRegistry.Assets().empty());
             }
             if (g_ddgiCornellTestMode) {
                 g_dxrDDGI.MarkLayoutDirty();
@@ -4977,6 +4999,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool usingVisibility =
             renderPath == RenderPath::VisibilityBuffer;
         visBuffer.extensionMotionVectors = g_settings.extensionMotionVectors;
+        visBuffer.rrForwardGuidesEnabled = g_settings.rrForwardGuides;
+        visBuffer.srForwardMotionEnabled = g_settings.dlssForwardMotion;
         // Only the visibility path writes this flag, so clear it on every other
         // path. Left stale at true, the forward renderer would skip its terrain
         // draw on a frame where nothing rasterized terrain at all.
@@ -5087,13 +5111,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enhancedRTReflections || rrRequested || lumenRequested);
             // Apply Lumen GI when it is requested and enhanced visuals are active.
             visBuffer.SetLumenGI(lumenRequested && visBuffer.enhancedVisualsActive);
+            const bool halfGI = visBuffer.lumenGIActive &&
+                g_settings.lumenGIHalfResolution &&
+                visBuffer.lumenGIHalfResolutionSupported;
+            if (halfGI != visBuffer.lumenGIHalfResolutionActive) {
+                visBuffer.lumenGIHalfResolutionActive = halfGI;
+                visBuffer.InvalidateTemporalHistory();
+            }
             visBuffer.settingsReflectionRoughnessCut =
                 g_settings.rtReflectionRoughnessCutoff;
             visBuffer.rayReconstructionActive = rrRequested &&
                 visBuffer.enhancedVisualsActive &&
-                g_dx12.screenWidth == g_dx12.displayWidth &&
-                g_dx12.screenHeight == g_dx12.displayHeight &&
+                (DLSS::GetSettings().rayReconstructionUpscale ||
+                 (g_dx12.screenWidth == g_dx12.displayWidth &&
+                  g_dx12.screenHeight == g_dx12.displayHeight)) &&
                 visBuffer.debugViewMode == 0 && rrGuidesReady;
+            visBuffer.rayReconstructionUpscaleActive =
+                visBuffer.rayReconstructionActive &&
+                DLSS::GetSettings().rayReconstructionUpscale;
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
@@ -5253,8 +5288,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 stressWallModel = CloneSceneTree(houseTemplate);
                 const bool customLayout = g_customLevelMode;
                 g_customLevelMode = false;
-                ArrangeHousesInCross(normalWallModel, false);
-                ArrangeHousesInCross(stressWallModel, true);
+                // The hub cannot use the demo/stress layouts. A later mission
+                // still runs the full loader and builds them when needed.
+                if (!g_baseMode) {
+                    ArrangeHousesInCross(normalWallModel, false);
+                    ArrangeHousesInCross(stressWallModel, true);
+                }
                 g_customLevelMode = customLayout;
                 if (customLayout) {
                     wallModel = CloneSceneTree(houseTemplate);
@@ -5366,7 +5405,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 LoadDandelionModel();
                 g_prefabRebuildReason = "island scale changed";
                 g_prefabRebuildRequested = true;
-                RebuildScalableEnvironment();
+                // The next frame rebuilds prefab physics. Scatter/navigation
+                // must consume that finished set, rather than build once here
+                // and then again after loading has already completed.
+                g_pendingEnvironmentRebuild = true;
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).
@@ -5387,13 +5429,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
 
             AdvanceLevelLoading(LevelLoadStage::Weapons,
-                "Weapon and explosive barrel",
-                "AK47 + models/Barrel Explosive/barrel.FBX");
-        } else if (g_game.loading.Stage() == LevelLoadStage::Weapons) {
-
-            // The AK47 view model. Loaded here so its texture uploads land in the
-            // same command list the flush below submits.
+                g_baseMode ? "Player arms and demolition kit" : "Weapon and explosive barrel",
+                g_baseMode ? "PlayerArms.fbx + C4" : "AK47 + models/Barrel Explosive/barrel.FBX");
+        } else if (g_game.loading.Stage() == LevelLoadStage::Weapons &&
+                   levelArmoryLoadOnly) {
             GunModel::Load();
+            AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
+                "Finalize armory textures", "firearm models");
+        } else if (g_game.loading.Stage() == LevelLoadStage::Weapons) {
+            if (!g_emptyLevelMode && g_pendingEnvironmentRebuild) {
+                RebuildScalableEnvironment();
+                g_pendingEnvironmentRebuild = false;
+            }
+            // The hub starts with no firearm; its first counter visit loads
+            // the collection through the same upload stages instead.
+            if (!g_baseMode) GunModel::Load();
             // The first-person arms share that window for the same reason, and
             // are drawn in the weapon's own local space.
             ArmsModel::Load();
@@ -5670,7 +5720,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             AdvanceLevelLoading(LevelLoadStage::BanditModel,
                 "Bandit mesh, skeleton, clips and physics asset",
                 "Content/Models/MilitaryMercenaryBandit/Mixamo/SK_BanditMixamo.fbx",
-                g_helicopterModel != nullptr);
+                g_baseMode || g_helicopterModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::BanditModel) {
 
             // Skinned Bandit enemy: mesh + four directional runs. Texture uploads
@@ -5997,7 +6047,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // No squad is expected on the empty level, so report the stage
                 // against what it actually had to do -- keying it to
                 // g_banditLoaded would mark every test level load as failed.
-                g_emptyLevelMode ? g_marineModel.valid : g_banditLoaded);
+                g_baseMode || (g_emptyLevelMode ? g_marineModel.valid : g_banditLoaded));
         } else if (g_game.loading.Stage() == LevelLoadStage::GPUFinalize) {
 
             // Flush the load/mip-generation commands now and print any D3D12
@@ -6126,23 +6176,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DumpDX12DebugMessages();
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: debug messages drained");
-                // First Level 1 load is complete. Start timing after load/GPU
-                // waits and staging cleanup, not from the menu click.
-                if (g_emptyLevelMode) {
-                    emptyLevelAssetsLoaded = true;
-                } else if (g_baseMode) {
-                    // The base deliberately skips the Humvee, the gunship and the
-                    // bandit/marine skinned meshes, so its load leaves the full
-                    // set incomplete. Latching fullLevelAssetsLoaded here would
-                    // tell the next level those imports had already happened and
-                    // StartLevelOne would skip BeginLevelLoading entirely --
-                    // the player would fly out of the hub into a map with no
-                    // vehicles and no enemies.
-                    emptyLevelAssetsLoaded = true;
-                } else {
-                    fullLevelAssetsLoaded = true;
-                    emptyLevelAssetsLoaded = true;
-                }
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: querying device health");
                 const HRESULT deviceStatus = g_dx12.device
@@ -6151,6 +6184,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: device health query returned " +
                     std::to_string(static_cast<long>(deviceStatus)));
+                if (deviceStatus == S_OK) {
+                    if (!g_baseMode || levelArmoryLoadOnly)
+                        firearmAssetsLoaded = true;
+                    if (!levelArmoryLoadOnly) {
+                        if (g_baseMode) baseLevelAssetsLoaded = true;
+                        else if (g_emptyLevelMode) emptyLevelAssetsLoaded = true;
+                        else {
+                            fullLevelAssetsLoaded = true;
+                            emptyLevelAssetsLoaded = true;
+                        }
+                    }
+                }
+                const bool armoryOnly = levelArmoryLoadOnly;
+                levelArmoryLoadOnly = false;
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    std::string(armoryOnly ? "Armory" : (g_baseMode ? "Base" : "Level")) +
+                    " loading took " +
+                    std::to_string(g_game.loading.TotalElapsedMilliseconds() / 1000.0) + " s");
                 CompleteLevelLoading(deviceStatus == S_OK);
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: loading marked complete");
@@ -6158,9 +6209,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 SGE_LOG("LogDX12", EngineLog::Level::Display,
                     "Texture upload release: compatibility state reset");
                 // Build the sparse probe layout now the level's geometry exists.
-                if (!g_emptyLevelMode && g_game.world.Level().dxrDDGI.enabled)
+                if (!armoryOnly && !g_emptyLevelMode && g_game.world.Level().dxrDDGI.enabled)
                     RequestLiveDXRDDGIRebuild();
-                g_game.session.StartTimer();
+                if (!armoryOnly && !g_baseMode) g_game.session.StartTimer();
                 lastTime = gameTimer.GetElapsed();
             }
         }
@@ -6300,7 +6351,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // frame (measured: door frames, rotor and fence lit up the
             // consecutive-frame diff; interior edges did not).
             bool skyDrawnBeforeRR = false;
-            if (visBuffer.rayReconstructionActive) {
+            // Upscaling RR runs in the Super Resolution slot instead.
+            if (visBuffer.rayReconstructionActive &&
+                !visBuffer.rayReconstructionUpscaleActive) {
                 if (lateSky) {
                     drawSky();
                     skyDrawnBeforeRR = true;
@@ -6961,7 +7014,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 dlssInputs.jitterPixels = scene.temporalJitterPixels;
                 // RR was requested but did not evaluate: the resolve already
                 // stripped the jitter from this frame's motion vectors.
-                dlssInputs.motionUnjittered = visBuffer.rayReconstructionActive;
+                dlssInputs.motionUnjittered =
+                    visBuffer.rayReconstructionActive &&
+                    !visBuffer.rayReconstructionUpscaleActive;
+                // Upscaling RR evaluates here, over the finished HDR scene.
+                ID3D12Resource* grassDepth = nullptr;
+                if (visBuffer.rayReconstructionUpscaleActive) {
+                    // Forward geometry is in RR's input here: give it its own
+                    // guides and motion, and the depth that includes grass.
+                    grassDepth = grassMSAAActive
+                        ? grassMSAA.GetCombinedDepthResource() : nullptr;
+                    if (visBuffer.PrepareRRForwardGuides(
+                            g_dx12.commandList.Get(), grassDepth,
+                            scene.GetViewMatrix() * scene.GetProjectionMatrix(),
+                            previousHZBViewProjection) && grassDepth) {
+                        dlssInputs.depth = grassDepth;
+                        dlssInputs.depthState =
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    } else {
+                        grassDepth = nullptr;
+                    }
+                    dlssInputs.rayReconstruction = true;
+                    dlssInputs.normalRoughness =
+                        visBuffer.GetNormalRoughnessResource();
+                    dlssInputs.diffuseAlbedo = visBuffer.GetRRDiffuseAlbedo();
+                    dlssInputs.specularAlbedo = visBuffer.GetRRSpecularAlbedo();
+                    dlssInputs.specularHitDistance =
+                        visBuffer.GetRRSpecularHitDistance();
+                } else if (!visBuffer.rayReconstructionActive) {
+                    // Super Resolution: real motion for forward pixels.
+                    grassDepth = grassMSAAActive
+                        ? grassMSAA.GetCombinedDepthResource() : nullptr;
+                    if (visBuffer.PrepareSRForwardMotion(
+                            g_dx12.commandList.Get(), grassDepth,
+                            scene.GetViewMatrix() * scene.GetProjectionMatrix(),
+                            previousHZBViewProjection) && grassDepth) {
+                        dlssInputs.depth = grassDepth;
+                        dlssInputs.depthState =
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    } else {
+                        grassDepth = nullptr;
+                    }
+                }
                 XMStoreFloat4x4(&dlssInputs.view, scene.GetViewMatrix());
                 XMStoreFloat4x4(&dlssInputs.projection,
                                 scene.GetUnjitteredProjectionMatrix());
@@ -6973,6 +7069,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (DLSS::Evaluate(dlssInputs)) {
                     visBuffer.dlssHistoryReset = false;
                     dlssUpscaled = dlssInputs.output != nullptr;
+                    // DLSS resolved the jitter; the HUD projections below
+                    // (objective markers, labels) would otherwise wobble by
+                    // it every frame. Recomputed next frame.
+                    g_dlssResolvedJitterPixels = scene.temporalJitterPixels;
+                    g_dlssResolvedJitterValid = true;
+                    scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
+                }
+                if (grassDepth) {
+                    D3D12_RESOURCE_BARRIER restore = {};
+                    restore.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    restore.Transition.pResource = grassDepth;
+                    restore.Transition.StateBefore = static_cast<
+                        D3D12_RESOURCE_STATES>(dlssInputs.depthState);
+                    restore.Transition.StateAfter =
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    restore.Transition.Subresource =
+                        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    g_dx12.commandList->ResourceBarrier(1, &restore);
                 }
             }
             if (usingVisibility && !visBuffer.validationMode &&
@@ -7540,6 +7654,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             break;
         }
         occlusionDepth.SubmitCopy();
+        if (g_dlssResolvedJitterValid) {
+            scene.temporalJitterPixels = g_dlssResolvedJitterPixels;
+            g_dlssResolvedJitterValid = false;
+        }
         if (hzbCaptureActive)
             previousHZBViewProjection =
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();

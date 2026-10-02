@@ -2,14 +2,20 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
-static void BeginLevelLoading() {
+static void BeginLevelLoading(bool armoryOnly = false) {
+    levelArmoryLoadOnly = armoryOnly;
     g_uploadHeapRelease.Reset();
-    g_game.loading.Begin({
-        g_emptyLevelMode ? 6u : 12u,
-        g_emptyLevelMode ? "Terrain material"
-                         : "Terrain material and crate model",
-        g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
-    });
+    if (armoryOnly) {
+        g_game.loading.Begin({ 4u, "Armory stock", "firearm models",
+                              LevelLoadStage::Weapons });
+    } else {
+        g_game.loading.Begin({
+            g_emptyLevelMode ? 6u : 12u,
+            g_emptyLevelMode ? "Terrain material"
+                             : "Terrain material and crate model",
+            g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
+        });
+    }
     if (!BeginTextureUploadArenaDX12()) {
         g_game.loading.SetCurrent(
             "Unable to begin pooled texture staging",

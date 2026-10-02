@@ -111,6 +111,11 @@ UINT                        g_dxrDDGIIndexCount = 0;
 float                       g_dxrDDGICellSize = 0.0f;
 static OcclusionDepthDX12   occlusionDepth;
 static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
+// Jitter this frame rendered with, kept after DLSS zeroes the live value for
+// the HUD: next frame's motion vectors and HZB test need the rendered matrix
+// (measured: storing the unjittered one put RR noise all over the terrain).
+static XMFLOAT2             g_dlssResolvedJitterPixels = { 0.0f, 0.0f };
+static bool                 g_dlssResolvedJitterValid = false;
 static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
 static NightVisionDX12      nightVision;
@@ -333,6 +338,9 @@ static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionCoreUploadHeaps;
 static bool                 fullLevelAssetsLoaded = false;
 static bool                 emptyLevelAssetsLoaded = false;
+static bool                 baseLevelAssetsLoaded = false;
+static bool                 levelArmoryLoadOnly = false;
+static bool                 firearmAssetsLoaded = false;
 static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
 static std::future<bool> levelDestructionLoadFuture;
 static bool levelDestructionLoadInFlight = false;

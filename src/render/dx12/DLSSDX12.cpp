@@ -373,6 +373,7 @@ bool Available() { return S().supported; }
 bool RayReconstructionAvailable() { return S().rrSupported; }
 const char* RayReconstructionStatus() { return S().rrStatus.c_str(); }
 const char* Status() { return S().status.c_str(); }
+bool LastEvaluatedRR() { return S().lastEvaluatedRR; }
 Settings& GetSettings() { return S().settings; }
 
 bool RenderSize(UINT displayWidth, UINT displayHeight, float percentage,
@@ -415,9 +416,9 @@ bool Evaluate(const DLSSFrameInputs& in) {
     const bool rr = in.rayReconstruction;
     if (rr && (!s.rrSupported || !in.normalRoughness ||
                !in.diffuseAlbedo || !in.specularAlbedo ||
-               !in.specularHitDistance || in.output ||
-               in.width != in.outputWidth ||
-               in.height != in.outputHeight)) {
+               !in.specularHitDistance ||
+               (!in.output && (in.width != in.outputWidth ||
+                               in.height != in.outputHeight)))) {
         s.rrStatus = "Ray Reconstruction missing support or native guides";
         return false;
     }
@@ -471,7 +472,7 @@ bool Evaluate(const DLSSFrameInputs& in) {
 
     if (rr) {
         sl::DLSSDOptions options{};
-        options.mode = sl::DLSSMode::eDLAA;
+        options.mode = mode;
         options.outputWidth = outputWidth;
         options.outputHeight = outputHeight;
         options.colorBuffersHDR = sl::Boolean::eTrue;
@@ -549,7 +550,9 @@ bool Evaluate(const DLSSFrameInputs& in) {
     // projection, so this frame's jitter is inside the vector -- except under
     // Ray Reconstruction, where the resolve subtracts it: RR left static-camera
     // frames moving at every edge with jittered vectors (SR/DLAA did not).
-    consts.motionVectorsJittered = (rr || in.motionUnjittered)
+    // Upscaling RR takes jittered vectors like SR (measured steadier).
+    consts.motionVectorsJittered =
+        ((rr && !superResolution) || in.motionUnjittered)
         ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 
     if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
@@ -558,7 +561,7 @@ bool Evaluate(const DLSSFrameInputs& in) {
     }
 
     const uint32_t readState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    sl::Resource depth(sl::ResourceType::eTex2d, in.depth, readState);
+    sl::Resource depth(sl::ResourceType::eTex2d, in.depth, in.depthState);
     sl::Resource motion(sl::ResourceType::eTex2d, in.motion, readState);
     sl::Resource color(sl::ResourceType::eTex2d, in.color, readState);
     if (superResolution && s.externalOutputReadable) {

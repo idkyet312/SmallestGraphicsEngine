@@ -35,6 +35,7 @@ struct LevelLoadRequest {
     uint32_t taskCount = 1;
     std::string firstLabel;
     std::string firstAsset;
+    LevelLoadStage firstStage = LevelLoadStage::WorldAssets;
 };
 
 class LevelLoadingController {
@@ -42,7 +43,7 @@ public:
     using Clock = std::chrono::steady_clock;
 
     void Begin(LevelLoadRequest request, Clock::time_point now = Clock::now()) {
-        stage_ = LevelLoadStage::WorldAssets;
+        stage_ = request.firstStage;
         active_ = true;
         progress_ = 0.02f;
         taskCount_ = (std::max)(1u, request.taskCount);
