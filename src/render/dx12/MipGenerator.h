@@ -26,6 +26,7 @@ public:
         UINT16 mipLevels = 1;
     };
     std::vector<PendingMip> pending;
+    std::vector<PendingMip> inFlight;
 
     // Total heap size: 2 descriptors per mip-level dispatch. All GenerateMips calls
     // made before the recording command list is executed share this heap, so it
@@ -171,9 +172,18 @@ public:
         pending.push_back(std::move(request));
     }
 
+    // Command lists hold raw resource pointers. A superseded texture can lose
+    // its material owner during import, so retain it through the direct handoff.
+    void ReleaseCompletedTextures() {
+        if (graphicsHandoffFence &&
+            graphicsHandoffFence->GetCompletedValue() >= graphicsHandoffFenceValue)
+            inFlight.clear();
+    }
+
     // Runs queued downsampling on the compute queue. Future direct submissions
     // wait on its fence, while CPU initialization continues.
     void FlushPending() {
+        ReleaseCompletedTextures();
         // Reports what mip generation actually did, because a texture that is
         // sharp up close and black at distance means mip 0 uploaded fine and
         // the generated levels did not -- and nothing in the normal path says
@@ -257,6 +267,7 @@ public:
         // Compute queues cannot transition to PIXEL_SHADER_RESOURCE. Perform
         // that final ownership/state handoff on a small direct command list.
         WaitForFenceCPU(graphicsHandoffFence.Get(), graphicsHandoffFenceValue);
+        ReleaseCompletedTextures();
         ThrowIfFailed(graphicsHandoffAllocator->Reset());
         ThrowIfFailed(graphicsHandoffList->Reset(graphicsHandoffAllocator.Get(), nullptr));
         std::vector<D3D12_RESOURCE_BARRIER> barriers(pending.size());
@@ -273,7 +284,7 @@ public:
         g_dx12.commandQueue->ExecuteCommandLists(1, handoffLists);
         const UINT64 value = ++graphicsHandoffFenceValue;
         ThrowIfFailed(g_dx12.commandQueue->Signal(graphicsHandoffFence.Get(), value));
-        pending.clear();
+        inFlight.swap(pending);
     }
 
 private:

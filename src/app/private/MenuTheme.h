@@ -2,6 +2,44 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+#include <imgui_internal.h>
+
+static bool g_menuSelectionChanged = false;
+static ImGuiID g_menuHoveredRow = 0;
+
+// Sample after drawing: one event per frame covers mouse, keyboard and custom
+// controls without replaying the sound while a highlight stays on the same row.
+static void UpdateMenuSelectionAudio(bool menuVisible) {
+    static ImGuiID previousHovered = 0;
+    static ImGuiID previousFocused = 0;
+    static double lastSoundTime = -1.0;
+    const ImGuiContext& context = *ImGui::GetCurrentContext();
+    const ImGuiID hovered = menuVisible
+        ? (g_menuHoveredRow ? g_menuHoveredRow : context.HoveredId) : 0;
+    const ImGuiID focused = menuVisible && context.NavCursorVisible &&
+        context.NavIdIsAlive ? context.NavId : 0;
+    const bool selectionChanged = (hovered && hovered != previousHovered) ||
+                                  (focused && focused != previousFocused);
+    const bool activated = menuVisible &&
+        ((context.ActiveId != 0 && context.ActiveIdIsJustActivated) ||
+         context.NavActivatePressedId != 0);
+    const bool edited = menuVisible &&
+        (g_menuSelectionChanged || context.ActiveIdHasBeenEditedThisFrame);
+    const double now = ImGui::GetTime();
+    // Slider edits arrive every frame; keep feedback responsive without making
+    // overlapping copies of the sample into a continuous buzz.
+    if (activated || (edited && now - lastSoundTime >= 0.08)) {
+        g_menuConfirmAudio.Play(0.65f);
+        lastSoundTime = now;
+    } else if (selectionChanged) {
+        g_menuSelectionAudio.Play(0.65f);
+    }
+    previousHovered = hovered;
+    previousFocused = focused;
+    g_menuSelectionChanged = false;
+    g_menuHoveredRow = 0;
+}
+
 // ---- Shared UI theme -------------------------------------------------------
 //
 // The HUD is hand-drawn with ImDrawList in a dark plate + pale text palette
@@ -282,6 +320,9 @@ static Row BeginRow(const char* label, const char* description,
     row.hovered = ImGui::IsWindowHovered(
                       ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                   ImGui::IsMouseHoveringRect(row.min, max);
+    if (row.hovered && !(ImGui::GetCurrentContext()->CurrentItemFlags &
+                         ImGuiItemFlags_Disabled))
+        g_menuHoveredRow = ImGui::GetID("##selection_sound");
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(row.min, max,
@@ -333,7 +374,10 @@ static bool Toggle(bool* value) {
     const ImVec2 size(52.0f, 26.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const bool pressed = ImGui::InvisibleButton("##toggle", size);
-    if (pressed) *value = !*value;
+    if (pressed) {
+        *value = !*value;
+        g_menuSelectionChanged = true;
+    }
     const bool hovered = ImGui::IsItemHovered();
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -433,6 +477,7 @@ static bool SelectorRow(const char* label, const char* description,
     ImGui::SameLine();
     if (ImGui::ArrowButton("##next", ImGuiDir_Right)) pressed = true;
     ImGui::PopStyleVar();
+    if (pressed) g_menuSelectionChanged = true;
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(mid, ImVec2(mid.x + midWidth, mid.y + h),
@@ -866,6 +911,7 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
                         IM_COL32(255, 255, 255, 50));
 
     // ---- Tabs -------------------------------------------------------------
+    const int previousTab = s_tab;
     // Not under the restart prompt: switching away from Video would stop
     // drawing the row the prompt is about.
     if (!ImGui::GetIO().WantTextInput && g_rtRestartChoice < 0) {
@@ -911,6 +957,7 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
     }
     KeyCap(draw, ImVec2(tabX + 8.0f, tabsY + (tabHeight - capHeight) * 0.5f),
            "E", capHeight);
+    if (s_tab != previousTab) g_menuSelectionChanged = true;
     draw->AddRectFilled(ImVec2(side, tabsY + tabHeight),
                         ImVec2(right, tabsY + tabHeight + 1.0f),
                         IM_COL32(255, 255, 255, 22));

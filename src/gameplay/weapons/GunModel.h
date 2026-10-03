@@ -25,6 +25,7 @@
 #include "DX12Core.h"
 #include "FBXImporter.h"
 #include "GLBImporter.h"
+#include "CookedAssetLoader.h"
 #include "CookedAssetPaths.h"
 #include <DirectXMath.h>
 #include <algorithm>
@@ -1347,7 +1348,9 @@ private:
             M4IronSightMesh() = finish(std::move(ironSights));
         std::cout << "M4A1 GLB ready: " << mesh->primitives.size()
                   << " primitive(s), " << ironSightIndices.size()
-                  << " iron sight primitive(s) split\n";
+                  << " iron sight primitive(s) split, bounds x[" << s_lo.x
+                  << ".." << s_hi.x << "] y[" << s_lo.y << ".." << s_hi.y
+                  << "] z[" << s_lo.z << ".." << s_hi.z << "]\n";
     }
 
     // Flatten, recording which primitives came from the M4's iron sight nodes.
@@ -1581,8 +1584,14 @@ private:
                 triangles += primitive.indices.size() / 3;
                 vertices += primitive.vertices.size() / 12;
             }
-            std::fprintf(file, "r700_loaded=1 prims=%zu verts=%zu tris=%zu\n",
-                         mesh->primitives.size(), vertices, triangles);
+            // The lens is found by material name, so this is what shows a cook
+            // that merged materials: lens=0 means the scope lost its aperture.
+            const XMFLOAT3& lens = R700LensCenterStorage();
+            std::fprintf(file,
+                "r700_loaded=1 prims=%zu verts=%zu tris=%zu lens=%d"
+                " lens_center=(%.4f,%.4f,%.4f)\n",
+                mesh->primitives.size(), vertices, triangles,
+                R700LensCenterValidStorage() ? 1 : 0, lens.x, lens.y, lens.z);
             std::fclose(file);
         }
     }
@@ -2039,11 +2048,19 @@ private:
             Resolve(dir + "RPG7_Normal.png"), g_dx12.device, g_dx12.commandList,
             mat->uploadHeaps);
 
+        // Packed at cook time (AssetCooker --pack-mr) when a fresh cook exists:
+        // decoding both 4K images and packing them here cost ~220 ms a load.
+        mat->metallicRoughnessTexture =
+            CookedAssetLoader::LoadPackedMetalRoughnessForSources(
+                Resolve(dir + "RPG7_Roughness.png"),
+                Resolve(dir + "RPG7_Metallic.png"), g_dx12.device.Get(),
+                g_dx12.commandList.Get(), mat->uploadHeaps);
         std::vector<unsigned char> rough, metal, packed;
         int rw = 0, rh = 0, mw = 0, mh = 0;
-        const bool haveRough = GLBImporter::LoadPixelsRGBA(
-            Resolve(dir + "RPG7_Roughness.png"), rough, rw, rh);
-        const bool haveMetal = GLBImporter::LoadPixelsRGBA(
+        const bool haveRough = !mat->metallicRoughnessTexture &&
+            GLBImporter::LoadPixelsRGBA(
+                Resolve(dir + "RPG7_Roughness.png"), rough, rw, rh);
+        const bool haveMetal = haveRough && GLBImporter::LoadPixelsRGBA(
             Resolve(dir + "RPG7_Metallic.png"), metal, mw, mh);
         if (haveRough && haveMetal && rw == mw && rh == mh && rw > 0) {
             const size_t texels = static_cast<size_t>(rw) * rh;

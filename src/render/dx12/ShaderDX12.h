@@ -158,10 +158,8 @@ struct alignas(256) ObjectBufferDX12 {
     // parts nearest the eye clear the most. Takes the first of the two floats
     // that padded the gap below, which keeps the uint4 on its byte-96 register.
     float viewmodelSeeThrough = 0.0f;
-    // HLSL starts uint4 values on a fresh 16-byte cbuffer register. Adding
-    // alphaCutoff moved materialTime to byte 80, so the bindless indices now
-    // begin at byte 96 rather than immediately after it.
-    float bindlessPadding = 0.0f;
+    // Uses the former padding at byte 92; bindless indices stay at byte 96.
+    float foliageShadowLift = 0.72f;
     UINT bindlessTextureIndices[4] = {
         BINDLESS_FALLBACK_WHITE, BINDLESS_FALLBACK_NORMAL,
         BINDLESS_FALLBACK_METALROUGH, BINDLESS_FALLBACK_BLACK
@@ -2289,6 +2287,7 @@ public:
                                     : (cacheOwner && cacheOwner->alphaBlend
                                         ? -1.0f : 0.0f));
         data.alphaCutoff = cacheOwner ? cacheOwner->alphaCutoff : 0.20f;
+        data.foliageShadowLift = cacheOwner ? cacheOwner->foliageShadowLift : 0.72f;
         data.ambientScale = ambientScale;
         data.occlusionStrength = occlusionStrength;
         data.normalYSign = normalYSign;

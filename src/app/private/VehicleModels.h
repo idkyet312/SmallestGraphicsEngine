@@ -502,11 +502,11 @@ static bool g_insertionChoiceCursorReleased = false;
 // The offsets ConfigureBlackHawkRideFromModel derives are cached at load and
 // re-applied through the mirror every time an insertion is armed, so flipping
 // the seat between runs never compounds an earlier flip.
-static bool g_playerRidesLeftSeat = false;
+static bool g_playerRidesLeftSeat = true;
 static float g_blackHawkRideSideBase = 0.0f;
 static float g_blackHawkRopeSideBase = 0.0f;
 // Raised when an insertion is armed, cleared on the first frame the player is
-// actually seated. Aiming the camera out of the chosen door is a one-shot: the
+// actually seated. Aiming the camera toward the front of the door is a one-shot: the
 // player keeps free look for the rest of the flight, so re-aiming every frame
 // would fight the mouse instead of just setting the starting view.
 static bool g_blackHawkRideFacingPending = false;
@@ -535,6 +535,7 @@ static bool g_blackHawkCabinLocalValid = false;
 // which is the whole reason it is scaled up.
 static constexpr float kCabinHalfWidth = 1.75f;
 static constexpr float kCabinHalfLength = 2.70f;
+static constexpr float kCabinSpawnOutwardOffset = 0.75f;
 
 // Vertical state for the cabin walk, in cabin space. The deck is a moving
 // platform, so the player cannot use the world-space fall in CameraDX12: its
@@ -628,6 +629,9 @@ static uint32_t g_baseKitWeapons = 0;
 static uint32_t g_baseKitGrenades = 0;
 static uint32_t g_baseKitGear = 0;
 static std::unordered_set<std::string> g_baseKitAttachments;
+// Marines asked for at the counter. Not charged there: like the deploy screen's
+// slider, the squad is paid for on DEPLOY, so this only pre-fills that slider.
+static int g_baseKitMarines = 0;
 // The rails as the counter left them: (weapon, attachment id) pairs actually
 // fitted, which is not the same question as what is owned -- see the restore in
 // ClearMissionRentals.

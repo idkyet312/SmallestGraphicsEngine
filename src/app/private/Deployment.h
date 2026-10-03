@@ -70,6 +70,7 @@ static void IssueBaseKit() {
     // owed back on the next visit -- it was never charged to a mission.
     g_baseKitPending = false;
     g_baseKitFitted.clear();
+    g_baseKitMarines = 0;
     GunModel::ConfigureLoadout(MissionLoadout::kIssuedChargeWeapon,
                                MissionLoadout::kIssuedChargeWeapon);
     scene.selectedGrenade = GrenadeType::Frag;
@@ -104,6 +105,10 @@ static void ClearMissionRentals() {
     g_ownedGrenades = g_baseKitGrenades;
     g_ownedGear = g_baseKitGear;
     g_ownedAttachments = g_baseKitAttachments;
+    // The squad asked for at the counter. Still charged on DEPLOY, and the
+    // deploy screen clamps it to the wallet before then.
+    g_deploymentMarineCount = g_baseKitMarines;
+    g_baseKitMarines = 0;
     // Re-fit the rails as they were left at the counter. The loop above
     // stripped every weapon, so the parts have to be put back on. Driven by
     // what was actually FITTED rather than by the owned set: a part bought and
@@ -651,14 +656,25 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
             return;
         }
 
-        // Seed the walk from the authored seat the first time the player
-        // boards, so the ride still starts in the door they chose.
+        // Start slightly outside the chosen door so the cabin skin clears the
+        // view. Re-entry also resets the view; free look resumes after this frame.
         if (!g_blackHawkCabinLocalValid) {
             g_blackHawkCabinLocalValid = true;
             g_blackHawkCabinLocal = {
-                vehicles.blackHawkRideSide,
+                vehicles.blackHawkRideSide +
+                    std::copysign(kCabinSpawnOutwardOffset, vehicles.blackHawkRideSide),
                 vehicles.blackHawkRideHeight,
                 vehicles.blackHawkRideForward };
+            g_blackHawkRideFacingPending = true;
+        }
+        if (g_blackHawkRideFacingPending) {
+            g_blackHawkRideFacingPending = false;
+            // Bias the door view toward the nose (+Z). Camera yaw uses
+            // atan2(z, x), so local front-left (-X, +Z) is 135 degrees.
+            scene.camera.Yaw = (g_playerRidesLeftSeat ? 135.0f : 45.0f) -
+                XMConvertToDegrees(vehicles.blackHawkYaw);
+            scene.camera.Pitch = 0.0f;
+            scene.camera.ProcessMouseMovement(0.0f, 0.0f);
         }
 
         // Walk the cabin. Input is applied in the AIRCRAFT's frame, not the
@@ -719,6 +735,10 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         // player boarded.
         const float centreX = 0.0f;
         const float centreZ = vehicles.blackHawkRideForward;
+        // The boarding perch must count as footing; otherwise an authored
+        // door near the deck edge would throw the player out on entry.
+        const float cabinHalfWidth = (std::max)(kCabinHalfWidth,
+            std::fabs(vehicles.blackHawkRideSide) + kCabinSpawnOutwardOffset);
 
         // Jump, in cabin space. Fires on the press rather than the hold so it
         // matches the ground jump, and only with both feet on the deck --
@@ -754,7 +774,7 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         // make the deck impossible to jump on at all.
         const bool pastSide =
             std::fabs(g_blackHawkCabinLocal.x - centreX) >
-                kCabinHalfWidth + kCabinEdgeGrace;
+                cabinHalfWidth + kCabinEdgeGrace;
         const bool pastEnd =
             std::fabs(g_blackHawkCabinLocal.z - centreZ) >
                 kCabinHalfLength + kCabinEdgeGrace;
@@ -776,7 +796,7 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         // Hard walls just outside the walkable deck. The grace band above is
         // what the player actually falls through; this only stops a mid-air
         // jump from carrying them clean out through the fuselage.
-        const float wallX = kCabinHalfWidth + kCabinEdgeGrace;
+        const float wallX = cabinHalfWidth + kCabinEdgeGrace;
         const float wallZ = kCabinHalfLength + kCabinEdgeGrace;
         g_blackHawkCabinLocal.x = (std::max)(centreX - wallX,
             (std::min)(centreX + wallX, g_blackHawkCabinLocal.x));
@@ -816,21 +836,6 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = g_blackHawkCabinGrounded;
         scene.camera.FloorY = scene.camera.Position.y - scene.camera.PlayerHeight;
-        // Look out of the door the player is sitting in, once, at the start of
-        // the ride. The airframe's forward is (sin, cos), so its right-hand
-        // side is (cos, -sin); camera yaw is atan2(z, x) in degrees, which
-        // makes the starboard view simply -yaw, and the port view that plus a
-        // half turn. Level the pitch too: whatever the player was looking at on
-        // the deployment map has nothing to do with where they now sit.
-        if (g_blackHawkRideFacingPending) {
-            g_blackHawkRideFacingPending = false;
-            const float facing =
-                -XMConvertToDegrees(vehicles.blackHawkYaw) +
-                (g_playerRidesLeftSeat ? 180.0f : 0.0f);
-            scene.camera.Yaw = facing;
-            scene.camera.Pitch = 0.0f;
-            scene.camera.ProcessMouseMovement(0.0f, 0.0f);
-        }
         return;
     }
     // Left the aircraft: the next boarding re-seats from the authored door
@@ -979,6 +984,11 @@ static void BeginDeploymentPlanning() {
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;
+    // The squad is hired the same way and cannot be inherited either, or a
+    // restart would deploy marines the player was never charged for. Cleared
+    // before the rentals so a squad asked for at the base counter, which
+    // ClearMissionRentals restores, pre-fills the slider (charged on DEPLOY).
+    g_deploymentMarineCount = 0;
     // Last mission's kit does not come back. Everything in the armory is hired
     // for one deployment, so this screen opens with nothing paid for and the
     // storefront quotes a price on every row again.
@@ -987,9 +997,6 @@ static void BeginDeploymentPlanning() {
     // deliberately not cleared here -- it is a mode the player chose, not kit
     // they rented for one mission.
     ResetOngoingBombardment();
-    // The squad is hired the same way and cannot be inherited either, or a
-    // restart would deploy marines the player was never charged for.
-    g_deploymentMarineCount = 0;
     LevelInsertionMode authored = g_customLevelMode
         ? g_game.world.Level().insertionMode
         : LevelInsertionMode::Helicopter;

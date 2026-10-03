@@ -325,15 +325,12 @@ fs::path CookedAssetLoader::FindForSource(const fs::path& source) {
 
 namespace {
 
-// A cooked asset (and, when present, its source) whose hashes a prefetch
-// verified. Keyed by the cooked path; valid only while both files keep the
-// size and write time they had when they were hashed.
+// A cooked asset whose payload hash a prefetch verified. Keyed by the cooked
+// path; valid only while the file keeps the size and write time it had when
+// it was hashed.
 struct VerifiedCooked {
     uint64_t cookedSize = 0;
     int64_t cookedTime = 0;
-    bool sourceVerified = false;
-    uint64_t sourceSize = 0;
-    int64_t sourceTime = 0;
 };
 
 struct PrefetchState {
@@ -388,14 +385,14 @@ bool StreamFile(const fs::path& path, uint64_t hashBegin, uint64_t hashEnd,
 
 void PrefetchOne(const fs::path& source) {
     const fs::path cooked = CookedAssetLoader::FindForSource(source);
-    uint64_t sourceSize = 0;
-    int64_t sourceTime = 0;
-    const bool sourceExists = FileStamp(source, sourceSize, sourceTime);
     if (cooked.empty()) {
         // No cooked asset: the importer reads the source itself, so warming
         // the file cache is all a worker can do for it.
+        uint64_t sourceSize = 0;
+        int64_t sourceTime = 0;
         uint64_t ignored = 0;
-        if (sourceExists) StreamFile(source, 0, 0, ignored);
+        if (FileStamp(source, sourceSize, sourceTime))
+            StreamFile(source, 0, 0, ignored);
         return;
     }
 
@@ -416,18 +413,10 @@ void PrefetchOne(const fs::path& source) {
         payloadHash != header.contentHash)
         return;
 
+    // The source is not read: CookedIsFresh needs only its size.
     VerifiedCooked entry;
     entry.cookedSize = cookedSize;
     entry.cookedTime = cookedTime;
-    if (sourceExists) {
-        uint64_t sourceHash = 1469598103934665603ull;
-        if (!StreamFile(source, 0, sourceSize, sourceHash) ||
-            header.sourceSize != sourceSize || header.sourceHash != sourceHash)
-            return;  // stale: the loader will reject it the normal way
-        entry.sourceVerified = true;
-        entry.sourceSize = sourceSize;
-        entry.sourceTime = sourceTime;
-    }
     std::lock_guard<std::mutex> lock(Prefetch().mutex);
     Prefetch().verified[PrefetchKey(cooked)] = entry;
 }
@@ -511,9 +500,38 @@ static bool CookedEnabledFor(const fs::path& source) {
     return false;
 }
 
+// False when `cooked` was built from a different `source`. Decided from the
+// file size alone -- a stat, never a read. Hashing the source here re-read
+// every original at load: 18.3 s of one Base load (the NATO shelter's 135 MB
+// GLB alone took 10.4 s on a cold USB drive), for files the game otherwise
+// never opens. Write times cannot stand in either: the RuntimeContent copy in
+// build/Content and a fresh clone both restamp them. Same-size edits are the
+// cook's job to catch -- it re-cooks every listed source -- and a missing
+// source is trusted, since cooked-only packages carry no originals.
+static bool CookedIsFresh(const fs::path& source, const fs::path& cooked,
+                          std::string* error) {
+    std::error_code ec;
+    const uint64_t sourceSize = fs::file_size(source, ec);
+    if (ec) return true;
+    Cooked::Header header{};
+    {
+        std::ifstream stream(cooked, std::ios::binary);
+        if (!stream.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+            if (error) *error = "truncated cooked asset";
+            return false;
+        }
+    }
+    if (header.sourceSize != sourceSize) {
+        if (error) *error = "cooked asset is stale";
+        return false;
+    }
+    return true;
+}
+
 std::shared_ptr<SceneNode> CookedAssetLoader::LoadForSource(
     const fs::path& source, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error) {
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error,
+    bool loadTextures) {
     // Escape hatch: SGE_NO_COOKED=1 makes every caller fall back to importing
     // the original FBX/GLB, which is how assets loaded before the cooked
     // pipeline landed. Returning empty here is exactly the "no cooked asset"
@@ -525,44 +543,74 @@ std::shared_ptr<SceneNode> CookedAssetLoader::LoadForSource(
 
     const fs::path cooked = FindForSource(source);
     if (cooked.empty()) return {};
-    if (fs::exists(source)) {
-        std::string headerError;
-        MappedFile headerMap;
-        if (!headerMap.Open(cooked, headerError) ||
-            headerMap.size < sizeof(Cooked::Header)) {
-            if (error) *error = headerError.empty()
-                ? "truncated cooked asset" : headerError;
-            return {};
-        }
-        const Cooked::Header& header =
-            *reinterpret_cast<const Cooked::Header*>(headerMap.data);
+    if (!CookedIsFresh(source, cooked, error)) return {};
+    return Load(cooked, std::move(device), std::move(commandList), error,
+                loadTextures);
+}
+
+// The one texture of a texture-only cook. `secondary` is the second input of a
+// packed cook, checked against the hash and size the cooker stamped into the
+// header's reserved words.
+static ComPtr<ID3D12Resource> LoadCookedTexture(
+    const fs::path& cooked, const fs::path* secondary, ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList,
+    std::vector<ComPtr<ID3D12Resource>>& uploads) {
+    std::string error;
+    MappedFile map;
+    if (!map.Open(cooked, error) || map.size < sizeof(Cooked::Header))
+        return {};
+    const Cooked::Header& header =
+        *reinterpret_cast<const Cooked::Header*>(map.data);
+    if (!Cooked::HeaderValid(header, map.size) || header.textureCount != 1 ||
+        header.primitiveCount != 0)
+        return {};
+    if (secondary) {
+        // Size only, like CookedIsFresh: the stored hash is the cook's record.
+        if (!(header.flags & Cooked::PackedSources)) return {};
         std::error_code ec;
-        const uint64_t sourceSize = fs::file_size(source, ec);
-        // A prefetch that already hashed this exact source saves re-reading it.
-        VerifiedCooked verified;
-        uint64_t stampSize = 0;
-        int64_t stampTime = 0;
-        const bool prefetched = LookupVerified(cooked, verified) &&
-            verified.sourceVerified && FileStamp(source, stampSize, stampTime) &&
-            stampSize == verified.sourceSize && stampTime == verified.sourceTime;
-        const auto tHash0 = std::chrono::steady_clock::now();  // TIMING
-        const bool stale = ec || header.sourceSize != sourceSize ||
-            (!prefetched && header.sourceHash != HashFile(source));
-        std::cout << "[TIMING] srcHash " << source.filename().string() << " "
-                  << std::chrono::duration<double, std::milli>(
-                         std::chrono::steady_clock::now() - tHash0).count()
-                  << " ms\n";
-        if (stale) {
-            if (error) *error = "cooked asset is stale";
-            return {};
-        }
+        const uint64_t size = fs::file_size(*secondary, ec);
+        if (!ec && size != header.reserved[1]) return {};
     }
-    return Load(cooked, std::move(device), std::move(commandList), error);
+    VerifiedCooked verified;
+    if (!LookupVerified(cooked, verified) &&
+        HashBytes(map.data + header.payloadOffset,
+                  static_cast<size_t>(header.payloadSize)) !=
+            header.contentHash)
+        return {};
+    const auto* record = reinterpret_cast<const Cooked::Texture*>(
+        map.data + header.textureOffset);
+    ComPtr<ID3D12Resource> texture =
+        CreateTexture(map, *record, device, commandList, uploads);
+    if (texture) texture->SetName(cooked.wstring().c_str());
+    return texture;
+}
+
+ComPtr<ID3D12Resource> CookedAssetLoader::LoadTextureForSource(
+    const fs::path& source, ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList,
+    std::vector<ComPtr<ID3D12Resource>>& uploads) {
+    if (!device || !commandList || !CookedEnabledFor(source)) return {};
+    const fs::path cooked =
+        SGE::Cooked::FindAssetForSource(source, Cooked::kTextureSuffix);
+    if (cooked.empty() || !CookedIsFresh(source, cooked, nullptr)) return {};
+    return LoadCookedTexture(cooked, nullptr, device, commandList, uploads);
+}
+
+ComPtr<ID3D12Resource> CookedAssetLoader::LoadPackedMetalRoughnessForSources(
+    const fs::path& roughness, const fs::path& metallic, ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList,
+    std::vector<ComPtr<ID3D12Resource>>& uploads) {
+    if (!device || !commandList || !CookedEnabledFor(roughness)) return {};
+    const fs::path cooked = SGE::Cooked::FindAssetForSource(
+        roughness, Cooked::kPackedMetalRoughnessSuffix);
+    if (cooked.empty() || !CookedIsFresh(roughness, cooked, nullptr)) return {};
+    return LoadCookedTexture(cooked, &metallic, device, commandList, uploads);
 }
 
 std::shared_ptr<SceneNode> CookedAssetLoader::Load(
     const fs::path& cookedPath, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error) {
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error,
+    bool loadTextures) {
     const auto tT0 = std::chrono::steady_clock::now();  // TIMING
     const auto tMs = [](std::chrono::steady_clock::time_point at) {
         return std::chrono::duration<double, std::milli>(
@@ -608,7 +656,7 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
     const auto tTex0 = std::chrono::steady_clock::now();
     std::vector<ComPtr<ID3D12Resource>> textureUploads;
     std::vector<ComPtr<ID3D12Resource>> textures(header.textureCount);
-    for (uint32_t i = 0; i < header.textureCount; ++i) {
+    for (uint32_t i = 0; loadTextures && i < header.textureCount; ++i) {
         textures[i] = CreateTexture(map, textureRecords[i], device.Get(),
                                     commandList.Get(), textureUploads);
         if (textures[i]) {
@@ -837,6 +885,19 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
             PumpPendingWindowMessages();
             continue;
         }
+        // Part-preserving cooks (Cooked::PreservedParts) name each primitive by
+        // its source node path. Give it back a node of that name, at identity
+        // since the cook already placed the vertices, so callers that walk the
+        // tree by node name -- the M4's iron sight split -- see the parts.
+        if (header.flags & Cooked::PreservedParts) {
+            auto part = std::make_shared<SceneNode>(primitiveName);
+            part->mesh = std::make_shared<SceneMesh>();
+            part->mesh->name = primitiveName;
+            part->mesh->primitives.push_back(std::move(primitive));
+            root->AddChild(part);
+            PumpPendingWindowMessages();
+            continue;
+        }
         root->mesh->primitives.push_back(std::move(primitive));
         PumpPendingWindowMessages();
     }
@@ -858,25 +919,7 @@ bool CookedAssetLoader::LoadAnimationsForSource(
 
     const fs::path cookedPath = FindForSource(sourcePath);
     if (cookedPath.empty()) return false;
-    if (fs::exists(sourcePath)) {
-        std::string headerError;
-        MappedFile headerMap;
-        if (!headerMap.Open(cookedPath, headerError) ||
-            headerMap.size < sizeof(Cooked::Header)) {
-            if (error) *error = headerError.empty()
-                ? "truncated cooked animation" : headerError;
-            return false;
-        }
-        const Cooked::Header& sourceHeader =
-            *reinterpret_cast<const Cooked::Header*>(headerMap.data);
-        std::error_code ec;
-        const uint64_t sourceSize = fs::file_size(sourcePath, ec);
-        if (ec || sourceHeader.sourceSize != sourceSize ||
-            sourceHeader.sourceHash != HashFile(sourcePath)) {
-            if (error) *error = "cooked animation is stale";
-            return false;
-        }
-    }
+    if (!CookedIsFresh(sourcePath, cookedPath, error)) return false;
 
     std::string localError;
     MappedFile map;

@@ -79,7 +79,7 @@ struct GameSettings {
     // Defaults match AudioDevice's own, so a missing file and a fresh device
     // agree the same way the sensitivity above does.
     float masterVolume = 1.0f;
-    float weaponsVolume = 1.0f;
+    float weaponsVolume = kDefaultWeaponsVolume;
     float voicesVolume = 1.0f;
     float ambienceVolume = 1.0f;
     float uiVolume = 1.0f;
@@ -177,6 +177,7 @@ struct GameSettings {
 
     static constexpr float kDefaultMasterVolume = 1.0f;
     static constexpr float kDefaultBusVolume = 1.0f;
+    static constexpr float kDefaultWeaponsVolume = 0.9f;
     static constexpr float kDefaultMusicVolume = 0.55f;
 
     static constexpr bool  kDefaultRealisticAiming = false;
@@ -251,7 +252,7 @@ struct GameSettings {
         showCrosshair = kDefaultShowCrosshair;
         debugLoadingScreen = kDefaultDebugLoadingScreen;
         masterVolume = kDefaultMasterVolume;
-        weaponsVolume = kDefaultBusVolume;
+        weaponsVolume = kDefaultWeaponsVolume;
         voicesVolume = kDefaultBusVolume;
         ambienceVolume = kDefaultBusVolume;
         uiVolume = kDefaultBusVolume;

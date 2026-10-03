@@ -217,6 +217,12 @@ static void SynchronizeEditorRuntime(bool play) {
 // built from the level the user actually chose, not from the template it would
 // otherwise have to reconcile away a frame later.
 static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) {
+    if (g_deferLoadingActions) {
+        QueueLoadingAction([=] { StartLevelEditor(hwnd, levelPath); },
+            levelPath.empty() ? "LEVEL EDITOR" : levelPath.stem().string(),
+            levelPath);
+        return;
+    }
     WaitForDeferredShaderCompiles();
     // The editor is a scene screen, so it needs the same terrain and sky the
     // boot path used to build. StartLevelOne is not on this route. Queued for
@@ -242,6 +248,8 @@ static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) 
     g_editorPreviousDestructionEnabled = scene.useDestruction;
     scene.useDestruction = false;
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
+    g_loadingLevelName = g_levelEditor.Level().name;
+    if (loaded) SetLoadingLevelPresentation(levelPath);
     g_pendingEnvironmentRebuild = false;
     g_editorFullReconcileRequested = false;
     g_editorFullReconcileInFlight = false;

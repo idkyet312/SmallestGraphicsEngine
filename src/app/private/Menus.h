@@ -39,59 +39,25 @@ static void RenderShaderCompileProgress() {
                             IM_COL32(236, 240, 236, 255));
 }
 
-static void RenderMainMenu(HWND hwnd) {
-    RenderShaderCompileProgress();
-    // A load started from the menu takes the whole screen. The loading screen
-    // paints to the background draw list, and every ImGui window renders above
-    // that list, so drawing the menu first left the wordmark showing through
-    // behind a live menu column -- the rows still lit up under the cursor
-    // while the level was loading. Nothing else in the menu may run either:
-    // the buttons below would happily start a second load on top of the one
-    // already in flight.
-    if (g_game.loading.Active()) {
-        RenderLoadingScreen();
-        return;
-    }
-    // Test hook: SGE_AUTO_SETTINGS=<tab> boots straight into that settings
-    // page, so the layout can be captured without driving the mouse.
-    static bool autoSettingsChecked = false;
-    if (!autoSettingsChecked) {
-        autoSettingsChecked = true;
-        char tab[8] = {};
-        if (GetEnvironmentVariableA("SGE_AUTO_SETTINGS", tab, sizeof(tab)) > 0) {
-            SettingsUI::s_tab = (std::max)(0, (std::min)(
-                std::atoi(tab), SettingsUI::kTabCount - 1));
-            g_showSettingsMenu = true;
-        }
-    }
-    // Settings are their own full-screen page, drawn instead of the menu.
-    if (g_showSettingsMenu) {
-        RenderSettingsMenu(g_showSettingsMenu);
-        return;
-    }
-
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
+// Shared by the menu and both loading screens so entering the game keeps
+// the same backdrop and column shading throughout startup and level loads.
+static void RenderFrontEndBackdrop(ImVec2 display, float columnOffset,
+                                   const char* imagePath = nullptr) {
     ImDrawList* background = ImGui::GetBackgroundDrawList();
     background->AddRectFilledMultiColor(ImVec2(0, 0), display,
         IM_COL32(10, 18, 21, 255), IM_COL32(25, 40, 40, 255),
         IM_COL32(8, 15, 18, 255), IM_COL32(7, 12, 15, 255));
 
-    // The menu column's geometry, needed up here because the backdrop is
-    // positioned against it -- the photo starts where the text ends.
-    const float kMenuBaseMargin =
-        (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
-    const float kMenuWidth = (std::min)(460.0f, display.x - kMenuBaseMargin * 2);
-    // Nudged right of the base margin so the column clears the dark left edge
-    // of the backdrop. Scales with width, and is clamped so a narrow window
-    // cannot push the column off the right.
-    const float kMenuMargin = (std::max)(0.0f, (std::min)(
-        kMenuBaseMargin + display.x * 0.019f, display.x - kMenuWidth));
-
     // Optional photographic backdrop. Missing art is not a failure: the drawn
     // contours below are the fallback, so the menu still has a background on a
     // build that ships without the image.
-    const uint64_t menuImage =
-        UITextureFromFile("Content/Textures/UI/menu_background.jpg");
+    const char* backdropPath = imagePath && *imagePath
+        ? imagePath : "Content/Textures/UI/menu_background.jpg";
+    uint64_t menuImage = UITextureFromFile(backdropPath);
+    if (!menuImage && imagePath && *imagePath) {
+        backdropPath = "Content/Textures/UI/menu_background.jpg";
+        menuImage = UITextureFromFile(backdropPath);
+    }
     if (menuImage) {
         // Contain, not cover: scale by whichever axis runs out first, so the
         // whole photo is on screen whatever the window shape -- nothing of the
@@ -99,7 +65,7 @@ static void RenderMainMenu(HWND hwnd) {
         // Read the aspect off the texture rather than hardcoding it, so
         // swapping the file for one of a different shape needs no code change.
         const D3D12_RESOURCE_DESC desc =
-            g_uiImages["Content/Textures/UI/menu_background.jpg"].texture->GetDesc();
+            g_uiImages[backdropPath].texture->GetDesc();
         const float imageAspect = static_cast<float>(desc.Width) /
             (std::max)(1.0f, static_cast<float>(desc.Height));
         const float screenAspect = display.x / (std::max)(display.y, 1.0f);
@@ -167,7 +133,7 @@ static void RenderMainMenu(HWND hwnd) {
     // fade always begins past it, rather than the column sliding out from
     // under the only thing keeping it readable.
     const float scrimWidth = (std::min)(display.x * 0.62f, 900.0f);
-    const float scrimStart = kMenuMargin - kMenuBaseMargin;
+    const float scrimStart = columnOffset;
     background->AddRectFilledMultiColor(
         ImVec2(scrimStart, 0), ImVec2(scrimStart + scrimWidth, display.y),
         IM_COL32(0, 0, 0, 205), IM_COL32(0, 0, 0, 0),
@@ -185,6 +151,85 @@ static void RenderMainMenu(HWND hwnd) {
     background->AddRectFilledMultiColor(ImVec2(0, display.y * 0.82f), ImVec2(display.x, display.y),
         IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
         IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+}
+
+static void RenderMilboxWordmark(float progress, const char* imagePath = nullptr,
+                                 const char* destination = nullptr,
+                                 const char* subtitle = nullptr);
+
+static void RenderMainMenu(HWND hwnd) {
+    // Capture the shared loading layout after boot, when normal frame capture
+    // is available; real loading stages can be too short to inspect reliably.
+    static const std::string loadingCapturePath = [] {
+        char path[MAX_PATH] = {};
+        GetEnvironmentVariableA("SGE_LOADING_CAPTURE_PATH", path, sizeof(path));
+        return std::string(path);
+    }();
+    if (!loadingCapturePath.empty()) {
+        static int frames = 0;
+        char value[32] = {};
+        const float progress = GetEnvironmentVariableA(
+            "SGE_LOADING_CAPTURE_PROGRESS", value, sizeof(value)) > 0
+            ? std::strtof(value, nullptr) : 0.65f;
+        static const std::string levelPath = [] {
+            char level[MAX_PATH] = {};
+            GetEnvironmentVariableA("SGE_LOADING_CAPTURE_LEVEL", level, sizeof(level));
+            if (*level) {
+                g_loadingLevelName = std::filesystem::path(level).stem().string();
+                SetLoadingLevelPresentation(level);
+            }
+            return std::string(level);
+        }();
+        RenderMilboxWordmark(progress, g_loadingLevelImagePath.c_str(),
+            levelPath.empty() ? nullptr : g_loadingLevelName.c_str(),
+            g_loadingLevelSubtitle.c_str());
+        if (++frames == 4) g_frameCapturePath = loadingCapturePath;
+        else if (frames > 4 && g_frameCapturePath.empty()) PostQuitMessage(0);
+        return;
+    }
+    RenderShaderCompileProgress();
+    // A load started from the menu takes the whole screen. The loading screen
+    // paints to the background draw list, and every ImGui window renders above
+    // that list, so drawing the menu first left the wordmark showing through
+    // behind a live menu column -- the rows still lit up under the cursor
+    // while the level was loading. Nothing else in the menu may run either:
+    // the buttons below would happily start a second load on top of the one
+    // already in flight.
+    if (g_game.loading.Active()) {
+        RenderLoadingScreen();
+        return;
+    }
+    // Test hook: SGE_AUTO_SETTINGS=<tab> boots straight into that settings
+    // page, so the layout can be captured without driving the mouse.
+    static bool autoSettingsChecked = false;
+    if (!autoSettingsChecked) {
+        autoSettingsChecked = true;
+        char tab[8] = {};
+        if (GetEnvironmentVariableA("SGE_AUTO_SETTINGS", tab, sizeof(tab)) > 0) {
+            SettingsUI::s_tab = (std::max)(0, (std::min)(
+                std::atoi(tab), SettingsUI::kTabCount - 1));
+            g_showSettingsMenu = true;
+        }
+    }
+    // Settings are their own full-screen page, drawn instead of the menu.
+    if (g_showSettingsMenu) {
+        RenderSettingsMenu(g_showSettingsMenu);
+        return;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    // The menu column's geometry, needed up here because the backdrop is
+    // positioned against it -- the photo starts where the text ends.
+    const float kMenuBaseMargin =
+        (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
+    const float kMenuWidth = (std::min)(460.0f, display.x - kMenuBaseMargin * 2);
+    // Nudged right of the base margin so the column clears the dark left edge
+    // of the backdrop. Scales with width, and is clamped so a narrow window
+    // cannot push the column off the right.
+    const float kMenuMargin = (std::max)(0.0f, (std::min)(
+        kMenuBaseMargin + display.x * 0.019f, display.x - kMenuWidth));
+
+    RenderFrontEndBackdrop(display, kMenuMargin - kMenuBaseMargin);
     // The menu sits in the left third over the art, with no panel behind it --
     // the background is the screen, and a plate floating on top of it would be
     // the thing the eye lands on instead of the image.
@@ -493,105 +538,116 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::End();
 }
 
-// Every wait in the game shows the same thing: the wordmark typing itself in,
-// with a blinking dot standing in the slot the next letter will occupy. The
-// dot is what says the game is still working -- it keeps moving even when a
-// stage stalls for seconds -- and each letter landing on top of it is what
-// says progress was actually made. Shared by the boot screen and the level
-// loading screen so a wait looks the same wherever the player meets it.
-//
-// `progress` is 0..1 through whatever is being waited on. Letters are revealed
-// across the first `letters/(letters+1)` of it, leaving the last slot's worth
-// of progress showing the finished word rather than landing the final letter
-// on the very last frame.
-static void RenderMilboxWordmark(float progress) {
+// The same tracked title and unplated column as the main menu. Keep the
+// wordmark complete while progress moves below it, so even a short load has
+// the game's identity and a long one has a readable destination.
+static void RenderMilboxWordmark(float progress, const char* imagePath,
+                                 const char* destination, const char* subtitle) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float baseMargin =
+        (std::max)(24.0f, (std::min)(display.x * 0.115f, 200.0f));
+    const float columnWidth = (std::max)(1.0f,
+        (std::min)(460.0f, display.x - baseMargin * 2.0f));
+    const float margin = (std::max)(0.0f, (std::min)(
+        baseMargin + display.x * 0.019f, display.x - columnWidth));
+    RenderFrontEndBackdrop(display, margin - baseMargin, imagePath);
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
-    draw->AddRectFilled(ImVec2(0, 0), display, IM_COL32(4, 8, 12, 255));
-
-    // Drawn straight onto the background list rather than into a window: with
-    // no readout to lay out there is nothing for a window to hold, and a
-    // centred wordmark wants the screen's centre, not a panel's.
-    const bool bigFont = g_menuTitleFont != nullptr;
-    if (bigFont) ImGui::PushFont(g_menuTitleFont);
-
-    const char* title = "MILBOX";
-    const int letters = static_cast<int>(std::strlen(title));
+    const float left = margin + 14.0f;
+    const float width = (std::max)(1.0f,
+        (std::min)(columnWidth - 28.0f, display.x - left - 24.0f));
     const float clamped = (std::min)(1.0f, (std::max)(0.0f, progress));
-    const float revealed = clamped * static_cast<float>(letters + 1);
-    // How many letters have fully landed, and so which slot the dot sits in.
-    // At least one: a load opens at 2% progress, which would otherwise put the
-    // dot in the first slot and show the player a lone blinking dot with no
-    // word attached. The M is the anchor the rest of the word grows from.
-    const int filled =
-        (std::min)(letters, (std::max)(1, static_cast<int>(revealed)));
 
-    // Hand-tracked, the same way the menu wordmark is: a wordmark wants
-    // tracking the font itself does not carry, and drawing one glyph at a time
-    // is also the only way to place a dot in a specific letter's slot.
-    const float tracking = ImGui::GetFontSize() * 0.14f;
+    ImFont* titleFont = g_menuTitleFont ? g_menuTitleFont : ImGui::GetFont();
+    ImFont* bodyFont = g_menuBodyFont ? g_menuBodyFont : ImGui::GetFont();
+    float titleSize = 68.0f;
+    const float bodySize = 18.0f;
+    const char* title = "MILBOX";
+    float tracking = titleSize * 0.14f;
     float wordWidth = 0.0f;
-    for (int i = 0; i < letters; ++i) {
-        const char glyph[2] = { title[i], '\0' };
-        wordWidth += ImGui::CalcTextSize(glyph).x;
-        if (i + 1 < letters) wordWidth += tracking;
+    for (const char* c = title; *c; ++c) {
+        const char glyph[2] = { *c, '\0' };
+        wordWidth += titleFont->CalcTextSizeA(titleSize, 1e6f, 0.0f, glyph).x;
+        if (c[1]) wordWidth += tracking;
     }
-    // Measured across the whole word, so the letters already on screen stay
-    // put as the rest arrive instead of sliding left on every step.
-    float x = (display.x - wordWidth) * 0.5f;
-    const float y = (display.y - ImGui::GetTextLineHeight()) * 0.5f;
+    // A narrow window should keep the whole title in the column.
+    const float titleScale = (std::min)(1.0f, width / (std::max)(wordWidth, 1.0f));
+    titleSize *= titleScale;
+    tracking *= titleScale;
+    const bool hasDestination = destination && *destination;
+    const bool hasSubtitle = hasDestination && subtitle && *subtitle;
+    const float destinationHeight = hasDestination
+        ? bodyFont->CalcTextSizeA(bodySize, 1e6f, width, destination).y : 0.0f;
+    const float subtitleHeight = hasSubtitle
+        ? bodyFont->CalcTextSizeA(bodySize, 1e6f, width, subtitle).y : 0.0f;
+    const float blockHeight = titleSize + 88.0f +
+        (hasDestination ? destinationHeight + 24.0f : 0.0f) +
+        (hasSubtitle ? subtitleHeight + 8.0f : 0.0f);
+    const float top = (std::max)(24.0f, (display.y - blockHeight) * 0.5f);
 
-    // Blink driven by wall clock, not frame count -- a load that hitches would
-    // otherwise freeze the one element telling the player it is still working.
-    const bool dotVisible = std::fmod(ImGui::GetTime(), 1.0) < 0.5;
-
-    for (int i = 0; i < letters; ++i) {
-        const char glyph[2] = { title[i], '\0' };
-        const float glyphWidth = ImGui::CalcTextSize(glyph).x;
-        if (i < filled) {
-            draw->AddText(ImVec2(x, y), IM_COL32(236, 240, 236, 255), glyph);
-        } else if (i == filled && dotVisible) {
-            // Centred in the slot its letter will take, so the dot does not
-            // jump sideways at the moment the letter replaces it.
-            const float dotWidth = ImGui::CalcTextSize(".").x;
-            draw->AddText(ImVec2(x + (glyphWidth - dotWidth) * 0.5f, y),
-                          IM_COL32(236, 240, 236, 255), ".");
+    float x = left;
+    for (const char* c = title; *c; ++c) {
+        const char glyph[2] = { *c, '\0' };
+        draw->AddText(titleFont, titleSize, ImVec2(x, top),
+                      IM_COL32(255, 255, 255, 255), glyph);
+        x += titleFont->CalcTextSizeA(titleSize, 1e6f, 0.0f, glyph).x + tracking;
+    }
+    float y = top + titleSize + 16.0f;
+    draw->AddRectFilled(ImVec2(left, y), ImVec2(left + width, y + 1.0f),
+                        IM_COL32(255, 255, 255, 60));
+    y += 24.0f;
+    if (hasDestination) {
+        draw->AddText(bodyFont, bodySize, ImVec2(left, y),
+            ImGui::GetColorU32(UITheme::kText), destination, nullptr, width);
+        y += destinationHeight + 8.0f;
+        if (hasSubtitle) {
+            draw->AddText(bodyFont, bodySize, ImVec2(left, y),
+                IM_COL32(166, 181, 169, 255), subtitle, nullptr, width);
+            y += subtitleHeight + 8.0f;
         }
-        x += glyphWidth + tracking;
+        y += 16.0f;
     }
 
-    const float lineHeight = ImGui::GetTextLineHeight();
-    if (bigFont) ImGui::PopFont();
-
-    // A hairline bar under the wordmark, the width of the word and aligned to
-    // it, so the two read as one mark rather than a title with a widget parked
-    // beneath it. The letters say roughly how far along the load is; this says
-    // it precisely, and keeps moving through the stages after the word is
-    // already complete.
-    const float barWidth = wordWidth;
-    const float barHeight = (std::max)(3.0f, lineHeight * 0.045f);
-    const float barLeft = (display.x - barWidth) * 0.5f;
-    const float barTop = y + lineHeight * 1.35f;
-    const ImVec2 barMin(barLeft, barTop);
-    const ImVec2 barMax(barLeft + barWidth, barTop + barHeight);
-    // The trough is dim rather than absent: without it the bar has no length
-    // until it is nearly full, so early progress reads as nothing at all.
-    draw->AddRectFilled(barMin, barMax, IM_COL32(255, 255, 255, 38));
-    if (clamped > 0.0f) {
-        draw->AddRectFilled(barMin,
-            ImVec2(barLeft + barWidth * clamped, barMax.y),
-            IM_COL32(236, 240, 236, 255));
-    }
+    const char* caption = hasDestination ? "LOADING MAP" : "LOADING";
+    draw->AddText(bodyFont, bodySize, ImVec2(left, y),
+                  IM_COL32(166, 181, 169, 255), caption);
+    // Keep a sign of life when one asset holds the progress bar still.
+    const float captionWidth = bodyFont->CalcTextSizeA(bodySize, 1e6f, 0.0f, caption).x;
+    const int activeDot = static_cast<int>(std::fmod(ImGui::GetTime() * 3.0, 3.0));
+    for (int dot = 0; dot < 3; ++dot)
+        draw->AddCircleFilled(ImVec2(left + captionWidth + 12.0f + dot * 7.0f,
+                                     y + bodySize * 0.6f), 1.5f,
+            dot == activeDot ? ImGui::GetColorU32(UITheme::kText)
+                             : IM_COL32(166, 181, 169, 80));
+    char percent[16];
+    std::snprintf(percent, sizeof(percent), "%d%%",
+                  static_cast<int>(clamped * 100.0f));
+    const float percentWidth = bodyFont->CalcTextSizeA(bodySize, 1e6f, 0.0f, percent).x;
+    draw->AddText(bodyFont, bodySize, ImVec2(left + width - percentWidth, y),
+                  ImGui::GetColorU32(UITheme::kText), percent);
+    y += bodySize + 14.0f;
+    draw->AddRectFilled(ImVec2(left, y), ImVec2(left + width, y + 2.0f),
+                        IM_COL32(255, 255, 255, 38));
+    if (clamped > 0.0f)
+        draw->AddRectFilled(ImVec2(left, y),
+            ImVec2(left + width * clamped, y + 2.0f),
+            ImGui::GetColorU32(UITheme::kAccent));
 }
 
 // The player-facing loading screen. Everything the debug screen shows --
 // stage index, upload byte counts, D3D12 resource states -- is diagnostic, and
 // a player waiting on a level has no use for any of it.
 static void RenderPlainLoadingScreen() {
-    RenderMilboxWordmark(g_game.loading.Progress());
+    RenderMilboxWordmark(g_game.loading.Progress(),
+        g_loadingLevelImagePath.c_str(), g_loadingLevelName.c_str(),
+        g_loadingLevelSubtitle.c_str());
 }
 
 static void RenderLoadingScreen() {
+    if (g_pendingLoadingAction) {
+        RenderMilboxWordmark(0.0f, g_loadingLevelImagePath.c_str(),
+            g_loadingLevelName.c_str(), g_loadingLevelSubtitle.c_str());
+        return;
+    }
     if (!g_settings.debugLoadingScreen) {
         RenderPlainLoadingScreen();
         return;
@@ -767,6 +823,11 @@ static bool CanReplayLastDeployment() {
 }
 
 static void RestartWithPlan(HWND hwnd, net::RestartPlanMode requestedPlan) {
+    if (g_deferLoadingActions) {
+        QueueLoadingAction([=] { RestartWithPlan(hwnd, requestedPlan); },
+                           g_loadingLevelName);
+        return;
+    }
     const net::RestartPlanMode plan = CanReplayLastDeployment()
         ? requestedPlan : net::RestartPlanMode::None;
     if (MultiplayerActive()) {
@@ -788,42 +849,94 @@ static void RenderDeathScreen(HWND hwnd) {
         deathCursorReleased = true;
     }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0, 0), display, IM_COL32(25, 0, 0, 190));
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(380.0f, 275.0f), ImGuiCond_Always);
-    ImGui::Begin("Death Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
+    // Keep the scene visible through the pause menu's scrim so this screen
+    // belongs to the same menu system, even over a bright sky.
+    ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
+    backdrop->AddRectFilledMultiColor(ImVec2(0, 0), display,
+        IM_COL32(8, 14, 16, 214), IM_COL32(20, 32, 32, 214),
+        IM_COL32(6, 12, 14, 226), IM_COL32(5, 9, 12, 226));
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, 0), ImVec2(display.x, display.y * 0.16f),
+        IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    backdrop->AddRectFilledMultiColor(
+        ImVec2(0, display.y * 0.82f), ImVec2(display.x, display.y),
+        IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+
+    const float width = (std::min)(460.0f, display.x - 48.0f);
+    const float height = (std::min)(360.0f, display.y - 48.0f);
+    ImGui::SetNextWindowPos(ImVec2((display.x - width) * 0.5f,
+                                   (display.y - height) * 0.5f),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse);
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    const char* died = "YOU DIED";
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 24));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2));
+    ImGui::Begin("Death Screen", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.3f);
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
     const float deathWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (deathWidth - ImGui::CalcTextSize(died).x) * 0.5f);
-    ImGui::TextColored(ImVec4(1.0f, 0.28f, 0.22f, 1.0f), "%s", died);
+    if (g_menuTitleFont) ImGui::PushFont(g_menuTitleFont);
+    else ImGui::SetWindowFontScale(4.4f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 12.0f);
+    {
+        const char* title = "YOU DIED";
+        const ImVec2 pen = ImGui::GetCursorScreenPos();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float tracking = ImGui::GetFontSize() * 0.14f;
+        float x = pen.x;
+        for (const char* c = title; *c; ++c) {
+            const char glyph[2] = { *c, '\0' };
+            draw->AddText(ImVec2(x, pen.y), IM_COL32(255, 255, 255, 255), glyph);
+            x += ImGui::CalcTextSize(glyph).x + tracking;
+        }
+        ImGui::Dummy(ImVec2(x - pen.x, ImGui::GetTextLineHeight()));
+    }
+    if (g_menuTitleFont) ImGui::PopFont();
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
     {
         ImDrawList* deathDraw = ImGui::GetWindowDrawList();
         const ImVec2 cursor = ImGui::GetCursorScreenPos();
-        constexpr float ruleWidth = 44.0f;
-        const float ruleX = cursor.x + (deathWidth - ruleWidth) * 0.5f;
-        deathDraw->AddRectFilled(ImVec2(ruleX, cursor.y),
-                                 ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
-                                 IM_COL32(224, 62, 48, 235), 1.0f);
+        deathDraw->AddRectFilled(ImVec2(cursor.x + 14.0f, cursor.y),
+                                 ImVec2(cursor.x + deathWidth, cursor.y + 1.0f),
+                                 IM_COL32(255, 255, 255, 60));
     }
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    ImGui::SetWindowFontScale(1.7f);
     if (!MultiplayerActive() ||
         g_netSession.CurrentRole() == net::Role::Host) {
-        if (UIPrimaryButton("QUICK RESTART"))
+        if (UIMenuRow("QUICK RESTART"))
             RestartWithPlan(hwnd, net::RestartPlanMode::Quick);
-        if (UIMenuButton("CHANGE PLAN", 40.0f))
+        if (UIMenuRow("CHANGE PLAN"))
             RestartWithPlan(hwnd, net::RestartPlanMode::ChangePlan);
     } else {
+        ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
         ImGui::TextDisabled("Waiting for host...");
     }
-    if (UIMenuButton("MAIN MENU", 40.0f))
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    {
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        draw->AddRectFilled(ImVec2(cursor.x + 14.0f, cursor.y),
+                            ImVec2(cursor.x + deathWidth, cursor.y + 1.0f),
+                            IM_COL32(255, 255, 255, 40));
+    }
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    ImGui::SetWindowFontScale(1.7f);
+    if (UIMenuRow("MAIN MENU"))
         OpenMainMenu();
+    ImGui::SetWindowFontScale(g_menuBodyFont ? 1.0f : 1.15f);
     ImGui::End();
 }
 
@@ -1115,6 +1228,9 @@ static void RestoreLastDeployment() {
 
 static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
     MissionLoadout& loadout = g_game.mission.Loadout();
+    // A squad pre-filled from the base counter bypasses the deploy slider's
+    // disabled state, so never charge for marines with no mesh to spawn.
+    if (!g_marineModel.valid) g_deploymentMarineCount = 0;
     if (replayPaidPlan) {
         // The saved squad was paid for on the previous attempt. Only newly
         // added marines need another purchase when the player changes plans.
@@ -1181,6 +1297,29 @@ static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
     firstMouse = true;
     g_replayPlanActive = false;
     SaveLastDeployment();
+    // What the run is actually fought in, so a replay can be compared with the
+    // attempt it replays: conditions plus a fingerprint of the enemy layout.
+    {
+        uint64_t layout = 1469598103934665603ull;
+        uint32_t live = 0;
+        for (const auto& bandit : g_bandits) {
+            if (!bandit || bandit->Dead() || bandit->faction != Faction::Bandit)
+                continue;
+            ++live;
+            const int32_t qx = static_cast<int32_t>(std::lround(bandit->position.x * 10.0f));
+            const int32_t qz = static_cast<int32_t>(std::lround(bandit->position.z * 10.0f));
+            layout = (layout ^ static_cast<uint32_t>(qx)) * 1099511628211ull;
+            layout = (layout ^ static_cast<uint32_t>(qz)) * 1099511628211ull;
+        }
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "Deploy conditions: %s, %s, fog %.6f, scatter seed %u, "
+            "%u bandits, layout %016llx, replay %d",
+            TimeOfDayName(g_selectedTimeOfDay), WeatherStateName(scene.weatherState),
+            VolumetricFogFor(g_selectedTimeOfDay).density, g_scatterEnemiesSeed,
+            live, static_cast<unsigned long long>(layout), replayPaidPlan ? 1 : 0);
+        SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+    }
 }
 
 // The planning map's grid: 50 m squares lettered west to east and numbered
@@ -1254,10 +1393,14 @@ static std::shared_ptr<SceneMesh> WeaponPreviewModel(int weapon) {
                         // Match the gameplay charge's opaque moulded plastic.
                         if (primitive.material) {
                             auto m = std::make_shared<SceneMaterial>(*primitive.material);
-                            m->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+                            const bool display =
+                                m->name == "c4_panorama_control_panel";
+                            m->baseColorFactor = display
+                                ? XMFLOAT4(0.018f, 0.045f, 0.026f, 1.0f)
+                                : XMFLOAT4(1, 1, 1, 1);
                             m->alphaBlend = m->alphaCutout = m->alphaFromLuminance = false;
                             m->metallicFactor = 0.0f;
-                            m->roughnessFactor = 0.85f;
+                            m->roughnessFactor = display ? 0.55f : 0.85f;
                             m->roughnessOnlyTexture = false;
                             mesh->primitives.back().material = std::move(m);
                         }
@@ -1417,7 +1560,7 @@ static void DrawFittedThumbnail(ImDrawList* draw, uint64_t texture,
 // weapon is already in the other slot).
 struct LoadoutPickerTarget {
     int weapons[2] = { -1, -1 };
-    // Ordnance and gear slots. Null where there are none to pick (the base).
+    // Ordnance and gear slots. Null where there are none to pick.
     MissionLoadout* mission = nullptr;
     // Racks `weapon` into `slot` once it is paid for; `bought` is true on the
     // purchase itself.
@@ -1860,6 +2003,9 @@ static void RenderLoadoutPicker(const LoadoutPickerTarget& target, ImVec2 displa
                     g_ownedGear |= (1u << static_cast<uint32_t>(focus->id));
                     target.mission->gear = static_cast<GearType>(focus->id);
                 }
+                // The base counter banks its kit on every change, ordnance and
+                // gear included, or the flight out would land without them.
+                if (!weaponSlot && target.kitChanged) target.kitChanged();
                 g_loadoutPickerSlot = -1;
                 g_loadoutPickerFocus = -1;
             }
@@ -1939,6 +2085,34 @@ static void DrawLoadoutWeaponTile(int slot, int weapon, float width) {
                             ImVec2(min.x + width * 0.55f, min.y + 4.0f),
                             ImVec2(max.x - 26.0f, max.y - 4.0f));
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
+}
+
+// The ordnance and field gear plates, side by side under the weapon plates.
+// Clicking one opens its picker (slots 2 and 3).
+static void DrawLoadoutKitTiles(const MissionLoadout& loadout, float width) {
+    const ImU32 textColor = IM_COL32(240, 244, 240, 255);
+    const ImU32 dimColor = IM_COL32(140, 152, 144, 230);
+    const float lineHeight = ImGui::GetTextLineHeight();
+    const float halfWidth = (width - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    const int grenade = static_cast<int>(loadout.grenade);
+    const int gear = static_cast<int>(loadout.gear);
+    const auto smallTile = [&](const char* id, const char* label,
+                               const char* value, int pickerSlot) {
+        const auto [min, max] = DrawLoadoutTile(id, halfWidth, 64.0f, pickerSlot);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddText(ImVec2(min.x + 12.0f, min.y + 8.0f), dimColor, label);
+        char clipped[64];
+        draw->AddText(ImVec2(min.x + 12.0f, min.y + 14.0f + lineHeight), textColor,
+                      EllipsizeToWidth(value, halfWidth - 34.0f, clipped,
+                                       sizeof(clipped)));
+    };
+    smallTile("##OrdnanceTile", "ORDNANCE",
+              grenade >= 0 && grenade < ArmoryCatalog::kGrenadeCount
+                  ? ArmoryCatalog::kGrenadeNames[grenade] : "--", 2);
+    ImGui::SameLine();
+    smallTile("##GearTile", "FIELD GEAR",
+              gear >= 0 && gear < ArmoryCatalog::kGearCount
+                  ? ArmoryCatalog::kGearNames[gear] : "--", 3);
 }
 
 // Shared by the screens' capture test hooks: once the named variable holds a
@@ -2405,6 +2579,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                              dx * dx + dy * dy <= 24.0f * 24.0f;
         if (selectClick && !missileClickConsumed && hovered) {
             g_selectedDeploymentZone = static_cast<int>(index);
+            g_menuSelectionChanged = true;
         }
         // Landing-zone markers: a dark disc with a white ring, numbered. The
         // chosen one turns insertion-blue with crosshair ticks and an
@@ -3197,7 +3372,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         if (g_deploymentBriefingStartTime < 0.0)
             g_deploymentBriefingStartTime = ImGui::GetTime();
         const double elapsed = ImGui::GetTime() - g_deploymentBriefingStartTime;
-        int lettersRemaining = static_cast<int>((std::min)(elapsed * 36.0, 100000.0));
+        int lettersRemaining = static_cast<int>((std::min)(elapsed * 72.0, 100000.0));
         bool briefingTyping = false;
         const auto briefingText = [&](const char* text) {
             const int length = static_cast<int>(std::strlen(text));
@@ -3413,17 +3588,24 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // the other four. Armory and insertion default open because a plan is not
     // valid without them; the rest start closed.
     //
-    // Headers are dark plates with a hairline, not the theme's accent fill: on
-    // this screen the accent belongs to DEPLOY alone.
+    // Headers are secondary: no plate, dim label, a hairline underneath. The
+    // armory above them is drawn as the page's headline and the accent belongs
+    // to DEPLOY, so these must read as the quiet extras they are.
     const auto deploySection = [&](const char* label, bool defaultOpen = false) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.07f, 0.09f, 0.08f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UITheme::kControlHover);
         ImGui::PushStyleColor(ImGuiCol_HeaderActive, UITheme::kControlHeld);
+        ImGui::PushStyleColor(ImGuiCol_Text, UITheme::kTextDim);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
         const bool open = ImGui::CollapsingHeader(
             label, defaultOpen ? ImGuiTreeNodeFlags_DefaultOpen : 0);
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(4);
+        const ImVec2 lineMin(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y);
+        ImGui::GetWindowDrawList()->AddLine(
+            lineMin, ImVec2(ImGui::GetItemRectMax().x, lineMin.y),
+            IM_COL32(120, 132, 124, 60), 1.0f);
         return open;
     };
 
@@ -3570,7 +3752,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // place for the loadout to disagree with what was paid for; here a row is
     // either owned-and-equippable or a price you can afford, and pressing it
     // does whichever applies.
-    if (deploySection("ARMORY", true)) {
+    // The armory is the headline of this column -- always open, titled in the
+    // display face with the wallet beside it -- so it is the first thing read
+    // after the map. It used to be one collapsing header among four.
+    {
     // Loadout card: one tile per slot. A tile shows what the slot carries;
     // clicking it opens that slot's full-screen picker (RenderLoadoutPicker),
     // where buying, equipping and rail attachments happen.
@@ -3578,50 +3763,47 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         char balanceText[32];
         MoneySystem::Format(balanceText, sizeof(balanceText),
                             g_game.money.Balance());
-        ImGui::TextColored(UITheme::kTextDim, "LOADOUT");
-        ImGui::SameLine();
-        const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
-        ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", balanceText);
+        ImFont* titleFont = g_menuTitleFont ? g_menuTitleFont : ImGui::GetFont();
+        constexpr float kTitleSize = 34.0f;
+        constexpr float kBalanceSize = 22.0f;
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const ImVec2 titleSize =
+            titleFont->CalcTextSizeA(kTitleSize, FLT_MAX, 0.0f, "ARMORY");
+        const ImVec2 balanceSize =
+            titleFont->CalcTextSizeA(kBalanceSize, FLT_MAX, 0.0f, balanceText);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddText(titleFont, kTitleSize, origin, IM_COL32(240, 244, 240, 255),
+                      "ARMORY");
+        // Wallet sits on the title's baseline, right-aligned.
+        const float baseline = origin.y + titleSize.y;
+        draw->AddText(titleFont, kBalanceSize,
+                      ImVec2(origin.x + width - balanceSize.x,
+                             baseline - balanceSize.y - 2.0f),
+                      IM_COL32(240, 244, 240, 255), balanceText);
+        const char* fundsLabel = "FUNDS";
+        const ImVec2 fundsSize = ImGui::CalcTextSize(fundsLabel);
+        draw->AddText(ImVec2(origin.x + width - balanceSize.x - fundsSize.x - 10.0f,
+                             baseline - fundsSize.y - 5.0f),
+                      ImGui::GetColorU32(UITheme::kTextDim), fundsLabel);
+        ImGui::Dummy(ImVec2(width, titleSize.y + 4.0f));
+        draw->AddLine(ImVec2(origin.x, origin.y + titleSize.y + 2.0f),
+                      ImVec2(origin.x + width, origin.y + titleSize.y + 2.0f),
+                      ImGui::GetColorU32(UITheme::kAccentDim), 1.5f);
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
     }
     {
-        const ImU32 textColor = IM_COL32(240, 244, 240, 255);
-        const ImU32 dimColor = IM_COL32(140, 152, 144, 230);
-        const float lineHeight = ImGui::GetTextLineHeight();
-        const auto tile = [](const char* id, float width, float height,
-                             int pickerSlot) {
-            return DrawLoadoutTile(id, width, height, pickerSlot);
-        };
         const float width = ImGui::GetContentRegionAvail().x;
         for (int slotIndex = 0; slotIndex < 2; ++slotIndex)
             DrawLoadoutWeaponTile(slotIndex,
                 loadout.weapons[static_cast<size_t>(slotIndex)], width);
-        const float halfWidth = (width - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        const int grenade = static_cast<int>(loadout.grenade);
-        const int gear = static_cast<int>(loadout.gear);
-        const auto smallTile = [&](const char* id, const char* label,
-                                   const char* value, int pickerSlot) {
-            const auto [min, max] = tile(id, halfWidth, 64.0f, pickerSlot);
-            ImDrawList* draw = ImGui::GetWindowDrawList();
-            draw->AddText(ImVec2(min.x + 12.0f, min.y + 8.0f), dimColor, label);
-            char clipped[64];
-            draw->AddText(ImVec2(min.x + 12.0f, min.y + 14.0f + lineHeight), textColor,
-                          EllipsizeToWidth(value, halfWidth - 34.0f, clipped,
-                                           sizeof(clipped)));
-        };
-        smallTile("##OrdnanceTile", "ORDNANCE",
-                  grenade >= 0 && grenade < ArmoryCatalog::kGrenadeCount
-                      ? ArmoryCatalog::kGrenadeNames[grenade] : "--", 2);
-        ImGui::SameLine();
-        smallTile("##GearTile", "FIELD GEAR",
-                  gear >= 0 && gear < ArmoryCatalog::kGearCount
-                      ? ArmoryCatalog::kGearNames[gear] : "--", 3);
+        DrawLoadoutKitTiles(loadout, width);
     }
     // C4 is demolition kit rather than a weapon pick, so it is carried on every
     // mission without spending a slot or a cent -- otherwise a player who chose
     // two rifles would have no way to take down a demolition objective.
     ImGui::TextDisabled("Remote C4 is issued free on every mission.");
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
     }
 
     // Stocking the development weapons is a debug switch, not a purchase, so it
@@ -3716,26 +3898,6 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // so the planning fly-through shows the light the run will actually be
     // fought in -- picking Night and then dropping into daylight would make the
     // choice meaningless on the one screen that can preview it.
-    // One roll for every condition below: time, weather, fog density and the
-    // enemy layout. Sits above them so it reads as covering the whole section,
-    // and the controls it drives stay editable afterwards -- a roll is a
-    // starting point, not a lock.
-    if (deploySection("RANDOMIZE")) {
-    ImGui::SetCursorPosX(45.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.28f, 0.10f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                          ImVec4(0.54f, 0.36f, 0.14f, 1.0f));
-    if (ImGui::Button("RANDOMIZE CONDITIONS", ImVec2(340.0f, 34.0f)))
-        g_lastDeploymentRollSeed = RandomizeDeployment();
-    ImGui::PopStyleColor(2);
-    if (g_deploymentDevTools && g_lastDeploymentRollSeed != 0)
-        ImGui::TextDisabled("Roll seed %u -- reuse it to replay this layout.",
-                            g_lastDeploymentRollSeed);
-    else
-        ImGui::TextWrapped("Rolls time, weather, fog and enemy positions.");
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
-    }
-
     // Volumetric fog for the selected time. Edits apply live for the same reason
     // the time buttons do: this is the one screen that previews the run's light,
     // so the fog has to be tunable against what is actually on screen. Kept as a
@@ -3845,10 +4007,14 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::BeginDisabled(!marinesAvailable || affordableMarines <= 0);
     ImGui::SetCursorPosX(45.0f);
     ImGui::SetNextItemWidth(340.0f);
+    // Neutral grab: a green block here competed with DEPLOY for the accent.
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.42f, 0.47f, 0.44f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, UITheme::kText);
     ImGui::SliderInt("##DeploymentMarines", &g_deploymentMarineCount,
                      0, (std::max)(1, affordableMarines),
                      g_deploymentMarineCount == 1 ? "%d marine"
                                                   : "%d marines");
+    ImGui::PopStyleColor(2);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Marines loaded aboard your transport, $2,000 each.\n"
@@ -3881,6 +4047,21 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "Lost with the transport if it goes down");
     }
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
+
+    // One roll for time, weather, fog density and the enemy layout. The
+    // controls it drives stay editable afterwards -- a roll is a starting
+    // point, not a lock. Below the squad: it is the least-used control here.
+    if (deploySection("RANDOMIZE")) {
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("RANDOMIZE CONDITIONS", ImVec2(340.0f, 34.0f)))
+        g_lastDeploymentRollSeed = RandomizeDeployment();
+    if (g_deploymentDevTools && g_lastDeploymentRollSeed != 0)
+        ImGui::TextDisabled("Roll seed %u -- reuse it to replay this layout.",
+                            g_lastDeploymentRollSeed);
+    else
+        ImGui::TextDisabled("Rolls time, weather, fog and enemy positions.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
     }
 
     if (g_deploymentDevTools && deploySection("OBJECTIVES")) {
@@ -4084,8 +4265,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
     // The one action this whole screen exists to reach, so it carries the accent
     // colour. Every other control here only edits the plan.
-    ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+    // Second in the column's hierarchy, after the armory: a deep green plate
+    // with the accent on its border and label, lighting to the full accent on
+    // hover. A solid accent block outshouted the loadout it commits.
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.05f, 0.20f, 0.10f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccentDim);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     // SGE_AUTO_DEPLOY=host|client|1 presses DEPLOY once, for that session role
@@ -4093,10 +4277,29 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // not the other -- which is how the aircraft countdown starting on the
     // first deploy anywhere is checked.
     static bool autoDeployed = false;
+    // SGE_AUTO_RANDOMIZE=<seed> presses RANDOMIZE CONDITIONS with that seed
+    // once the squad and navmesh are up; auto-deploy waits for it.
+    static bool autoRandomized = false;
+    bool autoRandomizeWaiting = false;
+    if (!autoRandomized) {
+        char seedText[16] = {};
+        if (GetEnvironmentVariableA("SGE_AUTO_RANDOMIZE", seedText,
+                                    sizeof(seedText)) > 0) {
+            if (g_banditLoaded && !g_game.loading.Active() &&
+                g_navigation.Ready()) {
+                g_lastDeploymentRollSeed = RandomizeDeployment(
+                    static_cast<unsigned int>(std::strtoul(seedText, nullptr, 10)));
+                autoRandomized = true;
+            } else {
+                autoRandomizeWaiting = true;
+            }
+        }
+    }
     bool autoDeploy = false;
     bool autoSquad = false;
     char autoRole[16] = {};
     if (!autoDeployed && weaponsReady && !g_deploymentZones.empty() &&
+        !autoRandomizeWaiting &&
         GetEnvironmentVariableA("SGE_AUTO_DEPLOY", autoRole,
                                 sizeof(autoRole)) > 0) {
         const bool client = g_netSession.CurrentRole() == net::Role::Client;
@@ -4608,10 +4811,10 @@ static void RenderWinScreen(HWND hwnd) {
         const float gradeWidth = rowWidth * 0.30f;
         const float careerWidth = rowWidth - rewardsWidth - gradeWidth - kGap * 2.0f;
 
-        // ---- Performance + squad -------------------------------------------
+        // ---- Performance ---------------------------------------------------
         const float middleTop = objMax.y + kGap;
         const float middleBottom = (std::max)(middleTop + 200.0f, bottomTop - kGap);
-        const float perfWidth = leftColumn * 0.72f;
+        const float perfWidth = leftColumn;
         {
             const float t = stage(0.42f);
             const ImVec2 min(left, middleTop);
@@ -4641,118 +4844,6 @@ static void RenderWinScreen(HWND hwnd) {
             row("DESTRUCTION", text);
             std::snprintf(text, sizeof(text), "%u", you.deaths);
             row("TIMES DOWNED", text);
-        }
-        {
-            // One card per player, then one per marine taken in. Marines lost
-            // are the last cards, so the survivors read first.
-            struct SquadCard { std::string name; bool alive; bool self; };
-            std::vector<SquadCard> squad;
-            if (MultiplayerActive()) {
-                for (const net::ScoreboardEntry& e : board) {
-                    if (e.id >= net::kMaxPlayers) continue;
-                    const bool self = e.id == g_netSession.LocalId();
-                    char name[24];
-                    std::snprintf(name, sizeof(name), self ? "YOU" : "PLAYER-%d",
-                                  static_cast<int>(e.id) + 1);
-                    squad.push_back({ name, self ? scene.player.health > 0.0f : true, self });
-                }
-            }
-            if (squad.empty())
-                squad.push_back({ "YOU", scene.player.health > 0.0f, true });
-            static constexpr const char* kCallsigns[] = {
-                "BRYNN", "KAEL", "RAPTOR", "GHOST", "VIPER", "HAWK",
-                "NOMAD", "REAPER", "SABER", "DUSTY", "ORCA", "JINX" };
-            const uint32_t deployed = stats.friendliesDeployed;
-            const uint32_t lost = (std::min)(report.casualties, deployed);
-            for (uint32_t i = 0; i < deployed; ++i)
-                squad.push_back({ kCallsigns[i % IM_ARRAYSIZE(kCallsigns)],
-                                  i < deployed - lost, false });
-
-            const float t = stage(0.50f);
-            constexpr float kCardWidth = 112.0f;
-            constexpr float kCardGap = 10.0f;
-            const float maxWidth = (std::min)(right - (left + perfWidth + kGap),
-                                              leftColumn * 1.15f);
-            const int fit = (std::max)(1, static_cast<int>(
-                (maxWidth - kPad * 2.0f + kCardGap) / (kCardWidth + kCardGap)));
-            const int shown = (std::min)(fit, static_cast<int>(squad.size()));
-            const ImVec2 min(left + perfWidth + kGap, middleTop);
-            const ImVec2 max(min.x + kPad * 2.0f + shown * kCardWidth +
-                                 (shown - 1) * kCardGap,
-                             middleBottom);
-            char counter[24];
-            std::snprintf(counter, sizeof(counter), "%u/%u",
-                          static_cast<unsigned>(deployed - lost) +
-                              (scene.player.health > 0.0f ? 1u : 0u),
-                          static_cast<unsigned>(deployed) + 1u);
-            const float cardTop = plate(min, max, "SQUAD STATUS",
-                                        MultiplayerActive() ? nullptr : counter, t);
-            const float cardBottom = max.y - 14.0f;
-            for (int i = 0; i < shown; ++i) {
-                const float ct = stage(0.56f + 0.06f * i);
-                const bool overflow = i == shown - 1 &&
-                                      static_cast<int>(squad.size()) > shown;
-                const SquadCard& card = squad[i];
-                const ImVec2 cMin(min.x + kPad + i * (kCardWidth + kCardGap), cardTop);
-                const ImVec2 cMax(cMin.x + kCardWidth, cardBottom);
-                const float nameHeight = bodySize + 12.0f;
-                const float stripHeight = bodySize + 10.0f;
-                const float portraitBottom = cMax.y - nameHeight - stripHeight;
-                draw->AddRectFilledMultiColor(cMin, ImVec2(cMax.x, portraitBottom),
-                    fade(IM_COL32(34, 44, 46, 230), ct), fade(IM_COL32(34, 44, 46, 230), ct),
-                    fade(IM_COL32(12, 18, 20, 230), ct), fade(IM_COL32(12, 18, 20, 230), ct));
-                if (overflow) {
-                    char more[24];
-                    std::snprintf(more, sizeof(more), "+%d",
-                                  static_cast<int>(squad.size()) - shown + 1);
-                    const float w = widthOf(titleFont, 34.0f, more);
-                    draw->AddText(titleFont, 34.0f,
-                        ImVec2((cMin.x + cMax.x - w) * 0.5f,
-                               (cMin.y + portraitBottom) * 0.5f - 17.0f),
-                        fade(kLabel, ct), more);
-                } else {
-                    // A helmeted head-and-shoulders silhouette; the game has
-                    // no portraits, and an empty box read as a missing texture.
-                    const float h = portraitBottom - cMin.y;
-                    const float cx = (cMin.x + cMax.x) * 0.5f;
-                    const ImU32 shade = fade(card.alive ? IM_COL32(74, 86, 84, 255)
-                                                        : IM_COL32(64, 44, 40, 255), ct);
-                    const ImU32 helmet = fade(card.alive ? IM_COL32(52, 62, 58, 255)
-                                                         : IM_COL32(48, 34, 30, 255), ct);
-                    draw->AddRectFilled(ImVec2(cx - kCardWidth * 0.36f, cMin.y + h * 0.70f),
-                                        ImVec2(cx + kCardWidth * 0.36f, portraitBottom),
-                                        shade, 16.0f, ImDrawFlags_RoundCornersTop);
-                    draw->AddRectFilled(ImVec2(cx - h * 0.08f, cMin.y + h * 0.56f),
-                                        ImVec2(cx + h * 0.08f, cMin.y + h * 0.74f), shade);
-                    draw->AddCircleFilled(ImVec2(cx, cMin.y + h * 0.44f), h * 0.17f, shade);
-                    draw->PathArcTo(ImVec2(cx, cMin.y + h * 0.42f), h * 0.20f,
-                                    3.14159265f, 6.2831853f);
-                    draw->PathFillConvex(helmet);
-                    draw->AddLine(ImVec2(cx - h * 0.23f, cMin.y + h * 0.42f),
-                                  ImVec2(cx + h * 0.23f, cMin.y + h * 0.42f), helmet, 3.0f);
-                }
-                const ImVec2 sMin(cMin.x, portraitBottom);
-                const ImVec2 sMax(cMax.x, portraitBottom + stripHeight);
-                const char* status = overflow ? "MORE"
-                                   : card.alive ? (card.self && !MultiplayerActive()
-                                                       ? "EXTRACTED" : "SURVIVED")
-                                                : "KIA";
-                const ImU32 statusColour = overflow ? kLabel : card.alive ? kGreen : kRed;
-                draw->AddRectFilled(sMin, sMax, fade(overflow ? IM_COL32(20, 28, 30, 220)
-                                                     : card.alive ? IM_COL32(22, 60, 36, 225)
-                                                                  : IM_COL32(70, 24, 20, 225), ct));
-                float w = widthOf(bodyFont, bodySize, status);
-                draw->AddText(bodyFont, bodySize,
-                    ImVec2((cMin.x + cMax.x - w) * 0.5f, sMin.y + 5.0f),
-                    fade(statusColour, ct), status);
-                const char* name = overflow ? "SQUAD" : card.name.c_str();
-                w = widthOf(bodyFont, bodySize, name);
-                draw->AddText(bodyFont, bodySize,
-                    ImVec2((cMin.x + cMax.x - w) * 0.5f, sMax.y + 6.0f),
-                    fade(card.self ? kValue : kLabel, ct), name);
-                draw->AddRect(cMin, cMax, fade(card.self ? IM_COL32(140, 210, 240, 140)
-                                                         : kPanelEdge, ct));
-            }
         }
 
         // Rewards: three tiles, icon over figure over caption.
@@ -4955,7 +5046,8 @@ static void RenderWinScreen(HWND hwnd) {
                                 fade(IM_COL32(255, 255, 255, 30), rt));
             if (fraction > 0.0f)
                 draw->AddRectFilled(ImVec2(x0, barY),
-                    ImVec2(x0 + (x1 - x0) * fraction, barY + 6.0f), fade(kBlue, rt));
+                    ImVec2(x0 + (x1 - x0) * fraction, barY + 6.0f),
+                    fade(IM_COL32(236, 242, 246, 235), rt));
             y += rowHeight;
         };
         char detail[96];

@@ -26,7 +26,22 @@ enum AssetFlags : uint32_t {
     GPUReadyVertices = 1u << 3,
     OptimizedIndices = 1u << 4,
     PrebuiltMeshlets = 1u << 5,
+    // One primitive per source node, each named by its node path ("Body/
+    // Sphere"), with no mesh or material merging. The loader rebuilds a child
+    // node per primitive so code that finds parts by node or material name
+    // works on the cooked copy. A flag bit rather than a version bump: older
+    // loaders ignore it and still read a valid flat asset.
+    PreservedParts = 1u << 6,
+    // Built from two sources -- a metallic-roughness texture packed from
+    // separate roughness and metallic images. sourceHash/sourceSize describe
+    // the first; reserved[0]/reserved[1] hold the second's hash and size, so
+    // editing either image makes the cook stale.
+    PackedSources = 1u << 7,
 };
+
+// Cooked-file suffixes for loose images (see CookedName). Models use none.
+constexpr const char* kTextureSuffix = ".sgeasset";
+constexpr const char* kPackedMetalRoughnessSuffix = ".mr.sgeasset";
 
 struct Header {
     uint64_t magic = kMagic;

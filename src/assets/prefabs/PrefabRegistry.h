@@ -156,8 +156,13 @@ struct PrefabSaveResult {
 
 class PrefabRegistry {
 public:
+    // validateModels=false skips the per-model warnings (triangle budget,
+    // UVs, missing textures). They cost a full Assimp import of every source
+    // model under 32 MB -- 2.4 s of a Base level start -- and only the editor
+    // shows them; the game must not need the source files at all.
     bool Refresh(const std::filesystem::path& prefabRoot = "prefabs",
-                 const std::filesystem::path& modelRoot = "models");
+                 const std::filesystem::path& modelRoot = "models",
+                 bool validateModels = true);
     const std::vector<PrefabAsset>& Assets() const { return assets_; }
     const PrefabAsset* Find(const std::string& id) const;
     uint64_t Revision() const { return revision_; }

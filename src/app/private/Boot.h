@@ -65,10 +65,8 @@ struct BootProgress {
 
 BootProgress g_boot;
 
-// The same wordmark the level loading screen shows, typed in against boot
-// progress. The player gets a title card, not a status readout: the step
-// label, the counter, the bar and the elapsed clock were all diagnostic, and
-// the console log still carries every one of them for debugging a slow boot.
+// The same title and progress treatment as level loading. Internal task labels
+// and elapsed times stay in the console unless the diagnostic screen is on.
 //
 // The diagnostic screen is not gone, only gated: DebugLoadingScreen brings it
 // back, the same flag RenderLoadingScreen() reads for level loads. Boot draws
@@ -76,9 +74,7 @@ BootProgress g_boot;
 // without it the setting appeared to do nothing at startup.
 void RenderBootScreen() {
     if (!g_settings.debugLoadingScreen) {
-        // Step count drives the reveal rather than a wall clock, so the word
-        // takes exactly as long to arrive as boot does on this machine instead
-        // of completing early on a fast one or being cut off on a slow one.
+        // Boot progress tracks completed work rather than elapsed time.
         RenderMilboxWordmark(
             static_cast<float>(g_boot.stepIndex) /
             static_cast<float>((std::max)(1u, g_boot.stepCount)));

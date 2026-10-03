@@ -17,6 +17,7 @@
 // each slice to whatever height it planted the tree at.
 
 #include "DX12Core.h"
+#include "CookedAssetLoader.h"
 #include "FBXImporter.h"
 #include "GLBImporter.h"
 #include <DirectXMath.h>
@@ -78,7 +79,14 @@ public:
         // PalmModel replaces imported materials below. Loading FBX textures here
         // would record uploads for resources discarded before command-list close,
         // invalidating the list and removing the DX12 device.
-        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
+        // The cooked mesh first: parsing the 7.5 MB FBX measured ~265 ms. It is
+        // cooked with the importer's own mesh grouping (KeepsImportedMeshes in
+        // AssetCooker) because SelectOneTree tells the three trees apart by
+        // primitive. Textures are skipped for the same reason as above.
+        std::shared_ptr<SceneNode> root = CookedAssetLoader::LoadForSource(
+            path, g_dx12.device, g_dx12.commandList, nullptr, false);
+        if (root) std::cout << "Loaded cooked palm mesh\n";
+        else root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
                                       1.0f, false, false);
         if (!root) {
             std::cerr << "Palm FBX unavailable; trees fall back to boxes\n";
@@ -356,15 +364,17 @@ private:
         auto bark = makeMat("palm_bark", "Bark.png");
         auto leaf = makeMat("palm_leaf", "leaf alpha texture.png");
         Materials() = { bark, leaf };
-        // Preserve the authored leaf photo. The old dark-green multiplier crushed
-        // already-shadowed texels and made every crown a silhouette. Keep a mild
-        // healthy-green grade when textured and a stronger fallback only when the
-        // texture is unavailable.
+        // Keep the photo's veins and shaded leaflets. These are linear-light
+        // multipliers, independently graded from the much brighter grass BRDF.
         leaf->baseColorFactor = leaf->baseColorTexture
-            ? XMFLOAT4(0.68f, 0.82f, 0.62f, 1.0f)
-            : XMFLOAT4(0.35f, 0.55f, 0.25f, 1.0f);
-        leaf->roughnessFactor = 0.82f;
+            ? XMFLOAT4(0.08f, 0.09f, 0.07f, 1.0f)
+            : XMFLOAT4(0.045f, 0.065f, 0.025f, 1.0f);
+        leaf->roughnessFactor = 0.90f;
         leaf->ambientScale = 0.90f;
+        leaf->occlusionStrength = 1.0f;
+        leaf->normalYSign = 0.25f;
+        leaf->viewFillStrength = 0.18f;
+        leaf->foliageShadowLift = 0.18f;
         leaf->doubleSided = true;
         // The leaf sheet shapes the cards through its alpha channel.
         leaf->alphaCutout = true;

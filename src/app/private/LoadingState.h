@@ -1,5 +1,7 @@
 #pragma once
 
+#include "TravelDestinations.h"
+
 // Private application implementation; included once by main.cpp in dependency order.
 
 // ?? cold-boot shader compile ????????????????????????????????????????????????
@@ -11,6 +13,42 @@
 static bool  g_shadersCompiling = false;
 static float g_shaderCompileProgress = 0.0f;
 static bool  g_bindlessHeapReady = false;
+
+static std::string g_loadingLevelName;
+static std::string g_loadingLevelSubtitle;
+static std::string g_loadingLevelImagePath;
+
+static bool g_deferLoadingActions = false;
+static std::function<void()> g_pendingLoadingAction;
+
+static void SetLoadingLevelPresentation(const std::filesystem::path& levelPath) {
+    // Starts through the command line and multiplayer use the same art
+    // as boarding; selecting it only in the helicopter would miss those loads.
+    const TravelDestination* destination = TravelDestinationForLevel(levelPath);
+    if (!destination) return;
+    g_loadingLevelName = destination->name;
+    g_loadingLevelSubtitle = destination->subtitle;
+    g_loadingLevelImagePath = TravelPreviewImagePath(*destination);
+}
+
+static void QueueLoadingAction(std::function<void()> action,
+                               const std::string& name,
+                               const std::filesystem::path& levelPath = {}) {
+    if (g_pendingLoadingAction || g_game.loading.Active()) return;
+    g_loadingLevelName = name;
+    g_loadingLevelSubtitle.clear();
+    g_loadingLevelImagePath.clear();
+    if (!levelPath.empty()) SetLoadingLevelPresentation(levelPath);
+    g_pendingLoadingAction = std::move(action);
+}
+
+static void RunPendingLoadingAction() {
+    if (!g_pendingLoadingAction) return;
+    // The click frame has been presented before any file parsing or scene setup.
+    auto action = std::move(g_pendingLoadingAction);
+    g_pendingLoadingAction = {};
+    action();
+}
 
 // Builds what waited on the compiles. Main thread, between frames.
 static void FinishDeferredShaderCompiles() {
@@ -50,9 +88,10 @@ static void BeginLevelLoading(bool armoryOnly = false) {
     } else {
         g_game.loading.Begin({
             g_emptyLevelMode ? 6u : 12u,
-            g_emptyLevelMode ? "Terrain material"
-                             : "Terrain material and crate model",
-            g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
+            g_emptyLevelMode ? "Firearms and terrain material"
+                             : "Firearms, terrain material and crate model",
+            g_emptyLevelMode ? "firearm models + floor material"
+                             : "firearm models + Content/Models/h2.glb"
         });
     }
     if (!BeginTextureUploadArenaDX12()) {

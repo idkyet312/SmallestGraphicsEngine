@@ -3839,6 +3839,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // and cleared at the end of the block so it cannot leak into the world.
         // Zero when off or at the hip, which leaves every material untouched.
         const float seeThrough = scene.ViewmodelSeeThroughStrength();
+        // HZB contains the previous weapon pose. Testing today's camera-relative
+        // meshlets against it can let the old body hide small moving parts.
+        // Keep world occlusion enabled, but never use that history for the hands
+        // or held weapon (including the ordinary opaque, mesh-shader path).
+        const bool worldOcclusionEnabled = g_meshShader.occlusionEnabled;
+        g_meshShader.occlusionEnabled = false;
         auto drawViewmodelPass = [&](bool depthPrepass) {
         shader.BeginViewmodelSeeThrough(
             seeThrough, scene.seeThroughNear, scene.seeThroughFar,
@@ -4285,6 +4291,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         if (seeThrough > 0.0f)
             drawViewmodelPass(true);
         drawViewmodelPass(false);
+        g_meshShader.occlusionEnabled = worldOcclusionEnabled;
         shader.Use(scene.wireframeMode);
 
         // Debug: the ramp's two endpoints, drawn as thin slabs across the view

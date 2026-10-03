@@ -119,6 +119,9 @@ static void OpenMainMenu() {
     // leaving clients believing they are still sharing a map with it.
     g_activeLevelKind = net::LevelKind::None;
     g_activeLevelFile.clear();
+    g_loadingLevelName.clear();
+    g_loadingLevelSubtitle.clear();
+    g_loadingLevelImagePath.clear();
     g_game.session.StopTimer();
     // Bank the wallet on the way out. Extraction already saves, but abandoning
     // a run mid-mission reaches the menu through here instead -- without this,
@@ -441,6 +444,7 @@ static bool g_sceneRenderAssetsReady = false;
 // the frame and failed with E_FAIL (0x80004005). Same hazard, and same fix, as
 // the sky swap and the AO resize that share that pre-BeginFrame slot.
 static bool g_sceneRenderAssetsPending = false;
+static bool g_sceneDescriptorResetPending = false;
 static void RequestSceneRenderAssets() {
     if (!g_sceneRenderAssetsReady) g_sceneRenderAssetsPending = true;
 }
@@ -624,6 +628,23 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
                           bool startWithUIAndMobileControls = false) {
+    if (g_deferLoadingActions) {
+        const std::string name = customLevel ? customLevel->name
+            : emptyLevel ? "EMPTY LEVEL" : stressTest ? "STRESS TEST" : "ISLAND 1";
+        if (customLevel) {
+            // The caller's definition may be a local that dies with the click.
+            QueueLoadingAction([=, level = *customLevel] {
+                StartLevelOne(hwnd, godMode, stressTest, emptyLevel, &level,
+                              startWithUIAndMobileControls);
+            }, name);
+        } else {
+            QueueLoadingAction([=] {
+                StartLevelOne(hwnd, godMode, stressTest, emptyLevel, nullptr,
+                              startWithUIAndMobileControls);
+            }, name);
+        }
+        return;
+    }
     WaitForDeferredShaderCompiles();
     // Terrain textures, the HDRI sky and its IBL are no longer built at boot.
     // Queue them rather than building them here: this runs from the menu button
@@ -631,11 +652,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // closed. The frame loop picks this up before its next BeginFrame, which is
     // still ahead of the loading screen's first level-load stage.
     RequestSceneRenderAssets();
-    if (bindlessHeap.Initialized()) {
-        WaitForGPUAllFrames();
-        bindlessHeap.ResetForNewScene();
-        visBuffer.ResetBindlessMaterials();
-    }
+    // Travel can start from the late UI pass, while the old frame still
+    // references these descriptors. Retire that frame before releasing owners.
+    g_sceneDescriptorResetPending = bindlessHeap.Initialized();
     const bool wasCornellTest = g_ddgiCornellTestMode;
     g_ddgiCornellTestMode = customLevel &&
         customLevel->name == "DXR DDGI Cornell Box";
@@ -671,6 +690,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                       : emptyLevel  ? net::LevelKind::TestLevel
                                     : net::LevelKind::Level1;
     g_activeLevelFile.clear();
+    g_loadingLevelName = customLevel ? customLevel->name
+        : emptyLevel ? "EMPTY LEVEL" : stressTest ? "STRESS TEST" : "ISLAND 1";
+    g_loadingLevelSubtitle.clear();
+    g_loadingLevelImagePath.clear();
     if (customLevel) {
         g_customLevelMode = true;
         g_game.world.ReplaceLevel(*customLevel);
@@ -854,6 +877,11 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
 // undo that a moment before the deploy screen renders the toggle.
 static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
                              bool godMode = true) {
+    if (g_deferLoadingActions) {
+        QueueLoadingAction([=] { StartCustomLevel(hwnd, path, godMode); },
+                           path.stem().string(), path);
+        return;
+    }
     LevelLoadResult loaded = LoadLevel(path);
     if (!loaded.ok) {
         g_mainMenuLevelStatus = "Load failed: " + loaded.error;
@@ -865,6 +893,7 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
     // which file the definition came out of, and the file name is what a
     // joining player needs to load the same map.
     g_activeLevelFile = path.filename().string();
+    SetLoadingLevelPresentation(path);
 }
 
 // Island 1 -- the campaign map, authored as Islandv10.json. The menu name and
@@ -1080,6 +1109,7 @@ static void RestartActiveLevel(HWND hwnd) {
         // restart should put the player back in the run they were already in.
         StartLevelOne(hwnd, scene.player.godMode, false, false, &custom);
         g_activeLevelFile = activeFile;
+        SetLoadingLevelPresentation(activeFile);
     } else {
         StartLevelOne(hwnd, scene.player.godMode);
     }

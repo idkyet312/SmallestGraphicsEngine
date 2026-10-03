@@ -2,6 +2,7 @@
 #include <stb_image.h>
 
 #include "CookedAssetFormat.h"
+#include "CookedAssetPaths.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -554,29 +555,95 @@ bool IsCookExcluded(const fs::path& path) {
         return true;
     if (generic.find("models/mainplayer/rifle idle") != std::string::npos)
         return true;
-    // The M4's iron sights are split out of the mesh at load by node name
-    // ("Aiming Module"), so they can be hidden when an optic is fitted. The
-    // cook merges primitives per material and drops those names: the cooked
-    // M4 loads as 1 primitive with 0 iron sights split, which bakes the rear
-    // leaf in permanently and pokes it through a mounted red dot. Measured on
-    // the shotgun smoke: 16 primitives / 2 split uncooked, 1 / 0 cooked.
-    // Cooking it is worth 192 MB of VRAM, so this is worth revisiting if the
-    // cook ever preserves node identity; until then it imports like the AK47.
-    if (generic.find("models/mainplayer/guns/m4/") != std::string::npos)
-        return true;
-    // The R700 for the same reason, one level down: the scope's aperture is
-    // found by the "Scope Glass" material name and the cook merges 11 materials
-    // into one called Metal, so GetR700LensCenter never resolves and the
-    // picture-in-picture scope loses its lens. Nothing is given up by skipping
-    // it -- the model carries no embedded textures, so its cook saves 0 MB.
-    if (generic.find("models/mainplayer/guns/r700/") != std::string::npos)
-        return true;
     // The Mi-24 source scripts/split-hind.py cuts the gunship from. Nothing
     // loads it, but the cook list is per directory, so it would be cooked
     // beside the parts: 24 4K textures, roughly 0.5 GB of BC for nothing.
     if (generic.find("models/helihind2/mi-24v hind.glb") != std::string::npos)
         return true;
     return false;
+}
+
+// Sources whose loaders find parts by node or material name, cooked with
+// Cooked::PreservedParts: one primitive per node, named by its node path, and
+// no mesh or material merging. The default cook merges per material and drops
+// both kinds of name:
+//   - M4: the iron sights are split out by node name ("Aiming Module") so they
+//     hide under an optic. Merged it loaded as 1 primitive / 0 sights split,
+//     against 16 / 2 uncooked, leaving the rear leaf through the red dot.
+//   - R700: the scope lens is found by the "Scope Glass" material, and
+//     RemoveRedundantMaterials folds its 11 untextured materials into one
+//     called Metal, so GetR700LensCenter never resolved.
+bool PreservesParts(const fs::path& path) {
+    std::string generic = path.generic_string();
+    std::transform(generic.begin(), generic.end(), generic.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return generic.find("models/mainplayer/guns/m4/") != std::string::npos ||
+           generic.find("models/mainplayer/guns/r700/") != std::string::npos;
+}
+
+// Sources cooked with the runtime FBX importer's own mesh grouping:
+// PreTransformVertices still bakes the hierarchy, but meshes and materials are
+// not merged further. The palm's SelectOneTree groups the FBX's three trees by
+// primitive, so the default cook's per-material merge would hand it one tree's
+// worth of primitives spanning all three.
+bool KeepsImportedMeshes(const fs::path& path) {
+    std::string generic = path.generic_string();
+    std::transform(generic.begin(), generic.end(), generic.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return generic.find("models/palmtree/") != std::string::npos;
+}
+
+bool IsImage(const fs::path& path) {
+    const std::string extension = LowerExtension(path);
+    return extension == ".png" || extension == ".jpg" ||
+           extension == ".jpeg" || extension == ".tga";
+}
+
+// Loose images that GLBImporter::LoadTextureFromFile reads one file at a time,
+// cooked to a texture-only asset beside their mirrored path. A 4K PNG measured
+// 0.3-0.5 s to decode, but a 4K BC cook is ~20 MB on disk, so this lists the
+// files a level load was measured to read rather than whole folders: the
+// bandit folder alone holds 19 4K maps and the game uses three of them. A file
+// missing here still loads, through the decode.
+bool IsCookedLooseTexture(const fs::path& path) {
+    if (!IsImage(path)) return false;
+    std::string generic = path.generic_string();
+    std::transform(generic.begin(), generic.end(), generic.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    static const char* const kSources[] = {
+        "models/militarymercenarybandit/textures/t_bandit_1_basecolor.png",
+        "models/militarymercenarybandit/textures/t_bandit_1_normal.png",
+        "models/militarymercenarybandit/textures/t_bandit_1_orm.png",
+        "models/marineally/textures/t_bandit_1_basecolor.png",
+        "models/marineally/textures/t_bandit_1_normal.png",
+        "models/marineally/textures/t_bandit_1_orm.png",
+        "models/rpg7/textures/rpg7_albedo.png",
+        "models/rpg7/textures/rpg7_normal.png",
+        "models/palmtree/texture/bark.png",
+        "models/palmtree/texture/leaf alpha texture.png",
+        "models/mainplayer/guns/r700/textures/rifle_camo_2.png",
+        "models/mainplayer/guns/r700/textures/rifle_stock_normal.png",
+        "models/mainplayer/guns/r700/textures/metal_roughness.jpg",
+    };
+    for (const char* source : kSources)
+        if (generic.size() >= std::strlen(source) &&
+            generic.compare(generic.size() - std::strlen(source),
+                            std::string::npos, source) == 0)
+            return true;
+    return false;
+}
+
+// Normal maps keep only XY (BC5); every shader that samples one rebuilds Z.
+// Everything else is BC3, which keeps alpha for cutout sheets like the palm
+// leaf. Chosen by file name because LoadTextureFromFile is not told the usage.
+Cooked::TextureFormat LooseTextureFormat(const fs::path& path) {
+    std::string name = path.filename().string();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    const bool normal = name.find("normal") != std::string::npos ||
+                        name.find("_nor_") != std::string::npos ||
+                        name.find("_nor.") != std::string::npos;
+    return normal ? Cooked::TextureFormat::BC5 : Cooked::TextureFormat::BC3;
 }
 
 struct CookContext {
@@ -588,6 +655,10 @@ struct CookContext {
     std::unordered_map<std::string, uint32_t> textureByKey;
     std::vector<PrimitiveData> primitives;
     std::vector<AnimationClipData> clips;
+    bool preserveParts = false;
+    // Second input of a packed texture; stamped into the header so editing
+    // either image makes the cook stale.
+    fs::path secondarySource;
 
     uint32_t AddTexture(const aiString& reference,
                         Cooked::TextureFormat format) {
@@ -837,20 +908,35 @@ uint32_t PickUVChannel(const aiMesh& mesh) {
     return 0;
 }
 
+// `transform` places a mesh instanced by a node when the import kept the
+// hierarchy (PreTransformVertices off); `name` then replaces the mesh name with
+// that node's path. Both default to the merged-import behaviour.
 PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
-                               const std::vector<Cooked::Material>& materials) {
+                               const std::vector<Cooked::Material>& materials,
+                               const aiMatrix4x4* transform = nullptr,
+                               const std::string* name = nullptr) {
     PrimitiveData result;
-    result.record.name = strings.Add(mesh.mName.C_Str());
+    result.record.name = strings.Add(name ? *name : mesh.mName.C_Str());
     result.record.material = mesh.mMaterialIndex;
     result.vertices.resize(mesh.mNumVertices);
     const uint32_t uvChannel = PickUVChannel(mesh);
+    aiMatrix3x3 normalMatrix;
+    if (transform) {
+        normalMatrix = aiMatrix3x3(*transform);
+        normalMatrix.Inverse().Transpose();
+    }
+    const aiMatrix3x3 tangentMatrix =
+        transform ? aiMatrix3x3(*transform) : aiMatrix3x3();
     for (uint32_t i = 0; i < mesh.mNumVertices; ++i) {
         Cooked::Vertex& vertex = result.vertices[i];
-        vertex.position[0] = mesh.mVertices[i].x;
-        vertex.position[1] = mesh.mVertices[i].y;
-        vertex.position[2] = mesh.mVertices[i].z;
-        const aiVector3D normal = mesh.HasNormals()
+        const aiVector3D position = transform
+            ? *transform * mesh.mVertices[i] : mesh.mVertices[i];
+        vertex.position[0] = position.x;
+        vertex.position[1] = position.y;
+        vertex.position[2] = position.z;
+        aiVector3D normal = mesh.HasNormals()
             ? mesh.mNormals[i] : aiVector3D(0, 1, 0);
+        if (transform) normal = (normalMatrix * normal).Normalize();
         vertex.normal[0] = normal.x;
         vertex.normal[1] = normal.y;
         vertex.normal[2] = normal.z;
@@ -858,15 +944,18 @@ PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
             ? mesh.mTextureCoords[uvChannel][i] : aiVector3D();
         vertex.uv[0] = uv.x;
         vertex.uv[1] = uv.y;
-        const aiVector3D tangent = mesh.HasTangentsAndBitangents()
+        aiVector3D tangent = mesh.HasTangentsAndBitangents()
             ? mesh.mTangents[i] : aiVector3D(1, 0, 0);
+        if (transform) tangent = (tangentMatrix * tangent).Normalize();
         vertex.tangent[0] = tangent.x;
         vertex.tangent[1] = tangent.y;
         vertex.tangent[2] = tangent.z;
         vertex.tangent[3] = 1.0f;
         if (mesh.HasTangentsAndBitangents()) {
+            const aiVector3D bitangent = transform
+                ? tangentMatrix * mesh.mBitangents[i] : mesh.mBitangents[i];
             const aiVector3D cross = normal ^ tangent;
-            vertex.tangent[3] = (cross * mesh.mBitangents[i]) < 0 ? -1.0f : 1.0f;
+            vertex.tangent[3] = (cross * bitangent) < 0 ? -1.0f : 1.0f;
         }
     }
     result.indices.reserve(static_cast<size_t>(mesh.mNumFaces) * 3);
@@ -1222,6 +1311,12 @@ bool WriteAsset(CookContext& context, const fs::path& destination) {
             Cooked::OptimizedIndices | Cooked::PrebuiltMeshlets;
     if (!context.textures.empty()) header.flags |= Cooked::HasTextures;
     if (!context.clips.empty()) header.flags |= Cooked::HasAnimations;
+    if (context.preserveParts) header.flags |= Cooked::PreservedParts;
+    if (!context.secondarySource.empty()) {
+        header.flags |= Cooked::PackedSources;
+        header.reserved[0] = HashFile(context.secondarySource);
+        header.reserved[1] = fs::file_size(context.secondarySource);
+    }
 
     BlobBuilder blob(sizeof(Cooked::Header));
     header.primitiveOffset = blob.Append(nullptr,
@@ -1366,11 +1461,18 @@ bool Cook(const fs::path& source, const fs::path& destination) {
         // there -- the discs stay separate and still land in the right place.
         const bool preserveRotorMeshes =
             source.filename().string().find("OH-1") != std::string::npos;
+        context.preserveParts = PreservesParts(source);
         unsigned geometryFlags = baseFlags | aiProcess_PreTransformVertices;
-        if (preserveRotorMeshes)
+        if (preserveRotorMeshes || context.preserveParts)
             geometryFlags &= ~(aiProcess_PreTransformVertices |
                                aiProcess_OptimizeMeshes |
                                aiProcess_OptimizeGraph);
+        if (context.preserveParts)
+            geometryFlags &= ~aiProcess_RemoveRedundantMaterials;
+        if (KeepsImportedMeshes(source))
+            geometryFlags &= ~(aiProcess_OptimizeMeshes |
+                               aiProcess_OptimizeGraph |
+                               aiProcess_RemoveRedundantMaterials);
         const aiScene* scene = geometryImporter.ReadFile(
             source.string(), geometryFlags);
         if (!scene || !scene->HasMeshes()) {
@@ -1380,6 +1482,35 @@ bool Cook(const fs::path& source, const fs::path& destination) {
         }
         context.scene = scene;
         ExtractMaterials(context);
+        if (context.preserveParts) {
+            // One primitive per (node, mesh) instance, in node order, placed
+            // by the node's global transform and named by its path. A node
+            // path keeps ancestor names searchable: GunModel's tagging looks
+            // for a substring anywhere above the part, as it does uncooked.
+            std::function<void(const aiNode*, const aiMatrix4x4&,
+                               const std::string&)> walk =
+                [&](const aiNode* node, const aiMatrix4x4& parent,
+                    const std::string& parentPath) {
+                    if (!node) return;
+                    const aiMatrix4x4 global = parent * node->mTransformation;
+                    const std::string path = node == scene->mRootNode
+                        ? std::string()
+                        : parentPath.empty()
+                            ? std::string(node->mName.C_Str())
+                            : parentPath + "/" + node->mName.C_Str();
+                    for (uint32_t m = 0; m < node->mNumMeshes; ++m) {
+                        const uint32_t index = node->mMeshes[m];
+                        if (index >= scene->mNumMeshes) continue;
+                        context.primitives.push_back(ExtractPrimitive(
+                            *scene->mMeshes[index], context.strings,
+                            context.materials, &global, &path));
+                    }
+                    for (uint32_t c = 0; c < node->mNumChildren; ++c)
+                        walk(node->mChildren[c], global, path);
+                };
+            walk(scene->mRootNode, aiMatrix4x4(), std::string());
+            return WriteAsset(context, destination);
+        }
         // Without PreTransformVertices the meshes arrive in node space, so the
         // node transforms are collected and baked per mesh below -- the flat
         // cooked format cannot carry a hierarchy, and this keeps the geometry
@@ -1432,8 +1563,70 @@ bool Cook(const fs::path& source, const fs::path& destination) {
     return WriteAsset(context, destination);
 }
 
+// One loose image -> a texture-only asset: no primitives or materials, one BC
+// texture with its full mip chain, stamped with the image's hash.
+bool CookTexture(const fs::path& source, const fs::path& destination) {
+    Image image;
+    if (!LoadExternalImage(source, image)) {
+        std::cerr << source.generic_string() << ": cannot decode image\n";
+        return false;
+    }
+    CookContext context;
+    context.sourcePath = source;
+    EncodedTexture texture = EncodeTexture(image, LooseTextureFormat(source));
+    texture.record.name = context.strings.Add(source.filename().string());
+    texture.record.source = texture.record.name;
+    context.textures.push_back(std::move(texture));
+    return WriteAsset(context, destination);
+}
+
+// glTF-layout metallic-roughness (R 255, G roughness, B metallic, A 255) from
+// separate greyscale images, the packing GunModel's RPG-7 used to do per load.
+bool CookPackedMetalRoughness(const fs::path& roughness,
+                              const fs::path& metallic,
+                              const fs::path& destination) {
+    Image rough, metal;
+    if (!LoadExternalImage(roughness, rough) ||
+        !LoadExternalImage(metallic, metal) ||
+        rough.width != metal.width || rough.height != metal.height) {
+        std::cerr << roughness.generic_string()
+                  << ": cannot pack (missing image or size mismatch)\n";
+        return false;
+    }
+    Image packed;
+    packed.width = rough.width;
+    packed.height = rough.height;
+    packed.rgba.resize(rough.rgba.size());
+    for (size_t i = 0; i < rough.rgba.size(); i += 4) {
+        packed.rgba[i + 0] = 255;
+        packed.rgba[i + 1] = rough.rgba[i];
+        packed.rgba[i + 2] = metal.rgba[i];
+        packed.rgba[i + 3] = 255;
+    }
+    CookContext context;
+    context.sourcePath = roughness;
+    context.secondarySource = metallic;
+    EncodedTexture texture =
+        EncodeTexture(packed, Cooked::TextureFormat::BC3);
+    texture.record.name = context.strings.Add(roughness.filename().string());
+    texture.record.source = texture.record.name;
+    context.textures.push_back(std::move(texture));
+    return WriteAsset(context, destination);
+}
+
+// Packed pairs cooked by --all, keyed on the roughness image. Content-relative.
+// Only the launcher: RPG72's rocket never separates into its own primitives,
+// so AssignRPGRocketMaterial does not run and its pair would be dead weight.
+struct PackedPair { const char* roughness; const char* metallic; };
+constexpr PackedPair kPackedMetalRoughness[] = {
+    { "Models/RPG7/textures/RPG7_Roughness.png",
+      "Models/RPG7/textures/RPG7_Metallic.png" },
+};
+
 void Usage() {
     std::cerr << "AssetCooker <input.fbx|glb|gltf> <output.sgeasset>\n"
+                 "AssetCooker <input.png|jpg|tga> <output.png.sgeasset>\n"
+                 "AssetCooker --pack-mr <roughness> <metallic> <output.mr.sgeasset>\n"
                  "AssetCooker --all <content-root> --out <cooked-root>\n"
                  "            [--only <list-file>]\n"
                  "\n"
@@ -1511,8 +1704,13 @@ int main(int argc, char** argv) {
                           << " (see IsCookExcluded)\n";
                 return 1;
             }
+            if (IsImage(fs::path(argv[1])))
+                return CookTexture(fs::path(argv[1]), fs::path(argv[2])) ? 0 : 1;
             return Cook(fs::path(argv[1]), fs::path(argv[2])) ? 0 : 1;
         }
+        if (argc == 5 && std::string(argv[1]) == "--pack-mr")
+            return CookPackedMetalRoughness(fs::path(argv[2]), fs::path(argv[3]),
+                                            fs::path(argv[4])) ? 0 : 1;
         if ((argc == 5 || argc == 7) && std::string(argv[1]) == "--all" &&
             std::string(argv[3]) == "--out") {
             const fs::path root = fs::absolute(argv[2]).lexically_normal();
@@ -1529,7 +1727,17 @@ int main(int argc, char** argv) {
             uint32_t skipped = 0;
             for (const fs::directory_entry& entry :
                  fs::recursive_directory_iterator(root)) {
-                if (!entry.is_regular_file() || !IsModel(entry.path())) continue;
+                if (!entry.is_regular_file()) continue;
+                if (IsCookedLooseTexture(entry.path())) {
+                    const fs::path relative = fs::relative(entry.path(), root);
+                    if (!MatchesOnlyList(relative, only)) { ++skipped; continue; }
+                    if (CookTexture(entry.path(), output /
+                            SGE::Cooked::CookedName(relative, Cooked::kTextureSuffix)))
+                        ++cooked;
+                    else ++failed;
+                    continue;
+                }
+                if (!IsModel(entry.path())) continue;
                 if (IsCookExcluded(entry.path())) {
                     std::cout << "Skipping (excluded): "
                               << entry.path().generic_string() << "\n";
@@ -1539,6 +1747,16 @@ int main(int argc, char** argv) {
                 if (!MatchesOnlyList(relative, only)) { ++skipped; continue; }
                 relative.replace_extension(".sgeasset");
                 if (Cook(entry.path(), output / relative)) ++cooked;
+                else ++failed;
+            }
+            for (const PackedPair& pair : kPackedMetalRoughness) {
+                const fs::path roughness = root / pair.roughness;
+                if (!fs::exists(roughness)) continue;
+                if (!MatchesOnlyList(fs::path(pair.roughness), only)) continue;
+                if (CookPackedMetalRoughness(roughness, root / pair.metallic,
+                        output / SGE::Cooked::CookedName(fs::path(pair.roughness),
+                            Cooked::kPackedMetalRoughnessSuffix)))
+                    ++cooked;
                 else ++failed;
             }
             std::cout << "Cook complete: " << cooked << " succeeded, "

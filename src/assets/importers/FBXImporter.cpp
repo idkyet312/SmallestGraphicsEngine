@@ -68,6 +68,9 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             return cooked;
         }
     }
+    // Grep tag for "what still imports from source": every load that reaches
+    // here missed or skipped the cooked cache.
+    std::cout << "[SourceImport] FBX " << filepath << "\n";
     Assimp::Importer importer;
     const bool preserveOH1Rotors = filepath.find("OH-1") != std::string::npos;
     unsigned importFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |

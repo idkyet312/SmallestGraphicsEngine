@@ -140,22 +140,14 @@ bool Load(const Key& key, CollisionMesh& out, std::string* error) {
     if (ec || header.fileSize != fileSize)
         return fail("cached tree size mismatch");
 
-    // Source staleness, in the cooked loader's order: the cheap size and
-    // write-time comparisons gate the full content hash, which for the airport
-    // means reading 233 MB.
+    // Source staleness by size alone, the cooked loader's rule: a stat, never
+    // a read. The content hash this used to fall back to read the whole
+    // source -- 233 MB for the airport -- whenever the write time moved, which
+    // the build/Content copy and a fresh clone both do.
     if (fs::exists(key.sourcePath, ec)) {
         const uint64_t sourceSize = fs::file_size(key.sourcePath, ec);
         if (ec || header.sourceSize != sourceSize)
             return fail("source model changed size");
-        const auto writeTime = fs::last_write_time(key.sourcePath, ec);
-        const int64_t stamp = ec ? 0
-            : static_cast<int64_t>(writeTime.time_since_epoch().count());
-        if (header.sourceWriteTime != stamp) {
-            // A touched-but-identical file is common (a re-export that changed
-            // nothing), so pay for the hash before declaring the tree stale.
-            if (header.sourceHash != CookedAssetLoader::HashFile(key.sourcePath))
-                return fail("source model changed");
-        }
     }
 
     const uint64_t triangleFloats = header.triangleCount * 9;
@@ -245,7 +237,7 @@ bool Save(const Key& key, const CollisionMesh& mesh, std::string* error) {
         const auto writeTime = fs::last_write_time(key.sourcePath, ec);
         header.sourceWriteTime = ec ? 0
             : static_cast<int64_t>(writeTime.time_since_epoch().count());
-        header.sourceHash = CookedAssetLoader::HashFile(key.sourcePath);
+        // sourceHash stays 0: nothing reads it since staleness went size-only.
     }
 
     header.triangleCount = mesh.TriangleCount();

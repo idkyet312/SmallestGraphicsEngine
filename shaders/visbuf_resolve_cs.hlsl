@@ -2455,7 +2455,11 @@ Surface EvaluateSurface(float3 fragPos,
             // albedo; a fixed green lift made ferns ignore the grass controls.
             float3 foliageBase =
                 dc.objectColor * material.baseColorFactor.rgb;
-            albedo = lerp(albedo, foliageBase * 0.72, dark * 0.72);
+            // The foliage material uses the otherwise water-only shading slot
+            // for its shadow lift. Unregistered foliage keeps the legacy value.
+            float shadowLift = material.pbrParams.w > 0.5
+                ? saturate(material.shadingParams.z) : 0.72;
+            albedo = lerp(albedo, foliageBase * 0.72, dark * shadowLift);
         }
     }
     if (isFoliage) {

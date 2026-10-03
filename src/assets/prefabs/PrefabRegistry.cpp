@@ -473,7 +473,8 @@ bool PrefabRegistry::IsSupportedModel(const std::filesystem::path& path) {
 }
 
 bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
-                             const std::filesystem::path& modelRoot) {
+                             const std::filesystem::path& modelRoot,
+                             bool validateModels) {
     std::vector<PrefabAsset> found;
     std::unordered_set<std::string> ids;
     std::unordered_set<std::string> configuredModels;
@@ -488,7 +489,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
         if (!it->is_regular_file() || Lower(it->path().extension().string()) != ".json")
             continue;
         PrefabAsset prefab = LoadDefinition(it->path());
-        if (prefab.error.empty()) {
+        if (prefab.error.empty() && validateModels) {
             prefab.warnings = ValidateImportedModel(prefab.modelPath);
             for (const std::string& warning : prefab.warnings)
                 SGE_LOG("LogAssetValidation", EngineLog::Level::Warning,
@@ -530,7 +531,8 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             generated.modelPath = relative;
             generated.modelGuid = GuidForAssetPath(relative);
             generated.generated = true;
-            generated.warnings = ValidateImportedModel(relative);
+            if (validateModels)
+                generated.warnings = ValidateImportedModel(relative);
             for (const std::string& warning : generated.warnings)
                 SGE_LOG("LogAssetValidation", EngineLog::Level::Warning,
                     generated.id + ": " + warning);

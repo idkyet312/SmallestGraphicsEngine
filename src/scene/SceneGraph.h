@@ -63,6 +63,9 @@ struct SceneMaterial {
     // the dark-texel green lift). Hard-surface cutouts such as fence mesh must
     // not, or they pick up a green tint along every clipped edge.
     bool foliageShading = false;
+    // Dark leaf photos need some recovery, but palm crowns must retain their
+    // texture contrast rather than borrowing the grass's bright shadow floor.
+    float foliageShadowLift = 0.72f;
     // glTF alphaMode=BLEND. Kept separate from alphaCutout so texture-driven
     // glass can use blending even when baseColorFactor alpha itself is 1.
     bool alphaBlend = false;

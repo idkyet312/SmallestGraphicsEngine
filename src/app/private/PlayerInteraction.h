@@ -446,7 +446,37 @@ static void RecordBaseArmoryKit() {
     }
 }
 
+// Test hook: SGE_AUTO_BASE_ARMORY=<slot> stands the player at the base counter
+// once the base has loaded and opens it; slot 0-3 also opens that slot's
+// picker, -1 leaves the card. SGE_ARMORY_CAPTURE_PATH=<file.ppm> then writes
+// the frame and quits, as SGE_UI_CAPTURE_PATH does for the deploy screen.
+static void RunBaseArmoryAutoHook() {
+    static int state = 0;
+    char value[16] = {};
+    if (!g_baseMode || g_game.loading.Active() ||
+        g_prefabArmoryShops.empty() ||
+        GetEnvironmentVariableA("SGE_AUTO_BASE_ARMORY", value, sizeof(value)) == 0)
+        return;
+    // Pinned every frame, so settling physics cannot walk the camera out of
+    // the counter's reach and close the panel before the capture.
+    const PrefabArmoryShop& shop = g_prefabArmoryShops.front();
+    scene.camera.Position = { shop.position.x,
+                              shop.position.y + scene.camera.PlayerHeight,
+                              shop.position.z };
+    if (state == 0 && OpenNearbyArmoryShop()) state = 1;
+    if (state == 1 && g_armoryShopOpen && !g_game.loading.Active()) {
+        g_loadoutPickerSlot = (std::clamp)(std::atoi(value), -1, 3);
+        g_loadoutPickerFocus = -1;
+        state = 2;
+    }
+}
+
 static void RenderArmoryShopPanel(HWND hwnd) {
+    RunBaseArmoryAutoHook();
+    if (g_armoryShopOpen) {
+        static UICaptureHook captureHook;
+        RunUICaptureHook(captureHook, "SGE_ARMORY_CAPTURE_PATH");
+    }
     if (!g_armoryShopOpen) return;
     // A shop whose prefab was deleted mid-playtest, or a player who walked away
     // while it was open. Either way the counter is gone and the panel closes
@@ -475,6 +505,7 @@ static void RenderArmoryShopPanel(HWND hwnd) {
         LoadoutPickerTarget target;
         target.weapons[0] = carried[0];
         target.weapons[1] = carried[1];
+        target.mission = &g_game.mission.Loadout();
         target.top = 40.0f;
         target.equipWeapon = [&carried](int slot, int weapon, bool bought) {
             const size_t slotIndex = static_cast<size_t>(slot);
@@ -550,11 +581,56 @@ static void RenderArmoryShopPanel(HWND hwnd) {
     const float width = kCardWidth - 40.0f;
     DrawLoadoutWeaponTile(0, carried[0], width);
     DrawLoadoutWeaponTile(1, carried[1], width);
-    ImGui::TextDisabled("Select a weapon to change it or fit attachments.");
+    DrawLoadoutKitTiles(g_game.mission.Loadout(), width);
+    ImGui::TextDisabled("Select a slot to change it or fit attachments.");
     // Per-weapon kick tuning is a development control, as on the deploy screen.
     if (g_deploymentDevTools) {
         DrawWeaponCameraShakeSlider(carried[0]);
         DrawWeaponCameraShakeSlider(carried[1]);
+    }
+
+    // Marines for the mission being outfitted. Only the base flies one out; a
+    // counter mid-mission has no transport to load them on. Charged on DEPLOY
+    // like the deploy screen's slider, which this pre-fills -- so it is capped
+    // by what the wallet can cover now, and re-clamped there.
+    if (g_baseMode) {
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::TextColored(UITheme::kTextDim, "MARINE SQUAD");
+        // No marine-mesh check here: the base defers combat assets, so the mesh
+        // is not loaded yet. CommitDeployment drops the squad if it never loads.
+        const int affordableMarines = (std::min)(kMaxDeploymentMarines,
+            static_cast<int>(g_game.money.Balance() / kDeploymentMarinePrice));
+        // Clamp before drawing: a purchase above can put the count out of reach.
+        const int clamped = (std::min)(g_baseKitMarines, affordableMarines);
+        if (clamped != g_baseKitMarines) {
+            g_baseKitMarines = clamped;
+            RecordBaseArmoryKit();
+        }
+        ImGui::BeginDisabled(affordableMarines <= 0);
+        ImGui::SetNextItemWidth(width);
+        if (ImGui::SliderInt("##BaseMarines", &g_baseKitMarines, 0,
+                             (std::max)(1, affordableMarines),
+                             g_baseKitMarines == 1 ? "%d marine"
+                                                   : "%d marines")) {
+            g_baseKitMarines = (std::clamp)(g_baseKitMarines, 0,
+                                            (std::max)(0, affordableMarines));
+            RecordBaseArmoryKit();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Marines loaded aboard your transport, $2,000 each.\n"
+                "Charged when you deploy. They only reach the ground\n"
+                "if the transport does.");
+        ImGui::EndDisabled();
+        if (affordableMarines <= 0) {
+            ImGui::TextColored(ImVec4(0.75f, 0.32f, 0.28f, 1.0f),
+                               "Cannot afford a marine ($2,000 each)");
+        } else if (g_baseKitMarines > 0) {
+            char squadCost[32];
+            MoneySystem::Format(squadCost, sizeof(squadCost),
+                                g_baseKitMarines * kDeploymentMarinePrice);
+            ImGui::TextColored(UITheme::kWarning, "%s on deploy", squadCost);
+        }
     }
 
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
@@ -575,34 +651,6 @@ static void RenderArmoryShopPanel(HWND hwnd) {
 // missing file draws a labelled placeholder card instead of failing, so the
 // screen works today and dropping a preview.png into the map's folder is the
 // only step needed to illustrate it later.
-struct TravelDestination {
-    const char* name;
-    const char* subtitle;
-    // Searched in order, exactly like the main menu's level buttons: the repo
-    // layout, the packaged flat levels/ copy, and a build/ run each resolve.
-    std::array<const char*, 3> levelCandidates;
-    const char* imagePath;
-};
-
-// The two combat maps. The Training Range and Home Base were cards here too;
-// both are still reachable from the main menu, which is where a player goes to
-// practise or to re-kit. The helicopter is a ride out to a job, so the board it
-// carries lists jobs -- landing back at the base you just took off from was
-// never one.
-static const std::array<TravelDestination, 2> kTravelDestinations = { {
-    { "ISLAND 1", "Campaign - hostile territory",
-      { "Content/Levels/Islandv10.json",
-        "levels/Islandv10.json",
-        "build/Content/Levels/Islandv10.json" },
-      "Content/Levels/Islandv10/preview.png" },
-    { "MILITARY AIRFIELD", "Strike - aircraft on the ground",
-      { "Content/Levels/BigIslandv34.json",
-        "levels/BigIslandv34.json",
-        "build/Content/Levels/BigIslandv34.json" },
-      "Content/Levels/BigIslandv34/preview.png" },
-} };
-
-
 // Open state mirrors the armory counter: an index rather than a pointer,
 // because the travel point list is rebuilt whenever a prefab is edited during a
 // playtest and a pointer into it would dangle the moment that happened.
@@ -716,6 +764,9 @@ static bool OpenNearbyTravelScreen() {
     // the camera here.
     g_travelReturnPosition = scene.camera.Position;
     g_travelAirborne = true;
+    // Model loading measures the authored right seat. Apply the chosen side
+    // here too, so base boarding starts at the same door as an insertion.
+    ApplyBlackHawkSeatSide();
     // Depart along the pad's own facing, which is the direction the aircraft is
     // modelled pointing -- so it flies out its nose instead of sliding sideways.
     g_game.vehicles.BeginBlackHawkDeparture(
@@ -899,7 +950,15 @@ static void RenderTravelPanel(HWND hwnd) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 imageMin = origin;
         const ImVec2 imageMax(origin.x + cardWidth, origin.y + imageHeight);
-        const uint64_t image = UITextureFromFile(destination.imagePath);
+        // Resolve once like the texture cache, including absent art. Both the
+        // card and the load can find build/ art when launched from the repo.
+        static const auto previewPaths = [] {
+            std::array<std::string, kTravelDestinations.size()> paths;
+            for (size_t i = 0; i < paths.size(); ++i)
+                paths[i] = TravelPreviewImagePath(kTravelDestinations[i]);
+            return paths;
+        }();
+        const uint64_t image = UITextureFromFile(previewPaths[index].c_str());
         if (image) {
             draw->AddImage((ImTextureID)(intptr_t)image, imageMin, imageMax);
         } else {

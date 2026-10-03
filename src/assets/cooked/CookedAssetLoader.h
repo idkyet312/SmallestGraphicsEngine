@@ -14,23 +14,45 @@ public:
     static std::filesystem::path FindForSource(
         const std::filesystem::path& source);
 
+    // loadTextures=false skips the baked textures entirely -- no resources, no
+    // copies recorded -- for callers that replace every material themselves.
+    // Creating them and dropping them is what made such callers avoid the
+    // cache: the open command list still referenced the released textures.
     static std::shared_ptr<SceneNode> LoadForSource(
         const std::filesystem::path& source,
         Microsoft::WRL::ComPtr<ID3D12Device> device,
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-        std::string* error = nullptr);
+        std::string* error = nullptr, bool loadTextures = true);
 
     static std::shared_ptr<SceneNode> Load(
         const std::filesystem::path& cookedPath,
         Microsoft::WRL::ComPtr<ID3D12Device> device,
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-        std::string* error = nullptr);
+        std::string* error = nullptr, bool loadTextures = true);
+
+    // A loose image's texture-only cook (AssetCooker <image>): BC with a full
+    // mip chain. Null when there is no fresh cook; the caller then decodes the
+    // image itself. Upload heaps go to `uploads` like the importer's own.
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureForSource(
+        const std::filesystem::path& source, ID3D12Device* device,
+        ID3D12GraphicsCommandList* commandList,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads);
+
+    // glTF metallic-roughness packed at cook time from separate roughness and
+    // metallic images (AssetCooker --pack-mr). Stale if either image changed.
+    static Microsoft::WRL::ComPtr<ID3D12Resource>
+    LoadPackedMetalRoughnessForSources(
+        const std::filesystem::path& roughness,
+        const std::filesystem::path& metallic, ID3D12Device* device,
+        ID3D12GraphicsCommandList* commandList,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads);
 
     // Background warm-up for assets that will be loaded soon. A worker thread
-    // reads each source file and its cooked asset sequentially -- pulling them
-    // into the OS file cache -- and verifies both hashes. A later LoadForSource
-    // of an unchanged file then skips the re-hash and maps memory that is
-    // already resident. Returns at once; safe to call from the main thread.
+    // reads each cooked asset sequentially -- pulling it into the OS file
+    // cache -- and verifies its payload hash, so a later LoadForSource skips
+    // the re-hash and maps memory that is already resident. Sources are only
+    // read when there is no cooked asset to load instead. Returns at once;
+    // safe to call from the main thread.
     //
     // Measured 2026-10-02 (game on a USB SSD): the armory's weapon set took
     // 21.3 s through the memory-mapped, random-access loader on a cold cache

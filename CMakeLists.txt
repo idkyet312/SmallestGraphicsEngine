@@ -657,6 +657,14 @@ if(BUILD_TESTING)
     target_link_libraries(TextureUploadArenaTests PRIVATE SGEProjectHeaders d3d12)
     add_test(NAME TextureUploadArenaTests COMMAND TextureUploadArenaTests)
 
+    # WARP makes the asynchronous texture-owner regression reproducible without
+    # a display or a hardware GPU. The shader path is relative to the build dir.
+    add_executable(MipTextureLifetimeTests tests/MipTextureLifetimeTests.cpp)
+    target_link_libraries(MipTextureLifetimeTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json d3d12 dxgi d3dcompiler)
+    add_test(NAME MipTextureLifetimeTests COMMAND MipTextureLifetimeTests)
+    set_tests_properties(MipTextureLifetimeTests PROPERTIES TIMEOUT 30)
+
     add_executable(UltraWaterSimulationTests tests/UltraWaterSimulationTests.cpp)
     target_link_libraries(UltraWaterSimulationTests PRIVATE SGEProjectHeaders)
     add_test(NAME UltraWaterSimulationTests COMMAND UltraWaterSimulationTests)

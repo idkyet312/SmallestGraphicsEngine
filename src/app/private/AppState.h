@@ -873,6 +873,8 @@ GunAudio                    g_briefingTypingAudio;
 // screen. Looped rather than one-shot so it covers however long the player
 // spends on either, and stopped the moment play begins.
 GunAudio                    g_menuMusicAudio;
+GunAudio                    g_menuSelectionAudio;
+GunAudio                    g_menuConfirmAudio;
 bool                        g_menuMusicPlaying = false;
 constexpr float             kMenuMusicVolume = 0.5f;
 // Under gameplay the score sits back so it does not crowd the mix.

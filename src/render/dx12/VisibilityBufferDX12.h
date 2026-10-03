@@ -1426,7 +1426,8 @@ public:
             data.pbrParams = XMFLOAT4(material->metallicFactor,
                 material->roughnessFactor, material->normalYSign, 1.0f);
             data.shadingParams = XMFLOAT4(material->ambientScale,
-                material->viewFillStrength, 0.7f, 0.0f);
+                material->viewFillStrength,
+                material->foliageShading ? material->foliageShadowLift : 0.7f, 0.0f);
         };
         auto found = materialLookup.find(material);
         if (found != materialLookup.end()) {
@@ -1513,7 +1514,8 @@ public:
             data.pbrParams = XMFLOAT4(material->metallicFactor,
                 material->roughnessFactor, material->normalYSign, 1.0f);
             data.shadingParams = XMFLOAT4(material->ambientScale,
-                material->viewFillStrength, 0.7f, 0.0f);
+                material->viewFillStrength,
+                material->foliageShading ? material->foliageShadowLift : 0.7f, 0.0f);
         };
 
         // The material's cached indices are only meaningful for the allocator

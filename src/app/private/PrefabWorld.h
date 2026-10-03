@@ -401,7 +401,9 @@ static void RebuildPrefabRenderBatches(bool refreshAssets = true) {
     g_blastHoleEntities.clear();
     if (refreshAssets) {
         g_assetRegistry.Refresh();
-        g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+        // Model warnings only matter in the editor, and producing them imports
+        // every source model; a game load reads cooked assets only.
+        g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot, IsEditorEditing());
     }
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;

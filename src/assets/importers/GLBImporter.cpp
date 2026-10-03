@@ -236,6 +236,10 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
         return nullptr;
     }
 
+    // The material may replace this map before its recorded copies execute.
+    // The loading queue drain retires destinations alongside staging resources.
+    uploadHeaps.push_back(texture);
+
     // Prepare base-level data (force 8-bit RGBA).
     //
     // Bit depth first: a 16-bit PNG decodes to two bytes per channel, and the
@@ -463,6 +467,11 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
 
 ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
     ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    // A texture-only cook (AssetCooker <image>) skips the PNG decode, the
+    // RGBA8 upload and the GPU mip pass: a 4K PNG measured 0.3-0.5 s to decode.
+    if (auto cooked = CookedAssetLoader::LoadTextureForSource(
+            filepath, device.Get(), commandList.Get(), uploadHeaps))
+        return cooked;
     int width = 0;
     int height = 0;
     int components = 0;
@@ -787,6 +796,7 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
         uploadHeaps.push_back(uploadHeap);
     }
 
+    uploadHeaps.push_back(texture);
     for (UINT16 level = 0; level < mipLevels; ++level) {
         D3D12_TEXTURE_COPY_LOCATION dst = {};
         dst.pResource = texture.Get();
@@ -1360,6 +1370,9 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
             return cooked;
         }
     }
+    // Grep tag for "what still imports from source", as in FBXImporter.
+    std::cout << "[SourceImport] GLB " << filepath
+              << (outSkeleton ? " (skinned)" : "") << "\n";
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err;

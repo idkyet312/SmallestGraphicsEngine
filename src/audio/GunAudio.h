@@ -170,7 +170,7 @@ private:
         // default: a score that competes with gunfire and callouts is a score
         // the player turns off.
         float busVolume[static_cast<int>(AudioBus::Count)] = {
-            1.0f, 1.0f, 1.0f, 1.0f, 0.55f };
+            0.9f, 1.0f, 1.0f, 1.0f, 0.55f };
         // Conservative default: enough to place sounds in a space, not enough
         // to smear a rifle crack into a cathedral.
         float reverbVolume = 0.22f;

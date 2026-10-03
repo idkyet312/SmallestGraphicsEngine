@@ -21,10 +21,8 @@ void MatchFoliageMaterialToGrass() {
         material->normalYSign = g_grass.TransmissionStrength();
         material->viewFillStrength = g_grass.ColorVariation();
     };
-    for (const auto& material : PalmModel::Materials()) {
-        if (material && material->name == "palm_leaf")
-            matchMaterial(material);
-    }
+    // Palm leaves carry their own texture and lighting grade. Grass's 2x sun
+    // response and transmission tuning flatten their crowns into bright green.
     if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
                                     const std::shared_ptr<SceneNode>& node) -> void {

@@ -424,6 +424,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         AudioBus::UI);
     g_menuMusicAudio.Initialize("Content/Audio/Music/testbackground.wav",
                                 AudioBus::Music);
+    g_menuSelectionAudio.Initialize(
+        "Content/Audio/UI/freesound_community-menu-select-sound-100466.wav",
+        AudioBus::UI);
+    g_menuConfirmAudio.Initialize(
+        "Content/Audio/UI/u_o8xh7gwsrj-flower_pickup_positive-476369.mp3",
+        AudioBus::UI);
     g_exfilHereAudio.Initialize(
         "Content/Audio/Voicelines/Commander/ExfilsHere.mp3", AudioBus::Voices);
     g_greatJobAudio.Initialize(
@@ -1111,6 +1117,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             continue;
         }
 
+        RunPendingLoadingAction();
+
         float now = gameTimer.GetElapsed();
         deltaTime = now - lastTime;
         lastTime  = now;
@@ -1234,6 +1242,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // not a gameplay screen, so anything inside that branch never ticks
         // there and the music would only ever start once a level was running.
         g_menuMusicAudio.Update();
+        g_menuSelectionAudio.Update();
+        g_menuConfirmAudio.Update();
         // Screen changes can bypass the briefing draw that normally stops this.
         if (!DeploymentPlanningVisible() || !IsSceneScreen() ||
             g_game.loading.Active() || g_deploymentBriefingUnderstood)
@@ -1869,7 +1879,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // the pose the very first update produces.
                     ApplyBlackHawkSeatSide();
                     StartBlackHawkInsertionAtPlayerSpawn();
-                    // Face out of the door once the seat is occupied. Deferred
+                    // Look out the left side once the seat is occupied. Deferred
                     // rather than set here: the aircraft's yaw is settled by the
                     // first UpdateBlackHawk, not by the call that arms the run.
                     g_blackHawkRideFacingPending = true;
@@ -4697,6 +4707,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     "Auto-win test hook fired");
                 OpenWinScreen();
             }
+            // Test hook: SGE_AUTO_QUICK_RESTART=<seconds> presses REPLAY
+            // MISSION once, that long after the first run's timer starts.
+            static const float autoRestartSeconds = [] {
+                char text[16] = {};
+                return GetEnvironmentVariableA("SGE_AUTO_QUICK_RESTART", text,
+                                               sizeof(text)) > 0
+                    ? static_cast<float>(std::atof(text)) : -1.0f;
+            }();
+            static bool autoRestarted = false;
+            if (!autoRestarted && autoRestartSeconds >= 0.0f &&
+                g_game.session.Screen() == GameScreen::Level1 &&
+                g_game.session.ElapsedSeconds() > autoRestartSeconds) {
+                autoRestarted = true;
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Auto quick-restart test hook fired");
+                RestartWithPlan(hwnd, net::RestartPlanMode::Quick);
+            }
         }
 
         // Clearing the field no longer ends the run on its own. The boat is the
@@ -4763,6 +4790,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // same reason as the two blocks above: the build resets that list and
         // its allocator. It runs before the loading screen's first stage, so
         // nothing samples these while they are still missing.
+        if (g_sceneDescriptorResetPending) {
+            WaitForDirectQueueIdleIsolated();
+            bindlessHeap.ResetForNewScene();
+            visBuffer.ResetBindlessMaterials();
+            g_sceneDescriptorResetPending = false;
+        }
         if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
 
         // Virtual shadows replace the cascade atlas rather than augmenting it,
@@ -5370,6 +5403,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
         if (IsSceneScreen() && g_game.loading.Active()) {
         if (g_game.loading.Stage() == LevelLoadStage::WorldAssets) {
+            // Firearms first, ahead of the level's own art -- the hub included,
+            // which used to defer them to the first armory-counter visit and
+            // put a second loading screen in front of the stock. Load() runs
+            // once; later stages and the armory path find it already done.
+            GunModel::Load();
             LoadFloorMudMaterial();
             if (!g_emptyLevelMode) {
                 std::cout << "Loading models/h2.glb...\n";
@@ -5550,11 +5588,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 RebuildScalableEnvironment();
                 g_pendingEnvironmentRebuild = false;
             }
-            // The hub starts with no firearm; its first counter visit loads
-            // the collection through the same upload stages instead.
-            if (!g_baseMode) GunModel::Load();
-            // The first-person arms share that window for the same reason, and
-            // are drawn in the weapon's own local space.
+            // Firearms were loaded in WorldAssets. The first-person arms are
+            // drawn in the weapon's own local space.
             ArmsModel::Load();
 
             if (g_emptyLevelMode) {
@@ -5631,13 +5666,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     XMStoreFloat4x4(&c4Identity, XMMatrixIdentity());
                     g_c4Model->UpdateGlobalTransform(c4Identity);
 
-                    // Pin the material to fully opaque plastic. The asset omits
-                    // baseColorFactor and alphaMode entirely, so those come from
-                    // whatever the importer left in place -- and any alpha below
-                    // 0.999 routes the brick through the transparent pipeline,
-                    // which is what made it read as blue glass. The GLB also
-                    // ships normalTexture.scale = 0, so its normal map
-                    // contributes nothing and only tints the shading.
+                    // The display is a separate untextured material; giving it
+                    // the case's white factor washed out the authored LCD finish.
                     const auto fixC4Material = [&](const auto& self,
                                                    const std::shared_ptr<SceneNode>& node)
                         -> void {
@@ -5645,12 +5675,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         if (node->mesh) for (auto& primitive : node->mesh->primitives) {
                             if (!primitive.material) continue;
                             auto& m = primitive.material;
-                            m->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+                            const bool display =
+                                m->name == "c4_panorama_control_panel";
+                            m->baseColorFactor = display
+                                ? XMFLOAT4(0.018f, 0.045f, 0.026f, 1.0f)
+                                : XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+                            m->alphaBlend = false;
                             m->alphaCutout = false;
                             m->alphaFromLuminance = false;
                             // Moulded plastic case: dielectric, fairly rough.
                             m->metallicFactor = 0.0f;
-                            m->roughnessFactor = 0.85f;
+                            m->roughnessFactor = display ? 0.55f : 0.85f;
                             m->roughnessOnlyTexture = false;
                         }
                         for (const auto& child : node->children) self(self, child);
@@ -6170,6 +6205,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // Mip handoff is submitted by FlushPending. Wait once, then free
             // texture staging resources retained by imported scene materials.
             WaitForDirectQueueIdleIsolated();
+            g_mipGen.ReleaseCompletedTextures();
             AdvanceLevelLoading(LevelLoadStage::SubmitUploads,
                 "Submit final staging copies",
                 "direct command list");
@@ -6295,8 +6331,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     "Texture upload release: device health query returned " +
                     std::to_string(static_cast<long>(deviceStatus)));
                 if (deviceStatus == S_OK) {
-                    if (!g_baseMode || levelArmoryLoadOnly)
-                        firearmAssetsLoaded = true;
+                    // Every load now carries the firearms (WorldAssets), the
+                    // hub's included, so the armory counter has nothing left
+                    // to load on its first visit.
+                    firearmAssetsLoaded = true;
                     if (!levelArmoryLoadOnly) {
                         if (g_baseMode) baseLevelAssetsLoaded = true;
                         else if (g_emptyLevelMode) emptyLevelAssetsLoaded = true;
@@ -6308,12 +6346,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 const bool armoryOnly = levelArmoryLoadOnly;
                 levelArmoryLoadOnly = false;
-                // The hub spawns with no firearms; the first armory visit loads
-                // them. Stream their files on a worker now, while the player
-                // walks over, so that load reads RAM instead of the disk.
-                if (!armoryOnly && g_baseMode && !firearmAssetsLoaded &&
-                    deviceStatus == S_OK)
-                    CookedAssetLoader::PrefetchSources(GunModel::AssetSources());
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     std::string(armoryOnly ? "Armory" : (g_baseMode ? "Base" : "Level")) +
                     " loading took " +
@@ -7556,6 +7588,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        g_deferLoadingActions = true;
+        const bool menuSelectionAudioActive = !g_game.loading.Active() &&
+            !g_deploymentDebugHideUI &&
+            (g_game.session.Screen() == GameScreen::MainMenu ||
+             g_game.session.Screen() == GameScreen::WinScreen ||
+             g_gamePaused || g_showSettingsMenu || DeploymentPlanningVisible() ||
+             g_armoryShopOpen || g_travelScreenOpen ||
+             (!scene.player.godMode && !scene.player.downed &&
+              scene.player.health <= 0.0f) ||
+             (MultiplayerActive() && squadWipeScreenAge >= 2.0f));
         g_thumbnailUploadedThisFrame = false;
         // Hurt/low-health blood overlays for RenderPlayerHUD. Loaded once and
         // cached by path; 0 (art missing) falls back to the drawn vignette.
@@ -7563,7 +7605,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             UITextureFromFile("Content/Textures/UI/hurt_blood.png");
         g_lowHealthBloodOverlay =
             UITextureFromFile("Content/Textures/UI/low_health_blood.png");
-        if (g_game.loading.Active() ||
+        if (g_pendingLoadingAction || g_game.loading.Active() ||
             (g_insertionChoicePending && !g_deploymentPlanningVisible)) {
             RenderLoadingScreen();
         } else if (g_game.session.Screen() == GameScreen::MainMenu) {
@@ -7747,6 +7789,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawVirtualShadowPageDebug(scene);
                 RenderScoreboard();
             }
+        }
+        UpdateMenuSelectionAudio(menuSelectionAudioActive);
+        g_deferLoadingActions = false;
+        if (g_pendingLoadingAction) {
+            // Replace windows already drawn before the click; background art
+            // alone would leave those windows above the loading screen.
+            ImGui::EndFrame();
+            ImGui::NewFrame();
+            RenderLoadingScreen();
         }
         ImGui::Render();
 
@@ -8486,6 +8537,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_exfilHereAudio.Shutdown();
     g_plantC4TowerAudio.Shutdown();
     g_menuMusicAudio.Shutdown();
+    g_menuSelectionAudio.Shutdown();
+    g_menuConfirmAudio.Shutdown();
     g_readyToDropAudio.Shutdown();
     g_briefingTypingAudio.Shutdown();
     g_banditSpottedAudio2.Shutdown();

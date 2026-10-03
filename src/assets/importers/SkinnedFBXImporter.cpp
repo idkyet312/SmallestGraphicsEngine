@@ -411,6 +411,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     const std::vector<std::string>& rotationOnlyAnims) {
 
     SkinnedModel out;
+    // Skinned geometry has no cooked form; only its clips do (below).
+    std::cout << "[SourceImport] SkinnedFBX " << meshPath << "\n";
     Assimp::Importer importer;
     importer.SetPropertyInteger(AI_CONFIG_PP_LBW_MAX_WEIGHTS, 4);
     const aiScene* scene = importer.ReadFile(meshPath, kImportFlags);
@@ -525,14 +527,23 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             aiString materialName;
             if (am->Get(AI_MATKEY_NAME, materialName) == AI_SUCCESS)
                 mat->name = materialName.C_Str();
+            // Hair and eyelash cards are dropped from the mesh below, so their
+            // maps are never sampled. Loading them anyway decoded the 4K hair
+            // PNG twice per character -- ~0.7 s of a 2.3 s load, measured.
+            const std::string cardName = lowerStr(mat->name);
+            const bool droppedCard =
+                cardName.find("hair") != std::string::npos ||
+                cardName.find("eyelash") != std::string::npos;
             aiString texture;
-            if ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &texture) == AI_SUCCESS &&
-                 texture.length) ||
-                (am->GetTexture(aiTextureType_DIFFUSE, 0, &texture) == AI_SUCCESS &&
-                 texture.length))
+            if (!droppedCard &&
+                ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &texture) == AI_SUCCESS &&
+                  texture.length) ||
+                 (am->GetTexture(aiTextureType_DIFFUSE, 0, &texture) == AI_SUCCESS &&
+                  texture.length)))
                 mat->baseColorTexture =
                     loadReferencedTexture(texture, mat->uploadHeaps);
-            if (am->GetTexture(aiTextureType_NORMALS, 0, &texture) == AI_SUCCESS &&
+            if (!droppedCard &&
+                am->GetTexture(aiTextureType_NORMALS, 0, &texture) == AI_SUCCESS &&
                 texture.length)
                 mat->normalTexture =
                     loadReferencedTexture(texture, mat->uploadHeaps);
@@ -559,9 +570,9 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 return tex;
             };
             if (hairCard) {
-                if (!mat->baseColorTexture)
-                    mat->baseColorTexture =
-                        loadByStem("T_Bandit_Hair_BaseColor", mat->uploadHeaps);
+                // No texture: the cards are skipped below (see droppedCard).
+                // The factors stay so the material reads sensibly if the cards
+                // are ever brought back -- at which point load the hair map.
                 const bool eyelashes = materialLower.find("eyelash") != std::string::npos;
                 mat->baseColorFactor = eyelashes
                     ? XMFLOAT4(0.018f, 0.012f, 0.008f, 1.0f)
@@ -758,6 +769,7 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                   << " cooked embedded animation(s): "
                   << fs::path(meshPath).stem().string() << "\n";
     } else {
+        std::cout << "[SourceImport] EmbeddedClips " << meshPath << "\n";
         AppendClips(scene, out.skeleton, 1.0f, out.clips);
     }
     for (const std::string& ap : animPaths) {
@@ -777,6 +789,7 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             std::cout << "Loaded cooked animation: " << stem << "\n";
             continue;
         }
+        std::cout << "[SourceImport] AnimFBX " << ap << "\n";
         Assimp::Importer animImporter;
         const aiScene* as = animImporter.ReadFile(ap, aiProcess_Triangulate);
         if (!as || as->mNumAnimations == 0) {

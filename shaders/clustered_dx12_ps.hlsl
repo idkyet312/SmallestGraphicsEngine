@@ -53,10 +53,8 @@ cbuffer ObjectBuffer : register(b3) {
     // > 0: fade the first-person weapon by view distance, so the parts nearest
     // the eye go the most transparent. See ViewmodelSeeThroughAlpha below.
     float viewmodelSeeThrough;
-    // The CPU struct reserves this float so the uint4 below starts on its
-    // 16-byte register at byte 96. Declared in both configurations, since the
-    // fields that follow it must land at the same offset either way.
-    float bindlessPadding;
+    // Former padding at byte 92; matches ObjectBufferDX12 without moving indices.
+    float foliageShadowLift;
 #ifdef SGE_BINDLESS_MATERIALS
     uint4 bindlessTextureIndices;
 #else
@@ -906,7 +904,8 @@ float4 main(PS_INPUT input) : SV_TARGET
             float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
             // Lift shadowed texels toward the live foliage albedo instead of a
             // fixed bright green that overrides the grass-matching controls.
-            albedo = lerp(albedo, objectColor * 0.72, dark * 0.72);
+            albedo = lerp(albedo, objectColor * 0.72,
+                          dark * saturate(foliageShadowLift));
         }
     }
     else if ((alphaCut > 0.5 && alphaCut < 1.5) || alphaCut > 2.5) {
