@@ -174,6 +174,17 @@ public:
         return hide;
     }
 
+    // Screen-left follows the mirror setting, independently of the grip bone.
+    // Remove the whole side's geometry, including sleeve and shoulder remnants.
+    static bool& HideLeftHand() {
+        static bool hide = false;
+        return hide;
+    }
+    static bool& HideRightHand() {
+        static bool hide = false;
+        return hide;
+    }
+
     // Play/pause the idle. Held still by default: a moving body is impossible to
     // align a fixed weapon against, because the hands are somewhere different
     // every frame. Get the pose sitting on the gun first, then turn this on.
@@ -236,7 +247,8 @@ public:
             Source().skeleton, RunAnimation(), 0.0f,
             RunBlendWeight() * sightedRunScale * kProceduralRunStrength,
             PaletteCPU(), &PoseGlobals(), idleMotionRange, 0.0f);
-        if (HideHead() || HideFreeHand()) CollapseHiddenBones();
+        if (HideHead() || HideFreeHand() || HideLeftHand() || HideRightHand())
+            CollapseHiddenBones();
     }
 
     // Per-frame palette upload. One buffer per in-flight frame so a palette the
@@ -254,6 +266,12 @@ public:
                      const XMMATRIX& view, const XMMATRIX& proj,
                      const XMMATRIX& lightSpace, float weaponScale) {
         if (!Loaded() || !Visible() || PaletteCPU().empty()) return;
+        if (HideLeftHand() && HideRightHand()) return;
+        const bool hideSide = HideLeftHand() || HideRightHand();
+        const auto& primitives = Source().node->mesh->primitives;
+        if (hideSide && ArmVisibilityMeshes().size() != primitives.size()) return;
+        const size_t visibleSide = HideLeftHand()
+            ? (MirrorX() ? 0 : 1) : (MirrorX() ? 1 : 0);
         const D3D12_GPU_VIRTUAL_ADDRESS paletteAddress = UploadPalette();
         if (!paletteAddress) return;
 
@@ -261,7 +279,10 @@ public:
             weaponScale, weaponScale, weaponScale) * base;
         shader.SetMatrices(world, view, proj, lightSpace);
 
-        for (const MeshPrimitive& primitive : Source().node->mesh->primitives) {
+        for (size_t p = 0; p < primitives.size(); ++p) {
+            const MeshPrimitive& primitive = hideSide
+                ? ArmVisibilityMeshes()[p][visibleSide] : primitives[p];
+            if (hideSide && primitive.indexCount == 0) continue;
             if (primitive.vbv.BufferLocation == 0 || !primitive.skinBuffer) continue;
             shader.Use(false);
             if (primitive.material) {
@@ -427,9 +448,11 @@ public:
         FindGripBone();
         FindFollowBone();
         FindHiddenBones();
+        BuildArmVisibilityMeshes();
         // Keep the artist-tuned startup Offset. Alignment remains available
         // through the UI for fitting another pose or asset.
-        if (HideHead() || HideFreeHand()) CollapseHiddenBones();
+        if (HideHead() || HideFreeHand() || HideLeftHand() || HideRightHand())
+            CollapseHiddenBones();
 
         if (FILE* file = std::fopen("arms_load.log", "w")) {
             size_t triangles = 0, vertices = 0, skinned = 0;
@@ -532,14 +555,14 @@ public:
     //
     // This adjusts whichever arm currently grips, so it follows
     // GripUsesLeftHand: the LEFT arm for the two-handed weapons on the default
-    // grip, the RIGHT for those ArmsFitForWeapon flips (RPG, M9).
+    // grip, the RIGHT for those ArmsFitForWeapon flips (M9).
     static XMFLOAT3& WeaponGripOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxGripWeapon + 1> offsets = {{
             { 0.000f,  0.000f, 0.0f }, // AK47
             // Support hand forward onto the pump, which sits further down
             // the barrel than the AK handguard the shared grip was set on.
             {-0.025f, -0.010f, 0.070f }, // Remington 870
-            // Gripped from the right bone with the left arm hidden (see
+            // Gripped from the left bone with the right arm hidden (see
             // ArmsFitForWeapon), so this is placing the firing hand on the
             // launcher's pistol grip rather than a support hand on a
             // handguard. That grip sits well forward of where the shared point
@@ -601,24 +624,18 @@ public:
         // across the view with nothing to hold, and hiding just its hand
         // leaves a severed forearm floating there instead.
         bool hideFreeArm = false;
+        bool hideFreeHand = true;
+        bool hideLeftHand = false;
+        bool hideRightHand = false;
     };
 
     // Fit for a weapon, or a non-overriding entry when it uses the shared pose.
     static WeaponArmsFit ArmsFitForWeapon(int weapon) {
-        // RPG: shouldered, so the firing hand is on the pistol grip under the
-        // tube and the support arm would have to reach across the launcher's
-        // body to hold anything. Gripped from the right bone with the left arm
-        // dropped, same arrangement as the M9 below.
-        //
-        // The body placement is the shared pose's own default, spelled out
-        // rather than read from SharedArmsFit(): this function must stay a pure
-        // function of the weapon id. SetGripWeapon captures its result BEFORE
-        // it writes SharedArmsFit(), so reading that here would bake in a stale
-        // offset on the way in. Only the grip hand and the hidden arm are what
-        // this weapon actually needed; no RPG-specific offset has been measured
-        // against the render, so this is a starting point, not a tuned number.
+        // Tuned in game: keep the left-bone grip and shared placement, disable
+        // the free-hand cut, and remove the complete screen-right arm instead.
+        // Use the constant so live edits to the shared fit cannot change this.
         if (weapon == 2)
-            return { true, kSharedOffset, false, true };
+            return { true, kSharedOffset, true, false, false, false, true };
         // M9: held in the rig's right hand, body pulled left and back so the
         // pistol sits centred in front of the eye instead of out on a rifle's
         // firing line, and fired one-handed, so the whole left arm goes.
@@ -641,7 +658,10 @@ public:
     // Seeded from the live values on first use rather than repeating the
     // defaults, so the two cannot drift apart when the shared pose is retuned.
     static WeaponArmsFit& SharedArmsFit() {
-        static WeaponArmsFit fit = { false, Offset(), GripUsesLeftHand() };
+        static WeaponArmsFit fit = {
+            false, Offset(), GripUsesLeftHand(), false,
+            HideFreeHand(), HideLeftHand(), HideRightHand()
+        };
         return fit;
     }
 
@@ -686,10 +706,16 @@ public:
         // trip through the pistol. Capture it on the way OUT of the shared
         // state, before the override writes over it.
         if (fit.overrides && !previous.overrides)
-            SharedArmsFit() = { false, Offset(), GripUsesLeftHand() };
+            SharedArmsFit() = {
+                false, Offset(), GripUsesLeftHand(), false,
+                HideFreeHand(), HideLeftHand(), HideRightHand()
+            };
 
         const WeaponArmsFit& target = fit.overrides ? fit : SharedArmsFit();
         Offset() = target.offset;
+        HideFreeHand() = target.hideFreeHand;
+        HideLeftHand() = target.hideLeftHand;
+        HideRightHand() = target.hideRightHand;
 
         // Rebind when the grip crosses to the other wrist, or when how much of
         // the free limb is hidden changes. Both feed the bone search, which
@@ -1266,6 +1292,87 @@ private:
         return bones;
     }
 
+    static std::array<std::vector<int>, 2>& ArmBones() {
+        static std::array<std::vector<int>, 2> bones;
+        return bones;
+    }
+
+    static std::vector<std::array<MeshPrimitive, 2>>& ArmVisibilityMeshes() {
+        static std::vector<std::array<MeshPrimitive, 2>> meshes;
+        return meshes;
+    }
+
+    // Shrinking a shoulder palette cannot hide vertices weighted to the torso.
+    // Partition the arms-only asset once, keeping both IA and meshlet draws on
+    // the same triangle set. Toggles then select immutable buffers at draw time.
+    static void BuildArmVisibilityMeshes() {
+        auto& meshes = ArmVisibilityMeshes();
+        meshes.clear();
+        const auto& primitives = Source().node->mesh->primitives;
+        std::vector<int> boneSide(Source().skeleton.BoneCount(), -1);
+        for (size_t side = 0; side < ArmBones().size(); ++side)
+            for (int bone : ArmBones()[side])
+                if (bone >= 0 && static_cast<size_t>(bone) < boneSide.size())
+                    boneSide[bone] = static_cast<int>(side);
+
+        std::array<double, 2> sideX{}, sideWeight{};
+        for (const MeshPrimitive& primitive : primitives)
+            for (size_t v = 0; v < primitive.skin.size(); ++v)
+                for (int i = 0; i < 4; ++i) {
+                    const SkinVertex& skin = primitive.skin[v];
+                    const uint32_t bone = skin.boneIndex[i];
+                    const int side = bone < boneSide.size() ? boneSide[bone] : -1;
+                    if (side < 0 || skin.boneWeight[i] <= 0.0f) continue;
+                    sideX[side] += primitive.vertices[v * 12] * skin.boneWeight[i];
+                    sideWeight[side] += skin.boneWeight[i];
+                }
+        if (sideWeight[0] == 0.0 || sideWeight[1] == 0.0) return;
+        for (size_t side = 0; side < sideX.size(); ++side)
+            sideX[side] /= sideWeight[side];
+
+        meshes.resize(primitives.size());
+        for (size_t p = 0; p < primitives.size(); ++p) {
+            const MeshPrimitive& source = primitives[p];
+            for (MeshPrimitive& mesh : meshes[p]) {
+                mesh = source;
+                mesh.indices.clear();
+                mesh.indexCount = 0;
+            }
+            for (size_t t = 0; t + 2 < source.indices.size(); t += 3) {
+                std::array<float, 2> weights{};
+                double x = 0.0;
+                for (size_t corner = 0; corner < 3; ++corner) {
+                    const unsigned int vertex = source.indices[t + corner];
+                    x += source.vertices[static_cast<size_t>(vertex) * 12];
+                    const SkinVertex& skin = source.skin[vertex];
+                    for (int i = 0; i < 4; ++i) {
+                        const uint32_t bone = skin.boneIndex[i];
+                        const int side = bone < boneSide.size() ? boneSide[bone] : -1;
+                        if (side >= 0) weights[side] += skin.boneWeight[i];
+                    }
+                }
+                // Torso-only scraps still belong to a side of the T-pose mesh.
+                // Derive its orientation from arm weights rather than assuming
+                // an exporter-specific sign for the rig's left side.
+                const size_t side = weights[0] != weights[1]
+                    ? (weights[0] > weights[1] ? 0 : 1)
+                    : (std::abs(x / 3.0 - sideX[0]) <=
+                       std::abs(x / 3.0 - sideX[1]) ? 0 : 1);
+                auto& indices = meshes[p][side].indices;
+                indices.insert(indices.end(), source.indices.begin() + t,
+                               source.indices.begin() + t + 3);
+            }
+            for (MeshPrimitive& mesh : meshes[p]) {
+                if (mesh.indices.empty()) continue;
+                if (!GLBImporter::BuildMeshletData(mesh, g_dx12.device.Get())) {
+                    std::cerr << "FPS arm visibility buffers failed\n";
+                    meshes.clear();
+                    return;
+                }
+            }
+        }
+    }
+
     // Collapse the hidden bones onto the posed joint at the root of their
     // group (the free wrist, or the head), hiding that part of the skinned
     // mesh without editing the geometry or splitting the draw. Runs after
@@ -1309,24 +1416,28 @@ private:
             }
         };
         if (HideHead()) collapse(HiddenBones());
-        if (HideFreeHand()) collapse(FreeHandBones());
+        // The manual geometry cut already removes the free wrist and fingers.
+        const bool freeOnLeft = GripUsesLeftHand() == MirrorX();
+        const bool freeArmHidden = freeOnLeft ? HideLeftHand() : HideRightHand();
+        if (HideFreeHand() && !freeArmHidden) collapse(FreeHandBones());
     }
 
     static void FindHiddenBones() {
         HiddenBones().clear();
         FreeHandBones().clear();
+        for (auto& bones : ArmBones()) bones.clear();
         const Skeleton& skeleton = Source().skeleton;
         // Where the free limb is cut. The wrist for a two-handed weapon; the
-        // upper arm for a one-handed one, which takes the forearm and shoulder
-        // with it through the descendant walk below. The rig is Mixamo, so the
-        // chain is Shoulder -> Arm -> ForeArm -> Hand and rooting at "*arm"
-        // drops everything from the deltoid down. Matched on the exact leaf, so
-        // "leftarm" cannot also catch "leftforearm".
+        // upper arm for a one-handed one. The shoulder is its parent, so it
+        // needs its own cut for the RPG and the manual hide controls; starting
+        // at Arm left a visible shoulder cap after the limb was collapsed.
         const bool wholeArm = HideFreeArmForCurrentWeapon();
-        const char* freeWristName = GripUsesLeftHand()
-            ? (wholeArm ? "rightarm" : "righthand")
-            : (wholeArm ? "leftarm" : "lefthand");
+        const char* cut = wholeArm
+            ? (GripWeapon() == 2 ? "shoulder" : "arm") : "hand";
+        const std::string freeWristName =
+            std::string(GripUsesLeftHand() ? "right" : "left") + cut;
         int freeWrist = -1;
+        std::array<int, 2> armRoots = { -1, -1 };
         for (size_t b = 0; b < skeleton.names.size(); ++b) {
             std::string name = skeleton.names[b];
             std::transform(name.begin(), name.end(), name.begin(),
@@ -1342,16 +1453,19 @@ private:
                 colon == std::string::npos ? name : name.substr(colon + 1);
             if (leaf == freeWristName)
                 freeWrist = static_cast<int>(b);
+            if (leaf == "leftshoulder") armRoots[0] = static_cast<int>(b);
+            if (leaf == "rightshoulder") armRoots[1] = static_cast<int>(b);
         }
 
         // Include wrist and every descendant, which covers all five fingers
         // without depending on exporter-specific finger naming.
-        if (freeWrist >= 0) {
+        const auto descendants = [&](int root, std::vector<int>& bones) {
+            if (root < 0) return;
             for (size_t b = 0; b < skeleton.parent.size(); ++b) {
                 int ancestor = static_cast<int>(b);
                 while (ancestor >= 0) {
-                    if (ancestor == freeWrist) {
-                        FreeHandBones().push_back(static_cast<int>(b));
+                    if (ancestor == root) {
+                        bones.push_back(static_cast<int>(b));
                         break;
                     }
                     if (static_cast<size_t>(ancestor) >= skeleton.parent.size())
@@ -1359,7 +1473,10 @@ private:
                     ancestor = skeleton.parent[ancestor];
                 }
             }
-        }
+        };
+        descendants(freeWrist, FreeHandBones());
+        for (size_t side = 0; side < armRoots.size(); ++side)
+            descendants(armRoots[side], ArmBones()[side]);
     }
 
     // The bone the weapon is held by. Matched once at load.

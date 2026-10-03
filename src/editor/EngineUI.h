@@ -4173,6 +4173,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::Checkbox("Hide Head", &ArmsModel::HideHead());
             ImGui::SameLine();
             ImGui::Checkbox("Hide Free Hand", &ArmsModel::HideFreeHand());
+            ImGui::Checkbox("Hide Left Hand", &ArmsModel::HideLeftHand());
+            ImGui::SetItemTooltip("Hide the whole screen-left arm, sleeve and shoulder.");
+            ImGui::SameLine();
+            ImGui::Checkbox("Hide Right Hand", &ArmsModel::HideRightHand());
+            ImGui::SetItemTooltip("Hide the whole screen-right arm, sleeve and shoulder.");
             // Mirrors the body so the rifle is held in the other hand. Re-solve
             // the alignment after toggling: the grip hand moves across.
             if (ImGui::Checkbox("Mirror", &ArmsModel::MirrorX()))
@@ -4195,7 +4200,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             if (ArmsModel::ArmsFitForWeapon(GunModel::SelectedWeapon()).overrides)
                 ImGui::TextColored(
                     ImVec4(0.55f, 0.80f, 1.0f, 1.0f),
-                    "Arms Offset + grip hand are per-weapon for %s; edits here\n"
+                    "Arms Offset + grip hand + hide toggles are per-weapon for %s; edits here\n"
                     "are lost on weapon switch unless ArmsFitForWeapon is updated.",
                     GunModel::SelectedWeaponName());
             // Yaw/pitch/roll in degrees, applied in the model's own space. This
