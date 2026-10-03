@@ -868,6 +868,7 @@ GunAudio                    g_banditSpottedAudio2;
 // dialogue slider moves it, and 2D: it is radio chatter, not a world sound.
 GunAudio                    g_readyToDropAudio;
 bool                        g_readyToDropPlayed = false;
+GunAudio                    g_briefingTypingAudio;
 // Background score for the front end: the main menu and the deployment planning
 // screen. Looped rather than one-shot so it covers however long the player
 // spends on either, and stopped the moment play begins.

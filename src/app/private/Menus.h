@@ -1221,37 +1221,153 @@ static void FormatDeploymentGrid(float x, float z, char* out, size_t size) {
 // attachments and the confirm button on the right. Buying and equipping stay
 // one action, as on the old storefront rows.
 
-// Weapon model per legacy weapon id, rendered through the prefab thumbnail
-// pipeline for the cards and the preview. Null where a weapon has no model of
-// its own; the card then shows its name alone.
-static uint64_t WeaponThumbnail(int weapon) {
-    static constexpr const char* kModels[MissionLoadout::kWeaponCount] = {
-        "Content/Models/ak47/AK47.FBX",
-        "Content/Models/MainPlayer/Guns/Shotgun/remington870.glb",
-        "Content/Models/RPG7/RPG72.fbx",
-        "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb",
-        nullptr,
-        nullptr,
-        nullptr,
-        "Content/Models/HarpoonGun/HarpoonGun.glb",
-        "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb",
-        "Content/Models/MainPlayer/Guns/m4/m4A1.glb",
-        "Content/Models/MainPlayer/Guns/Ak74/ak74.glb",
-        "Content/Models/MainPlayer/Guns/m9/M9.glb",
-        "Content/Models/MainPlayer/Guns/Kriss/KRISS+VECTOR.glb",
-        "Content/Models/MainPlayer/Guns/M1Grand/m1grand.glb",
-        nullptr,
-    };
-    if (weapon < 0 || weapon >= MissionLoadout::kWeaponCount || !kModels[weapon])
-        return 0;
-    static PrefabAsset assets[MissionLoadout::kWeaponCount];
-    PrefabAsset& asset = assets[weapon];
-    if (asset.id.empty()) {
-        asset.id = "loadout-weapon-" + std::to_string(weapon);
-        asset.modelPath = kModels[weapon];
-        asset.useMaterials = true;
+static std::shared_ptr<SceneMesh> WeaponPreviewModel(int weapon) {
+    switch (weapon) {
+    case 0: return GunModel::Mesh();
+    case 1: return GunModel::ShotgunMesh();
+    case 2: return GunModel::RPGMesh();
+    case 3: case 8: return GunModel::R700Mesh();
+    case 5: {
+        static std::shared_ptr<SceneNode> source;
+        static std::shared_ptr<SceneMesh> mesh;
+        static bool attempted = false;
+        static int readyFrame = 0;
+        // The base hub can skip world props; keep a private charge for its picker.
+        if (!g_c4Model && !attempted) {
+            attempted = true;
+            source = GLBImporter::LoadGLB("Content/Models/C4/C4_bomb/source/c4.glb",
+                g_dx12.device, g_dx12.commandList);
+        }
+        const auto model = g_c4Model ? g_c4Model : source;
+        if (!model) return nullptr;
+        if (!mesh || model != source) {
+            source = model;
+            const auto flattened = GLBImporter::MergeSceneByMaterial(model, g_dx12.device);
+            if (!flattened) return nullptr;
+            mesh = std::make_shared<SceneMesh>();
+            const auto collect = [&](const auto& self,
+                                     const std::shared_ptr<SceneNode>& node) -> void {
+                if (!node) return;
+                if (node->mesh)
+                    for (const auto& primitive : node->mesh->primitives) {
+                        mesh->primitives.push_back(primitive);
+                        // Match the gameplay charge's opaque moulded plastic.
+                        if (primitive.material) {
+                            auto m = std::make_shared<SceneMaterial>(*primitive.material);
+                            m->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+                            m->alphaBlend = m->alphaCutout = m->alphaFromLuminance = false;
+                            m->metallicFactor = 0.0f;
+                            m->roughnessFactor = 0.85f;
+                            m->roughnessOnlyTexture = false;
+                            mesh->primitives.back().material = std::move(m);
+                        }
+                    }
+                for (const auto& child : node->children) self(self, child);
+            };
+            collect(collect, flattened);
+            // The normal frame upload flush precedes UI rendering. Let it
+            // upload this new geometry before caching an immutable snapshot.
+            readyFrame = ImGui::GetFrameCount() + 1;
+        }
+        return ImGui::GetFrameCount() >= readyFrame ? mesh : nullptr;
     }
-    return PrefabThumbnailTexture(asset, /*sideView=*/true);
+    case 7: return GunModel::HarpoonGunMesh();
+    case 9: return GunModel::M4Mesh();
+    case 10: return GunModel::AK74Mesh();
+    case 11: return GunModel::M9Mesh();
+    case 12: return GunModel::KrissMesh();
+    case 13: return GunModel::GarandMesh();
+    default: return nullptr;
+    }
+}
+
+// Immutable snapshots share the inspector's materials and lighting. Each icon
+// is drawn once, then sampled by every loadout card without another model pass.
+static uint64_t WeaponThumbnail(int weapon) {
+    const auto model = WeaponPreviewModel(weapon);
+    if (!model) return 0;
+    struct Snapshot {
+        WeaponPreviewDX12 renderer;
+        uint64_t texture = 0;
+        Snapshot() { renderer.Width = 384; renderer.Height = 216; }
+    };
+    static std::unordered_map<const SceneMesh*, Snapshot> snapshots;
+    auto& snapshot = snapshots[model.get()];
+    if (!snapshot.texture) {
+        auto& geometry = g_weaponPreviewMeshes[model.get()];
+        if (geometry.Prepare(model)) {
+            ImVec2 uvMax;
+            // The M9 export's muzzle runs opposite the other normalised guns.
+            snapshot.texture = snapshot.renderer.Render(geometry, weapon == 11 ? XM_PI : 0.0f,
+                weapon == 5 ? 0.85f : 0.0f, 1.0f, ImVec2(384, 216), uvMax, true);
+        }
+    }
+    return snapshot.texture;
+}
+
+static void DrawWeaponPreview(int weapon, ImVec2 min, ImVec2 max) {
+    static int previousWeapon = -1, previousSlot = -1;
+    static float yaw = 0.18f, pitch = 0.12f, zoom = 1.0f;
+    if (previousWeapon != weapon || previousSlot != g_loadoutPickerSlot) {
+        previousWeapon = weapon;
+        previousSlot = g_loadoutPickerSlot;
+        yaw = 0.18f; pitch = weapon == 5 ? 0.85f : 0.12f; zoom = 1.0f;
+        // Capture the same model at distinct poses without driving the pointer.
+        char pose[96] = {};
+        float poseYaw, posePitch, poseZoom;
+        if (GetEnvironmentVariableA("SGE_WEAPON_PREVIEW_POSE", pose, sizeof(pose)) > 0 &&
+            sscanf_s(pose, "%f,%f,%f", &poseYaw, &posePitch, &poseZoom) == 3 &&
+            std::isfinite(poseYaw) && std::isfinite(posePitch) && std::isfinite(poseZoom)) {
+            yaw = std::remainder(poseYaw, XM_2PI);
+            pitch = (std::clamp)(posePitch, -1.35f, 1.35f);
+            zoom = (std::clamp)(poseZoom, 0.55f, 3.0f);
+        }
+    }
+    const ImVec2 size((std::max)(1.0f, max.x - min.x),
+                      (std::max)(1.0f, max.y - min.y));
+    ImGui::SetCursorScreenPos(min);
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##WeaponOrbit", size);
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+    const bool hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        const ImVec2 delta = ImGui::GetIO().MouseDelta;
+        yaw = std::remainder(yaw - delta.x * 0.01f, XM_2PI);
+        pitch = (std::clamp)(pitch + delta.y * 0.01f, -1.35f, 1.35f);
+    }
+    if (hovered) {
+        zoom = (std::clamp)(zoom * std::pow(0.88f, ImGui::GetIO().MouseWheel), 0.55f, 3.0f);
+    }
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(min, max, IM_COL32(33, 38, 46, 255));
+    const auto model = WeaponPreviewModel(weapon);
+    const char* status = "3D PREVIEW UNAVAILABLE";
+    if (model) {
+        auto& geometry = g_weaponPreviewMeshes[model.get()];
+        if (geometry.Prepare(model)) {
+            ImVec2 uvMax;
+            const uint64_t texture = g_weaponPreview.Render(geometry, yaw, pitch, zoom,
+                size, uvMax, false, weapon == 5 ? 0.85f : 0.12f);
+            if (texture) {
+                draw->AddImage((ImTextureID)(intptr_t)texture, min, max, ImVec2(0, 0), uvMax);
+                status = nullptr;
+            }
+        } else if (!geometry.failed) {
+            status = "LOADING 3D MODEL...";
+        }
+    }
+    if (status) {
+        const ImVec2 textSize = ImGui::CalcTextSize(status);
+        draw->AddText(ImVec2(min.x + (size.x - textSize.x) * 0.5f,
+                            min.y + (size.y - textSize.y) * 0.5f),
+                      IM_COL32(140, 152, 144, 230), status);
+    }
+    draw->AddText(ImVec2(min.x + 12.0f, max.y - ImGui::GetTextLineHeight() - 12.0f),
+                  IM_COL32(180, 192, 184, 230), "DRAG TO ROTATE  //  SCROLL TO ZOOM");
+    ImGui::SetCursorScreenPos(ImVec2((std::max)(min.x, max.x - 126.0f), min.y + 10.0f));
+    if (ImGui::Button("RESET VIEW", ImVec2(116.0f, 28.0f))) {
+        yaw = 0.18f; pitch = weapon == 5 ? 0.85f : 0.12f; zoom = 1.0f;
+    }
 }
 
 // Ammunition and role, for the card sub-lines and the preview header.
@@ -1275,29 +1391,20 @@ static const char* WeaponRole(int weapon) {
         ? kRoles[weapon] : "";
 }
 
-// Draws `texture` filling [min, max]. The thumbnails are square side views
-// with the weapon across the middle, so a wide target crops the empty top and
-// bottom rather than shrinking the gun into a square. A quiet placeholder
-// stands in while the image is still rendering.
+// Preserve the snapshot's aspect ratio so short weapons and C4 remain complete.
 static void DrawFittedThumbnail(ImDrawList* draw, uint64_t texture,
                                 ImVec2 min, ImVec2 max) {
-    const float side = (std::min)(max.x - min.x, max.y - min.y);
+    const float width = max.x - min.x, height = max.y - min.y;
+    draw->AddRectFilled(min, max, IM_COL32(33, 38, 46, 255));
     const ImVec2 centre((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
     if (texture) {
-        const float width = max.x - min.x;
-        const float height = max.y - min.y;
-        if (width >= height) {
-            // Full width, centre band of the image.
-            const float band = (std::max)(0.3f, height / (std::max)(1.0f, width));
-            draw->AddImage((ImTextureID)(intptr_t)texture, min, max,
-                           ImVec2(0.0f, 0.5f - band * 0.5f),
-                           ImVec2(1.0f, 0.5f + band * 0.5f));
-        } else {
-            draw->AddImage((ImTextureID)(intptr_t)texture,
-                           ImVec2(centre.x - side * 0.5f, centre.y - side * 0.5f),
-                           ImVec2(centre.x + side * 0.5f, centre.y + side * 0.5f));
-        }
+        const float fit = (std::min)(width / 384.0f, height / 216.0f);
+        const ImVec2 half(384.0f * fit * 0.5f, 216.0f * fit * 0.5f);
+        draw->AddImage((ImTextureID)(intptr_t)texture,
+            ImVec2(centre.x - half.x, centre.y - half.y),
+            ImVec2(centre.x + half.x, centre.y + half.y));
     } else {
+        const float side = (std::min)(width, height);
         draw->AddRect(ImVec2(centre.x - side * 0.5f, centre.y - side * 0.5f),
                       ImVec2(centre.x + side * 0.5f, centre.y + side * 0.5f),
                       IM_COL32(120, 132, 124, 50), 0.0f, 0, 1.0f);
@@ -1503,7 +1610,8 @@ static void RenderLoadoutPicker(const LoadoutPickerTarget& target, ImVec2 displa
     // ---- Preview -------------------------------------------------------------
     ImGui::SameLine(0.0f, 20.0f);
     const float centreWidth = ImGui::GetContentRegionAvail().x - rightWidth - 20.0f;
-    ImGui::BeginChild("##PickerPreview", ImVec2(centreWidth, height), true);
+    ImGui::BeginChild("##PickerPreview", ImVec2(centreWidth, height), true,
+        ImGuiWindowFlags_NoScrollWithMouse);
     {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -1523,9 +1631,8 @@ static void RenderLoadoutPicker(const LoadoutPickerTarget& target, ImVec2 displa
         const float imageTop = origin.y + lineHeight + 100.0f;
         const float imageBottom = origin.y + ImGui::GetContentRegionAvail().y * 0.62f;
         if (weaponSlot)
-            DrawFittedThumbnail(draw, WeaponThumbnail(focus->id),
-                                ImVec2(origin.x, imageTop),
-                                ImVec2(origin.x + width, imageBottom));
+            DrawWeaponPreview(focus->id, ImVec2(origin.x, imageTop),
+                              ImVec2(origin.x + width, imageBottom));
         ImGui::SetCursorScreenPos(ImVec2(origin.x, imageBottom + 18.0f));
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.24f, 1.0f), "OVERVIEW");
@@ -1579,13 +1686,25 @@ static void RenderLoadoutPicker(const LoadoutPickerTarget& target, ImVec2 displa
             }
             const SGE::ResolvedWeaponStats s = scene.player.weapons.Resolve(focus->id);
             const float rpm = 60.0f / (std::max)(0.01f, s.fireIntervalSeconds);
+            char values[6][32];
+            std::snprintf(values[0], sizeof(values[0]), "x%.2f", s.damageMultiplier);
+            std::snprintf(values[1], sizeof(values[1]), "%.0f", accuracyOf(s) / maxAccuracy * 100.0f);
+            std::snprintf(values[2], sizeof(values[2]), "%.0f", controlOf(s) / maxControl * 100.0f);
+            std::snprintf(values[3], sizeof(values[3]), "%.0f RPM", rpm);
+            std::snprintf(values[4], sizeof(values[4]), "%d", s.magazineCapacity);
+            std::snprintf(values[5], sizeof(values[5]), "%.1f s", s.reloadSeconds);
+            // Reserve the widest value for every row, including its units, so
+            // bars align and never extend underneath the numbers.
+            float valueWidth = 0.0f;
+            for (const auto& value : values)
+                valueWidth = (std::max)(valueWidth, ImGui::CalcTextSize(value).x);
             const auto bar = [&](const char* label, float fraction, const char* value) {
                 ImDrawList* draw = ImGui::GetWindowDrawList();
                 const ImVec2 at = ImGui::GetCursorScreenPos();
                 const float width = ImGui::GetContentRegionAvail().x;
-                draw->AddText(at, dimColor, label);
+                draw->AddText(at, IM_COL32(210, 218, 214, 255), label);
                 const float barLeft = at.x + 120.0f;
-                const float barRight = at.x + width - 70.0f;
+                const float barRight = (std::max)(barLeft, at.x + width - valueWidth - 16.0f);
                 const float barY = at.y + lineHeight * 0.5f;
                 draw->AddRectFilled(ImVec2(barLeft, barY - 3.0f),
                                     ImVec2(barRight, barY + 3.0f),
@@ -1594,24 +1713,18 @@ static void RenderLoadoutPicker(const LoadoutPickerTarget& target, ImVec2 displa
                     ImVec2(barLeft + (barRight - barLeft) *
                                (std::min)(1.0f, (std::max)(0.0f, fraction)),
                            barY + 3.0f),
-                    IM_COL32(140, 210, 240, 235));
+                    IM_COL32(245, 248, 245, 245));
                 const ImVec2 valueSize = ImGui::CalcTextSize(value);
-                draw->AddText(ImVec2(at.x + width - valueSize.x, at.y), textColor, value);
+                draw->AddText(ImVec2(at.x + width - valueSize.x, at.y),
+                              IM_COL32(250, 252, 250, 255), value);
                 ImGui::Dummy(ImVec2(width, lineHeight + 8.0f));
             };
-            char value[32];
-            std::snprintf(value, sizeof(value), "x%.2f", s.damageMultiplier);
-            bar("DAMAGE", s.damageMultiplier / maxDamage, value);
-            std::snprintf(value, sizeof(value), "%.0f", accuracyOf(s) / maxAccuracy * 100.0f);
-            bar("ACCURACY", accuracyOf(s) / maxAccuracy, value);
-            std::snprintf(value, sizeof(value), "%.0f", controlOf(s) / maxControl * 100.0f);
-            bar("CONTROL", controlOf(s) / maxControl, value);
-            std::snprintf(value, sizeof(value), "%.0f RPM", rpm);
-            bar("FIRE RATE", rpm / maxRate, value);
-            std::snprintf(value, sizeof(value), "%d", s.magazineCapacity);
-            bar("MAGAZINE", s.magazineCapacity / maxMagazine, value);
-            std::snprintf(value, sizeof(value), "%.1f s", s.reloadSeconds);
-            bar("HANDLING", (1.0f / (std::max)(0.2f, s.reloadSeconds)) / maxHandling, value);
+            bar("DAMAGE", s.damageMultiplier / maxDamage, values[0]);
+            bar("ACCURACY", accuracyOf(s) / maxAccuracy, values[1]);
+            bar("CONTROL", controlOf(s) / maxControl, values[2]);
+            bar("FIRE RATE", rpm / maxRate, values[3]);
+            bar("MAGAZINE", s.magazineCapacity / maxMagazine, values[4]);
+            bar("HANDLING", (1.0f / (std::max)(0.2f, s.reloadSeconds)) / maxHandling, values[5]);
 
             // Rail attachments for the previewed weapon. Bought once per part
             // and fitted per weapon, exactly as the old rail-systems rows.
@@ -1881,22 +1994,65 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         g_menuMusicRestartRequested = true;
     }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
+    // Keep capture timing alive when the picker replaces the planning screen.
+    static UICaptureHook captureHook;
+    RunUICaptureHook(captureHook, "SGE_UI_CAPTURE_PATH");
+    if (g_loadoutPickerSlot >= 0) {
+        g_briefingTypingAudio.StopLoop();
+        // Host orders still reach a client inspecting its loadout.
+        if (g_squadDeployRequested && g_selectedDeploymentZone >= 0) {
+            g_squadDeployRequested = false;
+            CommitDeployment(hwnd, g_replayPlanActive);
+            return;
+        }
+        auto& loadout = g_game.mission.Loadout();
+        LoadoutPickerTarget target;
+        target.weapons[0] = loadout.weapons[0];
+        target.weapons[1] = loadout.weapons[1];
+        target.mission = &loadout;
+        target.top = 24.0f;
+        target.equipWeapon = [&loadout](int slot, int weapon, bool) {
+            loadout.SelectWeapon(static_cast<size_t>(slot), weapon);
+        };
+        RenderLoadoutPicker(target, display);
+        return;
+    }
     // Unplated columns and fading scrims carry the main menu's identity over
     // the live map while keeping the briefing readable as the island rotates.
+    const uint32_t standingTowers = CountStandingCommTowers();
+    const uint32_t objectivePlanes = CountObjectivePlanes();
+    const bool showMissionBriefing = !g_deploymentBriefingUnderstood &&
+        (standingTowers > 0 || objectivePlanes > 0);
+    ImGui::SetNextWindowPos(ImVec2(display.x - 24.0f, 110.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("##DeploymentArmoryToggle", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBackground);
+    if (ImGui::Button(g_deploymentArmoryVisible ? "HIDE ARMORY >" : "< SHOW ARMORY",
+                      ImVec2(160.0f, 30.0f)))
+        g_deploymentArmoryVisible = !g_deploymentArmoryVisible;
+    ImGui::End();
+    ImGui::PopStyleVar();
     ImDrawList* backdrop = ImGui::GetBackgroundDrawList();
     const float scrimWidth = (std::min)(display.x * 0.48f, 680.0f);
     const float solidWidth = (std::min)(display.x * 0.32f, 454.0f);
-    backdrop->AddRectFilled(ImVec2(0, 0), ImVec2(solidWidth, display.y),
-        IM_COL32(5, 10, 12, 70));
-    backdrop->AddRectFilled(ImVec2(display.x - solidWidth, 0), display,
-        IM_COL32(5, 10, 12, 70));
-    backdrop->AddRectFilledMultiColor(ImVec2(solidWidth, 0), ImVec2(scrimWidth, display.y),
-        IM_COL32(5, 10, 12, 70), IM_COL32(5, 10, 12, 0),
-        IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 70));
-    backdrop->AddRectFilledMultiColor(ImVec2(display.x - scrimWidth, 0),
-        ImVec2(display.x - solidWidth, display.y),
-        IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 70),
-        IM_COL32(5, 10, 12, 70), IM_COL32(5, 10, 12, 0));
+    if (showMissionBriefing) {
+        backdrop->AddRectFilled(ImVec2(0, 0), ImVec2(solidWidth, display.y),
+            IM_COL32(5, 10, 12, 70));
+        backdrop->AddRectFilledMultiColor(ImVec2(solidWidth, 0), ImVec2(scrimWidth, display.y),
+            IM_COL32(5, 10, 12, 70), IM_COL32(5, 10, 12, 0),
+            IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 70));
+    }
+    if (g_deploymentArmoryVisible) {
+        backdrop->AddRectFilled(ImVec2(display.x - solidWidth, 0), display,
+            IM_COL32(5, 10, 12, 70));
+        backdrop->AddRectFilledMultiColor(ImVec2(display.x - scrimWidth, 0),
+            ImVec2(display.x - solidWidth, display.y),
+            IM_COL32(5, 10, 12, 0), IM_COL32(5, 10, 12, 70),
+            IM_COL32(5, 10, 12, 70), IM_COL32(5, 10, 12, 0));
+    }
     backdrop->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(display.x, 100),
         IM_COL32(0, 0, 0, 190), IM_COL32(0, 0, 0, 190),
         IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
@@ -1914,9 +2070,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
 
     const XMMATRIX viewProjection =
         scene.GetViewMatrix() * scene.GetProjectionMatrix();
-    // Map symbols go under the loadout picker while it is open, not over it.
-    ImDrawList* foreground = g_loadoutPickerSlot >= 0
-        ? backdrop : ImGui::GetForegroundDrawList();
+    ImDrawList* foreground = ImGui::GetForegroundDrawList();
     const ImVec2 mouse = ImGui::GetMousePos();
     const auto projectToScreen = [&](const XMFLOAT3& world, ImVec2& screen) {
         const XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&world),
@@ -1927,8 +2081,6 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                    (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
         return true;
     };
-    const uint32_t standingTowers = CountStandingCommTowers();
-    const uint32_t objectivePlanes = CountObjectivePlanes();
     const char* operationName = standingTowers > 0 ? "OPERATION BLACKOUT"
         : objectivePlanes > 0 ? "OPERATION GROUNDSWELL" : "OPERATION ORDER";
 
@@ -1937,8 +2089,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // a frame, a north arrow and a scale bar. Background list, so the markers
     // and every panel sit above it; clipped to the open map between the
     // side columns.
-    const ImVec2 mapMin(solidWidth + 20.0f, 108.0f);
-    const ImVec2 mapMax(display.x - solidWidth - 20.0f, display.y - 44.0f);
+    const ImVec2 mapMin(showMissionBriefing ? solidWidth + 20.0f : 18.0f, 108.0f);
+    const ImVec2 mapMax(g_deploymentArmoryVisible
+        ? display.x - solidWidth - 20.0f : display.x - 18.0f, display.y - 44.0f);
     const ImU32 furniture = IM_COL32(210, 222, 214, 150);
     {
         const TerrainRendererDX12::Params gridTerrain = CurrentTerrainParams();
@@ -2898,17 +3051,18 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             hint("CTRL+SHIFT+D", "HIDE DEV TOOLS");
         // Framed plates behind the two columns, so the briefing and the plan
         // read as instrument panels either side of the map.
-        const auto plate = [&](float left, float right) {
-            const ImVec2 min(left, 104.0f);
+        const auto plate = [&](float left, float right, float top = 104.0f) {
+            const ImVec2 min(left, top);
             const ImVec2 max(right, display.y - 40.0f);
             backdrop->AddRectFilled(min, max, IM_COL32(8, 13, 16, 150));
             backdrop->AddRect(min, max, IM_COL32(120, 132, 124, 120), 0.0f, 0, 1.0f);
             backdrop->AddRectFilled(min, ImVec2(right, min.y + 3.0f),
                                     IM_COL32(120, 132, 124, 160));
         };
-        if (standingTowers > 0 || objectivePlanes > 0)
+        if (showMissionBriefing)
             plate(18.0f, 460.0f);
-        plate(display.x - 460.0f, display.x - 18.0f);
+        if (g_deploymentArmoryVisible)
+            plate(display.x - 460.0f, display.x - 18.0f, 146.0f);
         if (MultiplayerActive()) {
             const char* link = "SQUAD COMMS  CONNECTED";
             backdrop->AddText(
@@ -3033,58 +3187,79 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             IM_COL32(220, 232, 224, 240), elevationLine);
     }
 
-    // Mission briefing. Left-hand side, where the zone markers already refuse to
-    // take clicks past display.x - 430, so it never fights the planning panel.
+    // Acknowledging the briefing frees the left side for map interaction.
     // Drawn only when the level actually carries an objective: on a map with
     // neither a mast nor an aircraft there is nothing to brief, and a hardcoded
     // dossier would be a lie. Each objective the map authors writes its own
     // dossier, so the airfield does not inherit the relay operation's copy.
-    if (standingTowers > 0 || objectivePlanes > 0) {
+    if (showMissionBriefing) {
+        // Start on the first visible frame, after the loading screen releases it.
+        if (g_deploymentBriefingStartTime < 0.0)
+            g_deploymentBriefingStartTime = ImGui::GetTime();
+        const double elapsed = ImGui::GetTime() - g_deploymentBriefingStartTime;
+        int lettersRemaining = static_cast<int>((std::min)(elapsed * 36.0, 100000.0));
+        bool briefingTyping = false;
+        const auto briefingText = [&](const char* text) {
+            const int length = static_cast<int>(std::strlen(text));
+            const int visible = (std::min)(lettersRemaining, length);
+            briefingTyping |= visible < length;
+            lettersRemaining -= visible;
+            if (visible > 0)
+                ImGui::TextWrapped("%.*s", visible, text);
+        };
         ImGui::SetNextWindowPos(ImVec2(24.0f, 110.0f),
                                 ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(430.0f, (std::max)(180.0f, display.y - 146.0f)), ImGuiCond_Always);
         ImGui::Begin("Mission Briefing", nullptr, ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
+        // Reference reading, not a decision: the column is kept quiet so the
+        // armory on the other side carries the screen. Dim section labels,
+        // softened body copy, no amber -- amber marks the objective on the top
+        // bar and the map, and repeating it here diluted that.
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        ImGui::TextColored(ImVec4(0.45f, 0.52f, 0.48f, 1.0f),
-                           "CLASSIFIED // EYES ONLY");
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextColored(UITheme::kText, "MISSION BRIEFING");
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0.0f, 4.0f));
-        // Operation-order paragraphs, numbered per dossier, with an amber
-        // heading the way the reference ops displays mark their sections.
+        ImGui::TextColored(UITheme::kTextDim, "MISSION BRIEFING");
+        ImGui::Dummy(ImVec2(0.0f, 10.0f));
+        // Keep acknowledgement reachable even when the dossier needs scrolling.
+        const float understoodHeight = 38.0f;
+        ImGui::BeginChild("MissionBriefingScroll",
+            ImVec2(0.0f, -(understoodHeight + ImGui::GetStyle().ItemSpacing.y)),
+            false, ImGuiWindowFlags_NoBackground);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.74f, 0.71f, 1.0f));
         int paragraph = 0;
         const auto heading = [&](const char* text) {
-            ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.24f, 1.0f), "%d. %s",
-                               ++paragraph, text);
+            if (lettersRemaining <= 0) return;
+            if (paragraph++ > 0) ImGui::Dummy(ImVec2(0.0f, 10.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, UITheme::kTextDim);
+            briefingText(text);
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0.0f, 1.0f));
         };
         if (standingTowers > 0) {
             heading("SITUATION");
-            ImGui::TextWrapped(
+            briefingText(
                 "The garrison on this island is not fighting alone. A hardened relay "
                 "mast on the ridge ties their patrols to the mainland battery. "
                 "Every movement we make is called in the moment it is seen, and the "
                 "guns answer within the minute.");
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
-            heading("MISSION");
-            if (standingTowers == 1) {
-                ImGui::TextWrapped("Destroy the communications tower.");
-            } else {
-                ImGui::TextWrapped("Destroy all %u communications towers.",
-                                   standingTowers);
+            // The top bar already states a single-mast objective; only a count
+            // it cannot show earns a paragraph here.
+            if (standingTowers > 1) {
+                heading("MISSION");
+                char mission[96];
+                std::snprintf(mission, sizeof(mission),
+                    "Destroy all %u communications towers.", standingTowers);
+                briefingText(mission);
             }
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
             heading("EXECUTION");
-            ImGui::TextWrapped(
+            briefingText(
                 "The lattice shrugs off small arms. Plant remote C4 on the mast and "
                 "clear the base before you trigger it. Nothing lighter will bring "
                 "the structure down.");
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
             heading("EXFILTRATION");
-            ImGui::TextWrapped(
+            briefingText(
                 "Hold the island once the mast is down. Without the relay the "
                 "battery is firing blind.");
         }
@@ -3093,30 +3268,28 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // aircraft starts its roll, so the briefing and the simulation cannot
         // disagree about how long the player has.
         if (objectivePlanes > 0) {
-            paragraph = 0;
-            if (standingTowers > 0) {
-                ImGui::Dummy(ImVec2(0.0f, 8.0f));
+            if (standingTowers > 0 && lettersRemaining > 0) {
+                ImGui::Dummy(ImVec2(0.0f, 10.0f));
                 ImGui::Separator();
-                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                paragraph = 0;
             }
             heading("SITUATION");
-            ImGui::TextWrapped(
+            briefingText(
                 "The strip on the north side of this island is not a civilian "
                 "field. A transport is standing on the apron with its ground "
                 "crew around it, loaded and fuelled, and the garrison is "
                 "holding the perimeter until it is away. Whatever is in the "
                 "hold leaves the theatre the moment those wheels come up.");
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
-            heading("MISSION");
-            if (objectivePlanes == 1) {
-                ImGui::TextWrapped("Destroy the transport aircraft on the ground.");
-            } else {
-                ImGui::TextWrapped("Destroy all %u transport aircraft on the ground.",
-                                   objectivePlanes);
+            if (objectivePlanes > 1) {
+                heading("MISSION");
+                char mission[96];
+                std::snprintf(mission, sizeof(mission),
+                    "Destroy all %u transport aircraft on the ground.", objectivePlanes);
+                briefingText(mission);
             }
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
             heading("TIME ON TARGET");
-            ImGui::TextWrapped(
+            char deadline[512];
+            std::snprintf(deadline, sizeof(deadline),
                 "The aircraft begins its takeoff roll %d seconds after you are "
                 "on the ground, and it is clear of the map about %d seconds "
                 "after that. It can still be brought down in the air, but the "
@@ -3124,30 +3297,29 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 "clock is the objective as much as the airframe is.",
                 static_cast<int>(kObjectivePlaneHoldSeconds),
                 static_cast<int>(kObjectivePlaneTakeoffSeconds));
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            briefingText(deadline);
             heading("EXECUTION");
-            ImGui::TextWrapped(
+            briefingText(
                 "The airframe is thin-skinned but large: rifle fire will not "
                 "put it down in the time you have. Bring the RPG and shoot it "
                 "on the apron, or stick remote C4 to the fuselage and clear the "
                 "blast before you trigger it. The fuel silo and the barrels on "
                 "the car park will do the rest of the work if the aircraft is "
                 "close enough to them.");
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
             heading("ENEMY FORCES");
-            ImGui::TextWrapped(
+            briefingText(
                 "Emplaced turret over the approach, a watch tower on the "
                 "perimeter and vehicle patrols working the apron roads. Expect "
                 "the field to come alive the moment the first shot is heard, "
                 "and expect the crew to try to get the aircraft moving early.");
-            ImGui::Dummy(ImVec2(0.0f, 6.0f));
             heading("EXFILTRATION");
-            ImGui::TextWrapped(
+            briefingText(
                 "Break contact once the wreck is burning. There is nothing on "
                 "this field worth holding after the transport is down.");
         }
+        ImGui::PopStyleColor();
         // Enemy force estimate, counted from what is actually on the map.
-        {
+        if (lettersRemaining > 0) {
             uint32_t infantry = 0;
             for (const auto& bandit : g_bandits)
                 if (bandit && !bandit->Dead() &&
@@ -3160,58 +3332,70 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             uint32_t airDefence = 0;
             for (const auto& turret : g_game.vehicles.aaTurrets)
                 if (turret.Active()) ++airDefence;
-            ImGui::Dummy(ImVec2(0.0f, 8.0f));
-            ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.24f, 1.0f),
-                               "ENEMY FORCE ESTIMATE");
-            ImGui::Separator();
-            const auto estimate = [](const char* label, uint32_t count) {
-                ImGui::BeginGroup();
-                ImGui::TextColored(UITheme::kText, "%u", count);
-                ImGui::TextColored(UITheme::kTextDim, "%s", label);
-                ImGui::EndGroup();
+            ImGui::Dummy(ImVec2(0.0f, 18.0f));
+            ImGui::TextColored(UITheme::kTextDim, "ENEMY FORCE ESTIMATE");
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            // Three equal columns, figure over label. The figures are the one
+            // thing on this side worth a glance mid-plan, so they get the
+            // display face; everything else stays body size.
+            ImFont* figureFont = g_menuTitleFont ? g_menuTitleFont : ImGui::GetFont();
+            constexpr float kFigureSize = 26.0f;
+            const float columnWidth = ImGui::GetContentRegionAvail().x / 3.0f;
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            const float figureHeight =
+                figureFont->CalcTextSizeA(kFigureSize, FLT_MAX, 0.0f, "0").y;
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            const auto estimate = [&](int column, const char* label, uint32_t count) {
+                char figure[16];
+                std::snprintf(figure, sizeof(figure), "%u", count);
+                const float x = origin.x + columnWidth * column;
+                draw->AddText(figureFont, kFigureSize, ImVec2(x, origin.y),
+                              ImGui::GetColorU32(UITheme::kText), figure);
+                draw->AddText(ImVec2(x, origin.y + figureHeight + 2.0f),
+                              ImGui::GetColorU32(UITheme::kTextDim), label);
             };
-            estimate("INFANTRY", infantry);
-            ImGui::SameLine(0.0f, 48.0f);
-            estimate("VEHICLES", vehicles);
-            ImGui::SameLine(0.0f, 48.0f);
-            estimate("AIR DEFENCE", airDefence);
+            estimate(0, "INFANTRY", infantry);
+            estimate(1, "VEHICLES", vehicles);
+            estimate(2, "AIR DEFENCE", airDefence);
+            ImGui::Dummy(ImVec2(columnWidth * 3.0f,
+                                figureHeight + ImGui::GetTextLineHeight() + 4.0f));
         }
-        ImGui::Dummy(ImVec2(0.0f, 8.0f));
-        ImGui::Separator();
-        ImGui::TextColored(UITheme::kTextDim,
-                           "PRIORITY  %d / 100 OF MISSION GRADE",
-                           MissionSystem::kPrimaryObjectiveScore);
-        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::EndChild();
+        g_briefingTypingAudio.SetLoop(briefingTyping, 0.8f);
+        if (ImGui::Button("UNDERSTOOD",
+                ImVec2(ImGui::GetContentRegionAvail().x, understoodHeight))) {
+            g_deploymentBriefingUnderstood = true;
+            g_briefingTypingAudio.StopLoop();
+        }
         ImGui::End();
+    } else {
+        g_briefingTypingAudio.StopLoop();
     }
 
-    ImGui::SetNextWindowPos(ImVec2(display.x - 24.0f, 110.0f),
+    MissionLoadout& loadout = g_game.mission.Loadout();
+    bool deployPressed = false;
+    const auto renderArmory = [&] {
+    ImGui::SetNextWindowPos(ImVec2(display.x - 24.0f, 152.0f),
                             ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    const float panelHeight = (std::max)(180.0f, display.y - 146.0f);
+    const float panelHeight = (std::max)(180.0f, display.y - 188.0f);
     ImGui::SetNextWindowSize(ImVec2(430.0f, panelHeight), ImGuiCond_Always);
     ImGui::Begin("Deployment Planning", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
+    // Hierarchy on this column: the armory first, DEPLOY second, everything
+    // else quiet. The chosen LZ is already on the top bar and on the DEPLOY
+    // button, so the header only speaks up when no zone is picked yet.
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    ImGui::TextColored(UITheme::kTextDim, "MISSION PREPARATION // 01");
-    ImGui::TextColored(UITheme::kText, "DEPLOYMENT PLAN");
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
-    if (g_selectedDeploymentZone >= 0 &&
-        g_selectedDeploymentZone < static_cast<int>(g_deploymentZones.size())) {
-        const XMFLOAT3& zone = g_deploymentZones[
-            static_cast<size_t>(g_selectedDeploymentZone)];
-        char grid[24];
-        FormatDeploymentGrid(zone.x, zone.z, grid, sizeof(grid));
-        ImGui::TextColored(ImVec4(0.35f, 0.67f, 1.0f, 1.0f), "LZ %02d",
-                           g_selectedDeploymentZone + 1);
-        ImGui::SameLine(0.0f, 14.0f);
-        ImGui::TextColored(UITheme::kTextDim, "GRID %s", grid);
-    } else {
-        ImGui::TextColored(UITheme::kWarning,
-                           "SELECT A LANDING ZONE ON THE MAP");
+    ImGui::TextColored(UITheme::kTextDim, "MISSION PREPARATION");
+    if (g_selectedDeploymentZone < 0 ||
+        g_selectedDeploymentZone >= static_cast<int>(g_deploymentZones.size())) {
+        ImGui::SameLine();
+        const char* prompt = "SELECT A LANDING ZONE";
+        ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x -
+                             ImGui::CalcTextSize(prompt).x);
+        ImGui::TextColored(UITheme::kWarning, "%s", prompt);
     }
-    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
 
     // DEPLOY stays pinned to the foot of the panel, the way an ops screen keeps
     // its commit action in one place; everything above it scrolls in a child.
@@ -3367,7 +3551,6 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "Pink: actual terrain grid edge");
     };
 
-    MissionLoadout& loadout = g_game.mission.Loadout();
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
         "AK47", "Remington 870", "RPG-7", "R700 Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
@@ -3944,7 +4127,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // exactly what pressing it does.
     const float deployWidth = ImGui::GetContentRegionAvail().x;
     const ImVec2 deployOrigin = ImGui::GetCursorScreenPos();
-    bool deployPressed =
+    deployPressed =
         ImGui::Button("##Deploy", ImVec2(deployWidth, 64.0f)) || autoDeploy;
     {
         ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -3995,17 +4178,18 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             deployPressed = true;
         }
     }
-    // A client the host ordered in. Its insertion was set up when the order
-    // arrived (ApplySquadDeployOrder); this is the press.
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+    ImGui::EndDisabled();
+    ImGui::End();
+    };
+    if (g_deploymentArmoryVisible) renderArmory();
+    // Squad orders must still reach clients while their armory is hidden.
     if (g_squadDeployRequested && g_selectedDeploymentZone >= 0) {
         g_squadDeployRequested = false;
         deployPressed = true;
     }
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
     if (deployPressed) CommitDeployment(hwnd, g_replayPlanActive);
-    ImGui::EndDisabled();
-    ImGui::End();
 
     // Test hook: SGE_AUTO_LOADOUT_PICKER=<slot> (0 primary, 1 secondary,
     // 2 ordnance, 3 gear) opens that picker once after two seconds, so it can
@@ -4022,26 +4206,12 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         if (autoPicker >= 0 && ImGui::GetTime() - autoPickerStart > 2.0) {
             g_loadoutPickerSlot = autoPicker;
             g_loadoutPickerFocus = -1;
+            char weapon[8] = {};
+            if (GetEnvironmentVariableA("SGE_AUTO_LOADOUT_WEAPON", weapon, sizeof(weapon)) > 0)
+                g_loadoutPickerFocus = std::atoi(weapon);
             autoPicker = -1;
         }
     }
-    // Last, so it sits over both columns and the map.
-    {
-        LoadoutPickerTarget target;
-        target.weapons[0] = loadout.weapons[0];
-        target.weapons[1] = loadout.weapons[1];
-        target.mission = &loadout;
-        target.equipWeapon = [&loadout](int slot, int weapon, bool) {
-            loadout.SelectWeapon(static_cast<size_t>(slot), weapon);
-        };
-        RenderLoadoutPicker(target, display);
-    }
-
-    // Test hook: SGE_UI_CAPTURE_PATH=<file.ppm> writes the presented frame,
-    // UI included, four seconds after this screen opens, then quits. Lets the
-    // layout be checked from the engine's own output.
-    static UICaptureHook captureHook;
-    RunUICaptureHook(captureHook, "SGE_UI_CAPTURE_PATH");
 }
 
 // The extraction report, laid out as a campaign debrief: the result as the

@@ -130,6 +130,7 @@ using namespace DirectX;
 #include "private/LoadingState.h"
 #include "private/ScopeView.h"
 #include "private/PrefabThumbnails.h"
+#include "private/WeaponPreview.h"
 #include "private/Vegetation.h"
 #include "private/PrefabAssets.h"
 #include "private/SceneModels.h"
@@ -418,6 +419,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                      AudioBus::Voices);
     g_readyToDropAudio.Initialize(
         "Content/Audio/Voicelines/Commander/ReadyToDrop.mp3", AudioBus::Voices);
+    g_briefingTypingAudio.Initialize(
+        "Content/Audio/texttyper/kave_msri-typewriter-sound-effect-312919.wav",
+        AudioBus::UI);
     g_menuMusicAudio.Initialize("Content/Audio/Music/testbackground.wav",
                                 AudioBus::Music);
     g_exfilHereAudio.Initialize(
@@ -1230,6 +1234,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // not a gameplay screen, so anything inside that branch never ticks
         // there and the music would only ever start once a level was running.
         g_menuMusicAudio.Update();
+        // Screen changes can bypass the briefing draw that normally stops this.
+        if (!DeploymentPlanningVisible() || !IsSceneScreen() ||
+            g_game.loading.Active() || g_deploymentBriefingUnderstood)
+            g_briefingTypingAudio.StopLoop();
         // Outside the gameplay gate below: the win screen is not a gameplay
         // screen, so a voice started there would never be reclaimed.
         g_greatJobAudio.Update();
@@ -8479,6 +8487,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_plantC4TowerAudio.Shutdown();
     g_menuMusicAudio.Shutdown();
     g_readyToDropAudio.Shutdown();
+    g_briefingTypingAudio.Shutdown();
     g_banditSpottedAudio2.Shutdown();
     g_banditSpottedAudio1.Shutdown();
     g_metalHitAudio.Shutdown();

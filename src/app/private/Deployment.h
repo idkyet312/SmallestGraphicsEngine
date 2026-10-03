@@ -452,6 +452,9 @@ static bool g_deploymentDebugHideUI = false;
 // sections, the per-weapon camera shake slider and the layout seeds. Hidden
 // from players; Ctrl+Shift+D on the planning screen toggles them.
 static bool g_deploymentDevTools = false;
+static bool g_deploymentArmoryVisible = true;
+static bool g_deploymentBriefingUnderstood = false;
+static double g_deploymentBriefingStartTime = -1.0;
 // Loadout picker on the planning screen: which slot's full-screen chooser is
 // open (-1 none, 0 primary, 1 secondary, 2 ordnance, 3 gear) and which choice
 // in it is being previewed (-1 until the player picks one).
@@ -466,6 +469,7 @@ static int g_loadoutPickerFocus = -1;
 static bool g_deploymentDebugShowGrass = false;
 
 static void CancelDeploymentPlanning() {
+    g_briefingTypingAudio.StopLoop();
     g_deploymentRestartPending = net::RestartPlanMode::None;
     g_replayPlanActive = false;
     g_insertionChoicePending = false;
@@ -944,7 +948,11 @@ void ApplyLiveWeatherState(WeatherState state);
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 
 static void BeginDeploymentPlanning() {
+    g_briefingTypingAudio.StopLoop();
     g_replayPlanActive = false;
+    g_deploymentArmoryVisible = true;
+    g_deploymentBriefingUnderstood = false;
+    g_deploymentBriefingStartTime = -1.0;
     // Keep the planning state prepared while the level finishes loading, but
     // let the main loop publish it only after the scene rebuilds are complete.
     g_deploymentPlanningVisible = false;
