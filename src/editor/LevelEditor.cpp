@@ -2024,7 +2024,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Volumetric fog in the editor viewport.\n"
-            "A view setting only -- it is not saved with the level and does\n"
+            "A view setting only; it is not saved with the level and does\n"
             "not change the authored weather. Turn it off to see far props\n"
             "through a dense preset.");
     ImGui::SameLine();
@@ -2043,7 +2043,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             "Walkable navmesh overlay: where enemies can path.\n"
             "Props punch holes in it, so this is how to check that a\n"
             "container or barrack actually blocks the route you think.\n"
-            "Shows the mesh as of the last Save, Play or Rebuild -- ordinary\n"
+            "Shows the mesh as of the last Save, Play or Rebuild; ordinary\n"
             "edits are preview-only and do not rebuild it.\n"
             "A view setting only; it is not saved with the level.");
     if (navmeshEnabled_) {
@@ -2080,7 +2080,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ? "Discard unsaved changes and start a flat level?"
             : "Start an empty flat level?");
         ImGui::TextDisabled(
-            "Level plane at ground height. No island, coast, pool or props --\n"
+            "Level plane at ground height. No island, coast, pool or props.\n"
             "just a player spawn to sculpt around.");
         if (ImGui::Button("Create")) {
             NewFlat();
@@ -2774,6 +2774,39 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                               "deployment/drop-off point.");
     }
     {
+        char preview[48] = {};
+        if (level_.defaultInsertionPoint == 0)
+            std::snprintf(preview, sizeof(preview), "None (player chooses)");
+        else
+            std::snprintf(preview, sizeof(preview), "Point %02d",
+                          level_.defaultInsertionPoint);
+        ImGui::TextUnformatted("Default insertion point");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##DefaultInsertionPoint", preview)) {
+            showInsertionRadiusPreview = true;
+            for (int point = 0; point <= kDeploymentZoneCount; ++point) {
+                char label[48] = {};
+                if (point == 0)
+                    std::snprintf(label, sizeof(label), "None (player chooses)");
+                else
+                    std::snprintf(label, sizeof(label), "Point %02d", point);
+                const bool selected = level_.defaultInsertionPoint == point;
+                if (ImGui::Selectable(label, selected) && !selected) {
+                    const LevelDefinition before = level_;
+                    level_.defaultInsertionPoint = point;
+                    MarkChanged(before);
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Preselect and highlight this point when deployment "
+                              "planning opens. The player can choose another point.");
+        ImGui::Checkbox("Preview insertion points", &showInsertionPoints_);
+        showInsertionRadiusPreview = showInsertionRadiusPreview || showInsertionPoints_;
+    }
+    {
         const LevelDefinition boatBefore = level_;
         const bool boatChanged = ImGui::Checkbox(
             "Patrol boat", &level_.patrolBoatEnabled);
@@ -3124,7 +3157,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGui::SetTooltip(
                 "Where the border feather starts, as a fraction of the stamp's\n"
                 "half-width. 0.82 feathers the outer 18%%. Lower it when a\n"
-                "stamp cuts a straight line into the terrain -- the relief then\n"
+                "stamp cuts a straight line into the terrain. The relief then\n"
                 "has more ground to fall off over. 1.00 is a hard square edge.");
 
         // Additive vs replace. Two presets plus the raw slider: full replace and
@@ -3243,7 +3276,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             MarkChanged(before);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Replace the procedural island with a level "
-                              "plane.\nNo relief, pool or coastline -- sculpt "
+                              "plane.\nNo relief, pool or coastline. Sculpt "
                               "stamps only.");
     }
     // Island size = the land radius. The tile grid auto-grows to fit it (see
@@ -3587,7 +3620,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         bool visible[ringSegments + 1] = {};
         const auto projectInsertionPoint = [&](float x, float z,
                                                ImVec2& screen) {
-            const float y = terrainHeight(x, z) + 0.15f;
+            const float y = (std::max)(0.0f, terrainHeight(x, z)) + 0.15f;
             const XMVECTOR clip = XMVector3Transform(
                 XMVectorSet(x, y, z, 1.0f), viewProjection);
             const float w = XMVectorGetW(clip);
@@ -3614,16 +3647,28 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
 
         ImVec2 labelPoint{};
         bool haveLabelPoint = false;
-        constexpr int deploymentZoneCount = 20;
-        for (int i = 0; i < deploymentZoneCount; ++i) {
+        for (int i = 0; i < kDeploymentZoneCount; ++i) {
             const float angle = XM_2PI * static_cast<float>(i) /
-                                static_cast<float>(deploymentZoneCount);
+                                static_cast<float>(kDeploymentZoneCount);
             ImVec2 point;
             if (!projectInsertionPoint(
                     std::sin(angle) * level_.deploymentRadius,
                     std::cos(angle) * level_.deploymentRadius, point))
                 continue;
-            draw->AddCircleFilled(point, 4.5f, IM_COL32(255, 205, 70, 245));
+            const bool isDefault = level_.defaultInsertionPoint == i + 1;
+            const ImU32 pointColour = isDefault
+                ? IM_COL32(90, 170, 255, 255) : IM_COL32(255, 205, 70, 245);
+            draw->AddCircleFilled(point, isDefault ? 7.0f : 4.5f, pointColour);
+            if (isDefault) draw->AddCircle(point, 11.0f, pointColour, 24, 2.0f);
+            char pointLabel[32] = {};
+            std::snprintf(pointLabel, sizeof(pointLabel),
+                          isDefault ? "%02d DEFAULT" : "%02d", i + 1);
+            const ImVec2 textPoint(point.x + 13.0f, point.y + 5.0f);
+            const ImVec2 textSize = ImGui::CalcTextSize(pointLabel);
+            draw->AddRectFilled(ImVec2(textPoint.x - 2.0f, textPoint.y - 2.0f),
+                ImVec2(textPoint.x + textSize.x + 2.0f,
+                       textPoint.y + textSize.y + 2.0f), IM_COL32(10, 20, 30, 210));
+            draw->AddText(textPoint, pointColour, pointLabel);
             if (!haveLabelPoint) {
                 labelPoint = point;
                 haveLabelPoint = true;

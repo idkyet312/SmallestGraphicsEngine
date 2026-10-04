@@ -899,7 +899,7 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
     // The pause screen's warning, carried over: multiplayer does not stop for
     // this page either, and a player tweaking audio needs to know that.
     if (&openFlag == &g_showPauseSettings && MultiplayerActive()) {
-        const char* warning = "MULTIPLAYER  -  GAME STILL LIVE";
+        const char* warning = "MULTIPLAYER: GAME STILL LIVE";
         const ImVec2 size = ImGui::CalcTextSize(warning);
         draw->AddText(ImVec2(right - size.x,
                              top + (titleHeight - size.y) * 0.5f),

@@ -545,7 +545,7 @@ static bool ToggleTankDriving(bool anyDistance = false) {
         ExitPlayerTank();
         return true;
     }
-    if (g_drivingHumvee ||
+    if (PlayerInVehicle() ||
         scene.player.health <= 0.0f || scene.player.downed) return false;
     EnemyTankState* best = nullptr;
     float bestSurface = anyDistance ? FLT_MAX : kTankBoardReach;

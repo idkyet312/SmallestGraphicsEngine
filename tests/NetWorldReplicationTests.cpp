@@ -343,8 +343,12 @@ int main() {
     boat.active = 1;
     boat.x = 11.0f; boat.y = 2.0f; boat.z = -7.0f;
     boat.yaw = 0.75f; boat.bobTime = 3.5f;
+    PatrolBoatSnapshot patrol;
+    patrol.captured = 1;
+    patrol.x = -35.0f; patrol.y = 0.2f; patrol.z = 90.0f;
+    patrol.yaw = -1.2f;
     const size_t vehicleStart = wire.size();
-    host.PublishVehicles(helicopters, boat);
+    host.PublishVehicles(helicopters, boat, patrol);
     host.Update(NetSession::kNetTickSeconds, local);
     // Searched for rather than read off the back: the same tick can also carry
     // the scoreboard, which goes out on the first tick after a join.
@@ -367,6 +371,10 @@ int main() {
     Check(remoteBoat && remoteBoat->active == 1 && remoteBoat->x == boat.x &&
           remoteBoat->yaw == boat.yaw,
           "client must receive the host escape boat");
+    const PatrolBoatSnapshot* remotePatrol = client.RemotePatrolBoat();
+    Check(remotePatrol && remotePatrol->captured == 1 &&
+          remotePatrol->x == patrol.x && remotePatrol->yaw == patrol.yaw,
+          "client must receive the captured military boat's pose");
 
     // A later join receives the host's current active state on its first tick.
     NetSession lateClient;
@@ -379,6 +387,10 @@ int main() {
     remoteBoat = lateClient.RemoteEscapeBoat();
     Check(remoteBoat && remoteBoat->active == 1 && remoteBoat->z == boat.z,
           "late client must receive current active boat state");
+    remotePatrol = lateClient.RemotePatrolBoat();
+    Check(remotePatrol && remotePatrol->captured == 1 &&
+          remotePatrol->z == patrol.z,
+          "late join must retain the military boat's parked pose");
 
     boat = {};
     host.PublishVehicles(helicopters, boat);
@@ -390,6 +402,8 @@ int main() {
     remoteBoat = client.RemoteEscapeBoat();
     Check(remoteBoat && remoteBoat->active == 0,
           "inactive host boat must reset the client state");
+    Check(client.RemotePatrolBoat() && !client.RemotePatrolBoat()->captured,
+          "resetting the level must clear the captured military boat");
 
     // Older snapshots and malformed boat values cannot move an already known
     // craft or poison the replicated state.
@@ -408,6 +422,14 @@ int main() {
     client.Update(0.0f, local);
     Check(client.RemoteEscapeBoat()->active == 0,
           "nonfinite boat packet must be rejected");
+    invalid = vehicleMessage;
+    invalid.tick = vehicleMessage.tick + 1;
+    invalid.patrolBoat.captured = 1;
+    invalid.patrolBoat.yaw = std::numeric_limits<float>::quiet_NaN();
+    Receive(3, invalid);
+    client.Update(0.0f, local);
+    Check(!client.RemotePatrolBoat()->captured,
+          "nonfinite military boat packet must be rejected");
 
     // A client's bought marines: the client asks, the host lands them. The
     // request must arrive intact from a known peer and nowhere else.
@@ -455,4 +477,6 @@ int main() {
     client.Shutdown();
     Check(client.RemoteEscapeBoat() == nullptr,
           "stopping a client must clear remote boat state");
+    Check(client.RemotePatrolBoat() == nullptr,
+          "stopping a client must clear the military boat state");
 }

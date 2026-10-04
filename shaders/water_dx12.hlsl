@@ -28,6 +28,8 @@ cbuffer WaterConstants : register(b0)
     // High-path shore shallowing: x = flatten weight (0 off, 1 full shoaling
     // and breaker cap). yzw reserved.
     float4 highShoreParams;
+    float4 boatWakeParams; // count, region centre xz, region radius
+    float4 boatWakeRipples[8]; // world xz, birth time, strength
 };
 
 // Number of Gerstner trains. Must match OceanWaveSettings::WaveCount; the
@@ -131,6 +133,31 @@ bool WaterUltraQuality() { return ultraSimulation.w > 0.5; }
 float MeshBandLimit(float wavelength, float meshCell)
 {
     return 1.0 - smoothstep(wavelength * 0.125, wavelength * 0.25, meshCell);
+}
+
+// Same broad radial wave and analytic slope as WaterVolume's boat ripples.
+// Ultra takes impulses through its simulation instead; its count stays zero.
+float3 EvaluateBoatWake(float2 worldXZ, float time, float meshCell)
+{
+    float3 result = 0.0; // height, slope x, slope z
+    float2 regionOffset = worldXZ - boatWakeParams.yz;
+    if (dot(regionOffset, regionOffset) > boatWakeParams.w * boatWakeParams.w)
+        return result;
+    [loop] for (uint i = 0; i < (uint)boatWakeParams.x; ++i) {
+        float4 ripple = boatWakeRipples[i];
+        float age = time - ripple.z;
+        if (age <= 0.0 || age > 4.0) continue;
+        float2 delta = worldXZ - ripple.xy;
+        float distance = length(delta);
+        float band = distance - 4.0 * age;
+        if (distance < 0.00001 || abs(band) > 3.0) continue;
+        float envelope = exp(-age * 1.2 - band * band * 1.5);
+        float amplitude = ripple.w * 0.5 * envelope;
+        float sine = sin(2.8 * band);
+        result.x += amplitude * sine * MeshBandLimit(2.24399475, meshCell);
+        result.yz += amplitude * (2.8 * cos(2.8 * band) - 3.0 * band * sine) * delta / distance;
+    }
+    return result;
 }
 
 // One Gerstner train, scaled by `weight` so two fields can be crossfaded.
@@ -566,6 +593,10 @@ VSOutput VSMain(VSInput input)
                           previousCameraTime.w * highWaveParams.x, meshCell,
                           previousPosition,
                           previousNormal, previousCrest);
+            if (boatWakeParams.x > 0.0) {
+                currentPosition.y += EvaluateBoatWake(currentXZ, cameraTime.w, meshCell).x;
+                previousPosition.y += EvaluateBoatWake(previousXZ, previousCameraTime.w, meshCell).x;
+            }
         }
 
         // Ease the geometric wave displacement out on the coarse rings so
@@ -1025,6 +1056,13 @@ PSOutput PSMain(VSOutput input)
         EvaluateOcean(input.oceanBaseXZ,
                       cameraTime.w * highWaveParams.x, 0.0,
                       evaluatedPosition, normal, crest);
+    }
+
+    if (boatWakeParams.x > 0.0) {
+        float3 wake = EvaluateBoatWake(input.oceanBaseXZ, cameraTime.w, 0.0);
+        normal = normalize(float3(normal.x - wake.y * normal.y,
+                                  normal.y, normal.z - wake.z * normal.y));
+        crest += abs(wake.x) * 2.0;
     }
 
     // Derivative-filtered capillary detail. Fine octaves disappear before they

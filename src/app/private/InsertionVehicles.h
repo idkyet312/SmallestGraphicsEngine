@@ -22,19 +22,25 @@ static void StartInsertionBoatRunAtPlayerSpawn() {
         { spawn.x, waterY, spawn.z }, waterY, facing);
 }
 
-// Keeps the player glued to the deck while riding, and puts them ashore (or in
-// the water) when the run ends. Mirrors RidePlayerInBlackHawk.
+// Place the passenger once; the moving deck carries their own walking offset.
+// Arrival and sinking still release them through the existing insertion events.
 static void RidePlayerInInsertionBoat() {
     VehicleSystem& vehicles = g_game.vehicles;
-    if (vehicles.insertionBoatCarryingPlayer) {
-        const XMFLOAT3 centre = vehicles.InsertionBoatRidePosition();
-        scene.camera.Position = { centre.x,
-                                  centre.y + scene.camera.PlayerHeight * 0.5f,
-                                  centre.z };
+    if (vehicles.drivingInsertionBoat) return;
+    if (vehicles.insertionBoatPassengerPlacementPending) {
+        vehicles.insertionBoatPassengerPlacementPending = false;
+        scene.camera.FPSMode = true;
+        scene.camera.Position = {
+            vehicles.insertionBoatPosition.x - std::sin(vehicles.insertionBoatYaw) * 3.0f,
+            vehicles.insertionBoatPosition.y - vehicles.insertionBoatSinkOffset +
+                vehicles.insertionBoatDeckOffset + scene.camera.PlayerHeight,
+            vehicles.insertionBoatPosition.z - std::cos(vehicles.insertionBoatYaw) * 3.0f};
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
         scene.camera.FloorY =
             scene.camera.Position.y - scene.camera.PlayerHeight;
+        scene.camera.SetViewAngles(90.0f - XMConvertToDegrees(vehicles.insertionBoatYaw),
+                                   scene.camera.Pitch);
         return;
     }
 
@@ -53,7 +59,12 @@ static void RidePlayerInInsertionBoat() {
         return;
     }
 
-    if (!vehicles.insertionBoatDroppedPlayer) return;
+    if (!vehicles.insertionBoatDroppedPlayer) {
+        if (!scene.ejected && scene.camera.FPSMode)
+            vehicles.insertionBoatCarryingPlayer = vehicles.InsertionBoatSupportsPassenger(
+                scene.camera.Position, scene.camera.PlayerHeight, true);
+        return;
+    }
 
     // Went down with the boat: dumped in the water beside the wreck.
     if (vehicles.insertionBoatJustSank) {
@@ -594,6 +605,8 @@ static void ConfigureBoatBounds() {
     // not resting on the surface. Applied in model space, hence the divide.
     g_boatModelScale = 9.0f / horizontalLength;
     g_boatModelMinY += kBoatFloatDepth / g_boatModelScale;
+    g_game.vehicles.boatCameraBounds = VehicleSystem::BoatCameraBounds::FromModel(
+        minimum, maximum, g_boatModelScale, kBoatFloatDepth);
 }
 
 XMMATRIX InsertionBoatWorldMatrix() {
@@ -665,6 +678,8 @@ static void ConfigureInsertionBoatBounds() {
         (minimum.z + maximum.z) * 0.5f };
     vehicles.insertionBoatModelMinY = minimum.y;
     vehicles.insertionBoatModelScale = 9.0f / horizontalLength;
+    vehicles.insertionBoatCameraBounds = VehicleSystem::BoatCameraBounds::FromModel(
+        minimum, maximum, vehicles.insertionBoatModelScale, kBoatFloatDepth);
     // Waterline a little above the hull bottom, so it floats rather than rests.
     vehicles.insertionBoatModelMinY +=
         kBoatFloatDepth / vehicles.insertionBoatModelScale;
@@ -675,6 +690,7 @@ static void ConfigureInsertionBoatBounds() {
     vehicles.insertionBoatRideForward =
         -(maximum.z - minimum.z) * vehicles.insertionBoatModelScale * 0.18f;
     vehicles.insertionBoatRideHeight = 1.25f - kBoatFloatDepth;
+    vehicles.insertionBoatDeckOffset = vehicles.insertionBoatRideHeight;
 }
 
 // The humvee ships its base colour map embedded in the source FBX. Where that

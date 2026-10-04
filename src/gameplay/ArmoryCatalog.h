@@ -98,7 +98,7 @@ struct ArmoryCatalog {
     static constexpr const char* kGearBlurbs[kGearCount] = {
         "Leave the slot empty.",
         "Amplifies starlight. Turns a night insertion into a daylight one.",
-        "Barrel-mounted lamp. Lights what you aim at -- and marks where you are.",
+        "Barrel-mounted lamp. Lights what you aim at and marks where you are.",
     };
 
     static int WeaponPrice(int weapon) {

@@ -411,6 +411,8 @@ public:
         }
         hostEscapeBoat_ = {};
         remoteEscapeBoat_ = {};
+        hostPatrolBoat_ = {};
+        remotePatrolBoat_ = {};
         remoteVehicleTick_ = 0;
         hasHostHelicopters_ = false;
         hasRemoteHelicopters_ = false;
@@ -1404,11 +1406,13 @@ public:
     // Host-side: the gunships as they stand this tick. Stored and sent with the
     // next snapshot rather than sent here, so the send stays on the net tick.
     void PublishVehicles(const EnemyHelicopterState* helicopters,
-                         const EscapeBoatSnapshot& escapeBoat = {}) {
+                         const EscapeBoatSnapshot& escapeBoat = {},
+                         const PatrolBoatSnapshot& patrolBoat = {}) {
         if (role_ != Role::Host || !helicopters) return;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i)
             hostHelicopters_[i] = helicopters[i];
         hostEscapeBoat_ = escapeBoat;
+        hostPatrolBoat_ = patrolBoat;
         hasHostHelicopters_ = true;
     }
 
@@ -1538,6 +1542,10 @@ public:
     // rather than snapping it to an all-zero pose at the origin.
     const EscapeBoatSnapshot* RemoteEscapeBoat() const {
         return hasRemoteHelicopters_ ? &remoteEscapeBoat_ : nullptr;
+    }
+
+    const PatrolBoatSnapshot* RemotePatrolBoat() const {
+        return hasRemoteHelicopters_ ? &remotePatrolBoat_ : nullptr;
     }
 
     const EnemyHelicopterState* RemoteVehicles() const {
@@ -1735,6 +1743,8 @@ private:
             if (v.index >= kMaxReplicatedHumvees) return false;
         } else if (v.kind == DrivenVehicleKind::Tank) {
             if (v.index >= kMaxReplicatedTanks) return false;
+        } else if (v.kind == DrivenVehicleKind::Boat) {
+            if (v.index != 0) return false;
         } else {
             return false;
         }
@@ -2548,6 +2558,7 @@ private:
         ServerVehicleStateMessage message;
         message.tick = tick_;
         message.escapeBoat = hostEscapeBoat_;
+        message.patrolBoat = hostPatrolBoat_;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             const EnemyHelicopterState& source = hostHelicopters_[i];
             EnemyHelicopterSnapshot& out = message.helicopters[i];
@@ -2771,6 +2782,9 @@ private:
         const auto& boat = message.escapeBoat;
         if (boat.active > 1 || !Finite3(boat.x, boat.y, boat.z) ||
             !std::isfinite(boat.yaw) || !std::isfinite(boat.bobTime)) return;
+        const auto& patrol = message.patrolBoat;
+        if (patrol.captured > 1 || !Finite3(patrol.x, patrol.y, patrol.z) ||
+            !std::isfinite(patrol.yaw)) return;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             const EnemyHelicopterSnapshot& in = message.helicopters[i];
             // Unreliable, so a corrupt or partial packet must not be allowed to
@@ -2792,6 +2806,7 @@ private:
             out.health = in.health;
         }
         remoteEscapeBoat_ = message.escapeBoat;
+        remotePatrolBoat_ = message.patrolBoat;
         remoteVehicleTick_ = message.tick;
         hasRemoteHelicopters_ = true;
     }
@@ -3304,6 +3319,8 @@ private:
     EnemyHelicopterState remoteHelicopters_[kEnemyHelicopterCount]{};
     EscapeBoatSnapshot hostEscapeBoat_{};
     EscapeBoatSnapshot remoteEscapeBoat_{};
+    PatrolBoatSnapshot hostPatrolBoat_{};
+    PatrolBoatSnapshot remotePatrolBoat_{};
     uint32_t remoteVehicleTick_ = 0;
     bool hasHostHelicopters_ = false;
     bool hasRemoteHelicopters_ = false;

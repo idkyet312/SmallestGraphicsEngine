@@ -14,7 +14,7 @@ struct ParticleInstance
     float3 velocity;
     float opacity;
     float3 color;
-    uint kind; // 0 smoke, 1 blood, 2 spark
+    uint kind; // 0 smoke, 1 blood, 2 spark, 3 water spray, 4 surface foam
 };
 
 StructuredBuffer<ParticleInstance> particles : register(t0);
@@ -54,6 +54,20 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
         extent.x *= 2.5 + min(length(particle.velocity) * 0.10, 5.0);
         extent.y *= 0.55;
     }
+    else if (particle.kind == 3) {
+        float2 projected = float2(dot(particle.velocity, cameraRight),
+                                  dot(particle.velocity, cameraUp));
+        float2 along = normalize(projected + float2(0.0, 0.001));
+        right = cameraRight * along.x + cameraUp * along.y;
+        up = cameraRight * -along.y + cameraUp * along.x;
+        extent *= float2(1.6, 0.65);
+    }
+    else if (particle.kind == 4) {
+        float2 direction = normalize(particle.velocity.xz + float2(0.001, 0.0));
+        right = float3(direction.x, 0.0, direction.y);
+        up = float3(-direction.y, 0.0, direction.x);
+        extent *= float2(1.15, 0.85);
+    }
 
     float3 worldPosition = particle.position +
         right * corner.x * extent.x + up * corner.y * extent.y;
@@ -78,7 +92,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     }
     clip(alpha - 0.003);
     float3 color = input.color;
-    if (input.kind == 0)
+    if (input.kind == 0 || input.kind >= 3)
         color *= smokeIllumination;
 #ifndef SGE_HDR_TARGET
     color = pow(color / (1.0 + color), 1.0 / 2.2);

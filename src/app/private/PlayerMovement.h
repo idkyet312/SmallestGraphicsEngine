@@ -22,6 +22,7 @@ static void ToggleHumveeDriving() {
     XMFLOAT3 position, forward;
 
     if (!g_drivingHumvee) {
+        if (PlayerInVehicle()) return;
         float nearestDistanceSq = 25.0f;
         size_t nearestIndex = kNoHumvee;
         for (size_t index = 0; index < g_destruction.VehicleCount(); ++index) {
@@ -63,6 +64,200 @@ static void ToggleHumveeDriving() {
     exitPosition = XMVectorSetY(exitPosition, XMVectorGetY(exitPosition) + 1.3f);
     XMStoreFloat3(&scene.camera.Position, exitPosition);
     g_activeHumveeIndex = kNoHumvee;
+}
+
+static BoatPlatformPose PlayerBoatPlatformPose() {
+    const VehicleSystem& boat = g_game.vehicles;
+    if (boat.drivingInsertionBoat)
+        return {boat.insertionBoatPosition, boat.insertionBoatYaw,
+                boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset};
+    return CurrentBoatPlatformPose();
+}
+
+static void ExitPlayerBoat() {
+    VehicleSystem& boat = g_game.vehicles;
+    if (!boat.drivingBoat && !boat.drivingInsertionBoat) return;
+    const BoatPlatformPose pose = PlayerBoatPlatformPose();
+    if (boat.drivingInsertionBoat) boat.insertionBoatCarryingPlayer = false;
+    boat.StopDrivingBoat();
+    scene.gun.visible = boat.boatSavedGunVisible;
+    scene.camera.FPSMode = boat.boatSavedFPSMode;
+    scene.camera.VerticalVelocity = 0.0f;
+    // Leave on the stern deck, where the existing platform collision takes
+    // over on the next frame, instead of dropping the player in the sea.
+    scene.camera.Position = {
+        pose.position.x - std::sin(pose.yaw) * 2.5f,
+        BoatDeckY(pose) + scene.camera.PlayerHeight,
+        pose.position.z - std::cos(pose.yaw) * 2.5f };
+    scene.camera.FloorY = BoatDeckY(pose);
+    scene.camera.IsGrounded = true;
+}
+
+static bool BoatTakenByRemotePlayer() {
+    if (!g_netSession.Active()) return false;
+    g_netSession.GetRemotePlayers(g_humveeSeatScratch);
+    for (const net::RemotePlayer& remote : g_humveeSeatScratch)
+        if (remote.vehicle.kind == net::DrivenVehicleKind::Boat) return true;
+    return false;
+}
+
+static bool ToggleBoatDriving(bool preferInsertion = false) {
+    VehicleSystem& boat = g_game.vehicles;
+    if (boat.drivingBoat || boat.drivingInsertionBoat) {
+        ExitPlayerBoat();
+        return true;
+    }
+    if (PlayerInVehicle() || scene.player.health <= 0.0f ||
+        scene.player.downed || scene.ejected || boat.blackHawkCarryingPlayer)
+        return false;
+    const bool patrolAvailable = g_levelPatrolBoatEnabled && g_boatModel &&
+        !BoatTakenByRemotePlayer() && boat.PlayerCanDriveBoat(scene.camera.Position);
+    const bool insertion = preferInsertion || boat.insertionBoatCarryingPlayer ||
+                           !patrolAvailable;
+    if (insertion) {
+        if (!g_insertionBoatModel || !boat.TakeInsertionBoatHelm(scene.camera.Position))
+            return false;
+    } else {
+        boat.boatCaptured = boat.drivingBoat = true;
+    }
+    boat.boatSavedGunVisible = scene.gun.visible;
+    boat.boatSavedFPSMode = scene.camera.FPSMode;
+    boat.boatCameraYaw = PlayerBoatPlatformPose().yaw;
+    boat.boatSpeed = 0.0f;
+    boat.SetBoatInput(0.0f, 0.0f, true);
+    scene.gun.visible = false;
+    scene.camera.FPSMode = false;
+    scene.camera.VerticalVelocity = 0.0f;
+    scene.camera.IsCrouching = false;
+    scene.camera.IsSliding = false;
+    scene.camera.IsSwimming = false;
+    scene.camera.SetViewAngles(90.0f - XMConvertToDegrees(boat.boatCameraYaw), -15.0f);
+    return true;
+}
+
+static void UpdatePlayerBoat() {
+    VehicleSystem& boat = g_game.vehicles;
+    if (!boat.drivingBoat && !boat.drivingInsertionBoat) return;
+    const bool invalidBoat = boat.drivingInsertionBoat
+        ? (!g_insertionBoatModel || !boat.insertionBoatVisible ||
+           boat.InsertionBoatIsFoundering() || boat.InsertionBoatIsSunk())
+        : (boat.boatDead || boat.boatSunk || !g_levelPatrolBoatEnabled || !g_boatModel);
+    if (invalidBoat || scene.player.health <= 0.0f || scene.player.downed ||
+        scene.ejected) {
+        ExitPlayerBoat();
+        return;
+    }
+    const BoatPlatformPose pose = PlayerBoatPlatformPose();
+    const float yawDelta = std::atan2(std::sin(pose.yaw - boat.boatCameraYaw),
+                                     std::cos(pose.yaw - boat.boatCameraYaw));
+    scene.camera.SetViewAngles(scene.camera.Yaw - XMConvertToDegrees(yawDelta),
+                               (std::clamp)(scene.camera.Pitch, -65.0f, -12.0f));
+    boat.boatCameraYaw = pose.yaw;
+    // A deck eye point intersects the cabin. Orbit outside the model's bounds
+    // instead, and keep the orbit above the water even when looking around.
+    const auto& bounds = boat.drivingInsertionBoat ? boat.insertionBoatCameraBounds
+                                                  : boat.boatCameraBounds;
+    const float roll = boat.drivingInsertionBoat ? boat.insertionBoatRoll : boat.boatRoll;
+    const XMVECTOR centreOffset = XMVector3TransformNormal(
+        XMVectorSet(0.0f, bounds.centerHeight, 0.0f, 0.0f),
+        XMMatrixRotationZ(roll) * XMMatrixRotationY(pose.yaw));
+    const XMVECTOR target = XMLoadFloat3(&pose.position) + centreOffset -
+        XMVectorSet(0.0f, pose.sinkDepth, 0.0f, 0.0f);
+    XMStoreFloat3(&scene.camera.Position,
+        target - XMLoadFloat3(&scene.camera.Front) * bounds.FollowDistance());
+    scene.camera.Position.y = (std::max)(scene.camera.Position.y,
+        (std::max)(GroundHeightAt(scene.camera.Position.x, scene.camera.Position.z),
+                   pose.position.y) + 0.75f);
+    XMStoreFloat3(&scene.camera.Front, XMVector3Normalize(
+        target - XMLoadFloat3(&scene.camera.Position)));
+    scene.camera.Up = {0.0f, 1.0f, 0.0f};
+    scene.camera.FloorY = BoatDeckY(pose);
+    scene.camera.VerticalVelocity = 0.0f;
+}
+
+static void DrawBoatDrivingPrompt() {
+    if (!IsGameplayScreen() || g_game.loading.Active()) return;
+    const VehicleSystem& boat = g_game.vehicles;
+    const bool insertionNearby = g_insertionBoatModel &&
+        boat.PlayerCanDriveInsertionBoat(scene.camera.Position);
+    const bool driving = boat.drivingBoat || boat.drivingInsertionBoat;
+    const bool nearby = !PlayerInVehicle() && !scene.ejected &&
+        !boat.blackHawkCarryingPlayer &&
+        (insertionNearby || (g_levelPatrolBoatEnabled && g_boatModel &&
+         !BoatTakenByRemotePlayer() && boat.PlayerCanDriveBoat(scene.camera.Position)));
+    if ((!driving && !nearby) || scene.player.health <= 0.0f ||
+        scene.player.downed || g_insertionChoicePending) return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos({viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                            viewport->WorkPos.y + viewport->WorkSize.y * 0.76f},
+                           ImGuiCond_Always, {0.5f, 0.5f});
+    ImGui::SetNextWindowBgAlpha(0.65f);
+    if (ImGui::Begin("##BoatDrivingPrompt", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+        if (driving) {
+            ImGui::Text("%s   W/S drive   A/D steer   Space brake   E leave helm",
+                boat.drivingInsertionBoat ? "INSERTION BOAT" : "MILITARY BOAT");
+            ImGui::Text("Speed %.0f km/h", std::abs(boat.boatSpeed) * 3.6f);
+        } else {
+            ImGui::TextUnformatted(insertionNearby ? "E  Drive insertion boat" :
+                                                   "E  Drive military boat");
+        }
+    }
+    ImGui::End();
+}
+
+static void RefreshInsertionBoatPassenger() {
+    VehicleSystem& boat = g_game.vehicles;
+    if (boat.drivingInsertionBoat || boat.insertionBoatPassengerPlacementPending ||
+        boat.insertionBoatBailedOut) return;
+    boat.insertionBoatCarryingPlayer = !scene.ejected && scene.camera.FPSMode &&
+        boat.InsertionBoatSupportsPassenger(scene.camera.Position,
+                                            scene.camera.PlayerHeight, true);
+}
+
+static void UpdateInsertionBoatPlatform(const BoatPlatformPose& oldPose) {
+    VehicleSystem& boat = g_game.vehicles;
+    if (!boat.insertionBoatVisible || boat.insertionBoatPassengerPlacementPending) return;
+    BoatPlatformPose pose{boat.insertionBoatPosition, boat.insertionBoatYaw,
+                          boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset};
+    if (boat.drivingInsertionBoat && !boat.InsertionBoatIsFoundering() &&
+        BoatMovesOntoShore(oldPose, pose, boat.insertionBoatWaterY)) {
+        boat.insertionBoatPosition.x = oldPose.position.x;
+        boat.insertionBoatPosition.z = oldPose.position.z;
+        boat.insertionBoatYaw = oldPose.yaw;
+        boat.boatSpeed = 0.0f;
+        pose.position = boat.insertionBoatPosition;
+        pose.yaw = boat.insertionBoatYaw;
+    }
+    const bool aboard = boat.insertionBoatCarryingPlayer && !boat.drivingInsertionBoat;
+    const bool carried = CarryBoatDeckPlayer(oldPose, pose, aboard);
+    if (carried && aboard) {
+        const float yawDelta = std::atan2(std::sin(pose.yaw - oldPose.yaw),
+                                         std::cos(pose.yaw - oldPose.yaw));
+        scene.camera.SetViewAngles(scene.camera.Yaw - XMConvertToDegrees(yawDelta),
+                                   scene.camera.Pitch);
+    }
+}
+
+static void ReleaseManualInsertionBoatSquad() {
+    VehicleSystem& boat = g_game.vehicles;
+    if (!boat.insertionBoatManualSquadPending || boat.drivingInsertionBoat ||
+        !scene.camera.FPSMode || !scene.camera.IsGrounded ||
+        scene.player.health <= 0.0f || scene.player.downed) return;
+    const XMFLOAT3& player = scene.camera.Position;
+    const float ground = GroundHeightAt(player.x, player.z);
+    if (ground < boat.insertionBoatWaterY - 0.2f ||
+        std::abs(player.y - scene.camera.PlayerHeight - ground) > 0.4f ||
+        BoatDeckSupports(player, player.y - scene.camera.PlayerHeight,
+            {boat.insertionBoatPosition, boat.insertionBoatYaw,
+             boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset}, 0.35f, 0.5f)) return;
+    // Taking the helm bypasses the scripted beach arrival. Land the squad
+    // once the player actually steps ashore at their chosen destination.
+    boat.insertionBoatManualSquadPending = false;
+    g_marineDropPending = true;
+    g_marineDropOrigin = {player.x, ground, player.z};
 }
 
 // Advances the idle hover/spin on every live pickup. Collection itself is on E

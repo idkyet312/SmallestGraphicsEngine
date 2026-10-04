@@ -45,7 +45,8 @@ static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit,
 }
 
 static void DamageBoat(float damage, const XMFLOAT3& hit) {
-    if (damage <= 0.0f || g_boatDead || !g_boatModel) return;
+    if (!g_levelPatrolBoatEnabled || damage <= 0.0f ||
+        g_boatDead || !g_boatModel) return;
     const VehicleSystem::DamageResult result = g_game.vehicles.DamageBoat(damage);
     if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
@@ -314,7 +315,7 @@ static bool HitBoatHullAtSegment(const XMFLOAT3& position, float yaw,
 
 static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                            float radius, XMFLOAT3& hit) {
-    if (!g_boatModel || g_boatDead) return false;
+    if (!g_levelPatrolBoatEnabled || !g_boatModel || g_boatDead) return false;
     return HitBoatHullAtSegment(
         g_boatPosition, g_boatYaw, start, end, radius, hit);
 }
@@ -515,8 +516,7 @@ static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
 
 static void UpdateHelicopter(float dt) {
     if (!g_helicopterModel || !scene.showHelicopter) return;
-    const bool rotorPowered = !g_helicopterDead ||
-        (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead);
+    const bool rotorPowered = !g_helicopterDead;
     g_helicopterRotorSpeedScale = VehicleSystem::StepHelicopterRotorSpeed(
         g_helicopterRotorSpeedScale, rotorPowered, dt);
     g_helicopterMainRotorAngle = std::fmod(
@@ -983,88 +983,25 @@ static int DropshipWaveTroopCount(uint32_t waveIndex) {
     return (std::min)(kMax, kBase + static_cast<int>(waveIndex));
 }
 
-// Calls in a reinforcement wave on the gunship. The drop point is offset from
-// the player so the squad lands nearby but not on top of them, and the entry
-// point is pushed far out along that same bearing so the craft flies in over
-// open ground rather than materialising at the hover.
+// Reinforcements block the shore at exfil. A wave before the boat is placed
+// would have no destination, so it waits for the objective to unlock exfil.
 static void CallInReinforcementWave() {
     VehicleSystem& vehicles = g_game.vehicles;
     if (!g_helicopterModel || !scene.showHelicopter) return;
     if (!vehicles.DropshipAvailable()) return;
 
-    // Bearing chosen per wave so successive drops do not stack on one side.
-    const float bearing = RandomUnit() * XM_2PI;
-    constexpr float kDropDistance = 34.0f;
+    XMFLOAT3 drop;
+    if (!vehicles.FindDropshipExfilDropPoint(
+            [](float x, float z) { return GroundHeightAt(x, z); }, drop))
+        return;
+
+    const XMFLOAT3& boat = vehicles.escapeBoatPosition;
+    const float boatDistance = std::sqrt(boat.x * boat.x + boat.z * boat.z);
+    const float laneX = boat.x / boatDistance;
+    const float laneZ = boat.z / boatDistance;
     constexpr float kEntryDistance = 210.0f;
-
-    const XMFLOAT3 player = scene.camera.Position;
-    float dropX = player.x + std::sin(bearing) * kDropDistance;
-    float dropZ = player.z + std::cos(bearing) * kDropDistance;
-    float laneX = std::sin(bearing);
-    float laneZ = std::cos(bearing);
-
-    // Once the exfil is on the water, reinforcements are dropped between the
-    // player and the boat instead of on a random bearing: the garrison's job at
-    // that point is to stand between the player and the way off the island, and
-    // a squad landing behind them is not doing it.
-    //
-    // They cannot be put AT the boat -- it floats 42 m offshore and troops
-    // rappel onto terrain (see SpawnDropshipBandit), so a drop over open water
-    // would rope a squad into the sea. Instead, walk inward from the boat along
-    // its own bearing and take the first point that is genuinely dry land. That
-    // lands the blocking force on the beach the player has to cross.
-    if (vehicles.EscapeBoatReady()) {
-        const XMFLOAT3& boat = vehicles.escapeBoatPosition;
-        const float toBoatX = boat.x - player.x;
-        const float toBoatZ = boat.z - player.z;
-        const float toBoatLength =
-            std::sqrt(toBoatX * toBoatX + toBoatZ * toBoatZ);
-        if (toBoatLength > 0.001f) {
-            laneX = toBoatX / toBoatLength;
-            laneZ = toBoatZ / toBoatLength;
-
-            // Step in from the boat until the ground clears the waterline. The
-            // island falloff works in per-axis normalised space, so a fixed
-            // world offset would miss the beach on a stretched island -- this
-            // samples the real height instead of assuming a shore radius.
-            constexpr float kMinBeachHeight = 0.6f;
-            constexpr float kSearchStep = 4.0f;
-            constexpr int kMaxSearchSteps = 14;
-            // Never land them on top of the player, however far in dry land
-            // turns out to start.
-            constexpr float kMinPlayerClearance = 18.0f;
-
-            bool foundShore = false;
-            for (int step = 0; step <= kMaxSearchSteps; ++step) {
-                const float distanceFromBoat =
-                    static_cast<float>(step) * kSearchStep;
-                if (distanceFromBoat >= toBoatLength - kMinPlayerClearance)
-                    break;
-                const float candidateX = boat.x - laneX * distanceFromBoat;
-                const float candidateZ = boat.z - laneZ * distanceFromBoat;
-                if (GroundHeightAt(candidateX, candidateZ) < kMinBeachHeight)
-                    continue;
-                dropX = candidateX;
-                dropZ = candidateZ;
-                foundShore = true;
-                break;
-            }
-            // No dry ground between the two (the player is already at the
-            // water's edge, or swimming). Fall back to the standard offset
-            // along the boat lane so the wave still arrives from that side.
-            if (!foundShore) {
-                dropX = player.x + laneX * kDropDistance;
-                dropZ = player.z + laneZ * kDropDistance;
-            }
-        }
-    }
-
-    const XMFLOAT3 drop{ dropX, GroundHeightAt(dropX, dropZ), dropZ };
-
-    // Fly in from beyond the drop, along the same lane, so the craft crosses the
-    // water the player is heading for rather than appearing inland behind them.
-    const float entryX = dropX + laneX * kEntryDistance;
-    const float entryZ = dropZ + laneZ * kEntryDistance;
+    const float entryX = drop.x + laneX * kEntryDistance;
+    const float entryZ = drop.z + laneZ * kEntryDistance;
     const XMFLOAT3 entry{ entryX,
                           GroundHeightAt(entryX, entryZ) +
                               VehicleSystem::DropshipHoverHeight + 14.0f,
@@ -1072,18 +1009,9 @@ static void CallInReinforcementWave() {
 
     const int troops = DropshipWaveTroopCount(vehicles.dropshipWavesCalled);
     vehicles.BeginDropshipRun(entry, drop, troops);
-    // No exfil is placed here. The boat used to ride in with the first wave,
-    // which put the way out on the water while the aircraft -- the thing the
-    // run is actually about -- was still on the ground. It now appears only
-    // once that aircraft is resolved (see OnObjectivePlaneResolved), so a wave
-    // called by a falling comm tower escalates the fight without also handing
-    // the player the exit.
-    //
-    // Waves called after the aircraft goes down still see an active boat above
-    // and drop their squad on the shore in front of it.
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Reinforcement wave " + std::to_string(vehicles.dropshipWavesCalled) +
-        " inbound with " + std::to_string(troops) + " troops");
+        " inbound at exfil with " + std::to_string(troops) + " troops");
 }
 
 // Resolving the aircraft -- shot down, or gone -- brings the ride home and the
@@ -1388,6 +1316,7 @@ struct BoatPlatformPose {
     XMFLOAT3 position = {};
     float yaw = 0.0f;
     float sinkDepth = 0.0f;
+    float deckOffset = kBoatDeckOffset;
 };
 
 static BoatPlatformPose CurrentBoatPlatformPose() {
@@ -1395,7 +1324,7 @@ static BoatPlatformPose CurrentBoatPlatformPose() {
 }
 
 static float BoatDeckY(const BoatPlatformPose& pose) {
-    return pose.position.y - pose.sinkDepth + kBoatDeckOffset;
+    return pose.position.y - pose.sinkDepth + pose.deckOffset;
 }
 
 static bool BoatDeckSupports(const XMFLOAT3& position, float feetY,
@@ -1415,33 +1344,23 @@ static bool BoatDeckSupports(const XMFLOAT3& position, float feetY,
 static void TransformWithBoat(XMFLOAT3& position,
                               const BoatPlatformPose& oldPose,
                               const BoatPlatformPose& newPose) {
-    const float dx = position.x - oldPose.position.x;
-    const float dz = position.z - oldPose.position.z;
-    const float oldSin = std::sin(oldPose.yaw);
-    const float oldCos = std::cos(oldPose.yaw);
-    const float localX = dx * oldCos - dz * oldSin;
-    const float localZ = dx * oldSin + dz * oldCos;
-    const float newSin = std::sin(newPose.yaw);
-    const float newCos = std::cos(newPose.yaw);
-    position.x = newPose.position.x + localX * newCos + localZ * newSin;
-    position.z = newPose.position.z - localX * newSin + localZ * newCos;
-    position.y += BoatDeckY(newPose) - BoatDeckY(oldPose);
+    position = VehicleSystem::CarryBoatPosition(position,
+        oldPose.position, oldPose.yaw, BoatDeckY(oldPose),
+        newPose.position, newPose.yaw, BoatDeckY(newPose));
 }
 
 static constexpr int kBoatGunnerMount = -1;
 static constexpr int kStressHumveeGunnerMount = -2;
 
-static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
-    const BoatPlatformPose newPose = CurrentBoatPlatformPose();
-    const float yawDelta = std::atan2(
-        std::sin(newPose.yaw - oldPose.yaw),
-        std::cos(newPose.yaw - oldPose.yaw));
-
+static bool CarryBoatDeckPlayer(const BoatPlatformPose& oldPose,
+                                const BoatPlatformPose& newPose,
+                                bool carryJumpingPassenger = false) {
     const float playerFeet =
         scene.camera.Position.y - scene.camera.PlayerHeight;
-    if (scene.camera.FPSMode && scene.camera.IsGrounded &&
+    if (!scene.ejected && scene.camera.FPSMode &&
+        (scene.camera.IsGrounded || carryJumpingPassenger) &&
         BoatDeckSupports(scene.camera.Position, playerFeet, oldPose, 0.35f,
-                         0.28f)) {
+                         carryJumpingPassenger ? 2.0f : 0.28f)) {
         const XMFLOAT3 previousPlayerPosition = scene.camera.Position;
         TransformWithBoat(scene.camera.Position, oldPose, newPose);
         g_game.playerMovement.ApplyPlatformDisplacement({
@@ -1449,7 +1368,17 @@ static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
             scene.camera.Position.y - previousPlayerPosition.y,
             scene.camera.Position.z - previousPlayerPosition.z });
         scene.camera.FloorY = BoatDeckY(newPose);
+        return true;
     }
+    return false;
+}
+
+static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
+    const BoatPlatformPose newPose = CurrentBoatPlatformPose();
+    const float yawDelta = std::atan2(
+        std::sin(newPose.yaw - oldPose.yaw),
+        std::cos(newPose.yaw - oldPose.yaw));
+    CarryBoatDeckPlayer(oldPose, newPose);
 
     for (const auto& bandit : g_bandits) {
         if (!bandit || bandit->Dead() || bandit.get() == g_heldBandit) continue;
@@ -1468,9 +1397,42 @@ static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
     }
 }
 
+static float BoatFootprintGroundHeight(const BoatPlatformPose& pose) {
+    float height = GroundHeightAt(pose.position.x, pose.position.z);
+    for (float x : { -kBoatDeckHalfBeam, kBoatDeckHalfBeam })
+        for (float z : { -kBoatDeckHalfLength, kBoatDeckHalfLength }) {
+            const float wx = pose.position.x + x * std::cos(pose.yaw) +
+                             z * std::sin(pose.yaw);
+            const float wz = pose.position.z - x * std::sin(pose.yaw) +
+                             z * std::cos(pose.yaw);
+            height = (std::max)(height, GroundHeightAt(wx, wz));
+        }
+    return height;
+}
+
+static bool BoatMovesOntoShore(const BoatPlatformPose& oldPose,
+                              const BoatPlatformPose& newPose, float waterY) {
+    const float newGround = BoatFootprintGroundHeight(newPose);
+    return newGround > waterY - kBoatFloatDepth &&
+           newGround > BoatFootprintGroundHeight(oldPose) + 0.001f;
+}
+
 static void UpdateBoat(float dt) {
-    if (!g_boatModel) return;
+    if (!g_levelPatrolBoatEnabled || !g_boatModel) return;
     const BoatPlatformPose oldPose = CurrentBoatPlatformPose();
+    if (ClientOwnedByHost() && !g_game.vehicles.drivingBoat) {
+        const net::PatrolBoatSnapshot* remote = g_netSession.RemotePatrolBoat();
+        if (remote && remote->captured && !g_boatDead) {
+            const bool wasCaptured = g_game.vehicles.boatCaptured;
+            g_game.vehicles.boatCaptured = true;
+            const float blend = wasCaptured
+                ? 1.0f - std::exp(-12.0f * (std::max)(0.0f, dt)) : 1.0f;
+            g_boatPosition.x += (remote->x - g_boatPosition.x) * blend;
+            g_boatPosition.z += (remote->z - g_boatPosition.z) * blend;
+            g_boatYaw += std::atan2(std::sin(remote->yaw - g_boatYaw),
+                std::cos(remote->yaw - g_boatYaw)) * blend;
+        }
+    }
     if (g_boatDead) {
         if (g_boatSunk) return;
         // Settle into the water rather than falling: sink depth grows and
@@ -1481,6 +1443,26 @@ static void UpdateBoat(float dt) {
             g_boatSinkDepth = 3.2f;
             g_boatSunk = true;
         }
+        CarryBoatOccupants(oldPose);
+        return;
+    }
+
+    if (g_game.vehicles.boatCaptured) {
+        VehicleSystem& boat = g_game.vehicles;
+        const bool localSimulation = !boat.boatRemoteDriven &&
+            (!ClientOwnedByHost() || boat.drivingBoat);
+        if (localSimulation) boat.StepDrivenBoat(dt);
+        const float waterY = g_ocean.GetSurfaceY();
+        // Check the hull footprint, not just its centre, so the bow cannot
+        // drive onto the beach while the helm is still over water.
+        if (localSimulation && BoatMovesOntoShore(oldPose, CurrentBoatPlatformPose(), waterY)) {
+            g_boatPosition = oldPose.position;
+            g_boatYaw = oldPose.yaw;
+            boat.boatSpeed = 0.0f;
+        }
+        g_boatPosition.y = waterY +
+            g_ocean.WaveHeightAt(g_boatPosition.x, g_boatPosition.z);
+        g_boatRoll *= std::exp(-2.0f * (std::max)(0.0f, dt));
         CarryBoatOccupants(oldPose);
         return;
     }

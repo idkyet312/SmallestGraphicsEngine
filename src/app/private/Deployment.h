@@ -974,14 +974,17 @@ static void BeginDeploymentPlanning() {
     //
     // The planning camera scales with this ring, keeping marker spacing stable
     // when an editor-authored radius is much larger than the historical 34 m.
-    constexpr uint32_t deploymentZoneCount = 20;
     g_deploymentZones = DeploymentPlanner::BuildPerimeterZones(
-        deploymentRadius, deploymentRadius, deploymentZoneCount,
+        deploymentRadius, deploymentRadius, kDeploymentZoneCount,
         [&](float x, float z) {
             return (std::max)(0.0f,
                 TerrainRendererDX12::HeightAt(params, x, z));
         });
-    g_selectedDeploymentZone = -1;
+    const int defaultPoint = g_customLevelMode
+        ? g_game.world.Level().defaultInsertionPoint : 0;
+    g_selectedDeploymentZone = defaultPoint > 0 &&
+        defaultPoint <= static_cast<int>(g_deploymentZones.size())
+        ? defaultPoint - 1 : -1;
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;

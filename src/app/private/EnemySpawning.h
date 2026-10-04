@@ -681,7 +681,8 @@ static bool SpawnBoatTurretGunner() {
     // No patrol boat on the training range, so no gunner to ride it -- the boat
     // model is hidden there, and without this he is left firing from open water.
     // Same for the base, whose level file switches the patrol boat off.
-    if (g_trainingRangeMode || g_baseMode) return false;
+    if (!g_levelPatrolBoatEnabled || g_trainingRangeMode || g_baseMode)
+        return false;
     if (!g_banditModel.valid || !g_boatModel) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&

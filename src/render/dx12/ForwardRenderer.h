@@ -84,6 +84,8 @@ extern WaterVolume g_ocean;   // sea ringing the island
 extern bool g_customLevelMode;
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
 extern ComPtr<ID3D12Resource> g_bloodTexture;
+extern ComPtr<ID3D12Resource> g_boatSprayTexture;
+extern ComPtr<ID3D12Resource> g_boatFoamTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
 extern ComPtr<ID3D12Resource> g_explosionTexture;   // 4x4 flipbook explosion sheet
@@ -332,6 +334,7 @@ extern DDGIRendererDX12 g_ddgiRenderer;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
 extern bool g_trainingRangeMode;
+extern bool g_levelPatrolBoatEnabled;
 // Whether the loaded level places a Humvee entity. The vehicle is authored
 // content: a level that does not place one must not draw one, or it appears at
 // the world origin where primaryHumveeSpawn's default leaves it.
@@ -961,7 +964,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
             [phase](const ImpactParticle& particle) {
                 return TransparencyPhaseIncludesEffectDX12(
                     particle.position, particle.size, phase);
-            });
+            }, g_boatSprayTexture.Get(), g_boatFoamTexture.Get());
         // Dedicated particle root signature/heap invalidates cached main bindings.
         shader.InvalidateGraphicsRootBinding();
         shader.UseTransparent();
@@ -991,19 +994,26 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         const float age = 1.0f - fade;
         const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
         const float fadeOut = fade < 0.4f ? fade / 0.4f : 1.0f;
-        const float opacity = sp.blood
+        const float opacity = sp.waterFoam ? fadeIn * fadeOut * 0.55f : sp.blood
             ? (std::min)(0.36f, fadeIn * fadeOut * 0.36f)
             : (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
         if (opacity <= 0.01f) continue;
 
         const XMVECTOR pos = XMVectorSet(
             sp.position.x, sp.position.y, sp.position.z, 1.0f);
-        const XMMATRIX model(camRight * sp.size, camUp * sp.size,
-                            camFwd * sp.size, XMVectorSetW(pos, 1.0f));
+        const XMMATRIX model = sp.waterFoam
+            ? XMMATRIX(XMVectorSet(sp.size, 0.0f, 0.0f, 0.0f),
+                       XMVectorSet(0.0f, 0.0f, sp.size, 0.0f),
+                       XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f), XMVectorSetW(pos, 1.0f))
+            : XMMATRIX(camRight * sp.size, camUp * sp.size,
+                       camFwd * sp.size, XMVectorSetW(pos, 1.0f));
         shader.SetMatrices(model, view, proj, lightSpace);
         XMFLOAT3 tint = sp.color;
         ID3D12Resource* texture = g_bloodTexture.Get();
-        if (!sp.blood) {
+        if (sp.waterSpray || sp.waterFoam) {
+            texture = sp.waterFoam ? g_boatFoamTexture.Get() : g_boatSprayTexture.Get();
+            if (!texture) texture = g_smokeTexture.Get();
+        } else if (!sp.blood) {
             const float g = 1.0f + 2.0f * age;
             tint = XMFLOAT3((std::min)(1.0f, sp.color.x * g),
                             (std::min)(1.0f, sp.color.y * g),
@@ -2922,7 +2932,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    if (!g_emptyLevelMode && !g_trainingRangeMode && g_boatModel) {
+    if (!g_emptyLevelMode && !g_trainingRangeMode &&
+        g_levelPatrolBoatEnabled && g_boatModel) {
         if (visibilityExtensionsOnly) {
             DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
                 view, proj, lightSpace, true);

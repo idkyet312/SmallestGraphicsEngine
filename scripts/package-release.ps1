@@ -27,11 +27,10 @@ param(
     [switch]$CookedOnly,
     # Levels the package ships. Content/Levels holds two dozen maps, most of
     # them authoring history and test scenes; a build sent to someone else wants
-    # the ones the game can actually reach from its own menus. These three are
-    # what the engine names in code -- the hub, the island the travel board
-    # flies to, and the training range. Level 1 and the test level need no entry
-    # here: both are built into the exe rather than loaded from a file.
-    [string[]]$Levels = @('Base.json', 'Islandv10.json', 'TrainingRange.json'),
+    # the ones the game can actually reach from its own menus: the hub, the
+    # helicopter destinations, and the training range. The built-in test level
+    # needs no entry here.
+    [string[]]$Levels = @('Base.json', 'Islandv15.json', 'BigIslandv34.json', 'level3v4.json', 'TrainingRange.json'),
     [switch]$NoZip
 )
 
@@ -194,7 +193,7 @@ foreach ($d in $dataDirs) {
 
 # Content/Levels is the canonical authoring tree. build/levels is a legacy
 # partial copy and can survive for months without receiving newer maps; using
-# the generic build-first rule above made a fresh package drop Islandv10 even
+# the generic build-first rule above made a fresh package drop the campaign map even
 # though the level was present in the repository. Keep the simple levels/
 # package layout, but always populate it from the canonical tree.
 #
@@ -220,7 +219,7 @@ foreach ($target in $levelTargets) {
 foreach ($name in $Levels) {
     $stem = [IO.Path]::GetFileNameWithoutExtension($name)
     $found = $false
-    # Newest wins per file name, not repo-first. The roots hold the same map at
+    # Newest wins per relative path, not repo-first. The roots hold the same map at
     # different ages: the editor writes wherever the game was run from, so a hub
     # edited in a build/ run leaves the repo copy behind. Repo-first shipped that
     # stale copy -- a package whose Base.json was the old flat hub while its
@@ -229,8 +228,14 @@ foreach ($name in $Levels) {
     # the right one.
     $newest = @{}
     foreach ($root in $levelRoots) {
-        foreach ($file in (Get-ChildItem $root -File -Filter "$stem*" -ErrorAction SilentlyContinue)) {
-            $key = $file.Name.ToLower()
+        $levelFiles = @(Get-ChildItem $root -File -Filter "$stem*" -ErrorAction SilentlyContinue)
+        # Preview art, splats and baked height stamps live in the map's folder.
+        $sidecarDir = Join-Path $root $stem
+        if (Test-Path -LiteralPath $sidecarDir) {
+            $levelFiles += @(Get-ChildItem -LiteralPath $sidecarDir -Recurse -File)
+        }
+        foreach ($file in $levelFiles) {
+            $key = $file.FullName.Substring($root.Length + 1)
             if (-not $newest.ContainsKey($key) -or
                 $file.LastWriteTimeUtc -gt $newest[$key].LastWriteTimeUtc) {
                 $newest[$key] = $file
@@ -244,9 +249,11 @@ foreach ($name in $Levels) {
     # Both staging layouts get the same bytes. They are two spellings of one
     # level, and the engine picks Content/Levels first; letting them differ is
     # how a package ends up playing a different map than it shows.
-    foreach ($file in $newest.Values) {
+    foreach ($key in $newest.Keys) {
         foreach ($target in $levelTargets) {
-            Copy-Item $file.FullName (Join-Path $target $file.Name) -Force
+            $destination = Join-Path $target $key
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $newest[$key].FullName -Destination $destination -Force
         }
     }
     Write-Host "  levels/$name" -ForegroundColor DarkGray
@@ -383,8 +390,8 @@ start "" "GraphicEngine.exe"
 @'
 @echo off
 cd /d "%~dp0"
-start "" "GraphicEngine.exe" --level "levels\Islandv10.json"
-'@ | Set-Content (Join-Path $stage 'Play Islandv10.bat') -Encoding ascii
+start "" "GraphicEngine.exe" --level "levels\Islandv15.json"
+'@ | Set-Content (Join-Path $stage 'Play Islandv15.bat') -Encoding ascii
 
 # Hosting from a .bat rather than the menu because a tester joining a session
 # usually wants to be in a level already: the client follows the host onto
@@ -392,14 +399,14 @@ start "" "GraphicEngine.exe" --level "levels\Islandv10.json"
 @'
 @echo off
 cd /d "%~dp0"
-start "" "GraphicEngine.exe" --level "levels\Islandv10.json" -host-steam
+start "" "GraphicEngine.exe" --level "levels\Islandv15.json" -host-steam
 '@ | Set-Content (Join-Path $stage 'Host on Steam.bat') -Encoding ascii
 
 @'
 Smallest Graphics Engine
 ========================
 
-Run Play.bat to start at the main menu, or Play Islandv10.bat to load Islandv10
+Run Play.bat to start at the main menu, or Play Islandv15.bat to load Islandv15
 directly from the packaged levels folder.
 
 Play.bat sets the working directory to this folder before launching. The engine
@@ -419,7 +426,7 @@ What is in this build
   TEST LEVEL    empty terrain, no gameplay actors -- fastest thing to load
   LEVEL 1       the built-in map
   ENTER BASE    the hub; the travel board there flies to Island 1
-  Island 1      Islandv10, also reachable directly via Play Islandv10.bat
+  Island 1      Islandv15, also reachable directly via Play Islandv15.bat
   Training Range
 
 Other maps in the authoring tree are left out of this package.
@@ -441,7 +448,7 @@ every change after it.
   JOIN                   an address for a direct host (127.0.0.1 is this
                          machine), or steam:<id> for a Steam host.
 
-Host on Steam.bat does the Steam version in one step, starting on Islandv10.
+Host on Steam.bat does the Steam version in one step, starting on Islandv15.
 
 Steam
 -----

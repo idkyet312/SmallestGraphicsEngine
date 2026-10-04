@@ -1075,7 +1075,7 @@ public:
         }
 
         if (drawDynamic && !g_emptyLevelMode && !g_trainingRangeMode &&
-            g_boatModel) {
+            g_levelPatrolBoatEnabled && g_boatModel) {
             std::vector<XMMATRIX> boatTransforms = { BoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
                 g_boatShadowModel ? g_boatShadowModel : g_boatModel,

@@ -275,6 +275,8 @@ struct ImpactParticle {
     XMFLOAT3 color;
     bool     spark = false;  // true = ballistic bright shard, false = smoke
     bool     blood = false;  // textured blood billboard with ballistic motion
+    bool     waterSpray = false;
+    bool     waterFoam = false;
 };
 
 // Layered one-shot explosion. The 4x4 smoky sheet supplies the outer fireball;
@@ -1848,7 +1850,13 @@ struct Scene {
 
         // Impact particles: sparks/blood fall; smoke rises and expands.
         for (auto& ip : impactParticles) {
-            if (ip.spark) {
+            if (ip.waterSpray) {
+                ip.velocity.y -= 9.8f * dt;
+                const float drag = std::exp(-1.5f * dt);
+                ip.velocity.x *= drag; ip.velocity.z *= drag;
+            } else if (ip.waterFoam) {
+                ip.velocity.y = 0.0f;
+            } else if (ip.spark) {
                 ip.velocity.y += -22.0f * dt;          // gravity pulls sparks down
                 ip.velocity.x *= 0.99f; ip.velocity.z *= 0.99f;
             } else if (ip.blood) {
@@ -2638,7 +2646,8 @@ struct Scene {
         gunRecoilBack = (std::min)(0.045f, gunRecoilBack + 0.006f);
     }
 
-    void ThrowGrenade() {
+    bool ThrowGrenade() {
+        if (!player.ConsumeGrenade()) return false;
         Projectile p;
         p.position  = camera.Position;
         p.previousPosition = p.position;
@@ -2655,6 +2664,7 @@ struct Scene {
                         camera.GetAimFront().y * grenadeThrowSpeed + grenadeLob,
                         camera.GetAimFront().z * grenadeThrowSpeed };
         projectiles.push_back(p);
+        return true;
     }
 
     void SpawnVortexFX(const XMFLOAT3& center) {

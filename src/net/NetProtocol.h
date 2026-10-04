@@ -97,7 +97,8 @@ namespace net {
 // 27: C4 carries a turret attachment and a host charge id for late-join replay.
 // 28: grenade kind 3 carries player-designated bombardment missiles.
 // 29: Humvee armor snapshots carry destruction in a former padding byte.
-inline constexpr uint32_t kProtocolVersion = 29;
+// 30: captured military patrol boats share their pose and driver's seat.
+inline constexpr uint32_t kProtocolVersion = 30;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -223,6 +224,7 @@ enum class DrivenVehicleKind : uint8_t {
     None = 0,
     Humvee,
     Tank,
+    Boat,
 };
 
 // The vehicle a player is at the wheel of. A driven vehicle is simulated by
@@ -452,11 +454,19 @@ struct EscapeBoatSnapshot {
     float bobTime = 0.0f;
 };
 
+struct PatrolBoatSnapshot {
+    uint8_t captured = 0;
+    uint8_t padding[3] = {};
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f;
+};
+
 struct ServerVehicleStateMessage {
     MessageHeader header{ MessageType::ServerVehicleState, {} };
     uint32_t tick = 0;
     EnemyHelicopterSnapshot helicopters[kEnemyHelicopterCount];
     EscapeBoatSnapshot escapeBoat;
+    PatrolBoatSnapshot patrolBoat;
 };
 
 // One enemy tank as the host drives it. Keyed by the level entity id the tank

@@ -168,6 +168,8 @@ static void ProcessInput(HWND) {
                             !g_tankTestInputActive);
         if (g_drivingHumvee && g_activeHumveeIndex < g_humveeGameplay.size())
             g_destruction.SetVehicleInput(g_activeHumveeIndex, 0.0f, 0.0f, true);
+        if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat)
+            g_game.vehicles.SetBoatInput(0.0f, 0.0f, true);
         return;
     }
 
@@ -187,6 +189,17 @@ static void ProcessInput(HWND) {
         return;
     }
 
+    if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat) {
+        const float throttle =
+            ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('S') & 0x8000) ? 1.0f : 0.0f);
+        const float steering =
+            ((FocusedKeyState('D') & 0x8000) ? 1.0f : 0.0f) -
+            ((FocusedKeyState('A') & 0x8000) ? 1.0f : 0.0f);
+        g_game.vehicles.SetBoatInput(throttle, steering,
+            (FocusedKeyState(VK_SPACE) & 0x8000) != 0 || !HasInputFocus());
+        return;
+    }
     if (g_playerTankEntity != 0) {
         float throttle =
             ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
@@ -406,7 +419,7 @@ static void ProcessInput(HWND) {
     if (((FocusedKeyState('G') & 0x8000) || autoGrenade) &&
         scene.grenadeCooldown <= 0.0f && !scene.player.downed) {
         const size_t projectileStart = scene.projectiles.size();
-        scene.ThrowGrenade();
+        if (!scene.ThrowGrenade()) return;
         for (size_t index = projectileStart; index < scene.projectiles.size(); ++index)
             scene.projectiles[index].playerOwned = true;
         if (g_game.session.TimerRunning())
@@ -602,7 +615,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // aim or swap weapons mid-sentence.
         if (ChatPromptOpen()) return 0;
         if (!ImGui::GetIO().WantCaptureMouse) {
-            if (g_playerTankEntity != 0) {
+            if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat) {
+                return 0;
+            } else if (g_playerTankEntity != 0) {
                 FirePlayerTankShell();
                 return 0;
             } else if (g_drivingHumvee) {
@@ -827,12 +842,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (NearbyDownedPlayer()) { /* handled as a held key above */ }
             else if (g_armoryShopOpen) CloseArmoryShop(hwnd);
             else if (g_travelScreenOpen) CloseTravelScreen(hwnd);
+            else if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat)
+                ExitPlayerBoat();
             else if (!g_game.vehicles.BailOutOfBlackHawk() &&
+                !(g_game.vehicles.insertionBoatCarryingPlayer && ToggleBoatDriving(true)) &&
                 !g_game.vehicles.BailOutOfInsertionBoat() &&
                 !CollectNearbyWeaponPickup() &&
                 !OpenNearbyArmoryShop() &&
                 !OpenNearbyTravelScreen() &&
-                !ToggleTankDriving())
+                !ToggleTankDriving() && !ToggleBoatDriving())
                 ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.

@@ -396,6 +396,32 @@ struct VehicleSystem {
 
     bool EscapeBoatReady() const { return escapeBoatActive; }
 
+    // Approach from the exfil's own bearing, so moving the player cannot move
+    // the blocking squad. Search the full lane for wide authored insertion rings.
+    template <typename HeightSampler>
+    bool FindDropshipExfilDropPoint(HeightSampler&& heightAt,
+                                   DirectX::XMFLOAT3& drop) const {
+        if (!EscapeBoatReady()) return false;
+        const float distance = std::sqrt(
+            escapeBoatPosition.x * escapeBoatPosition.x +
+            escapeBoatPosition.z * escapeBoatPosition.z);
+        if (!std::isfinite(distance) || distance <= 0.001f) return false;
+        constexpr float searchStep = 4.0f;
+        constexpr float minBeachHeight = 0.6f;
+        const int steps = static_cast<int>(std::ceil(distance / searchStep));
+        for (int step = 0; step <= steps; ++step) {
+            const float radius = (std::max)(0.0f,
+                distance - static_cast<float>(step) * searchStep);
+            const float x = escapeBoatPosition.x / distance * radius;
+            const float z = escapeBoatPosition.z / distance * radius;
+            const float y = heightAt(x, z);
+            if (!std::isfinite(y) || y < minBeachHeight) continue;
+            drop = { x, y, z };
+            return true;
+        }
+        return false;
+    }
+
     // Places the exfil on an explicit compass bearing, measured the same way the
     // dropship's is (+Z = 0, turning through +X).
     //
@@ -461,7 +487,7 @@ struct VehicleSystem {
 
     // Arms a wave. `entry` is where the craft comes from (map edge), `drop` is
     // the hover it unloads over. Caller supplies both because only the app
-    // layer knows the terrain and the player's position.
+    // layer knows the terrain and the approach lane.
     void BeginDropshipRun(const DirectX::XMFLOAT3& entry,
                           const DirectX::XMFLOAT3& drop, int troops) {
         if (!DropshipAvailable() || troops <= 0) return;
@@ -649,8 +675,8 @@ public:
     DirectX::XMFLOAT3 primaryHumveeSpawn{ 0.0f, 3.45f, 0.0f };
     float primaryHumveeYaw = 0.0f;
 
-    // Boat: circles the island on the water surface. Sinks in place (rather
-    // than falling like a downed helicopter) once destroyed.
+    // Patrol until captured; leaving the helm parks it at the new position.
+    // Sinks in place (rather than falling like a downed helicopter) if destroyed.
     DirectX::XMFLOAT3 boatPosition{ 0.0f, 0.0f, 0.0f };
     DirectX::XMFLOAT3 boatCenter{ 0.0f, 0.0f, 0.0f };
     float boatYaw = 0.0f;
@@ -660,6 +686,105 @@ public:
     bool boatDead = false;
     bool boatSunk = false;
     float boatSinkDepth = 0.0f;
+
+    static constexpr float BoatHalfBeam = 1.5f;
+    static constexpr float BoatHalfLength = 4.5f;
+    static constexpr float BoatFloatDepth = 0.75f;
+    static constexpr float BoatDeckOffset = 0.45f - BoatFloatDepth;
+    static constexpr float BoatBoardReach = 2.5f;
+    static constexpr float BoatForwardSpeed = 18.0f;
+    static constexpr float BoatReverseSpeed = 6.0f;
+    bool drivingBoat = false;
+    bool drivingInsertionBoat = false;
+    bool boatCaptured = false;
+    bool boatRemoteDriven = false;
+    bool boatSavedGunVisible = true;
+    bool boatSavedFPSMode = true;
+    float boatCameraYaw = 0.0f;
+    struct BoatCameraBounds {
+        float centerHeight = 1.1f;
+        float radius = 5.2f;
+
+        static BoatCameraBounds FromModel(const DirectX::XMFLOAT3& minimum,
+                                         const DirectX::XMFLOAT3& maximum,
+                                         float scale, float floatDepth) {
+            BoatCameraBounds bounds;
+            const float halfX = (maximum.x - minimum.x) * scale * 0.5f;
+            const float halfY = (maximum.y - minimum.y) * scale * 0.5f;
+            const float halfZ = (maximum.z - minimum.z) * scale * 0.5f;
+            bounds.centerHeight = halfY - floatDepth;
+            bounds.radius = std::sqrt(halfX * halfX + halfY * halfY + halfZ * halfZ);
+            return bounds;
+        }
+
+        float FollowDistance() const { return (std::max)(8.0f, radius * 2.2f + 1.0f); }
+    };
+    BoatCameraBounds boatCameraBounds;
+    BoatCameraBounds insertionBoatCameraBounds;
+    float boatSpeed = 0.0f;
+    float boatThrottle = 0.0f;
+    float boatSteering = 0.0f;
+    bool boatBrake = true;
+
+    static bool PlayerWithinBoatReach(const DirectX::XMFLOAT3& player,
+                                     const DirectX::XMFLOAT3& position, float yaw) {
+        const float dx = player.x - position.x;
+        const float dz = player.z - position.z;
+        const float localX = dx * std::cos(yaw) - dz * std::sin(yaw);
+        const float localZ = dx * std::sin(yaw) + dz * std::cos(yaw);
+        const float outsideX = (std::max)(0.0f, std::abs(localX) - BoatHalfBeam);
+        const float outsideZ = (std::max)(0.0f, std::abs(localZ) - BoatHalfLength);
+        return outsideX * outsideX + outsideZ * outsideZ <=
+                   BoatBoardReach * BoatBoardReach &&
+               std::abs(player.y - position.y) <= 3.5f;
+    }
+
+    bool PlayerCanDriveBoat(const DirectX::XMFLOAT3& player) const {
+        return !boatDead && !boatSunk && PlayerWithinBoatReach(player, boatPosition, boatYaw);
+    }
+
+    void SetBoatInput(float throttle, float steering, bool brake) {
+        boatThrottle = (std::clamp)(throttle, -1.0f, 1.0f);
+        boatSteering = (std::clamp)(steering, -1.0f, 1.0f);
+        boatBrake = brake;
+    }
+
+    void StopDrivingBoat() {
+        if (drivingInsertionBoat) insertionBoatCarryingPlayer = false;
+        drivingBoat = false;
+        drivingInsertionBoat = false;
+        boatSpeed = 0.0f;
+        SetBoatInput(0.0f, 0.0f, true);
+    }
+
+    void StepDrivenBoat(float deltaTime) {
+        if (!drivingBoat && drivingInsertionBoat) return;
+        if (!drivingBoat || boatDead || boatSunk) {
+            boatSpeed = 0.0f;
+            return;
+        }
+        StepBoatMotion(boatPosition, boatYaw, deltaTime);
+    }
+
+    void StepBoatMotion(DirectX::XMFLOAT3& position, float& yaw, float deltaTime) {
+        // Bound catch-up and integrate steering in small steps: a loading hitch
+        // must not jump the hull through the shore or change its turning circle.
+        float remaining = (std::clamp)(deltaTime, 0.0f, 0.25f);
+        while (remaining > 0.0f) {
+            const float dt = (std::min)(remaining, 1.0f / 60.0f);
+            remaining -= dt;
+            const float target = boatBrake ? 0.0f : boatThrottle *
+                (boatThrottle >= 0.0f ? BoatForwardSpeed : BoatReverseSpeed);
+            const float rate = boatBrake ? 16.0f :
+                (boatThrottle == 0.0f ? 3.0f : 5.0f);
+            boatSpeed += (std::clamp)(target - boatSpeed, -rate * dt, rate * dt);
+            const float rudder = (std::clamp)(boatSpeed / 5.0f, -1.0f, 1.0f);
+            yaw += boatSteering * rudder * 0.8f * dt;
+            yaw = std::atan2(std::sin(yaw), std::cos(yaw));
+            position.x += std::sin(yaw) * boatSpeed * dt;
+            position.z += std::cos(yaw) * boatSpeed * dt;
+        }
+    }
 
     // Insertion boat: the seaborne counterpart to the BlackHawk, for levels that
     // land the player from the water. It runs in across the surface, slows onto
@@ -723,8 +848,60 @@ public:
     bool insertionBoatVisible = true;
     // True while the player is riding the deck, before the drop-off.
     bool insertionBoatCarryingPlayer = false;
+    bool insertionBoatPassengerPlacementPending = false;
+    float insertionBoatDeckOffset = 1.25f - BoatFloatDepth;
     // Set for the single frame the player jumps off early.
     bool insertionBoatBailedOut = false;
+    bool insertionBoatCaptured = false;
+    bool insertionBoatManualSquadPending = false;
+
+    bool InsertionBoatSupportsPassenger(const DirectX::XMFLOAT3& player,
+                                       float playerHeight, bool jumping = false) const {
+        if (!insertionBoatVisible || InsertionBoatIsSunk() ||
+            insertionBoatPhase == InsertionBoatPhase::Gone) return false;
+        const float dx = player.x - insertionBoatPosition.x;
+        const float dz = player.z - insertionBoatPosition.z;
+        const float localX = dx * std::cos(insertionBoatYaw) - dz * std::sin(insertionBoatYaw);
+        const float localZ = dx * std::sin(insertionBoatYaw) + dz * std::cos(insertionBoatYaw);
+        const float aboveDeck = player.y - playerHeight -
+            (insertionBoatPosition.y - insertionBoatSinkOffset + insertionBoatDeckOffset);
+        return std::abs(localX) <= BoatHalfBeam + 0.15f &&
+               std::abs(localZ) <= BoatHalfLength + 0.15f &&
+               aboveDeck >= -0.4f && aboveDeck <= (jumping ? 2.0f : 0.4f);
+    }
+
+    static DirectX::XMFLOAT3 CarryBoatPosition(const DirectX::XMFLOAT3& player,
+        const DirectX::XMFLOAT3& oldPosition, float oldYaw, float oldDeckY,
+        const DirectX::XMFLOAT3& newPosition, float newYaw, float newDeckY) {
+        const float dx = player.x - oldPosition.x;
+        const float dz = player.z - oldPosition.z;
+        const float localX = dx * std::cos(oldYaw) - dz * std::sin(oldYaw);
+        const float localZ = dx * std::sin(oldYaw) + dz * std::cos(oldYaw);
+        return {newPosition.x + localX * std::cos(newYaw) + localZ * std::sin(newYaw),
+                player.y + (newDeckY - oldDeckY),
+                newPosition.z - localX * std::sin(newYaw) + localZ * std::cos(newYaw)};
+    }
+
+    bool PlayerCanDriveInsertionBoat(const DirectX::XMFLOAT3& player) const {
+        return insertionBoatRouteValid && insertionBoatVisible && insertionBoatHealth > 0.0f &&
+            !InsertionBoatIsFoundering() && !InsertionBoatIsSunk() &&
+            insertionBoatPhase != InsertionBoatPhase::Gone &&
+            (insertionBoatCarryingPlayer ||
+             PlayerWithinBoatReach(player, insertionBoatPosition, insertionBoatYaw));
+    }
+
+    bool TakeInsertionBoatHelm(const DirectX::XMFLOAT3& player) {
+        if (drivingBoat || drivingInsertionBoat || !PlayerCanDriveInsertionBoat(player))
+            return false;
+        insertionBoatManualSquadPending |= insertionBoatCarryingPlayer;
+        insertionBoatCaptured = drivingInsertionBoat = true;
+        insertionBoatCarryingPlayer = true;
+        insertionBoatPassengerPlacementPending = false;
+        insertionBoatDroppedPlayer = insertionBoatBailedOut = false;
+        boatSpeed = 0.0f;
+        SetBoatInput(0.0f, 0.0f, true);
+        return true;
+    }
 
     // Ride-along spot in the boat's local frame: side (positive to starboard,
     // since right is (cos, -sin)), forward from the model centre, and height
@@ -734,7 +911,7 @@ public:
     // Overwritten by ConfigureInsertionBoatBounds, which derives it from how
     // deep the hull floats. Kept in step here so the default is not the one
     // figure still describing a boat that rode higher.
-    float insertionBoatRideHeight = 0.7f;
+    float insertionBoatRideHeight = 1.25f - BoatFloatDepth;
 
     // Where the passenger's centre sits for the current pose. Rotated by roll
     // and yaw both, so they lean with the hull as it founders instead of
@@ -757,9 +934,10 @@ public:
     // Lets the player jump off mid-run. Safe to call straight off a keypress:
     // it does nothing when they are not aboard. The boat carries on its route.
     bool BailOutOfInsertionBoat() {
-        if (!insertionBoatCarryingPlayer) return false;
+        if (!insertionBoatCarryingPlayer || drivingInsertionBoat) return false;
         insertionBoatCarryingPlayer = false;
         insertionBoatBailedOut = true;
+        insertionBoatPassengerPlacementPending = false;
         return true;
     }
 
@@ -771,6 +949,8 @@ public:
     // the camera each frame would fight over it.
     void BeginInsertionBoatRun(const DirectX::XMFLOAT3& landing,
                                float waterY, float approachHeading) {
+        if (drivingInsertionBoat) StopDrivingBoat();
+        insertionBoatCaptured = insertionBoatManualSquadPending = false;
         insertionBoatLanding = landing;
         insertionBoatWaterY = waterY;
         insertionBoatApproachHeading = approachHeading;
@@ -784,6 +964,7 @@ public:
         insertionBoatJustSank = false;
         insertionBoatVisible = true;
         insertionBoatCarryingPlayer = true;
+        insertionBoatPassengerPlacementPending = true;
         insertionBoatSinkOffset = 0.0f;
         insertionBoatBobTime = 0.0f;
         insertionBoatHealth = InsertionBoatMaxHealth;
@@ -810,6 +991,16 @@ public:
         // Gentle swell everywhere except on the bottom.
         const float bob = insertionBoatPhase == InsertionBoatPhase::Sunk
             ? 0.0f : std::sin(insertionBoatBobTime * 0.9f) * 0.10f;
+
+        if (insertionBoatCaptured && insertionBoatHealth > 0.0f &&
+            insertionBoatPhase != InsertionBoatPhase::Gone &&
+            !InsertionBoatIsFoundering() && !InsertionBoatIsSunk()) {
+            if (drivingInsertionBoat)
+                StepBoatMotion(insertionBoatPosition, insertionBoatYaw, deltaTime);
+            insertionBoatPosition.y = insertionBoatWaterY + bob;
+            insertionBoatRoll *= (std::max)(0.0f, 1.0f - 2.0f * dt);
+            return;
+        }
 
         switch (insertionBoatPhase) {
         case InsertionBoatPhase::Inbound: {
@@ -894,6 +1085,7 @@ public:
                 // to place and hurt them.
                 insertionBoatDroppedPlayer = insertionBoatCarryingPlayer;
                 insertionBoatCarryingPlayer = false;
+                insertionBoatPassengerPlacementPending = false;
             }
             break;
         }
@@ -909,10 +1101,13 @@ public:
     // not merely hidden: the route is dropped, so a reset does not resurrect a
     // run this level never wanted or leave one parked at the origin.
     void DisableInsertionBoat() {
+        if (drivingInsertionBoat) StopDrivingBoat();
+        insertionBoatCaptured = insertionBoatManualSquadPending = false;
         insertionBoatRouteValid = false;
         insertionBoatVisible = false;
         insertionBoatCarryingPlayer = false;
         insertionBoatDroppedPlayer = false;
+        insertionBoatPassengerPlacementPending = false;
         insertionBoatBailedOut = false;
         insertionBoatJustSank = false;
         insertionBoatHealth = InsertionBoatMaxHealth;
@@ -926,6 +1121,7 @@ public:
         if (insertionBoatPhase == InsertionBoatPhase::Foundering ||
             insertionBoatPhase == InsertionBoatPhase::Sunk) return;
         insertionBoatHealth = 0.0f;
+        insertionBoatManualSquadPending = false;
         insertionBoatPhase = InsertionBoatPhase::Foundering;
         insertionBoatLanded = false;
     }
@@ -969,6 +1165,7 @@ private:
         insertionBoatLanded = true;
         insertionBoatDroppedPlayer = insertionBoatCarryingPlayer;
         insertionBoatCarryingPlayer = false;
+        insertionBoatPassengerPlacementPending = false;
         insertionBoatUnloadTimer = 0.0f;
         insertionBoatPhase = InsertionBoatPhase::Unloading;
     }
@@ -1789,6 +1986,12 @@ public:
         boatDead = false;
         boatSunk = false;
         boatSinkDepth = 0.0f;
+        StopDrivingBoat();
+        boatCaptured = false;
+        boatRemoteDriven = false;
+        boatSavedGunVisible = true;
+        boatSavedFPSMode = true;
+        boatCameraYaw = 0.0f;
 
         // Same for the insertion boat: re-run it from the heading the route was
         // set up on, not the live yaw, which the turn-out and a founder list

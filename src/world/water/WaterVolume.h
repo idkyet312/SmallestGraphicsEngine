@@ -210,6 +210,19 @@ public:
         if (m_ripples.size() > 24) m_ripples.erase(m_ripples.begin());
     }
 
+    void BoatWakeSplash(float x, float z, float strength) {
+        m_ripples.push_back({x, z, m_time, strength, true});
+        if (m_ripples.size() > 24) m_ripples.erase(m_ripples.begin());
+    }
+
+    size_t CopyBoatWakeRipples(XMFLOAT4* output, size_t capacity) const {
+        size_t count = 0;
+        for (auto ripple = m_ripples.rbegin(); ripple != m_ripples.rend() && count < capacity; ++ripple)
+            if (ripple->boatWake)
+                output[count++] = {ripple->x, ripple->z, ripple->t0, ripple->strength};
+        return count;
+    }
+
     // Swept bullet test against the live wavy surface. Endpoint signs catch a
     // crossing even when a fast round travels several metres in one frame.
     bool ShootSurface(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -346,17 +359,18 @@ public:
             const float dx = x - r.x, dz = z - r.z;
             const float dist = std::sqrt(dx * dx + dz * dz);
             if (dist < 1e-5f) continue;              // gradient is undefined at the centre
-            const float front = 3.0f * age;
+            const float front = (r.boatWake ? 4.0f : 3.0f) * age;
             const float band = dist - front;
             const float decay = std::exp(-age * 1.2f);
             const float env = decay * std::exp(-band * band * 1.5f);
             const float amp = r.strength * 0.5f;
-            const float sn = std::sin(6.0f * band);
-            const float cs = std::cos(6.0f * band);
+            const float k = r.boatWake ? 2.8f : 6.0f;
+            const float sn = std::sin(k * band);
+            const float cs = std::cos(k * band);
 
             h += amp * sn * env;
             // d/dband of [sin(6b) * exp(-1.5 b^2)] = 6cos(6b)*e + sin(6b)*(-3b)*e
-            const float dband = amp * env * (6.0f * cs - 3.0f * band * sn);
+            const float dband = amp * env * (k * cs - 3.0f * band * sn);
             dhdx += dband * (dx / dist);
             dhdz += dband * (dz / dist);
         }
@@ -437,7 +451,7 @@ public:
 
 private:
     static constexpr UINT kFrames = 3;   // frames in flight
-    struct Ripple { float x, z, t0, strength; };
+    struct Ripple { float x, z, t0, strength; bool boatWake = false; };
 
     void PruneRipples() {
         m_ripples.erase(

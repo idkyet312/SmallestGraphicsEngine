@@ -397,6 +397,10 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         level.deploymentRadius < kMinDeploymentRadius ||
         level.deploymentRadius > kMaxDeploymentRadius)
         result.errors.push_back("deployment radius must be between 5 and 600");
+    if (level.defaultInsertionPoint < 0 ||
+        level.defaultInsertionPoint > kDeploymentZoneCount)
+        result.errors.push_back("default insertion point must be between 0 and " +
+                                std::to_string(kDeploymentZoneCount));
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
@@ -558,6 +562,14 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         // Old levels used the historical 34 m ring and did not save this key.
         level.deploymentRadius = root.value(
             "deploymentRadius", kDefaultDeploymentRadius);
+        if (root.contains("defaultInsertionPoint")) {
+            const json& point = root.at("defaultInsertionPoint");
+            if (!point.is_number_integer() || point < 0 ||
+                point > kDeploymentZoneCount)
+                throw std::runtime_error("defaultInsertionPoint must be an integer "
+                    "between 0 and " + std::to_string(kDeploymentZoneCount));
+            level.defaultInsertionPoint = point.get<int>();
+        }
         // Older maps all shipped with the patrol boat, so absence preserves
         // their existing behavior.
         level.patrolBoatEnabled = root.value("patrolBoatEnabled", true);
@@ -818,6 +830,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"deploymentRadius", level.deploymentRadius},
+            {"defaultInsertionPoint", level.defaultInsertionPoint},
             {"patrolBoatEnabled", level.patrolBoatEnabled},
             {"virtualShadowMaps", level.virtualShadowMaps},
             {"terrain", {{"heightScale", level.terrainHeightScale},

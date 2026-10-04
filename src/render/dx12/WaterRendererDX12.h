@@ -444,8 +444,10 @@ private:
         XMFLOAT4 ultraDebug;
         XMFLOAT4 highWaveParams;
         XMFLOAT4 highShoreParams;
+        XMFLOAT4 boatWakeParams;
+        XMFLOAT4 boatWakeRipples[8];
     };
-    static_assert(sizeof(Constants) == 720,
+    static_assert(sizeof(Constants) == 864,
                   "WaterConstants must match water_dx12.hlsl exactly");
 
     static UINT AlignConstantSize(UINT size) {
@@ -1278,6 +1280,25 @@ private:
         constants.highShoreParams = {
             ocean ? std::clamp(scene.highWaterShoreFlatten, 0.0f, 1.0f) : 0.0f,
             0.0f, 0.0f, 0.0f };
+        if (ocean && !ultraActive) {
+            const size_t count = volume.CopyBoatWakeRipples(constants.boatWakeRipples, 8);
+            constants.boatWakeParams.x = static_cast<float>(count);
+            if (count) {
+                XMFLOAT2 minimum{FLT_MAX, FLT_MAX}, maximum{-FLT_MAX, -FLT_MAX};
+                for (size_t i = 0; i < count; ++i) {
+                    const XMFLOAT4& ripple = constants.boatWakeRipples[i];
+                    const float radius = 4.0f * (std::max)(0.0f, volume.GetTime() - ripple.z) + 3.0f;
+                    minimum.x = (std::min)(minimum.x, ripple.x - radius);
+                    minimum.y = (std::min)(minimum.y, ripple.y - radius);
+                    maximum.x = (std::max)(maximum.x, ripple.x + radius);
+                    maximum.y = (std::max)(maximum.y, ripple.y + radius);
+                }
+                constants.boatWakeParams.y = (minimum.x + maximum.x) * 0.5f;
+                constants.boatWakeParams.z = (minimum.y + maximum.y) * 0.5f;
+                constants.boatWakeParams.w = std::hypot(maximum.x - minimum.x,
+                                                       maximum.y - minimum.y) * 0.5f;
+            }
+        }
         return constants;
     }
 

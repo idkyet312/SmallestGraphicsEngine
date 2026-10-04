@@ -85,6 +85,7 @@ int main() {
     level.dxrDDGI.hysteresis = 0.9f;
     level.insertionMode = LevelInsertionMode::PlayerChoice;
     level.deploymentRadius = 137.5f;
+    level.defaultInsertionPoint = kDeploymentZoneCount;
     level.patrolBoatEnabled = false;
 
     const auto root = std::filesystem::temp_directory_path() /
@@ -128,6 +129,7 @@ int main() {
     CHECK(loaded.level.dxrDDGI.maxRayDistance == 42.0f);
     CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
     CHECK(loaded.level.insertionMode == LevelInsertionMode::PlayerChoice);
+    CHECK(loaded.level.defaultInsertionPoint == kDeploymentZoneCount);
     CHECK(loaded.level.deploymentRadius == 137.5f);
     CHECK(!loaded.level.patrolBoatEnabled);
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
@@ -220,7 +222,38 @@ int main() {
     // Files saved before insertion modes existed all arrived by helicopter.
     CHECK(legacyLoaded.level.insertionMode == LevelInsertionMode::Helicopter);
     CHECK(legacyLoaded.level.deploymentRadius == kDefaultDeploymentRadius);
+    CHECK(legacyLoaded.level.defaultInsertionPoint == 0);
     CHECK(legacyLoaded.level.patrolBoatEnabled);
+
+    {
+        LevelDefinition pointLevel = legacyLoaded.level;
+        const auto pointPath = root / "default-insertion-point.json";
+        for (int point : { 0, 1, kDeploymentZoneCount }) {
+            pointLevel.defaultInsertionPoint = point;
+            CHECK(SaveLevel(pointLevel, pointPath).ok);
+            const auto pointLoaded = LoadLevel(pointPath);
+            CHECK(pointLoaded.ok);
+            CHECK(pointLoaded.level.defaultInsertionPoint == point);
+        }
+        for (int point : { -1, kDeploymentZoneCount + 1 }) {
+            pointLevel.defaultInsertionPoint = point;
+            CHECK(!ValidateLevel(pointLevel).ok);
+            CHECK(!SaveLevel(pointLevel, pointPath).ok);
+        }
+        nlohmann::json pointJson;
+        { std::ifstream stream(legacy); stream >> pointJson; }
+        for (const nlohmann::json& invalid : {
+                nlohmann::json(-1), nlohmann::json(kDeploymentZoneCount + 1),
+                nlohmann::json(2.5), nlohmann::json("2"),
+                nlohmann::json(nullptr), nlohmann::json(true),
+                nlohmann::json(uint64_t{1} << 40) }) {
+            pointJson["defaultInsertionPoint"] = invalid;
+            { std::ofstream stream(pointPath); stream << pointJson; }
+            const auto pointLoaded = LoadLevel(pointPath);
+            CHECK(!pointLoaded.ok);
+            CHECK(pointLoaded.error.find("defaultInsertionPoint") != std::string::npos);
+        }
+    }
 
     // An unknown mode is rejected rather than silently falling back, so a typo
     // in a hand-edited level is caught at load.

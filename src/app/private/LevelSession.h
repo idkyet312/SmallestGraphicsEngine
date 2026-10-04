@@ -744,10 +744,14 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_exfilHereDelay = -1.0f;
     // A hub load omits mission assets. Reuse it for another hub visit without
     // treating it as a complete mission/test-level load.
+    // A mission loaded with patrols off also omitted the hull; a later level
+    // that enables patrols needs the boat load stage before reusing its assets.
     const bool modeAssetsLoaded = g_baseMode
         ? ((baseLevelAssetsLoaded || fullLevelAssetsLoaded) &&
            (!MultiplayerActive() || g_marineModel.valid))
-        : (g_emptyLevelMode ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded);
+        : (g_emptyLevelMode ? emptyLevelAssetsLoaded
+                           : fullLevelAssetsLoaded &&
+                             (!g_levelPatrolBoatEnabled || g_boatModel != nullptr));
     if (modeAssetsLoaded)
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     // The base is not a run, so its clock never starts -- a mission timer
@@ -897,9 +901,7 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
     SetLoadingLevelPresentation(path);
 }
 
-// Island 1 -- the campaign map, authored as Islandv10.json. The menu name and
-// the file name differ on purpose: the file keeps its authoring history (v10 is
-// the tenth revision of the island) while the player sees a level name.
+// Island 1 keeps its menu name as newer authored revisions replace the map.
 //
 // The path is searched rather than hardcoded because the two layouts differ:
 // the repo and the packaged build both carry Content/Levels, but the packager
@@ -908,9 +910,9 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path,
 // them instead of only wherever it was last tested.
 static void StartIsland1(HWND hwnd) {
     static constexpr const char* kCandidates[] = {
-        "Content/Levels/Islandv10.json",
-        "levels/Islandv10.json",
-        "build/Content/Levels/Islandv10.json",
+        "Content/Levels/Islandv15.json",
+        "levels/Islandv15.json",
+        "build/Content/Levels/Islandv15.json",
     };
     std::error_code error;
     for (const char* candidate : kCandidates) {
@@ -921,7 +923,7 @@ static void StartIsland1(HWND hwnd) {
     // Say which file is missing rather than failing silently: a menu button
     // that does nothing when clicked gives the player nothing to act on.
     g_mainMenuLevelStatus =
-        "Island 1 not found (Islandv10.json missing from Content/Levels).";
+        "Island 1 not found (Islandv15.json missing from Content/Levels).";
 }
 
 // Same candidate walk as StartIsland1: the repo, the packaged flat levels/ copy

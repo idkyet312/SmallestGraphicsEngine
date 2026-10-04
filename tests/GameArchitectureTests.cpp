@@ -9,6 +9,7 @@
 #include "RankSystem.h"
 #include "CombatSystem.h"
 #include "VehicleSystem.h"
+#include "BoatWakeEmitter.h"
 #include "DeploymentPlanner.h"
 #include "LevelLoadingController.h"
 #include "LevelRuntimeBuilder.h"
@@ -465,6 +466,217 @@ int main() {
     CHECK(!vehicles.helicopterDead);
     CHECK(vehicles.helicopterRotorSpeedScale == 1.0f);
     CHECK(!vehicles.drivingHumvee);
+    {
+        const DirectX::XMFLOAT3 minimum{-1.51464f, -0.83008f, -3.39820f};
+        const DirectX::XMFLOAT3 maximum{1.51458f, 1.57925f, 3.37742f};
+        const float scale = 9.0f / (maximum.z - minimum.z);
+        const auto bounds = VehicleSystem::BoatCameraBounds::FromModel(
+            minimum, maximum, scale, VehicleSystem::BoatFloatDepth);
+        CHECK(bounds.FollowDistance() > bounds.radius + 0.75f);
+        const float halfX = (maximum.x - minimum.x) * scale * 0.5f;
+        const float halfY = (maximum.y - minimum.y) * scale * 0.5f;
+        const float halfZ = (maximum.z - minimum.z) * scale * 0.5f;
+        // The old deck camera sat inside this cabin. Every allowed orbit must
+        // remain outside it, including broadside and steep downward views.
+        for (float pitch : {-65.0f, -15.0f, -12.0f}) {
+            for (int heading = 0; heading < 360; heading += 15) {
+                const float yaw = DirectX::XMConvertToRadians(static_cast<float>(heading));
+                const float p = DirectX::XMConvertToRadians(pitch);
+                const float x = -std::cos(yaw) * std::cos(p) * bounds.FollowDistance();
+                const float y = -std::sin(p) * bounds.FollowDistance();
+                const float z = -std::sin(yaw) * std::cos(p) * bounds.FollowDistance();
+                CHECK(std::abs(x) > halfX || std::abs(y) > halfY || std::abs(z) > halfZ);
+                CHECK(bounds.centerHeight + y > 0.75f);
+            }
+        }
+    }
+    {
+        VehicleSystem boat;
+        boat.boatPosition = {10.0f, 0.0f, 20.0f};
+        CHECK(boat.PlayerCanDriveBoat({10.0f, 1.8f, 20.0f}));
+        CHECK(boat.PlayerCanDriveBoat({13.5f, 1.8f, 20.0f}));
+        CHECK(!boat.PlayerCanDriveBoat({15.0f, 1.8f, 20.0f}));
+        CHECK(!boat.PlayerCanDriveBoat({10.0f, 20.0f, 20.0f}));
+        boat.boatYaw = DirectX::XM_PIDIV2;
+        CHECK(boat.PlayerCanDriveBoat({16.0f, 1.8f, 20.0f}));
+        CHECK(!boat.PlayerCanDriveBoat({10.0f, 1.8f, 25.0f}));
+        boat.boatYaw = 0.0f;
+        boat.SetBoatInput(1.0f, 1.0f, false);
+        boat.StepDrivenBoat(0.25f);
+        CHECK(boat.boatPosition.x == 10.0f && boat.boatPosition.z == 20.0f);
+        boat.drivingBoat = boat.boatCaptured = true;
+        boat.SetBoatInput(1.0f, 0.0f, false);
+        for (int i = 0; i < 600; ++i) boat.StepDrivenBoat(1.0f / 60.0f);
+        CHECK(boat.boatPosition.z > 100.0f);
+        CHECK(std::abs(boat.boatPosition.x - 10.0f) < 0.001f);
+        CHECK(std::abs(boat.boatSpeed - VehicleSystem::BoatForwardSpeed) < 0.001f);
+        const float yaw = boat.boatYaw;
+        boat.SetBoatInput(1.0f, -1.0f, false);
+        boat.StepDrivenBoat(0.25f);
+        CHECK(boat.boatYaw < yaw); // A steers left when moving forward.
+        boat.SetBoatInput(0.0f, 0.0f, true);
+        for (int i = 0; i < 120; ++i) boat.StepDrivenBoat(1.0f / 60.0f);
+        CHECK(std::abs(boat.boatSpeed) < 0.001f);
+        boat.boatYaw = 0.0f;
+        const float reverseStart = boat.boatPosition.z;
+        boat.SetBoatInput(-1.0f, 0.0f, false);
+        for (int i = 0; i < 120; ++i) boat.StepDrivenBoat(1.0f / 60.0f);
+        CHECK(boat.boatPosition.z < reverseStart);
+        CHECK(std::abs(boat.boatSpeed + VehicleSystem::BoatReverseSpeed) < 0.001f);
+        boat.SetBoatInput(-1.0f, -1.0f, false);
+        boat.StepDrivenBoat(0.25f);
+        CHECK(boat.boatYaw > 0.0f); // Rudder reverses when backing up.
+        boat.StopDrivingBoat();
+        const auto parked = boat.boatPosition;
+        boat.StepDrivenBoat(0.25f);
+        CHECK(boat.boatCaptured && !boat.drivingBoat);
+        CHECK(boat.boatPosition.x == parked.x && boat.boatPosition.z == parked.z);
+        CHECK(boat.boatSpeed == 0.0f);
+        boat.boatDead = true;
+        CHECK(!boat.PlayerCanDriveBoat(boat.boatPosition));
+        boat.ResetLevel();
+        CHECK(!boat.boatCaptured && !boat.drivingBoat && !boat.boatDead);
+        CHECK(boat.boatThrottle == 0.0f && boat.boatSteering == 0.0f && boat.boatBrake);
+
+        VehicleSystem slowFrame, fastFrame;
+        slowFrame.drivingBoat = fastFrame.drivingBoat = true;
+        slowFrame.SetBoatInput(1.0f, 0.5f, false);
+        fastFrame.SetBoatInput(1.0f, 0.5f, false);
+        for (int i = 0; i < 30; ++i) slowFrame.StepDrivenBoat(1.0f / 30.0f);
+        for (int i = 0; i < 120; ++i) fastFrame.StepDrivenBoat(1.0f / 120.0f);
+        CHECK(std::abs(slowFrame.boatPosition.x - fastFrame.boatPosition.x) < 0.03f);
+        CHECK(std::abs(slowFrame.boatPosition.z - fastFrame.boatPosition.z) < 0.03f);
+        CHECK(std::abs(slowFrame.boatYaw - fastFrame.boatYaw) < 0.01f);
+        const auto beforePause = fastFrame.boatPosition;
+        fastFrame.StepDrivenBoat(0.0f);
+        CHECK(fastFrame.boatPosition.x == beforePause.x &&
+              fastFrame.boatPosition.z == beforePause.z);
+    }
+    {
+        VehicleSystem insertion;
+        insertion.DisableInsertionBoat();
+        CHECK(!insertion.TakeInsertionBoatHelm({}));
+        insertion.BeginInsertionBoatRun({20.0f, 0.0f, 30.0f}, 0.0f, 0.0f);
+        insertion.UpdateInsertionBoat(0.1f);
+        const auto start = insertion.insertionBoatPosition;
+        const auto patrol = insertion.boatPosition;
+        CHECK(insertion.TakeInsertionBoatHelm(insertion.InsertionBoatRidePosition()));
+        CHECK(insertion.drivingInsertionBoat && !insertion.drivingBoat);
+        CHECK(insertion.insertionBoatCaptured && insertion.insertionBoatCarryingPlayer);
+        CHECK(!insertion.BailOutOfInsertionBoat());
+        insertion.SetBoatInput(1.0f, 0.0f, false);
+        for (int i = 0; i < 120; ++i) {
+            insertion.StepDrivenBoat(1.0f / 60.0f);
+            insertion.UpdateInsertionBoat(1.0f / 60.0f);
+        }
+        CHECK(insertion.insertionBoatPosition.z > start.z + 8.0f);
+        CHECK(insertion.boatPosition.x == patrol.x && insertion.boatPosition.z == patrol.z);
+        CHECK(insertion.boatSpeed > 9.0f); // A parked patrol must not brake the other helm.
+        CHECK(!insertion.insertionBoatDroppedPlayer && insertion.insertionBoatVisible);
+        insertion.StopDrivingBoat();
+        const auto parked = insertion.insertionBoatPosition;
+        insertion.UpdateInsertionBoat(60.0f);
+        CHECK(insertion.insertionBoatPosition.x == parked.x &&
+              insertion.insertionBoatPosition.z == parked.z);
+        CHECK(insertion.insertionBoatVisible && !insertion.insertionBoatCarryingPlayer);
+        CHECK(!insertion.PlayerCanDriveInsertionBoat({1000.0f, 0.0f, 1000.0f}));
+        CHECK(insertion.TakeInsertionBoatHelm(parked));
+        insertion.SetBoatInput(-1.0f, 0.0f, false);
+        for (int i = 0; i < 120; ++i) insertion.UpdateInsertionBoat(1.0f / 60.0f);
+        CHECK(insertion.insertionBoatPosition.z < parked.z);
+        CHECK(std::abs(insertion.boatSpeed + VehicleSystem::BoatReverseSpeed) < 0.001f);
+        auto damage = insertion.DamageInsertionBoatFromEnemyFire(
+            VehicleSystem::InsertionBoatMaxHealth);
+        CHECK(damage.destroyed && insertion.InsertionBoatIsFoundering());
+        CHECK(!insertion.PlayerCanDriveInsertionBoat(insertion.insertionBoatPosition));
+        CHECK(!insertion.insertionBoatManualSquadPending);
+        const auto wreck = insertion.insertionBoatPosition;
+        insertion.UpdateInsertionBoat(0.25f);
+        CHECK(insertion.insertionBoatPosition.x == wreck.x &&
+              insertion.insertionBoatPosition.z == wreck.z);
+        CHECK(insertion.insertionBoatSinkOffset > 0.0f);
+        insertion.ResetLevel();
+        CHECK(!insertion.drivingInsertionBoat && !insertion.insertionBoatCaptured);
+        CHECK(insertion.insertionBoatCarryingPlayer);
+        CHECK(insertion.insertionBoatPhase == VehicleSystem::InsertionBoatPhase::Inbound);
+        CHECK(insertion.TakeInsertionBoatHelm(insertion.InsertionBoatRidePosition()));
+        insertion.DisableInsertionBoat();
+        CHECK(!insertion.drivingInsertionBoat && !insertion.insertionBoatCaptured);
+        CHECK(!insertion.insertionBoatVisible && !insertion.insertionBoatManualSquadPending);
+    }
+    {
+        VehicleSystem insertion;
+        insertion.BeginInsertionBoatRun({0.0f, 0.0f, 180.0f}, 0.0f, 0.0f);
+        CHECK(insertion.insertionBoatPassengerPlacementPending);
+        constexpr float height = 1.8f;
+        const DirectX::XMFLOAT3 stern{0.7f, height + insertion.insertionBoatDeckOffset, -3.0f};
+        CHECK(insertion.InsertionBoatSupportsPassenger(stern, height));
+        CHECK(!insertion.InsertionBoatSupportsPassenger({2.0f, stern.y, stern.z}, height));
+        CHECK(!insertion.InsertionBoatSupportsPassenger({stern.x, stern.y, 5.0f}, height));
+        CHECK(!insertion.InsertionBoatSupportsPassenger({stern.x, stern.y - 1.0f, stern.z}, height, true));
+        const DirectX::XMFLOAT3 jumping{stern.x, stern.y + 1.3f, stern.z};
+        CHECK(!insertion.InsertionBoatSupportsPassenger(jumping, height));
+        CHECK(insertion.InsertionBoatSupportsPassenger(jumping, height, true));
+
+        // Translation, turning and bobbing preserve the passenger's chosen
+        // local walking position and jump height instead of returning to a seat.
+        const auto oldPosition = insertion.insertionBoatPosition;
+        const float oldDeck = oldPosition.y + insertion.insertionBoatDeckOffset;
+        insertion.insertionBoatPosition = {10.0f, 0.2f, 20.0f};
+        insertion.insertionBoatYaw = DirectX::XM_PIDIV2;
+        const auto carried = VehicleSystem::CarryBoatPosition(jumping,
+            oldPosition, 0.0f, oldDeck, insertion.insertionBoatPosition,
+            insertion.insertionBoatYaw, 0.2f + insertion.insertionBoatDeckOffset);
+        CHECK(std::abs(carried.x - 7.0f) < 0.001f);
+        CHECK(std::abs(carried.z - 19.3f) < 0.001f);
+        CHECK(std::abs(carried.y - (jumping.y + 0.2f)) < 0.001f);
+        CHECK(insertion.InsertionBoatSupportsPassenger(carried, height, true));
+        CHECK(insertion.BailOutOfInsertionBoat());
+        CHECK(!insertion.insertionBoatPassengerPlacementPending);
+        CHECK(!insertion.insertionBoatCarryingPlayer);
+        insertion.ResetLevel();
+        CHECK(insertion.insertionBoatPassengerPlacementPending);
+        insertion.DisableInsertionBoat();
+        CHECK(!insertion.insertionBoatPassengerPlacementPending);
+        CHECK(!insertion.InsertionBoatSupportsPassenger(carried, height, true));
+    }
+    {
+        auto traceWake = [](int fps) {
+            BoatWakeEmitter emitter;
+            std::vector<BoatWakeSample> samples;
+            const float dt = 1.0f / fps;
+            for (int i = 0; i < fps * 2; ++i)
+                emitter.Step({0.0f, 0.0f, i * 12.0f * dt},
+                             {0.0f, 0.0f, (i + 1) * 12.0f * dt}, dt, true,
+                    [&](const BoatWakeSample& sample) { samples.push_back(sample); });
+            return samples;
+        };
+        const auto slow = traceWake(30), fast = traceWake(120);
+        CHECK(slow.size() == fast.size() && slow.size() > 20);
+        for (size_t i = 0; i < (std::min)(slow.size(), fast.size()); ++i) {
+            CHECK(std::abs(slow[i].position.z - fast[i].position.z) < 0.001f);
+            CHECK(slow[i].wave == fast[i].wave);
+        }
+        BoatWakeEmitter emitter;
+        std::vector<BoatWakeSample> samples;
+        auto collect = [&](const BoatWakeSample& sample) { samples.push_back(sample); };
+        emitter.Step({}, {}, 0.1f, true, collect);
+        emitter.Step({}, {1000.0f, 0.0f, 0.0f}, 0.1f, true, collect);
+        emitter.Step({}, {0.0f, 0.0f, 5.0f}, 0.0f, true, collect);
+        emitter.Step({}, {0.0f, 0.0f, 5.0f}, 0.1f, false, collect);
+        CHECK(samples.empty());
+        emitter.Step({}, {0.0f, 0.0f, -2.0f}, 0.2f, true, collect);
+        CHECK(!samples.empty() && samples.front().direction.y == -1.0f);
+        CHECK(samples.front().position.z < 0.0f);
+        const float reverseStrength = samples.front().strength;
+        samples.clear(); emitter.Reset();
+        emitter.Step({}, {2.0f, 0.0f, 0.0f}, 0.1f, true, collect);
+        CHECK(!samples.empty() && samples.front().direction.x == 1.0f);
+        CHECK(samples.front().strength > reverseStrength);
+        samples.clear(); emitter.Reset();
+        emitter.Step({}, {20.0f, 0.0f, 0.0f}, 1.0f, true, collect);
+        CHECK(samples.size() == 4);
+    }
     auto vehicleDamage = vehicles.DamagePrimaryHelicopter(500.0f);
     CHECK(vehicleDamage.applied);
     CHECK(!vehicleDamage.destroyed);
@@ -645,6 +857,21 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.Magazine(0) == 5);
     CHECK(player.Reserve(0) == 0);
+    PlayerState demolitionKit;
+    for (int charge = 0; charge < 3; ++charge)
+        CHECK(demolitionKit.ConsumeAmmo(5));
+    CHECK(!demolitionKit.ConsumeAmmo(5));
+    CHECK(!demolitionKit.BeginReload(5));
+    CHECK(demolitionKit.ConsumeGrenade());
+    CHECK(demolitionKit.ConsumeGrenade());
+    CHECK(!demolitionKit.ConsumeGrenade());
+    demolitionKit.RestoreAmmo();
+    CHECK(demolitionKit.Magazine(5) == 3);
+    CHECK(demolitionKit.Reserve(5) == 0);
+    CHECK(demolitionKit.grenades == 2);
+    CHECK(demolitionKit.SetAmmo(5, 99, 99));
+    CHECK(demolitionKit.Magazine(5) == 3);
+    CHECK(demolitionKit.Reserve(5) == 0);
     CHECK(PlayerState::kWeaponSlots == 15);
     CHECK(MissionLoadout::kWeaponCount == PlayerState::kWeaponSlots);
     const auto* designator = player.weapons.FindWeapon(14);
@@ -970,6 +1197,40 @@ int main() {
     // Verified by inspection and in-game instead.)
 
     // ---- Enemy reinforcement dropship ---------------------------------------
+    {
+        VehicleSystem vehicles;
+        DirectX::XMFLOAT3 drop{ 99.0f, 99.0f, 99.0f };
+        int samples = 0;
+        const auto shore = [&](float x, float) {
+            ++samples;
+            return x <= 36.0f ? 1.0f : -2.0f;
+        };
+        CHECK(!vehicles.FindDropshipExfilDropPoint(shore, drop));
+        CHECK(samples == 0);
+        CHECK(drop.x == 99.0f);
+
+        // Search the whole exfil lane even when the insertion ring is large.
+        vehicles.PlaceEscapeBoatOnBearing(DirectX::XM_PIDIV2, 0.0f, 616.0f);
+        CHECK(vehicles.FindDropshipExfilDropPoint(shore, drop));
+        CHECK(std::abs(drop.x - 36.0f) < 0.001f);
+        CHECK(std::abs(drop.z) < 0.001f);
+        CHECK(drop.y == 1.0f);
+        CHECK(samples > 14);
+        CHECK(!vehicles.FindDropshipExfilDropPoint(
+            [](float, float) { return -2.0f; }, drop));
+
+        // A diagonal exfil keeps its own bearing and chooses the closest shore.
+        vehicles.ResetEscapeBoat();
+        vehicles.PlaceEscapeBoatOnBearing(DirectX::XM_PI / 4.0f, 0.0f, 50.0f);
+        CHECK(vehicles.FindDropshipExfilDropPoint(
+            [](float x, float z) {
+                return x * x + z * z <= 31.0f * 31.0f ? 0.8f : 0.0f;
+            }, drop));
+        CHECK(std::abs(drop.x - drop.z) < 0.001f);
+        CHECK(std::abs(std::sqrt(drop.x * drop.x + drop.z * drop.z) -
+                       30.0f) < 0.001f);
+        CHECK(drop.y >= 0.6f);
+    }
     // The wave flies in on the shared secondary-helicopter fields, so the state
     // machine has to hand the airframe back cleanly or the patrol path and the
     // dropship fight over the same position every frame.

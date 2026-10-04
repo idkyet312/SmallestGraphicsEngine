@@ -54,6 +54,9 @@ struct PlayerState {
     SGE::WeaponCustomizationSystem weapons;
     float reloadTimer = 0.0f;
     int reloadingSlot = -1;
+    static constexpr int kGrenadeCapacity = 2;
+    // Shared by all throwable types, so changing selection cannot refill them.
+    int grenades = kGrenadeCapacity;
 
     bool AmmoEnforced() const { return !godMode; }
     bool Reloading() const { return reloadTimer > 0.0f; }
@@ -93,6 +96,7 @@ struct PlayerState {
 
     void RestoreAmmo() {
         weapons.RestoreAmmo();
+        grenades = kGrenadeCapacity;
         reloadTimer = 0.0f;
         reloadingSlot = -1;
     }
@@ -131,6 +135,13 @@ struct PlayerState {
             needed : instance->reserve;
         instance->magazine += moved;
         instance->reserve -= moved;
+    }
+
+    bool ConsumeGrenade() {
+        if (!AmmoEnforced()) return true;
+        if (grenades <= 0) return false;
+        --grenades;
+        return true;
     }
 
     bool ConsumeAmmo(int slot) {

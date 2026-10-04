@@ -101,7 +101,7 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 29, "protocol version was not bumped");
+    Check(kProtocolVersion == 30, "protocol version was not bumped");
     static_assert(std::is_trivially_copyable<ChargeStickData>::value,
                   "charge attachment must be memcpy-able");
     static_assert(std::is_trivially_copyable<ClientChargeStuckMessage>::value,

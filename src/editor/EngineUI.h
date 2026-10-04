@@ -1072,7 +1072,12 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // C4 is carried on top of the two chosen weapons, so it is shown as
             // an equipment entry rather than a weapon. Lit when it is in hand.
             const bool c4Held = slot == GunModel::kRemoteChargeWeapon;
-            const char* c4Label = "C4";
+            char c4Label[24];
+            if (scene.AmmoEnforced())
+                snprintf(c4Label, sizeof(c4Label), "C4 %d",
+                         scene.player.Magazine(GunModel::kRemoteChargeWeapon));
+            else
+                snprintf(c4Label, sizeof(c4Label), "C4 unlimited");
             const ImVec2 c4Size = hudTextSize(c4Label);
             cursorX -= c4Size.x;
             hudText(ImVec2(cursorX, statusY),
@@ -1082,13 +1087,18 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddCircleFilled(ImVec2(cursorX + 3.0f, statusY + 7.0f), 2.6f,
                                   c4Held ? statusLit : statusDim, 10);
 
-            // Selected grenade. Grenades are cooldown-gated rather than counted
-            // in this engine, so this shows readiness, not a stock number --
-            // dim while the throw cooldown is still running.
-            const char* grenadeLabel =
+            const char* grenadeName =
                 scene.selectedGrenade == GrenadeType::Molotov ? "MOLOTOV" :
                 scene.selectedGrenade == GrenadeType::Vortex ? "VORTEX" : "FRAG";
-            const bool grenadeReady = scene.grenadeCooldown <= 0.0f;
+            char grenadeLabel[32];
+            if (scene.AmmoEnforced())
+                snprintf(grenadeLabel, sizeof(grenadeLabel), "%s %d",
+                         grenadeName, scene.player.grenades);
+            else
+                snprintf(grenadeLabel, sizeof(grenadeLabel), "%s unlimited",
+                         grenadeName);
+            const bool grenadeReady = scene.grenadeCooldown <= 0.0f &&
+                (!scene.AmmoEnforced() || scene.player.grenades > 0);
             const ImVec2 grenadeSize = hudTextSize(grenadeLabel);
             cursorX -= grenadeSize.x + 10.0f;
             hudText(ImVec2(cursorX, statusY),
@@ -1172,7 +1182,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
         constexpr float kBarHeight = 4.0f;
 
         char rankLine[96];
-        snprintf(rankLine, sizeof(rankLine), "%s  -  LVL %d", rank.RankLabel(),
+        snprintf(rankLine, sizeof(rankLine), "%s: LVL %d", rank.RankLabel(),
                  rank.Level());
         const ImVec2 rankSize = hudTextSize(rankLine);
         hudText(ImVec2(rankRight - rankSize.x, xpBarY - 18.0f * kHudTextScale),
@@ -1616,7 +1626,7 @@ inline void ProfilerPanelBody() {
         // family. Already counted inside a parent above, so they are collapsed
         // and must not be added to the total.
         if (!nested.empty() && ImGui::TreeNode("CPU: nested scopes")) {
-            ImGui::TextDisabled("Counted inside the spans above -- do not add up.");
+            ImGui::TextDisabled("Counted inside the spans above. Do not add up.");
             for (const ProfilerSampleDX12* sample : nested)
                 ImGui::BulletText("%s: %.3f ms", sample->name.c_str(),
                                   sample->milliseconds);
@@ -1634,7 +1644,7 @@ inline void ProfilerPanelBody() {
     if (!g_profiler.RecordingSamples().empty() &&
         ImGui::TreeNode("CPU: command recording")) {
         ImGui::TextDisabled("Time building command lists, not GPU execution.");
-        ImGui::TextDisabled("Scopes nest -- do not add these up.");
+        ImGui::TextDisabled("Scopes nest. Do not add these up.");
         for (const auto& sample : g_profiler.RecordingSamples())
             ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
                               sample.milliseconds);
@@ -2445,7 +2455,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 vb.BindlessMaterialCount() >= VB_MAX_MATERIALS;
             if (texturesFull || materialsFull || rejected > 0) {
                 ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
-                    "  Material budget EXHAUSTED -- surfaces render untextured");
+                    "  Material budget EXHAUSTED: surfaces render untextured");
             }
             ImGui::Text("  Materials: legacy %u/%u, bindless %u/%u",
                 vb.MaterialCount(), VB_MAX_LEGACY_MATERIALS,
@@ -2478,7 +2488,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "bounds problem rather than a plane problem.\n"
                 "Below 1.0 deliberately under-sizes the sphere so the cull "
                 "bites early and its\nboundary becomes visible. That WILL drop "
-                "geometry you can see -- debug only.");
+                "geometry you can see. Debug only.");
 
         ImGui::SeparatorText("Meshlet cull isolation (debug)");
         ImGui::TextDisabled("F6 cycles these. Pair with Z (meshlet wireframe):");
@@ -2876,7 +2886,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         // registers and just renders untextured, which reads as
                         // an authoring mistake rather than a capacity limit.
                         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
-                            "  Textures: %u/%u FULL - %u dropped (needs %u)",
+                            "  Textures: %u/%u FULL; %u dropped (needs %u)",
                             used, capacity, rejected, capacity + rejected);
                     } else if (used * 10u >= capacity * 8u) {
                         ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.35f, 1.0f),
@@ -3350,7 +3360,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     "Off compiles the original pre-optimization shader\n"
                     "(bit-identical bytecode); on uses hoisted loop\n"
                     "invariants, multiply chains for pow(), and rsqrt\n"
-                    "distance math. Both should look the same -- watch the\n"
+                    "distance math. Both should look the same; watch the\n"
                     "'GTAO + Contact Shadows' GPU timer above for the cost.");
             ImGui::TextDisabled(
                 scene.optimizedAmbientOcclusion
@@ -3559,7 +3569,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         "full deep-water height.\n\n"
                         "Safe to leave on. Unlike refraction this only lowers\n"
                         "the surface, and only in shallows. It is also what\n"
-                        "stops the shallows showing hard polygonal facets --\n"
+                        "stops the shallows showing hard polygonal facets,\n"
                         "neighbouring crests folding through each other where\n"
                         "the water is too shallow to hold them, which makes\n"
                         "the clipmap triangles visible.");
@@ -3886,7 +3896,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SetItemTooltip(
                 "How fast the climb releases. Lower hangs longer; the default "
                 "7.0 settles in roughly 0.4 s. The weapon's own "
-                "recoil is unaffected -- this is the dot only.");
+                "recoil is unaffected. This is the dot only.");
             ImGui::Text("dot climb %.2f", scene.opticDotRecoil);
             ImGui::Checkbox("World Dot In Lens##optic",
                             &scene.opticWorldDotVisible);
@@ -4030,7 +4040,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Pushes the scope camera forward along its own view axis.\n\n"
                 "Zero is the correct value. The lens shader builds its sample "
                 "coordinate from the MAIN camera's view ray, and the glass "
-                "disc's half-angle is measured from the player's eye -- both "
+                "disc's half-angle is measured from the player's eye. Both "
                 "stay anchored to the eye when this moves, so the two bases "
                 "disagree and the image collapses toward the lens centre. "
                 "Measured at 1.35 m the glass filled with concentric rings and "
@@ -4124,12 +4134,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("See-Through Near", &scene.seeThroughNear, 0.005f,
                          0.05f, 2.0f, "%.3f m");
         ImGui::SetItemTooltip(
-            "Distance that fades the most. Default 0.30 m -- the receiver at "
+            "Distance that fades the most. Default 0.30 m: the receiver at "
             "cheek weld.");
         ImGui::DragFloat("See-Through Far", &scene.seeThroughFar, 0.005f,
                          0.10f, 4.0f, "%.3f m");
         ImGui::SetItemTooltip(
-            "Distance that stays solid. Default 1.05 m -- the muzzle, which "
+            "Distance that stays solid. Default 1.05 m: the muzzle, which "
             "both eyes very nearly agree on.");
         ImGui::SliderFloat("See-Through Floor", &scene.seeThroughNearAlpha,
                            0.0f, 1.0f, "%.2f");
@@ -4164,7 +4174,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 if (!straddles)
                     ImGui::TextColored(
                         ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
-                        "Near/Far sit outside that span -- no visible fade.");
+                        "Near/Far sit outside that span, so there is no visible fade.");
                 if (ImGui::Button("Fit To Weapon")) {
                     scene.seeThroughNear = nearest;
                     scene.seeThroughFar = farthest;

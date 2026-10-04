@@ -150,6 +150,7 @@ using namespace DirectX;
 #include "private/Diagnostics.h"
 #include "private/WindowAndGeometry.h"
 #include "private/PlayerMovement.h"
+#include "private/BoatWaterEffects.h"
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
 #include "private/EnemyHumvees.h"
@@ -821,6 +822,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             StartCustomLevel(hwnd, std::filesystem::path(text));
         if (GetEnvironmentVariableA("SGE_CAPTURE_VBDEBUG", text, sizeof(text)) > 0)
             visBuffer.debugViewMode = atoi(text);
+        if (GetEnvironmentVariableA("SGE_CAPTURE_WATER_QUALITY", text, sizeof(text)) > 0)
+            scene.waterQuality = static_cast<WaterQuality>((std::clamp)(atoi(text), 0, 2));
     }
     // SGE_CAPTURE_SWEEP="dyaw,dx,dz" moves the camera by that much per frame,
     // arriving at SGE_CAPTURE_POSE on the captured frame. A still camera lets
@@ -1380,6 +1383,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
+        RefreshInsertionBoatPassenger();
         // The window follows the setting rather than a toggle request, so the
         // menu checkbox and RESET TO DEFAULTS cannot leave the two out of step.
         // F11 writes the setting from the window, so both directions agree.
@@ -1429,7 +1433,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // ground snap in the same frame stands the player on them instead of
         // falling through. Uses last frame's body transforms -- fine for
         // standing, and avoids a one-frame lag that would drop the player.
-        if (!ridingBlackHawk && !deploymentPlanning) {
+        if (!ridingBlackHawk && !deploymentPlanning &&
+            !g_game.vehicles.drivingBoat && !g_game.vehicles.drivingInsertionBoat) {
             if (scene.useDestruction && g_destruction.IsInitialized()) {
                 g_destruction.ResolvePlayerCollision(scene.camera.Position,
                     scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight,
@@ -1475,13 +1480,81 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 << std::endl;
         }
         if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
+            char captureBoat[16] = {};
+            GetEnvironmentVariableA("SGE_CAPTURE_BOAT", captureBoat, sizeof(captureBoat));
+            const bool captureBoatWalk = std::strcmp(captureBoat, "walk") == 0;
+            const bool captureBoatWake = std::strcmp(captureBoat, "wake") == 0;
+            static bool captureBoatWalkStarted = false;
             const float sweepFrames = static_cast<float>(poseCaptureFrames) -
                 static_cast<float>(poseCaptureTarget - 1u);
-            scene.camera.Position = { capturePose[0] + captureSweep[1] * sweepFrames,
-                                      capturePose[1],
-                                      capturePose[2] + captureSweep[2] * sweepFrames };
-            scene.camera.SetViewAngles(
-                capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
+            if (!captureBoatWalk || !captureBoatWalkStarted) {
+                scene.camera.Position = { capturePose[0] + captureSweep[1] * sweepFrames,
+                                          capturePose[1],
+                                          capturePose[2] + captureSweep[2] * sweepFrames };
+                scene.camera.SetViewAngles(
+                    capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
+            }
+            // Exercise the actual driver camera against the imported cabin;
+            // fixed world poses alone cannot catch a helm point inside a wall.
+            if (g_insertionBoatModel && captureBoat[0]) {
+                if (captureBoatWalk ? !captureBoatWalkStarted :
+                                     !g_game.vehicles.drivingInsertionBoat) {
+                    g_game.vehicles.DisableBlackHawkInsertion();
+                    g_blackHawkInsertionRestartPending = false;
+                    g_insertionBoatRestartPending = false;
+                    const XMFLOAT3 hull{capturePose[0], capturePose[1], capturePose[2]};
+                    g_game.vehicles.BeginInsertionBoatRun(hull, hull.y,
+                        XM_PIDIV2 - XMConvertToRadians(capturePose[3]));
+                    g_game.vehicles.insertionBoatPosition = hull;
+                    scene.player.godMode = true;
+                    if (captureBoatWalk) {
+                        // Keep the automatic approach running while exercising
+                        // actual walking input relative to its moving deck.
+                        const float heading = g_game.vehicles.insertionBoatYaw;
+                        g_game.vehicles.insertionBoatLanding = {
+                            hull.x + std::sin(heading) * 180.0f, hull.y,
+                            hull.z + std::cos(heading) * 180.0f};
+                        captureBoatWalkStarted = true;
+                    } else {
+                        ToggleBoatDriving(true);
+                        if (captureBoatWake) g_game.vehicles.boatSpeed = 12.0f;
+                    }
+                }
+                g_insertionChoicePending = false;
+                if (captureBoatWalk) {
+                    if (!g_game.vehicles.insertionBoatPassengerPlacementPending &&
+                        poseCaptureFrames < poseCaptureTarget) {
+                        PlayerInput walk;
+                        walk.yaw = scene.camera.Yaw;
+                        walk.pitch = scene.camera.Pitch;
+                        walk.deltaTime = 1.0f / 75.0f;
+                        walk.forward = poseCaptureFrames < poseCaptureTarget / 2 ? 0.4f : 0.0f;
+                        walk.strafe = poseCaptureFrames >= poseCaptureTarget / 2 ? 0.3f : 0.0f;
+                        walk.Set(PlayerInput::Jump, poseCaptureFrames == 10);
+                        scene.camera.ApplyInput(walk);
+                    }
+                    if (poseCaptureFrames + 1 == poseCaptureTarget) {
+                        const auto& boat = g_game.vehicles;
+                        const float dx = scene.camera.Position.x - boat.insertionBoatPosition.x;
+                        const float dz = scene.camera.Position.z - boat.insertionBoatPosition.z;
+                        std::ofstream("boat_walk_capture.log", std::ios::trunc)
+                            << "Boat walking capture: localX="
+                            << dx * std::cos(boat.insertionBoatYaw) - dz * std::sin(boat.insertionBoatYaw)
+                            << " localZ=" << dx * std::sin(boat.insertionBoatYaw) + dz * std::cos(boat.insertionBoatYaw)
+                            << " grounded=" << scene.camera.IsGrounded
+                            << " passenger=" << boat.insertionBoatCarryingPlayer
+                            << " feetAboveDeck=" << scene.camera.Position.y - scene.camera.PlayerHeight -
+                                (boat.insertionBoatPosition.y - boat.insertionBoatSinkOffset + boat.insertionBoatDeckOffset)
+                            << " boatTravel=" << std::hypot(boat.insertionBoatPosition.x - capturePose[0],
+                                                           boat.insertionBoatPosition.z - capturePose[2])
+                            << std::endl;
+                    }
+                } else {
+                    scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
+                    if (captureBoatWake)
+                        g_game.vehicles.SetBoatInput(1.0f, 0.15f, false);
+                }
+            }
             // SGE_CAPTURE_HELI="distance,rise,bearing" re-places the camera on
             // the enemy gunship every frame instead -- it flies, so no fixed
             // pose frames it. Bearing is degrees clockwise from its nose.
@@ -1680,6 +1753,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << g_profiler.GpuScopeMs("VB Raster")
                                 << " terrainMs="
                                 << g_profiler.GpuScopeMs("VB Terrain")
+                                << " waterQuality=" << static_cast<int>(scene.waterQuality)
                                 << " waterMs="
                                 << g_profiler.GpuScopeMs("Tropical Water")
                                 << " lightPos=" << scene.lightPos.x << ","
@@ -1817,8 +1891,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             scene.camera.FPSMode && scene.camera.IsGrounded &&
             !scene.camera.IsSwimming && !scene.camera.IsSliding &&
             !scene.ejected && !poseCapture && !scene.player.downed &&
-            scene.player.health > 0.0f && !nonLocomotionCameraMotion &&
-            !g_game.vehicles.insertionBoatCarryingPlayer);
+            scene.player.health > 0.0f && !nonLocomotionCameraMotion);
         // Each weapon can carry its own nudge on top of the shared grip point,
         // so the body offset is re-solved when the selection changes. A weapon
         // whose nudge is still zero resolves to exactly the shared value, which
@@ -1876,7 +1949,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // are driven off the same state every machine agrees on.
             ApplyNetworkEnemyHelicopters();
             UpdateEnemyHelicopterDamageSmoke(deltaTime);
+            const XMFLOAT3 previousPatrolBoatPosition = g_boatPosition;
             UpdateBoat(deltaTime);
+            UpdateBoatWaterEffects(g_patrolWakeEmitter, previousPatrolBoatPosition,
+                g_boatPosition, deltaTime,
+                g_levelPatrolBoatEnabled && g_boatModel && !g_boatDead && !g_boatSunk &&
+                    !g_insertionChoicePending, waterRenderer);
             // Aim the insertion once the level is actually up. Waits for the
             // model and for loading to finish, so the drop-off is taken from
             // the settled player spawn. The arming frame uses zero delta so a
@@ -2010,30 +2088,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 const XMFLOAT3 previousBoatPosition =
                     g_game.vehicles.insertionBoatPosition;
+                const BoatPlatformPose previousBoatPose{
+                    previousBoatPosition, g_game.vehicles.insertionBoatYaw,
+                    g_game.vehicles.insertionBoatSinkOffset,
+                    g_game.vehicles.insertionBoatDeckOffset};
+                if (g_game.vehicles.insertionBoatCaptured &&
+                    scene.waterQuality != WaterQuality::Ultra)
+                    g_game.vehicles.insertionBoatWaterY = g_ocean.GetSurfaceY() +
+                        g_ocean.WaveHeightAt(previousBoatPosition.x, previousBoatPosition.z);
+                RefreshInsertionBoatPassenger();
                 g_game.vehicles.UpdateInsertionBoat(
                     armedBoatRunThisFrame ? 0.0f : deltaTime);
+                UpdateInsertionBoatPlatform(previousBoatPose);
                 RidePlayerInInsertionBoat();
                 UpdateInsertionBoatDamageEffects(deltaTime);
-                if (scene.waterQuality == WaterQuality::Ultra &&
+                UpdateBoatWaterEffects(g_insertionWakeEmitter, previousBoatPosition,
+                    g_game.vehicles.insertionBoatPosition, deltaTime,
                     g_game.vehicles.insertionBoatVisible &&
-                    deltaTime > 1e-4f) {
-                    const XMFLOAT3& boat =
-                        g_game.vehicles.insertionBoatPosition;
-                    const float vx =
-                        (boat.x - previousBoatPosition.x) / deltaTime;
-                    const float vz =
-                        (boat.z - previousBoatPosition.z) / deltaTime;
-                    if (vx * vx + vz * vz > 0.04f) {
-                        WaterInteraction wake;
-                        wake.worldXZ = {boat.x, boat.z};
-                        wake.radius = 1.35f;
-                        wake.heightImpulse = 0.018f;
-                        wake.velocityImpulse = {-vx * 0.012f, -vz * 0.012f};
-                        wake.type = WaterInteractionType::Wake;
-                        waterRenderer.QueueInteraction(wake);
-                    }
-                }
+                        !g_game.vehicles.InsertionBoatIsFoundering() &&
+                        !g_game.vehicles.InsertionBoatIsSunk() && !g_insertionChoicePending,
+                    waterRenderer);
             }
+            UpdatePlayerBoat();
+            ReleaseManualInsertionBoatSquad();
             // After both transports, so whichever one raised the flag this
             // frame is honoured. Outside the g_insertionBoatModel guard on
             // purpose: a helicopter insertion must still land its squad on a
@@ -2625,7 +2702,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         groundY = TerrainRendererDX12::HeightAt(
                             tp, bandit->position.x, bandit->position.z);
                     }
-                    if (g_boatModel && !g_boatSunk) {
+                    if (g_levelPatrolBoatEnabled && g_boatModel && !g_boatSunk) {
                         const BoatPlatformPose boatPose =
                             CurrentBoatPlatformPose();
                         if (BoatDeckSupports(
@@ -2880,6 +2957,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (!g_emptyLevelMode) {
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
+        FloatBoatFoamOnWater();
         if (captureWaterTime >= 0.0f)
             g_ocean.PinTime(captureWaterTime);
         if (captureNoWind) g_grass.WindStrength() = 0.0f;
@@ -3587,7 +3665,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     projectile.playerOwned);
                             }
                         }
-                        if (!g_boatDead && g_boatModel) {
+                        if (g_levelPatrolBoatEnabled && !g_boatDead && g_boatModel) {
                             const float dx = g_boatPosition.x - center.x;
                             const float dy = g_boatPosition.y - center.y;
                             const float dz = g_boatPosition.z - center.z;
@@ -4725,9 +4803,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_game.mission.Stats().objectivePlanesTotal > 0;
             if (g_netSession.CurrentRole() != net::Role::Client &&
                 objectiveMet && !levelHasAircraft &&
-                !g_game.vehicles.EscapeBoatReady())
+                !g_game.vehicles.EscapeBoatReady()) {
                 g_game.vehicles.PlaceEscapeBoatOnBearing(
                     RandomUnit() * XM_2PI, 0.0f, CurrentEscapeBoatDistance());
+                // The tower's request ran before the boat existed, so this
+                // unlock must also send the squad that blocks the way out.
+                CallInReinforcementWave();
+            }
             g_game.vehicles.UpdateEscapeBoat(deltaTime);
             if (objectiveMet && g_game.vehicles.EscapeBoatReady() &&
                 g_game.vehicles.PlayerCanBoardEscapeBoat(scene.camera.Position)) {
@@ -7731,6 +7813,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) {
                 RenderPlayerHUD(scene);
+                DrawBoatDrivingPrompt();
                 DrawArmoryShopPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 RenderArmoryShopPanel(hwnd);
@@ -7745,6 +7828,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (scene.player.health > 0.0f || scene.player.downed ||
                     scene.player.godMode)
                     RenderPlayerHUD(scene);
+                DrawBoatDrivingPrompt();
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawMarineFriendlyMarkers(
@@ -8272,6 +8356,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         static const bool travelSmokeAirfield =
             GetEnvironmentVariableA("SGE_TRAVEL_TEST_AIRFIELD",
                                     nullptr, 0) > 0;
+        static const size_t travelSmokeDestination =
+            GetEnvironmentVariableA("SGE_TRAVEL_TEST_LEVEL3", nullptr, 0) > 0
+                ? 2 : (travelSmokeAirfield ? 1 : 0);
         if (g_travelSmokeEnabled && !g_game.loading.Active() &&
             !g_prefabRebuildRequested &&
             ++g_travelSmokeFrames > 8) {
@@ -8332,25 +8419,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 if (!allResolved) PostQuitMessage(7);
                 else g_travelSmokeStage = 3;
             } else if (g_travelSmokeStage == 3) {
-                // Stage 4: fly. Island 1 is the default now that the Training
-                // Range has left the board -- index 2 no longer exists, and an
-                // out-of-range read here would have been the test corrupting
-                // itself rather than failing.
+                // Stage 4: fly to the selected mission through the real board.
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     "Travel smoke stage 4: departing");
                 TravelToDestination(hwnd, kTravelDestinations[
-                    travelSmokeAirfield ? 1 : 0]);
+                    travelSmokeDestination]);
                 g_travelSmokeStage = 4;
                 g_travelSmokeFrames = 0;
             } else if (g_travelSmokeStage == 4 && g_travelSmokeFrames > 30) {
-                // Stage 5: the swap landed. Both routes are now checked by the
+                // Stage 5: the swap landed. All routes are checked by the
                 // level file the load recorded. The default route used to infer
                 // it from g_prefabTravelPoints going empty, which only ever
                 // meant "a map with no boarding helicopter in it" -- true of
                 // every destination, since Base.json is the only level that
                 // places one. Naming the file asserts the right map arrived.
                 //
-                // The cursor is deliberately not asserted free here. Both maps
+                // The cursor is deliberately not asserted free here. These maps
                 // are player_choice, so StartLevelOne hands them to the
                 // deployment screen on arrival; whether mouse-look is live on
                 // landing belongs to the destination level's insertion mode,
@@ -8360,8 +8444,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const bool closed = !g_travelScreenOpen;
                 const bool boardReleased = !g_travelCursorReleased;
                 const bool swapped = g_activeLevelFile ==
-                    (travelSmokeAirfield ? "BigIslandv34.json"
-                                         : "Islandv10.json");
+                    std::filesystem::path(kTravelDestinations[
+                        travelSmokeDestination].levelCandidates[0])
+                        .filename().string();
                 const bool passed = closed && boardReleased && swapped;
                 SGE_LOG("LogGameplay", passed ? EngineLog::Level::Display
                                               : EngineLog::Level::Error,

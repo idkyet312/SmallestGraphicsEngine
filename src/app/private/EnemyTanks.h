@@ -147,9 +147,10 @@ static EnemyTankState* PlayerTank() {
     return nullptr;
 }
 
-// In any vehicle the player drives: the Humvee or a captured tank.
+// Driving owns movement input, water state and the weapon visibility.
 static bool PlayerInVehicle() {
-    return g_drivingHumvee || g_playerTankEntity != 0;
+    return g_drivingHumvee || g_playerTankEntity != 0 ||
+           g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat;
 }
 
 static void ReleaseEnemyTanks() {

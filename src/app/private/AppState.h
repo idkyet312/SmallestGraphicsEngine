@@ -575,18 +575,18 @@ constexpr float              kBoatMaxHealth = VehicleSystem::BoatMaxHealth;
 // 28-43 units out and only reaches open seabed past ~88. Patrol well clear of
 // the beach/surf so the boat reads as sailing open water, not beached.
 constexpr float              kBoatPatrolRadius = 60.0f;
-constexpr float              kBoatDeckHalfBeam = 1.5f;
-constexpr float              kBoatDeckHalfLength = 4.5f;
+constexpr float              kBoatDeckHalfBeam = VehicleSystem::BoatHalfBeam;
+constexpr float              kBoatDeckHalfLength = VehicleSystem::BoatHalfLength;
 constexpr float              kBoatHullHeight = 1.1f;
 // How far a hull sits below the water plane. Both boats normalise their mesh
 // against this, so it is the one number that says how deep they ride; the deck
 // and rider offsets below are measured to match it and have to move with it,
 // or the surfaces people stand on come away from the planking they belong to.
-constexpr float              kBoatFloatDepth = 0.55f;
+constexpr float              kBoatFloatDepth = VehicleSystem::BoatFloatDepth;
 // Deck plane, relative to the water rather than to the hull -- the patrol
 // boat's own y IS the waterline. Negative because the deck now sits just under
-// it: the hull rides 0.55 m deep and the freeboard is ~0.45 m of that.
-constexpr float              kBoatDeckOffset = -0.10f;
+// it: the freeboard datum is 0.45 m above the normalized hull bottom.
+constexpr float              kBoatDeckOffset = VehicleSystem::BoatDeckOffset;
 // Crew stand this much above the deck the player walks on. The bandit rig's
 // origin sits slightly inside the boots, so an actor placed exactly on the deck
 // plane reads as sunk into it. Lifting the actors alone leaves the walkable
@@ -1034,7 +1034,7 @@ bool                        g_baseMode = false;
 // shadow and a nav obstacle. Level 1's template authors its own, so it is
 // unaffected.
 bool                        g_levelPlacesHumvee = false;
-static bool                 g_levelPatrolBoatEnabled = true;
+bool                        g_levelPatrolBoatEnabled = true;
 // Mouse-walk test mode (F10). Holding the right mouse button walks the player
 // forward, and aiming down sights is suppressed for as long as the mode is on --
 // the same button cannot both drive and aim. WASD still works; this is an extra

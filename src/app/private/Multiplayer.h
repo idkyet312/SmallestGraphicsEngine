@@ -778,7 +778,13 @@ static void PublishHostVehicles() {
     boat.z = vehicles.escapeBoatPosition.z;
     boat.yaw = vehicles.escapeBoatYaw;
     boat.bobTime = vehicles.escapeBoatBobTime;
-    g_netSession.PublishVehicles(state, boat);
+    net::PatrolBoatSnapshot patrol;
+    patrol.captured = vehicles.boatCaptured ? 1 : 0;
+    patrol.x = vehicles.boatPosition.x;
+    patrol.y = vehicles.boatPosition.y;
+    patrol.z = vehicles.boatPosition.z;
+    patrol.yaw = vehicles.boatYaw;
+    g_netSession.PublishVehicles(state, boat, patrol);
 }
 
 static void ApplyNetworkEscapeBoat() {
@@ -2235,6 +2241,14 @@ static void UpdateMultiplayerSession(float frameDelta,
     // and sending the eye would sink every other player waist-deep in terrain.
     local.y = scene.camera.Position.y - scene.camera.PlayerHeight;
     local.z = scene.camera.Position.z;
+    if (g_game.vehicles.drivingInsertionBoat) {
+        const VehicleSystem& boat = g_game.vehicles;
+        // The personal insertion boat has no shared vehicle id. Report the
+        // driver at its helm rather than standing out at the orbit camera.
+        local.x = boat.insertionBoatPosition.x - std::sin(boat.insertionBoatYaw) * 1.5f;
+        local.y = boat.insertionBoatPosition.y + boat.insertionBoatDeckOffset;
+        local.z = boat.insertionBoatPosition.z - std::cos(boat.insertionBoatYaw) * 1.5f;
+    }
     // The Humvee this machine is driving: its solver is the one with the
     // input, so its pose is the one everyone else is shown.
     if (g_drivingHumvee && g_activeHumveeIndex < g_humveeGameplay.size() &&
@@ -2260,6 +2274,16 @@ static void UpdateMultiplayerSession(float frameDelta,
         }
     }
     // Tank the player is driving: find its replication index and send pose + turret.
+    if (g_game.vehicles.drivingBoat) {
+        const VehicleSystem& boat = g_game.vehicles;
+        auto& vehicle = local.vehicle;
+        vehicle.kind = net::DrivenVehicleKind::Boat;
+        vehicle.x = boat.boatPosition.x;
+        vehicle.y = boat.boatPosition.y;
+        vehicle.z = boat.boatPosition.z;
+        vehicle.qy = std::sin(boat.boatYaw * 0.5f);
+        vehicle.qw = std::cos(boat.boatYaw * 0.5f);
+    }
     if (g_playerTankEntity != 0) {
         for (uint8_t i = 0; i < g_enemyTanks.size() && i < net::kMaxReplicatedTanks; ++i) {
             if (g_enemyTanks[i].entityId != g_playerTankEntity) continue;
@@ -2474,6 +2498,23 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                        });
 
     if (g_netSession.CurrentRole() == net::Role::Host) {
+        VehicleSystem& boat = g_game.vehicles;
+        boat.boatRemoteDriven = false;
+        for (const net::RemotePlayer& remote : g_netRemoteScratch) {
+            const net::DrivenVehicleState& vehicle = remote.vehicle;
+            if (vehicle.kind != net::DrivenVehicleKind::Boat ||
+                !g_levelPatrolBoatEnabled || !g_boatModel || boat.boatDead ||
+                boat.drivingBoat || remote.health <= 0.0f || remote.downed)
+                continue;
+            boat.boatCaptured = boat.boatRemoteDriven = true;
+            const BoatPlatformPose previous = CurrentBoatPlatformPose();
+            boat.boatPosition = { vehicle.x, vehicle.y, vehicle.z };
+            boat.boatYaw = std::atan2(
+                2.0f * (vehicle.qw * vehicle.qy + vehicle.qx * vehicle.qz),
+                1.0f - 2.0f * (vehicle.qx * vehicle.qx + vehicle.qy * vehicle.qy));
+            CarryBoatOccupants(previous);
+            break;
+        }
         // Humvees other players are driving. Their machine simulates the
         // chassis; the host takes the pose off their input, eases its own body
         // there in SyncEnemyHumveePoses, and hands it on in the armor state

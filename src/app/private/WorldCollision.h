@@ -449,35 +449,43 @@ static void ResolvePlayerWorldObjectCollisions(
     // Low oriented hull box matches projectile collision. Deck top becomes a
     // temporary floor when landing on it; sides push the player out in hull-local
     // space as the patrol boat turns.
-    if (!g_boatModel || g_boatSunk) return;
-    const float boatY = g_boatPosition.y - g_boatSinkDepth;
-    const float top = boatY + kBoatDeckOffset;
-    const float bottom = boatY - kBoatHullHeight;
-    const float sinYaw = std::sin(g_boatYaw);
-    const float cosYaw = std::cos(g_boatYaw);
-    const float worldX = position.x - g_boatPosition.x;
-    const float worldZ = position.z - g_boatPosition.z;
-    float localX = worldX * cosYaw - worldZ * sinYaw;
-    float localZ = worldX * sinYaw + worldZ * cosYaw;
-    const float expandedBeam = kBoatDeckHalfBeam + radius;
-    const float expandedLength = kBoatDeckHalfLength + radius;
-    if (std::abs(localX) >= expandedBeam ||
-        std::abs(localZ) >= expandedLength) return;
-    if (top <= feet + kStepHeight && top >= feet - 0.25f) {
-        floorY = (std::max)(floorY, top);
-        return;
-    }
-    if (position.y <= bottom || feet >= top) return;
-    const float penetrationX = expandedBeam - std::abs(localX);
-    const float penetrationZ = expandedLength - std::abs(localZ);
-    if (penetrationX < penetrationZ)
-        localX = std::copysign(expandedBeam,
-            std::abs(localX) > 0.001f ? localX : 1.0f);
-    else
-        localZ = std::copysign(expandedLength,
-            std::abs(localZ) > 0.001f ? localZ : 1.0f);
-    position.x = g_boatPosition.x + localX * cosYaw + localZ * sinYaw;
-    position.z = g_boatPosition.z - localX * sinYaw + localZ * cosYaw;
+    const auto resolveBoat = [&](const BoatPlatformPose& pose) {
+        const float boatY = pose.position.y - pose.sinkDepth;
+        const float top = BoatDeckY(pose);
+        const float bottom = boatY - kBoatHullHeight;
+        const float sinYaw = std::sin(pose.yaw);
+        const float cosYaw = std::cos(pose.yaw);
+        const float worldX = position.x - pose.position.x;
+        const float worldZ = position.z - pose.position.z;
+        float localX = worldX * cosYaw - worldZ * sinYaw;
+        float localZ = worldX * sinYaw + worldZ * cosYaw;
+        const float expandedBeam = kBoatDeckHalfBeam + radius;
+        const float expandedLength = kBoatDeckHalfLength + radius;
+        if (std::abs(localX) >= expandedBeam ||
+            std::abs(localZ) >= expandedLength) return;
+        if (top <= feet + kStepHeight && top >= feet - 0.25f) {
+            floorY = (std::max)(floorY, top);
+            return;
+        }
+        if (position.y <= bottom || feet >= top) return;
+        const float penetrationX = expandedBeam - std::abs(localX);
+        const float penetrationZ = expandedLength - std::abs(localZ);
+        if (penetrationX < penetrationZ)
+            localX = std::copysign(expandedBeam,
+                std::abs(localX) > 0.001f ? localX : 1.0f);
+        else
+            localZ = std::copysign(expandedLength,
+                std::abs(localZ) > 0.001f ? localZ : 1.0f);
+        position.x = pose.position.x + localX * cosYaw + localZ * sinYaw;
+        position.z = pose.position.z - localX * sinYaw + localZ * cosYaw;
+    };
+    if (g_levelPatrolBoatEnabled && g_boatModel && !g_boatSunk)
+        resolveBoat(CurrentBoatPlatformPose());
+    const VehicleSystem& boat = g_game.vehicles;
+    if (boat.insertionBoatVisible &&
+        g_insertionBoatModel && !boat.InsertionBoatIsSunk())
+        resolveBoat({boat.insertionBoatPosition, boat.insertionBoatYaw,
+                     boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset});
 }
 
 // How far above the feet a walkable surface still counts as floor to step onto

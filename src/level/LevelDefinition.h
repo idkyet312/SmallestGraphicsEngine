@@ -205,6 +205,7 @@ enum class LevelInsertionMode : uint32_t {
 inline constexpr float kDefaultDeploymentRadius = 34.0f;
 inline constexpr float kMinDeploymentRadius = 5.0f;
 inline constexpr float kMaxDeploymentRadius = 600.0f;
+inline constexpr int kDeploymentZoneCount = 20;
 
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
@@ -215,6 +216,8 @@ struct LevelDefinition {
     // World-space radius of the selectable insertion/drop-off ring. It is not
     // multiplied by island scale: an authored 120 m radius stays exactly 120 m.
     float deploymentRadius = kDefaultDeploymentRadius;
+    // Screen numbering is 1-based; zero preserves the legacy player choice.
+    int defaultInsertionPoint = 0;
     // The autonomous armed patrol boat is level scenery/gameplay, separate from
     // the insertion and extraction boats selected by mission flow.
     bool patrolBoatEnabled = true;

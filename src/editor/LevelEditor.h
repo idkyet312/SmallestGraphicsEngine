@@ -219,6 +219,7 @@ private:
     bool localSpace_ = false;
     bool snapEnabled_ = true;
     bool terrainSnap_ = true;
+    bool showInsertionPoints_ = false;
     float translationSnap_ = 0.5f;
     float rotationSnap_ = 15.0f;
     int gizmoOperation_ = 0;

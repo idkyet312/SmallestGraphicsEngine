@@ -238,7 +238,7 @@ static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) 
             levelPath.string());
     }
     if (!loaded) g_levelEditor.NewFromLevelOne();
-    StartLevelOne(hwnd, true);
+    StartLevelOne(hwnd, true, false, false, &g_levelEditor.Level());
     // StartLevelOne opens the mission deployment planner. The editor has no
     // deployment screen, so carrying that state across would keep its orbit
     // camera and make ProcessInput reject every playtest movement command.

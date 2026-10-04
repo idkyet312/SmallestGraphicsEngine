@@ -12,7 +12,7 @@ static void RenderShaderCompileProgress() {
     const float clamped =
         (std::min)(1.0f, (std::max)(0.0f, g_shaderCompileProgress));
     const float margin = 36.0f;
-    const char* caption = "FIRST TIME COMPILING SHADERS - MAY TAKE A MINUTE";
+    const char* caption = "FIRST TIME COMPILING SHADERS. MAY TAKE A MINUTE";
     const ImVec2 captionSize = ImGui::CalcTextSize(caption);
     // Never narrower than the caption plus room for the percentage.
     const float barWidth = (std::max)(captionSize.x + 64.0f,
@@ -229,7 +229,8 @@ static void RenderMainMenu(HWND hwnd) {
     const float kMenuMargin = (std::max)(0.0f, (std::min)(
         kMenuBaseMargin + display.x * 0.019f, display.x - kMenuWidth));
 
-    RenderFrontEndBackdrop(display, kMenuMargin - kMenuBaseMargin);
+    RenderFrontEndBackdrop(display, kMenuMargin - kMenuBaseMargin,
+                           "Content/Textures/UI/menu_background.png");
     // The menu sits in the left third over the art, with no panel behind it --
     // the background is the screen, and a plate floating on top of it would be
     // the thing the eye lands on instead of the image.
@@ -346,7 +347,7 @@ static void RenderMainMenu(HWND hwnd) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
         if (level >= RankSystem::kMaxLevel) {
             ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.62f, 1.0f),
-                               "MAX RANK  -  %lld KILLS",
+                               "MAX RANK: %lld KILLS",
                                static_cast<long long>(g_game.rank.LifetimeKills()));
         } else {
             char remainingText[32];
@@ -3470,7 +3471,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 "The aircraft begins its takeoff roll %d seconds after you are "
                 "on the ground, and it is clear of the map about %d seconds "
                 "after that. It can still be brought down in the air, but the "
-                "moment it leaves the map the mission is a failure -- the "
+                "moment it leaves the map the mission is a failure because the "
                 "clock is the objective as much as the airframe is.",
                 static_cast<int>(kObjectivePlaneHoldSeconds),
                 static_cast<int>(kObjectivePlaneTakeoffSeconds));
@@ -3639,7 +3640,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ImGui::SetTooltip(
                 "The planning camera normally skips the grass field.\n"
                 "On, the draw distance is raised to cover the whole\n"
-                "field from up here -- every cell submitted at once --\n"
+                "field from up here, with every cell submitted at once,\n"
                 "so the blades' footprint and their terrain-material\n"
                 "boundary can be read from above. Costs frames.");
 
@@ -3652,7 +3653,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
                     "Off: cascade shadow maps take the sun back.\n"
-                    "This is a scene setting, not a planning-only one --\n"
+                    "This is a scene setting rather than a planning-only one;\n"
                     "it carries into the mission.");
         } else {
             ImGui::TextDisabled("Shadows disabled in scene settings");
@@ -3690,7 +3691,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                         &g_deploymentDebugHideUI);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Drops every ImGui element -- this panel included.\n"
+                "Drops every ImGui element, including this panel.\n"
                 "The windows are still there invisibly and still take\n"
                 "clicks where they sat, so turn the map from the middle\n"
                 "of the screen, clear of the two side columns.\n"
@@ -3804,7 +3805,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // C4 is demolition kit rather than a weapon pick, so it is carried on every
     // mission without spending a slot or a cent -- otherwise a player who chose
     // two rifles would have no way to take down a demolition objective.
-    ImGui::TextDisabled("Remote C4 is issued free on every mission.");
+    ImGui::TextDisabled("3 C4 charges and 2 grenades are issued on every mission.");
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     }
 
@@ -3880,7 +3881,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                                "No effect on you while god mode is on.");
         else
             ImGui::TextColored(UITheme::kTextDim,
-                "%.1f damage per rifle hit -- %d to drop you from full health.",
+                "%.1f damage per rifle hit; %d to drop you from full health.",
                 perShot, shots);
 
         // The other half of the bargain, and the reason this is not a debug
@@ -4059,7 +4060,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (ImGui::Button("RANDOMIZE CONDITIONS", ImVec2(340.0f, 34.0f)))
         g_lastDeploymentRollSeed = RandomizeDeployment();
     if (g_deploymentDevTools && g_lastDeploymentRollSeed != 0)
-        ImGui::TextDisabled("Roll seed %u -- reuse it to replay this layout.",
+        ImGui::TextDisabled("Roll seed %u. Reuse it to replay this layout.",
                             g_lastDeploymentRollSeed);
     else
         ImGui::TextDisabled("Rolls time, weather, fog and enemy positions.");
@@ -4181,7 +4182,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             ImGui::SetTooltip(
                 "Walk a four-round barrage across the island at random.\n"
                 "Same round and same blast scale as a called strike, but\n"
-                "the impact points are picked for you -- spread apart and\n"
+                "the impact points are picked for you, spread apart and\n"
                 "kept on dry land.");
     }
 
@@ -4196,7 +4197,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             "Keeps shelling the island for the whole mission: one round\n"
             "on a random point every interval, starting once you are on\n"
             "the ground. Rounds are aimed without regard for where you\n"
-            "are -- each one is marked on the ground and whistles as it\n"
+            "are. Each one is marked on the ground and whistles as it\n"
             "falls, and you have about four seconds to leave the ring.");
     if (g_bombardmentEnabled) {
         ImGui::SetCursorPosX(45.0f);
@@ -4211,7 +4212,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // ring is the other half, and it moves with the blast slider below.
         ImGui::TextColored(
             ImVec4(1.0f, 0.62f, 0.25f, 1.0f),
-            "Lethal ring %.0f m -- rounds do not avoid you",
+            "Lethal ring %.0f m. Rounds do not avoid you",
             scene.grenadeEnemyRadius * scene.missileBlastScale);
     }
 
@@ -5342,7 +5343,7 @@ static void RenderPauseMenu(HWND hwnd) {
     // settings early-out, so it stays visible in the settings panel too.
     if (MultiplayerActive()) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.0f);
-        ImGui::TextColored(UITheme::kWarning, "MULTIPLAYER  -  GAME STILL LIVE");
+        ImGui::TextColored(UITheme::kWarning, "MULTIPLAYER: GAME STILL LIVE");
         ImGui::Dummy(ImVec2(0.0f, 12.0f));
     }
 

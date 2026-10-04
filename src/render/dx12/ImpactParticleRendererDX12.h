@@ -111,7 +111,7 @@ public:
             !frames_.Create(FRAME_COUNT)) return false;
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heap.NumDescriptors = 2;
+        heap.NumDescriptors = 4;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heap, IID_PPV_ARGS(&textureHeap_)))) return false;
@@ -123,22 +123,30 @@ public:
 
     UINT Render(const Scene& scene, ID3D12Resource* smokeTexture,
                 ID3D12Resource* bloodTexture, bool hdrTarget, bool msaaTarget,
-                const std::function<bool(const ImpactParticle&)>& include = {}) {
+                const std::function<bool(const ImpactParticle&)>& include = {},
+                ID3D12Resource* sprayTexture = nullptr,
+                ID3D12Resource* foamTexture = nullptr) {
         drawCallsThisFrame_ = 0;
         if (!initialized || !smokeTexture) return 0;
         if (!bloodTexture) bloodTexture = smokeTexture;
-        UpdateTextureDescriptors(smokeTexture, bloodTexture);
+        if (!sprayTexture) sprayTexture = smokeTexture;
+        if (!foamTexture) foamTexture = smokeTexture;
+        UpdateTextureDescriptors(smokeTexture, bloodTexture, sprayTexture, foamTexture);
 
         std::vector<const ImpactParticle*> smoke;
         std::vector<const ImpactParticle*> blood;
         std::vector<const ImpactParticle*> sparks;
+        std::vector<const ImpactParticle*> spray;
+        std::vector<const ImpactParticle*> foam;
         smoke.reserve(scene.impactParticles.size());
         blood.reserve(scene.impactParticles.size());
         sparks.reserve(scene.impactParticles.size());
         for (const ImpactParticle& particle : scene.impactParticles) {
             if (particle.life <= 0.0f || particle.size <= 0.0f) continue;
             if (include && !include(particle)) continue;
-            if (particle.spark) sparks.push_back(&particle);
+            if (particle.waterSpray) spray.push_back(&particle);
+            else if (particle.waterFoam) foam.push_back(&particle);
+            else if (particle.spark) sparks.push_back(&particle);
             else if (particle.blood) blood.push_back(&particle);
             else smoke.push_back(&particle);
         }
@@ -154,6 +162,8 @@ public:
         };
         std::sort(smoke.begin(), smoke.end(), backToFront);
         std::sort(blood.begin(), blood.end(), backToFront);
+        std::sort(spray.begin(), spray.end(), backToFront);
+        std::sort(foam.begin(), foam.end(), backToFront);
 
         const UINT frame = g_dx12.frameIndex % FRAME_COUNT;
         const UINT frameBase = frame * MaxParticles;
@@ -164,6 +174,10 @@ public:
         cursor = UploadGroup(blood, 1, frameBase, cursor);
         const UINT sparkStart = cursor;
         cursor = UploadGroup(sparks, 2, frameBase, cursor);
+        const UINT sprayStart = cursor;
+        cursor = UploadGroup(spray, 3, frameBase, cursor);
+        const UINT foamStart = cursor;
+        cursor = UploadGroup(foam, 4, frameBase, cursor);
 
         const XMMATRIX view = scene.GetViewMatrix();
         const XMMATRIX inverseView = XMMatrixTranspose(view);
@@ -204,7 +218,9 @@ public:
         };
         draw(smokeStart, bloodStart - smokeStart, 0, false);
         draw(bloodStart, sparkStart - bloodStart, 1, false);
-        draw(sparkStart, cursor - sparkStart, 0, true);
+        draw(sparkStart, sprayStart - sparkStart, 0, true);
+        draw(foamStart, cursor - foamStart, 3, false);
+        draw(sprayStart, foamStart - sprayStart, 2, false);
         return drawCallsThisFrame_;
     }
 
@@ -221,6 +237,8 @@ private:
     UINT drawCallsThisFrame_ = 0;
     ID3D12Resource* cachedSmoke_ = nullptr;
     ID3D12Resource* cachedBlood_ = nullptr;
+    ID3D12Resource* cachedSpray_ = nullptr;
+    ID3D12Resource* cachedFoam_ = nullptr;
 
     bool CreatePipelines(ID3DBlob* vs, ID3DBlob* ps, ID3DBlob* hdrPs) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
@@ -302,7 +320,7 @@ private:
             instance.size = source->size;
             instance.kind = kind;
             instance.opacity = kind == 2 ? fade : fadeIn * fadeOut *
-                (kind == 1 ? 0.36f : 0.85f);
+                (kind == 1 ? 0.36f : (kind == 4 ? 0.55f : 0.85f));
             instance.color = source->color;
             if (kind == 0) {
                 const float brighten = 1.0f + 2.0f * age;
@@ -321,15 +339,23 @@ private:
         return cursor;
     }
 
-    void UpdateTextureDescriptors(ID3D12Resource* smoke, ID3D12Resource* blood) {
-        if (smoke == cachedSmoke_ && blood == cachedBlood_) return;
+    void UpdateTextureDescriptors(ID3D12Resource* smoke, ID3D12Resource* blood,
+                                  ID3D12Resource* spray, ID3D12Resource* foam) {
+        if (smoke == cachedSmoke_ && blood == cachedBlood_ &&
+            spray == cachedSpray_ && foam == cachedFoam_) return;
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
             textureHeap_->GetCPUDescriptorHandleForHeapStart();
         g_dx12.device->CreateShaderResourceView(smoke, nullptr, handle);
         handle.ptr += descriptorSize_;
         g_dx12.device->CreateShaderResourceView(blood, nullptr, handle);
+        handle.ptr += descriptorSize_;
+        g_dx12.device->CreateShaderResourceView(spray, nullptr, handle);
+        handle.ptr += descriptorSize_;
+        g_dx12.device->CreateShaderResourceView(foam, nullptr, handle);
         cachedSmoke_ = smoke;
         cachedBlood_ = blood;
+        cachedSpray_ = spray;
+        cachedFoam_ = foam;
     }
 };
 

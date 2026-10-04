@@ -121,6 +121,15 @@ static void LoadFloorMudMaterial() {
     if (!g_bloodTexture)
         std::cerr << "Blood sprite (models/textures/blood_splat.png) unavailable\n";
 
+    g_boatSprayTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("Content/Textures/BoatWake/spray.png"),
+        g_dx12.device, g_dx12.commandList, g_boatWakeUploadHeaps);
+    g_boatFoamTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("Content/Textures/BoatWake/foam.png"),
+        g_dx12.device, g_dx12.commandList, g_boatWakeUploadHeaps);
+    if (!g_boatSprayTexture || !g_boatFoamTexture)
+        std::cerr << "Boat wake textures unavailable; using particle fallback\n";
+
     g_muzzleFlashTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath("Content/Models/textures/muzzle_flash.png"),
         g_dx12.device, g_dx12.commandList, g_muzzleFlashUploadHeaps);

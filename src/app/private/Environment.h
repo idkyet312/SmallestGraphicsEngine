@@ -327,12 +327,15 @@ static std::shared_ptr<SceneMaterial> floorMaterial;
 // upload heap that must outlive the copy.
 ComPtr<ID3D12Resource> g_smokeTexture;
 ComPtr<ID3D12Resource> g_bloodTexture;
+ComPtr<ID3D12Resource> g_boatSprayTexture;
+ComPtr<ID3D12Resource> g_boatFoamTexture;
 ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 ComPtr<ID3D12Resource> g_fireTexture;
 ComPtr<ID3D12Resource> g_explosionTexture;
 ComPtr<ID3D12Resource> g_explosionCoreTexture;
 static std::vector<ComPtr<ID3D12Resource>> g_smokeUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_bloodUploadHeaps;
+static std::vector<ComPtr<ID3D12Resource>> g_boatWakeUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
