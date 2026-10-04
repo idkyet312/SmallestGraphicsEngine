@@ -123,8 +123,14 @@ int main() {
     destroyedTurret.killer = 1;
     destroyedTurret.x = 12.0f;
     destroyedTurret.z = 24.0f;
+    EnemyHumveeSnapshot destroyedHumvee;
+    destroyedHumvee.index = 2;
+    destroyedHumvee.dead = 1;
+    destroyedHumvee.x = 34.0f;
+    destroyedHumvee.y = 3.45f;
+    destroyedHumvee.z = 56.0f;
     mark = wire.size();
-    host.PublishArmor(nullptr, 0, &destroyedTurret, 1, nullptr, 0);
+    host.PublishArmor(nullptr, 0, &destroyedTurret, 1, &destroyedHumvee, 1);
     host.Update(1.0f / 20.0f, local);
     const auto armor = Messages<ServerArmorStateMessage>(
         mark, MessageType::ServerArmorState);
@@ -136,6 +142,12 @@ int main() {
           remoteArmor->turrets[0].dead == 1 &&
           remoteArmor->turrets[0].killer == 1,
           "client must receive turret death and planter credit");
+    Check(remoteArmor->humveeCount == 1 &&
+          remoteArmor->humvees[0].index == 2 &&
+          remoteArmor->humvees[0].dead == 1 &&
+          remoteArmor->humvees[0].x == 34.0f &&
+          remoteArmor->humvees[0].z == 56.0f,
+          "client must receive a destroyed Humvee even without a live pose");
 
     ServerChargeStuckMessage oldLevelCharge = replay[0];
     oldLevelCharge.chargeId += 100;

@@ -86,9 +86,9 @@ public:
     bool hdriEnabled = false;
     bool depthTestEnabled = false;
     bool sunLensEnabled = false;
-    float sunAngularRadius = XMConvertToRadians(0.10f);
-    float sunDiscIntensity = 61.9f;
-    float sunHaloIntensity = 1.31f;
+    float sunAngularRadius = XMConvertToRadians(0.88f);
+    float sunDiscIntensity = 80.0f;
+    float sunHaloIntensity = 4.00f;
     XMFLOAT3 sunLensColor = { 1.0f, 0.92f, 0.70f };
 
     bool Init() {

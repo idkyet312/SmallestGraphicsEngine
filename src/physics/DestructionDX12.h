@@ -215,6 +215,8 @@ public:
     void Reset();
     void Update(float dt);
     void ClearVehicles();
+    // Keep the level's spawn slots stable when one Humvee is destroyed.
+    void DestroyVehicle(size_t vehicleIndex);
     bool InitializeVehicle(size_t vehicleIndex,
                            const DirectX::XMFLOAT3& chassisCenter,
                            float yawRadians = 0.0f);

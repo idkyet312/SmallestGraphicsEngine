@@ -2,6 +2,11 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+const ShootingRangeScore* PlayerShootingRangeScore() {
+    const auto& prefabs = g_game.world.Prefabs();
+    return prefabs.shootingTargets.empty() ? nullptr : &prefabs.shootingRange;
+}
+
 // Drops one destroyed entity out of the prefab runtime lists in place.
 //
 // A blast that destroys a prop used to set g_prefabRebuildRequested, which runs
@@ -52,6 +57,7 @@ static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
     dropById(g_prefabMeshColliders);
     dropById(g_prefabLightInstances);
     dropById(g_prefabDestructibles);
+    dropById(g_game.world.Prefabs().shootingTargets);
     dropById(g_prefabSpawnPoints);
     dropById(g_prefabArmoryShops);
     // Boarding points go with the entity for the same reason the counters do:
@@ -755,6 +761,18 @@ static void RebuildPrefabRenderBatches(bool refreshAssets = true) {
                 std::atan2(spawnWorldX.z, spawnWorldX.x),
                 spawner.value("enemyType", "bandit"),
                 spawner.value("count", 1u) });
+        }
+        if (components.contains("shootingTarget")) {
+            try {
+                ShootingTargetInstance target;
+                target.entityId = entityId;
+                target.definition = ReadShootingTarget(components.at("shootingTarget"));
+                XMStoreFloat4x4(&target.localToWorld, world);
+                g_game.world.Prefabs().shootingTargets.push_back(std::move(target));
+            } catch (const std::exception& error) {
+                SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                    "Invalid shooting target " + prefabId + ": " + error.what());
+            }
         }
         // The shop counter. Its reach is authored in metres on the prefab, so a
         // designer who scales a placement up in the editor gets a proportionally

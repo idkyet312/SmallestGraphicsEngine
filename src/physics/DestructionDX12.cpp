@@ -4260,6 +4260,11 @@ void DestructionDX12::ClearVehicles() {
     m->vehicles.clear();
 }
 
+void DestructionDX12::DestroyVehicle(size_t vehicleIndex) {
+    if (!m || B3_IS_NULL(m->world) || vehicleIndex >= m->vehicles.size()) return;
+    Impl::DestroyVehicleBodies(m->vehicles[vehicleIndex]);
+}
+
 bool DestructionDX12::InitializeVehicle(size_t vehicleIndex,
                                         const XMFLOAT3& chassisCenter,
                                         float yawRadians) {

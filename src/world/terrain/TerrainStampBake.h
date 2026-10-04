@@ -98,7 +98,9 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     const HeightFn& height,
     const std::string& outputName,
     unsigned char* (*compress)(unsigned char*, int, int*, int),
-    TerrainSculptStamp& outStamp) {
+    TerrainSculptStamp& outStamp,
+    uint32_t resolution = kTerrainStampBakeResolution,
+    const TerrainBakeBounds& region = {}) {
     TerrainBakeResult result;
     if (stamps.empty()) {
         result.error = "No sculpt stamps to bake.";
@@ -109,7 +111,11 @@ TerrainBakeResult BakeTerrainSculptToStamp(
         return result;
     }
 
-    const TerrainBakeBounds bounds = TerrainSculptBounds(stamps);
+    if (resolution < 2 || resolution > kTerrainStampBakeResolution) {
+        result.error = "Invalid bake resolution.";
+        return result;
+    }
+    const TerrainBakeBounds bounds = region.valid ? region : TerrainSculptBounds(stamps);
     if (!bounds.valid) {
         result.error = "Sculpt stamps have no usable extent.";
         return result;
@@ -131,7 +137,6 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     // stamp, so it writes at the dedicated slot's resolution. At 512 a level
     // sculpted across 500 m resolved to ~1 m/texel and averaged its own detail
     // away; 4096 puts that at ~12 cm, finer than the clipmap can draw.
-    const uint32_t resolution = kTerrainStampBakeResolution;
     std::vector<uint16_t> gray(static_cast<size_t>(resolution) * resolution, 0);
 
     // Sample the stack, tracking the range so the 16-bit codomain is used fully
@@ -142,12 +147,20 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     bool first = true;
     for (uint32_t y = 0; y < resolution; ++y) {
         // Texel centres, matching SampleTerrainStamp's uv -> texel mapping.
-        const float v = (static_cast<float>(y) + 0.5f) / resolution;
+        // Regional merges use endpoint samples, matching the atlas sampler's
+        // uv * (side - 1). Keep the existing whole-level bake unchanged.
+        const float v = region.valid ? static_cast<float>(y) / (resolution - 1u)
+            : (static_cast<float>(y) + 0.5f) / resolution;
         const float worldZ = centerZ + (v - 0.5f) * (halfSpan * 2.0f);
         for (uint32_t x = 0; x < resolution; ++x) {
-            const float u = (static_cast<float>(x) + 0.5f) / resolution;
+            const float u = region.valid ? static_cast<float>(x) / (resolution - 1u)
+                : (static_cast<float>(x) + 0.5f) / resolution;
             const float worldX = centerX + (u - 0.5f) * (halfSpan * 2.0f);
             const float h = height(worldX, worldZ);
+            if (!std::isfinite(h)) {
+                result.error = "Terrain sampler returned a non-finite height.";
+                return result;
+            }
             heights[static_cast<size_t>(y) * resolution + x] = h;
             if (first) {
                 minHeight = maxHeight = h;

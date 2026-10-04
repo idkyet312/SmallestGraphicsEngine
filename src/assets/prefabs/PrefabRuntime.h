@@ -4,6 +4,7 @@
 #include "CollisionMesh.h"
 #include "PrefabColliders.h"
 #include "SceneGraph.h"
+#include "ShootingTarget.h"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cmath>
@@ -113,6 +114,8 @@ struct PrefabRuntimeState {
     std::vector<PrefabArmoryShop> armoryShops;
     std::vector<PrefabTravelPoint> travelPoints;
     std::vector<PrefabDestructibleInstance> destructibles;
+    std::vector<ShootingTargetInstance> shootingTargets;
+    ShootingRangeScore shootingRange;
     std::unordered_map<uint64_t, float> health;
 
     void ClearDerived() {
@@ -125,10 +128,12 @@ struct PrefabRuntimeState {
         armoryShops.clear();
         travelPoints.clear();
         destructibles.clear();
+        shootingTargets.clear();
     }
 
     void ResetGameplayState() {
         health.clear();
+        shootingRange = {};
     }
 };
 
@@ -141,6 +146,7 @@ struct PrefabTransformUpdateResult {
     size_t armoryShops = 0;
     size_t travelPoints = 0;
     size_t destructibles = 0;
+    size_t shootingTargets = 0;
 };
 
 enum class PrefabTransformUpdateScope {
@@ -239,6 +245,12 @@ inline PrefabTransformUpdateResult ApplyPrefabEntityTransformDelta(
         if (destructible.entityId != entityId) continue;
         transformPoint(destructible.position);
         ++result.destructibles;
+    }
+    for (ShootingTargetInstance& target : state.shootingTargets) {
+        if (target.entityId != entityId) continue;
+        XMStoreFloat4x4(&target.localToWorld,
+            XMLoadFloat4x4(&target.localToWorld) * delta);
+        ++result.shootingTargets;
     }
     return result;
 }

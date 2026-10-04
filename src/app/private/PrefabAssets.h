@@ -43,7 +43,8 @@ static bool ComputePrefabModelBounds(const std::shared_ptr<SceneNode>& model,
 // optimization upstream would otherwise yield a silently empty tree (R2).
 static bool ExtractPrefabCollisionTriangles(const std::shared_ptr<SceneNode>& model,
                                             std::vector<float>& triangles,
-                                            std::string* emptyPrimitives = nullptr) {
+                                            std::string* emptyPrimitives = nullptr,
+                                            const SceneNode* skippedSubtree = nullptr) {
     triangles.clear();
     size_t primitiveCount = 0;
     size_t emptyCount = 0;
@@ -51,7 +52,7 @@ static bool ExtractPrefabCollisionTriangles(const std::shared_ptr<SceneNode>& mo
 
     const auto visit = [&](const auto& self,
                            const std::shared_ptr<SceneNode>& node) -> void {
-        if (!node) return;
+        if (!node || node.get() == skippedSubtree) return;
         const XMMATRIX nodeWorld = XMLoadFloat4x4(&node->globalTransform);
         if (node->mesh) for (const MeshPrimitive& primitive : node->mesh->primitives) {
             ++primitiveCount;

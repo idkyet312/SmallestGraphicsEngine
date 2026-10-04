@@ -162,7 +162,8 @@ static bool g_missileStrikeArmed = false;
 // Declared here the way DeploymentPlanningActive above is.
 static void LaunchMissileStrike(const XMFLOAT3& origin,
                                 const XMFLOAT3& target,
-                                float flightSeconds = 1.6f);
+                                float flightSeconds = 1.6f,
+                                bool fromPlayer = true);
 
 static constexpr int kWartornSalvoRounds = 4;
 // Spacing between rounds. Flight time is a fixed 1.6 s, so at this interval the
@@ -358,7 +359,7 @@ static void UpdateOngoingBombardment(float deltaTime, bool active) {
         impact.x + std::cos(bearing) * kBombardmentStandoff,
         impact.y + kBombardmentAltitude,
         impact.z + std::sin(bearing) * kBombardmentStandoff };
-    LaunchMissileStrike(origin, impact, kBombardmentFlightSeconds);
+    LaunchMissileStrike(origin, impact, kBombardmentFlightSeconds, false);
 
     g_bombardmentInbound = true;
     g_bombardmentImpact = impact;

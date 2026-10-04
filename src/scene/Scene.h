@@ -50,6 +50,8 @@ struct Projectile {
     // Marine rounds share the friendly collision path, so hostile=false alone
     // cannot identify ownership.
     bool     playerOwned = false;
+    // A mounted gun clears its own vehicle, even on later flight segments.
+    int      sourceHumvee = -1;
     // Fired by a gunship door gun rather than a rifle. Mechanically identical
     // to any other hostile round except that it cannot score an instant
     // headshot kill: the door gun puts out a long burst at a leading aim
@@ -478,9 +480,9 @@ struct Scene {
     bool     enableSunLens = true;
     // Compact Battlefield-style source: a white-hot core whose energy is spread
     // by bloom and the authored radial-scattering texture.
-    float    sunAngularRadiusDegrees = 0.10f;
-    float    sunDiscIntensity = 61.9f;
-    float    sunHaloIntensity = 1.31f;
+    float    sunAngularRadiusDegrees = 0.88f;
+    float    sunDiscIntensity = 80.0f;
+    float    sunHaloIntensity = 4.00f;
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;

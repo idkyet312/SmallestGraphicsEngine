@@ -398,6 +398,7 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
     if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
         g_levelPlacesHumvee) {
         for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+            if (!HumveeAlive(index)) continue;
             PrepareHumveeModelForRender(index);
             AppendOpaqueSceneNodeDrawItemsKeyed(
                 g_humveeModel, HumveeWorldMatrix(index), index + 1, items);

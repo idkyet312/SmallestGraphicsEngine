@@ -189,7 +189,42 @@ float3 SampleFlare(float2 uv) {
 // leaves, and the result blends toward unoccluded. Light entering the barrel
 // from just outside the frame is not blocked by anything the depth buffer
 // knows about.
+#if defined(SGE_HIGH_QUALITY_LENS)
+float SkyCoverage(float2 uv, uint2 dimensions) {
+    float2 p = uv * float2(dimensions) - 0.5;
+    int2 base = int2(floor(p));
+    float2 f = frac(p);
+    int2 last = int2(dimensions) - 1;
+    // Filter the binary coverage, not depth: interpolating a foreground depth
+    // with sky before thresholding keeps almost the whole edge pixel blocked.
+    float a = sceneDepth.Load(int3(clamp(base, int2(0, 0), last), 0)) >= 0.9999;
+    float b = sceneDepth.Load(int3(clamp(base + int2(1, 0), int2(0, 0), last), 0)) >= 0.9999;
+    float c = sceneDepth.Load(int3(clamp(base + int2(0, 1), int2(0, 0), last), 0)) >= 0.9999;
+    float d = sceneDepth.Load(int3(clamp(base + int2(1, 1), int2(0, 0), last), 0)) >= 0.9999;
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+#endif
+
 float SunDepthVisibility(float2 sunUV) {
+#if defined(SGE_HIGH_QUALITY_LENS)
+    uint w, h;
+    sceneDepth.GetDimensions(w, h);
+    float radius = max(sunLensColor.w, 1.5 / float(h));
+    float2 discRadius = radius * float2(float(outputSize.y) / float(outputSize.x), 1.0);
+    float visibility = 0.0;
+    // A static equal-area disc stays stable in motion and follows the solar
+    // angular radius at every render scale, including DLSS.
+    [unroll]
+    for (int i = 0; i < 12; ++i) {
+        float r = sqrt((float(i) + 0.5) / 12.0);
+        float angle = float(i) * 2.39996323;
+        float2 tap = sunUV + float2(cos(angle), sin(angle)) * r * discRadius;
+        float outside = max(max(-tap.x, tap.x - 1.0), max(-tap.y, tap.y - 1.0));
+        visibility += lerp(SkyCoverage(tap, uint2(w, h)), 1.0,
+                           smoothstep(0.0, 0.06, outside));
+    }
+    return visibility / 12.0;
+#else
     float2 texel = 1.0 / float2(outputSize);
 #if defined(SGE_DLSS_SR)
     uint depthWidth, depthHeight;
@@ -214,6 +249,7 @@ float SunDepthVisibility(float2 sunUV) {
                           max(-sunUV.y, sunUV.y - 1.0));
     float offScreen = smoothstep(0.0, 0.06, overshoot);
     return lerp(visibility, 1.0, offScreen);
+#endif
 }
 
 float LinearizeDepth(float depth) {
@@ -490,6 +526,12 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         float sunResponse = 0.0;
         float sunEnergy = 0.0;
         float3 sunBloom = 0.0;
+#if defined(SGE_HIGH_QUALITY_LENS)
+        float sunVisibility = 0.0;
+        if (sunLensPosition.z > 0.0 &&
+            (lensFlareStrength > 0.0 || lensDirtStrength > 0.0))
+            sunVisibility = SunDepthVisibility(sunLensPosition.xy);
+#endif
         // sunLensPosition.z is a continuous presence, not an on-screen flag:
         // it ramps down across a margin outside the frame so the flare fades
         // as the sun leaves rather than switching off at the boundary. Testing
@@ -502,7 +544,11 @@ void main(uint3 threadID : SV_DispatchThreadID) {
             const float intensityScale =
                 saturate(sunLensPosition.w * (1.0 / 6.0));
             sunResponse = sunLensPosition.z *
+#if defined(SGE_HIGH_QUALITY_LENS)
+                          sunVisibility *
+#else
                           SunDepthVisibility(sunLensPosition.xy) *
+#endif
                           sourcePresent * intensityScale;
         }
         // The flare buffer already carries its own presence and intensity from
@@ -512,7 +558,11 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         float3 flare = 0.0;
         if (lensFlareStrength > 0.0) {
             flare = SampleFlare(lensUV) *
+#if defined(SGE_HIGH_QUALITY_LENS)
+                    sunVisibility;
+#else
                     max(SunDepthVisibility(sunLensPosition.xy), 0.0);
+#endif
             lens += flare;
         }
         // Dirt is lit BY the bloom rather than drawn over the image: grime is
@@ -524,6 +574,15 @@ void main(uint3 threadID : SV_DispatchThreadID) {
             float dirt = LensDirtMask(lensUV);
             float3 dirtLight = bloomColor + flare * 0.85 +
                 max(sunLensColor.rgb, 0.0) * (sunEnergy * sunResponse * 0.18);
+#if defined(SGE_HIGH_QUALITY_LENS)
+            // Dust catches local glare; distant solar energy should not light
+            // every speck equally across an otherwise dark frame.
+            float2 delta = (lensUV - sunLensPosition.xy) *
+                float2(float(outputSize.x) / float(outputSize.y), 1.0);
+            dirtLight = bloomColor * 0.7 + flare * 0.85 +
+                max(sunLensColor.rgb, 0.0) * (sunEnergy * sunResponse *
+                exp(-length(delta) * 4.0) * 0.08);
+#endif
             lens += dirtLight * dirt * lensDirtStrength * 1.65;
         }
     }
@@ -549,19 +608,43 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     // than as a blur.
     if (chromaticAberration > 0.0 && validationMode == 0u) {
         float2 direction = centered * chromaticAberration * 0.01;
+#if defined(SGE_HIGH_QUALITY_LENS)
+        float radiusSquared = saturate(dot(centered, centered) * 0.5);
+#endif
         float2 texel = 1.0 / float2(outputSize);
+#if defined(SGE_HIGH_QUALITY_LENS)
+        // Express dispersion in display pixels: changing resolution should
+        // not turn subtle lens fringing into a many-pixel colour smear.
+        float2 radial = centered * float2(float(outputSize.x) / float(outputSize.y), 1.0);
+        direction = radial / max(length(radial), 1e-5) * texel *
+            min(chromaticAberration * 1.25, 3.0) * radiusSquared * radiusSquared;
+#endif
         // Sample the same HDR path so the fringes are tonemapped consistently
         // with the pixel they surround.
+#if defined(SGE_HIGH_QUALITY_LENS)
+        float3 shiftedR = hdrInput.SampleLevel(
+            lutSampler, saturate(uv - direction), 0.0).rgb;
+        float3 shiftedB = hdrInput.SampleLevel(
+            lutSampler, saturate(uv + direction), 0.0).rgb;
+#else
         float3 shiftedR = hdrInput.SampleLevel(
             lutSampler, saturate(uv - direction * texel * outputSize.y), 0.0).rgb;
         float3 shiftedB = hdrInput.SampleLevel(
             lutSampler, saturate(uv + direction * texel * outputSize.y), 0.0).rgb;
+#endif
         if (NonFinite(shiftedR)) shiftedR = hdr;
         if (NonFinite(shiftedB)) shiftedB = hdr;
         float3 fringeR = TonemapAgX((shiftedR + lens) * exposure * autoExposure);
         float3 fringeB = TonemapAgX((shiftedB + lens) * exposure * autoExposure);
         fringeR = ApplySceneColorGrade(fringeR);
         fringeB = ApplySceneColorGrade(fringeB);
+#if defined(SGE_HIGH_QUALITY_LENS)
+        // Match the green channel's display transform before combining them.
+        fringeR = colorLUT.SampleLevel(lutSampler,
+            saturate(fringeR) * lutScale + lutOffset, 0).rgb;
+        fringeB = colorLUT.SampleLevel(lutSampler,
+            saturate(fringeB) * lutScale + lutOffset, 0).rgb;
+#endif
         color = float3(fringeR.r, color.g, fringeB.b);
     }
 

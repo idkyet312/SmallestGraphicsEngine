@@ -639,6 +639,8 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     const bool stressVehicle = vehicleIndex == kStressHumveeGunnerMount &&
         g_stressTestMode;
     if (!authoredVehicle && !stressVehicle) return false;
+    if (authoredVehicle && !HumveeAlive(static_cast<size_t>(vehicleIndex)))
+        return true; // This mount has been dealt with, so no spawn retry is needed.
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
             existing->mountedVehicleIndex == vehicleIndex)

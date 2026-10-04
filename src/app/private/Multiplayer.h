@@ -609,6 +609,9 @@ static float ResolveRemoteTracerRange(const XMFLOAT3& origin,
     if (scene.useDestruction && g_destruction.IsInitialized() &&
         g_destruction.HitTestSegmentForVision(origin, end, kRayRadius, hit))
         consider(hit);
+    CollisionMeshRayHit humveeHit;
+    if (HitHumveeSegment(origin, end, kRayRadius, humveeHit))
+        consider(humveeHit.point);
     return best;
 }
 
@@ -941,6 +944,19 @@ static void PublishHostArmor() {
     g_hostHumveeScratch.clear();
     for (size_t index = 0; index < g_humveeGameplay.size() &&
                            index < net::kMaxReplicatedHumvees; ++index) {
+        const HumveeGameplayState& state = g_humveeGameplay[index];
+        if (state.dead) {
+            // Removed physics bodies still need a snapshot, including for a
+            // player joining after the deploy-screen strike landed.
+            net::EnemyHumveeSnapshot out;
+            out.index = static_cast<uint8_t>(index);
+            out.dead = 1;
+            out.x = state.wreckPosition.x;
+            out.y = state.wreckPosition.y;
+            out.z = state.wreckPosition.z;
+            g_hostHumveeScratch.push_back(out);
+            continue;
+        }
         XMFLOAT4X4 pose;
         XMFLOAT3 position;
         if (!g_destruction.GetVehicleTransform(index, pose, &position))
@@ -1090,6 +1106,11 @@ static void ApplyNetworkArmor() {
         const net::EnemyHumveeSnapshot& in = armor->humvees[i];
         if (in.index >= g_humveeGameplay.size()) continue;
         HumveeGameplayState& state = g_humveeGameplay[in.index];
+        if (in.dead) {
+            WreckHumvee(in.index, { in.x, in.y, in.z }, false);
+            continue;
+        }
+        if (state.dead) continue;
         state.netTurretYaw = in.turretYaw;
         state.netTurretSeen = true;
         if (!in.hostDriven) continue;
@@ -2467,6 +2488,7 @@ static void UpdateMultiplayerBodies(float frameDelta) {
             if (g_drivingHumvee && g_activeHumveeIndex == vehicle.index)
                 continue;
             HumveeGameplayState& state = g_humveeGameplay[vehicle.index];
+            if (state.dead) continue;
             state.remoteDriven = true;
             state.playerEverDriven = true;
             state.netPosition = { vehicle.x, vehicle.y, vehicle.z };

@@ -510,6 +510,14 @@ if(BUILD_TESTING)
         SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
 
+    add_executable(TerrainStampMergeTests
+        tests/TerrainStampMergeTests.cpp
+        tests/StbImageWriteImpl.cpp
+        src/world/terrain/TerrainStampBake.cpp)
+    target_include_directories(TerrainStampMergeTests PRIVATE ${TINYGLTF_INCLUDE_DIRS})
+    target_link_libraries(TerrainStampMergeTests PRIVATE SGEProjectHeaders)
+    add_test(NAME TerrainStampMergeTests COMMAND TerrainStampMergeTests)
+
     # Header-only and free of any device, so they need nothing but the headers.
     add_executable(GameSettingsTests tests/GameSettingsTests.cpp)
     target_link_libraries(GameSettingsTests PRIVATE SGEProjectHeaders)
@@ -530,6 +538,15 @@ if(BUILD_TESTING)
     add_executable(BulletPenetrationTests tests/BulletPenetrationTests.cpp)
     target_link_libraries(BulletPenetrationTests PRIVATE SGEProjectHeaders)
     add_test(NAME BulletPenetrationTests COMMAND BulletPenetrationTests)
+
+    add_executable(ShootingTargetTests
+        tests/ShootingTargetTests.cpp
+        src/physics/CollisionMesh.cpp)
+    target_compile_definitions(ShootingTargetTests PRIVATE
+        SGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(ShootingTargetTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json)
+    add_test(NAME ShootingTargetTests COMMAND ShootingTargetTests)
 
     add_executable(RuntimeWorldTests
         tests/RuntimeWorldTests.cpp
@@ -796,6 +813,9 @@ if(BUILD_TESTING)
     add_executable(AATurretChargeTests tests/AATurretChargeTests.cpp)
     target_link_libraries(AATurretChargeTests PRIVATE SGEProjectHeaders)
     add_test(NAME AATurretChargeTests COMMAND AATurretChargeTests)
+    add_executable(VehicleBlastTests tests/VehicleBlastTests.cpp)
+    target_link_libraries(VehicleBlastTests PRIVATE SGEProjectHeaders)
+    add_test(NAME VehicleBlastTests COMMAND VehicleBlastTests)
     add_executable(NetChargeSyncTests tests/NetChargeSyncTests.cpp)
     target_link_libraries(NetChargeSyncTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetChargeSyncTests COMMAND NetChargeSyncTests)

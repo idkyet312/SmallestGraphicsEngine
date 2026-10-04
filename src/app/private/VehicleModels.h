@@ -4,6 +4,10 @@
 
 size_t LevelHumveeCount() { return g_levelHumveeSpawns.size(); }
 
+bool HumveeAlive(size_t index) {
+    return index >= g_humveeGameplay.size() || !g_humveeGameplay[index].dead;
+}
+
 struct HumveeVisualPoseSample {
     XMFLOAT3 position{};
     XMFLOAT4 rotation{ 0.0f, 0.0f, 0.0f, 1.0f };

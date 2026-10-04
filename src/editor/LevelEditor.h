@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,9 @@ public:
     bool BirdseyeEnabled() const { return birdseyeEnabled_; }
     // Whether the viewport wants the walkable navmesh drawn over the ground.
     bool NavmeshEnabled() const { return navmeshEnabled_; }
+    const TerrainSculptStamp* TerrainStampPreview() const {
+        return terrainStampPreview_ ? &*terrainStampPreview_ : nullptr;
+    }
     bool IsDirty() const { return dirty_; }
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
@@ -179,6 +183,7 @@ private:
     void SaveFavourites() const;
     void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
+    void AutoMergeTerrain(const std::function<float(float, float)>& terrainHeight);
     // Terrain tool 5: paint layer weights into the level's splatmap. Shares the
     // sculpt brush's stroke/undo/spacing machinery but writes texels instead of
     // height stamps. islandHalfExtent is the same world->UV frame the resolve
@@ -273,9 +278,12 @@ private:
     // Lifts or sinks a replace stamp's target plane relative to the ground the
     // cursor is on, so a plateau can sit above the terrain it overwrites.
     float terrainStampBaseOffset_ = 0.0f;
-    // Downsampled grayscale of the selected stamp, used to draw the heightmap
-    // inside the placement square. Cached by filename: decoding a 4K 16-bit PNG
-    // every frame the cursor moves would stall the editor.
+    std::optional<TerrainSculptStamp> terrainStampPreview_;
+    std::optional<DirectX::XMFLOAT3> terrainStampPreviewAnchor_;
+    bool terrainStampPreviewNeedsMove_ = false;
+    DirectX::XMFLOAT2 terrainStampCommitMouse_{};
+    // Downsampled grayscale for the shape thumbnail. Cached by filename so
+    // decoding a 4K 16-bit PNG does not stall the editor every frame.
     std::string stampPreviewName_;
     std::vector<float> stampPreviewHeights_;  // kStampPreviewGrid^2, 0..1
     bool stampPreviewValid_ = false;
@@ -285,6 +293,8 @@ private:
     float terrainPaintStrength_ = 1.0f;
     bool terrainStrokeActive_ = false;
     bool terrainStrokeChanged_ = false;
+    bool terrainAutoMerge_ = false;
+    bool terrainAutoMergePending_ = false;
     DirectX::XMFLOAT3 lastTerrainStamp_ = { 100000.0f, 0.0f, 100000.0f };
     LevelDefinition terrainStrokeBefore_;
     std::vector<LevelDefinition> undo_;

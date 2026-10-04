@@ -231,6 +231,7 @@ static void InitializeLevelHumveePhysics() {
         !g_levelPlacesHumvee)
         return;
     for (size_t index = 0; index < g_levelHumveeSpawns.size(); ++index) {
+        if (!HumveeAlive(index)) continue;
         const Transform& humvee = g_levelHumveeSpawns[index];
         g_destruction.InitializeVehicle(
             index,

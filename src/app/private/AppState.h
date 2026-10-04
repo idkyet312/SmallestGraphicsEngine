@@ -1091,6 +1091,8 @@ static std::vector<Transform> g_levelHumveeSpawns;
 static constexpr size_t kNoHumvee = SIZE_MAX;
 static size_t g_activeHumveeIndex = kNoHumvee;
 struct HumveeGameplayState {
+    bool dead = false;
+    XMFLOAT3 wreckPosition{};
     XMFLOAT3 previousPosition{};
     bool previousPositionValid = false;
     float houseImpactCooldown = 0.0f;

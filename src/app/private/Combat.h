@@ -229,7 +229,8 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start,
                                      uint64_t* hitEntityId = nullptr,
                                      XMFLOAT3* hitNormal = nullptr,
                                      bool fencePanelsTransparent = false,
-                                     bool ignoreAATurretColliders = false);
+                                     bool ignoreAATurretColliders = false,
+                                     bool preciseShootingTargets = false);
 
 static bool FindDesignatorTarget(XMFLOAT3& target) {
     const XMFLOAT3 origin = scene.camera.Position;
@@ -516,7 +517,7 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit,
 // for considerably longer (see UpdateOngoingBombardment).
 static void LaunchMissileStrike(const XMFLOAT3& origin,
                                 const XMFLOAT3& target,
-                                float flightSeconds) {
+                                float flightSeconds, bool fromPlayer) {
     const float kFlightSeconds = (std::max)(0.2f, flightSeconds);
     const float gravity = 9.81f * scene.grenadeGravityScale;
 
@@ -530,6 +531,7 @@ static void LaunchMissileStrike(const XMFLOAT3& origin,
     // contacts nothing.
     missile.impactFuse = true;
     missile.missile = true;
+    missile.playerOwned = fromPlayer;
     missile.fuse = kFlightSeconds + 8.0f;
     // Launched from the camera, which is where the player's own body would be
     // -- without the grace period the round detonates on its own launch point.
@@ -573,7 +575,7 @@ static void CallDesignatedMissileStrike(const XMFLOAT3& center) {
             impact.y + kBombardmentAltitude,
             impact.z + std::sin(bearing) * kBombardmentStandoff };
         LaunchMissileStrike(origin, impact,
-                            kBombardmentFlightSeconds + 0.35f * round);
+                            kBombardmentFlightSeconds + 0.35f * round, false);
     }
     g_rpgFireAudio.PlayAt(center.x, center.y, center.z,
                           0.9f, 0.62f, 220.0f);

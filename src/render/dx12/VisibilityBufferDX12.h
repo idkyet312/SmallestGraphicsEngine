@@ -646,6 +646,8 @@ public:
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12PipelineState> postUpscalePSO;
+    ComPtr<ID3D12PipelineState> postQualityLensPSO;
+    ComPtr<ID3D12PipelineState> postUpscaleQualityLensPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
     // Two source choices (render input or DLSS output), each with four history
     // parity combinations. Immutable descriptors stay safe across frame slots.
@@ -659,8 +661,12 @@ public:
     ComPtr<ID3D12PipelineState> flareFeaturePSO;
     ComPtr<ID3D12PipelineState> flareStreakPSO;
     ComPtr<ID3D12PipelineState> flareBlurPSO;
+    ComPtr<ID3D12PipelineState> flareQualityFeaturePSO;
+    ComPtr<ID3D12PipelineState> flareQualityStreakPSO;
+    ComPtr<ID3D12PipelineState> flareQualityBlurPSO;
     ComPtr<ID3D12DescriptorHeap> flareDescHeap;
     bool flarePipelineReady = false;
+    bool qualityLensPipelineReady = false;
     ComPtr<ID3D12RootSignature> exposureRootSig;
     ComPtr<ID3D12PipelineState> exposureResetPSO;
     ComPtr<ID3D12PipelineState> exposureAccumulatePSO;
@@ -797,7 +803,9 @@ public:
     float chromaticAberration = 0.08f;
     // The apertures are deliberately low-opacity; strength provides the bold
     // Battlefield-style response without turning them into painted rings.
-    float lensFlareStrength = 0.33f;
+    float lensFlareStrength = 1.34f;
+    bool highQualityLensEnabled = true;
+    float sunLensRadiusUV = 0.0f;
     bool sunLensSystemEnabled = false;
     XMFLOAT4 sunLensPosition = { 0.5f, 0.5f, 0.0f, 0.0f };
     XMFLOAT4 sunLensColor = { 1.0f, 0.92f, 0.70f, 0.0f };
@@ -834,19 +842,19 @@ public:
     // running across the frame, and a cool horizontal streak -- so defaults
     // that keep it subliminal are simply the wrong look. The master Lens Flare
     // slider scales all of it for anyone who wants it quieter.
-    float flareStreakIntensity = 0.85f;
-    // In UV, the half-width of the horizontal blur. 0.28 spans well over half
+    float flareStreakIntensity = 0.78f;
+    // In UV, the half-width of the horizontal blur. 0.369 spans well over half
     // the frame, which is where the streak stops reading as a smear and starts
     // reading as a cylindrical front element.
-    float flareStreakLength = 0.28f;
-    float flareGhostIntensity = 1.00f;
+    float flareStreakLength = 0.369f;
+    float flareGhostIntensity = 1.23f;
     // Per-channel radial split. Above roughly 0.12 the three channels separate
     // far enough to read as three discs rather than one refracted element.
-    float flareGhostDispersion = 0.075f;
+    float flareGhostDispersion = 0.200f;
     // Carries both the veiling wash and the ring, and the wash is the single
     // largest feature in the reference -- hence the highest default here.
-    float flareHaloIntensity = 1.00f;
-    float flareStarburstIntensity = 0.45f;
+    float flareHaloIntensity = 2.00f;
+    float flareStarburstIntensity = 1.63f;
 
     // Updates the display-lens source without coupling this renderer to Scene.
     // The unjittered projection matches the sky pass; TAA jitter belongs to
@@ -4638,11 +4646,17 @@ public:
                 ? XMFLOAT4(0.5f, 0.5f, 0.0f, 0.0f)
                 : sunLensPosition;
         constants.sunLensColor = sunLensColor;
+        // The existing unused component carries the projected solar radius;
+        // no cbuffer offsets or descriptor tables change for the new variant.
+        if (highQualityLensEnabled)
+            constants.sunLensColor.w = sunLensRadiusUV;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
-        cmdList->SetPipelineState(scaledInput ? postUpscalePSO.Get()
-                                             : postPSO.Get());
+        cmdList->SetPipelineState(highQualityLensEnabled && qualityLensPipelineReady && !validationMode &&
+            !preserveDebugOutput && sunLensSystemEnabled
+            ? (scaledInput ? postUpscaleQualityLensPSO.Get() : postQualityLensPSO.Get())
+            : (scaledInput ? postUpscalePSO.Get() : postPSO.Get()));
         ID3D12DescriptorHeap* heaps[] = { postDescHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootConstantBufferView(0,
@@ -8618,6 +8632,28 @@ private:
             return false;
         UpdateFlareDescriptors();
         flarePipelineReady = true;
+        const D3D_SHADER_MACRO qualityDefines[] = {
+            { "SGE_HIGH_QUALITY_LENS", "1" }, { nullptr, nullptr }
+        };
+        auto createQuality = [&](const char* entry,
+                                 ComPtr<ID3D12PipelineState>& pipeline) {
+            ComPtr<ID3DBlob> blob;
+            HRESULT result = ShaderCacheDX12::CompileCached(
+                source.data(), source.size(), "shaders/visbuf_flare_cs.hlsl",
+                qualityDefines, nullptr, entry, "cs_5_0", flags, 0, &blob, &errors);
+            if (FAILED(result)) {
+                if (errors) std::cerr << "VB quality lens " << entry << ": "
+                    << (const char*)errors->GetBufferPointer() << std::endl;
+                return false;
+            }
+            pso.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+            return SUCCEEDED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&pipeline)));
+        };
+        if (!createQuality("FeatureGenCS", flareQualityFeaturePSO) ||
+            !createQuality("StreakCS", flareQualityStreakPSO) ||
+            !createQuality("BlurCS", flareQualityBlurPSO))
+            std::cerr << "High quality lens unavailable; keeping the established lens pass\n";
         return true;
     }
 
@@ -8865,6 +8901,8 @@ private:
             !flareDescHeap || !flareRootSig)
             return;
 
+        ProfilerDX12::Scope profile(g_profiler, "Lens Flare", cmdList);
+
         const UINT descriptorSize =
             g_dx12.device->GetDescriptorHandleIncrementSize(
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -8938,12 +8976,13 @@ private:
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         };
 
-        dispatch(0, flareFeaturePSO.Get());
-        dispatch(1, flareStreakPSO.Get());
+        const bool qualityLens = highQualityLensEnabled && qualityLensPipelineReady;
+        dispatch(0, qualityLens ? flareQualityFeaturePSO.Get() : flareFeaturePSO.Get());
+        dispatch(1, qualityLens ? flareQualityStreakPSO.Get() : flareStreakPSO.Get());
         constants.blurDirection = 0;
-        dispatch(2, flareBlurPSO.Get());
+        dispatch(2, qualityLens ? flareQualityBlurPSO.Get() : flareBlurPSO.Get());
         constants.blurDirection = 1;
-        dispatch(3, flareBlurPSO.Get());
+        dispatch(3, qualityLens ? flareQualityBlurPSO.Get() : flareBlurPSO.Get());
     }
 
     // Where RenderFlare leaves its result. Four passes alternate targets
@@ -9140,6 +9179,34 @@ private:
         hr = g_dx12.device->CreateComputePipelineState(
             &pso, IID_PPV_ARGS(&postUpscalePSO));
         if (FAILED(hr)) return false;
+
+        auto createQualityPost = [&](bool upscale,
+                                     ComPtr<ID3D12PipelineState>& pipeline) {
+            const D3D_SHADER_MACRO defines[] = {
+                { "SGE_HIGH_QUALITY_LENS", "1" },
+                { upscale ? "SGE_DLSS_SR" : nullptr, "1" },
+                { nullptr, nullptr }
+            };
+            ComPtr<ID3DBlob> blob;
+            HRESULT result = ShaderCacheDX12::CompileCached(
+                source.data(), source.size(), "shaders/visbuf_post_cs.hlsl", defines,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0, &blob, &errorBlob);
+            if (FAILED(result)) {
+                if (errorBlob) std::cerr << "VB quality lens post: "
+                    << (const char*)errorBlob->GetBufferPointer() << std::endl;
+                return false;
+            }
+            pso.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+            return SUCCEEDED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&pipeline)));
+        };
+        qualityLensPipelineReady = flareQualityFeaturePSO && flareQualityStreakPSO &&
+            flareQualityBlurPSO && createQualityPost(false, postQualityLensPSO) &&
+            createQualityPost(true, postUpscaleQualityLensPSO);
+        if (!qualityLensPipelineReady)
+            std::cerr << "High quality lens unavailable; keeping the established post pass\n";
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
         heap.NumDescriptors = kPostDescriptorsPerVariant *

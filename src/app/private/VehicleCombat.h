@@ -2,6 +2,47 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+static void WreckHumvee(size_t index, const XMFLOAT3& position, bool fromPlayer) {
+    if (index >= g_humveeGameplay.size() || g_humveeGameplay[index].dead) return;
+    if (g_drivingHumvee && g_activeHumveeIndex == index)
+        ToggleHumveeDriving();
+    HumveeGameplayState& state = g_humveeGameplay[index];
+    state.dead = true;
+    state.wreckPosition = position;
+    state.aiDriving = state.remoteDriven = state.netPosed = false;
+    g_destruction.DestroyVehicle(index);
+    scene.SpawnExplosionFX(position, 6.5f, 1.0f);
+    scene.SpawnSmokeBurst(position, 2.2f, 2.4f);
+    if (!ClientOwnedByHost()) {
+        // A gunner may load after the deploy screen opens. Kill any present
+        // rider now; the spawn path also rejects the destroyed mount.
+        for (auto& bandit : g_bandits)
+            if (bandit && bandit->turretGunner && !bandit->Dead() &&
+                bandit->mountedVehicleIndex == static_cast<int>(index))
+                bandit->ApplyExplosion(bandit->position, 6.0f, 1000000.0f,
+                                       scene.grenadeEnemyPush, fromPlayer);
+        PlayBanditDeathEvents();
+    }
+    if (g_game.session.TimerRunning()) {
+        g_game.mission.RecordDestruction();
+        if (fromPlayer) AwardCombatEvent(MoneyEvent::PropDestroyed);
+    }
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Humvee " + std::to_string(index) + " destroyed by missile");
+}
+
+static void DestroyHumveesFromMissileBlast(const XMFLOAT3& center, float radius,
+                                          bool fromPlayer) {
+    for (size_t index = 0; index < g_humveeGameplay.size(); ++index) {
+        if (!HumveeAlive(index)) continue;
+        XMFLOAT4X4 pose;
+        XMFLOAT3 position;
+        if (!g_destruction.GetVehicleTransform(index, pose, &position)) continue;
+        if (SGE::MissileBlastHitsHumvee(center, radius, pose))
+            WreckHumvee(index, position, fromPlayer);
+    }
+}
+
 static void UpdateHumveeChaseCamera(float dt) {
     static size_t trackedHumvee = kNoHumvee;
     static XMFLOAT3 cameraOffset{};
@@ -116,6 +157,7 @@ static void FireHumveeTurret() {
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnPlayerProjectile(muzzle, shotDirection, 1.35f);
+    scene.projectiles.back().sourceHumvee = static_cast<int>(g_activeHumveeIndex);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.15f);
     g_gunAudio.Play(0.72f, 0.90f + ((float)std::rand() / RAND_MAX) * 0.06f);
     state.turretFireCooldown = 0.12f;

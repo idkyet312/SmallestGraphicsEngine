@@ -5,6 +5,7 @@
 #include "GLBImporter.h"
 #include "LevelDefinition.h"
 #include "TerrainStampLibrary.h"
+#include "TerrainStampMerge.h"
 #include "EngineLogger.h"
 #include "TextureUploadArenaDX12.h"
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <vector>
 
 // Procedural heightfield terrain drawn entirely on the GPU through the
@@ -116,6 +118,7 @@ public:
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> sculptBuffers;
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> stampAtlasBuffers;
     std::array<uint64_t, FRAME_COUNT> uploadedSculptRevision_{};
+    std::array<uint64_t, FRAME_COUNT> uploadedPreviewRevision_{};
     std::array<uint64_t, FRAME_COUNT> uploadedStampAtlasRevision_{};
     // Texel span of s_stampAtlas each frame buffer still has to pick up, as an
     // inclusive [first, last]. Held per frame because frames upload at
@@ -353,6 +356,31 @@ public:
                a.strength == b.strength && a.texture == b.texture &&
                a.rotation == b.rotation && a.replace == b.replace &&
                a.baseHeight == b.baseHeight && a.edgeFalloff == b.edgeFalloff;
+    }
+
+    // Appended only for drawing: cursor picking, baking and shoreline queries
+    // must keep sampling authored terrain rather than chasing the preview.
+    bool SetEditorSculptPreview(const TerrainSculptStamp* stamp) {
+        if (!stamp || s_sculptStamps.size() >= kMaxTerrainSculptStamps) {
+            if (!editorSculptPreview_) return false;
+            editorSculptPreview_.reset();
+            ++editorPreviewRevision_;
+            return true;
+        }
+        // The dedicated bake slot belongs to the island. A different bake
+        // cannot be previewed there without replacing the island's own texels.
+        if (IsTerrainStampBakeFilename(stamp->texture) &&
+            stamp->texture != s_bakeName)
+            return SetEditorSculptPreview(nullptr);
+        const uint64_t contentBefore = s_stampContentRevision;
+        if (EnsureHeightStampLoaded(stamp->texture) == UINT_MAX)
+            return SetEditorSculptPreview(nullptr);
+        if (editorSculptPreview_ &&
+            SameSculptStamp(*editorSculptPreview_, *stamp) &&
+            s_stampContentRevision == contentBefore) return false;
+        editorSculptPreview_ = *stamp;
+        ++editorPreviewRevision_;
+        return true;
     }
 
     // Adds one runtime stamp without re-running the heightmap residency sweep.
@@ -739,13 +767,15 @@ public:
 
     void UploadSculptStamps(UINT frame) {
         if (frame >= FRAME_COUNT || !sculptBuffers[frame] ||
-            uploadedSculptRevision_[frame] == s_sculptRevision) return;
+            (uploadedSculptRevision_[frame] == s_sculptRevision &&
+             uploadedPreviewRevision_[frame] == editorPreviewRevision_)) return;
         SculptGPU* destination = nullptr;
         if (FAILED(sculptBuffers[frame]->Map(0, nullptr,
                 reinterpret_cast<void**>(&destination)))) return;
         std::memset(destination, 0, sizeof(SculptGPU) * kMaxTerrainSculptStamps);
-        for (size_t i = 0; i < s_sculptStamps.size(); ++i) {
-            const TerrainSculptStamp& source = s_sculptStamps[i];
+        for (size_t i = 0; i < RenderSculptCount(); ++i) {
+            const TerrainSculptStamp& source = i < s_sculptStamps.size()
+                ? s_sculptStamps[i] : *editorSculptPreview_;
             destination[i] = { source.x, source.z, source.radius,
                 static_cast<UINT>(source.operation), source.value, source.strength,
                 FindHeightStampLayer(source.texture), source.rotation,
@@ -753,6 +783,24 @@ public:
         }
         sculptBuffers[frame]->Unmap(0, nullptr);
         uploadedSculptRevision_[frame] = s_sculptRevision;
+        uploadedPreviewRevision_[frame] = editorPreviewRevision_;
+    }
+
+    UINT RenderSculptCount() const {
+        return static_cast<UINT>(s_sculptStamps.size() +
+            (editorSculptPreview_ && s_sculptStamps.size() < kMaxTerrainSculptStamps
+                ? 1u : 0u));
+    }
+
+    float RenderSculptMaxDisplacement() const {
+        if (!editorSculptPreview_ ||
+            s_sculptStamps.size() >= kMaxTerrainSculptStamps)
+            return m_sculptMaxDisplacement;
+        const TerrainSculptStamp& stamp = *editorSculptPreview_;
+        return stamp.replace <= 0.0f
+            ? m_sculptMaxDisplacement + std::abs(stamp.value)
+            : (std::max)(m_sculptMaxDisplacement,
+                std::abs(stamp.baseHeight) + std::abs(stamp.value) + 12.0f);
     }
 
     void UploadStampAtlas(UINT frame) {
@@ -1384,8 +1432,8 @@ public:
             : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         Params drawParams = params;
-        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
-        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        drawParams.sculptCount = RenderSculptCount();
+        drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
         UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
@@ -1439,8 +1487,8 @@ public:
         commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
         commandList6->SetPipelineState(psoShadow.Get());
         Params drawParams = params;
-        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
-        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        drawParams.sculptCount = RenderSculptCount();
+        drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
         UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
@@ -1461,8 +1509,8 @@ public:
         commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
         commandList6->SetPipelineState(psoVisibility.Get());
         Params drawParams = params;
-        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
-        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        drawParams.sculptCount = RenderSculptCount();
+        drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
         UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
@@ -1515,6 +1563,8 @@ private:
     static UINT EnsureHeightStampLoaded(const std::string& texture) {
         EnsureStampLibrary();
         if (!IsTerrainStampFilename(texture)) return UINT_MAX;
+        s_autoMergeAtlasUsed = s_autoMergeAtlasUsed ||
+            IsTerrainAutoMergeStampFilename(texture);
         // Bakes live in the single dedicated slot, so they never consume one of
         // the 64 atlas layers. One bake is resident at a time: loading a second
         // overwrites the first, which is correct because a level carries at
@@ -1536,13 +1586,22 @@ private:
             // Editor bakes are written after the startup directory scan. Keep
             // existing layer indices stable and append the new file instead of
             // sorting it into the middle of the already-populated GPU atlas.
-            if (s_stampNames.size() >= kMaxTerrainStampTextures)
-                return UINT_MAX;
-            s_stampNames.push_back(texture);
-            s_stampLoadState.push_back(0u);
-            s_stampWriteTimes.push_back(
-                std::filesystem::file_time_type{});
-            found = s_stampNames.end() - 1;
+            if (s_stampNames.size() >= kMaxTerrainStampTextures) {
+                if (!s_autoMergeAtlasUsed) return UINT_MAX;
+                const size_t unused = FindUnusedTerrainStampLayer(
+                    s_stampNames, s_sculptStamps);
+                if (unused == (std::numeric_limits<size_t>::max)()) return UINT_MAX;
+                s_stampNames[unused] = texture;
+                s_stampLoadState[unused] = 0u;
+                s_stampWriteTimes[unused] = std::filesystem::file_time_type{};
+                found = s_stampNames.begin() + unused;
+            } else {
+                s_stampNames.push_back(texture);
+                s_stampLoadState.push_back(0u);
+                s_stampWriteTimes.push_back(
+                    std::filesystem::file_time_type{});
+                found = s_stampNames.end() - 1;
+            }
         }
         const size_t layer = static_cast<size_t>(found - s_stampNames.begin());
         return EnsureStampSlotLoaded(texture, layer, s_stampLoadState[layer],
@@ -1716,6 +1775,7 @@ private:
 
     inline static std::vector<TerrainSculptStamp> s_sculptStamps;
     inline static std::vector<std::string> s_stampNames;
+    inline static bool s_autoMergeAtlasUsed = false;
     inline static std::vector<uint8_t> s_stampLoadState;
     inline static std::vector<std::filesystem::file_time_type>
         s_stampWriteTimes;
@@ -1743,6 +1803,8 @@ private:
     inline static uint64_t s_stampContentRevision = 0;
     inline static uint64_t s_stampAtlasRevision = 1;
     float m_sculptMaxDisplacement = 0.0f;
+    std::optional<TerrainSculptStamp> editorSculptPreview_;
+    uint64_t editorPreviewRevision_ = 1;
 };
 
 #endif // TERRAIN_RENDERER_DX12_H

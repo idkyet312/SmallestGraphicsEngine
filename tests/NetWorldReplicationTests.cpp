@@ -278,6 +278,28 @@ int main() {
     client.DrainGrenadeSpawns(spawns);
     Check(spawns.empty(), "wrong server must not spawn grenades");
 
+    ClientGrenadeThrowMessage missileThrow = throwMessage;
+    missileThrow.clientToken = 80;
+    missileThrow.kind = GrenadeKind::Missile;
+    missileThrow.y = 200.0f;
+    missileThrow.velocityY = -120.0f;
+    missileThrow.fuse = 9.6f;
+    Receive(7, missileThrow);
+    Receive(7, missileThrow);
+    host.Update(0.0f, local);
+    host.DrainGrenadeSpawns(spawns);
+    Check(spawns.size() == 1 && spawns[0].kind == GrenadeKind::Missile &&
+          spawns[0].owner == 1 && spawns[0].velocityY == -120.0f,
+          "a client's deploy missile must create one host-owned simulation");
+    ServerGrenadeSpawnMessage missileSpawn;
+    std::memcpy(&missileSpawn, wire.back().bytes.data(), sizeof(missileSpawn));
+    Receive(3, missileSpawn);
+    client.Update(0.0f, local);
+    client.DrainGrenadeSpawns(spawns);
+    Check(spawns.size() == 1 && spawns[0].kind == GrenadeKind::Missile &&
+          spawns[0].clientToken == 80 && !spawns[0].hostile,
+          "the deploy missile must return with its prediction token intact");
+
     ClientGrenadeThrowMessage invalidThrow = throwMessage;
     invalidThrow.clientToken = 78;
     invalidThrow.kind = static_cast<GrenadeKind>(99);

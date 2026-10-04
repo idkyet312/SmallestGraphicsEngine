@@ -96,7 +96,8 @@ namespace net {
 //     struct keeps its 36 bytes) -- a client built every replica as a bandit.
 // 27: C4 carries a turret attachment and a host charge id for late-join replay.
 // 28: grenade kind 3 carries player-designated bombardment missiles.
-inline constexpr uint32_t kProtocolVersion = 28;
+// 29: Humvee armor snapshots carry destruction in a former padding byte.
+inline constexpr uint32_t kProtocolVersion = 29;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -496,11 +497,12 @@ struct AATurretSnapshot {
 // from the same level file in the same order. `hostDriven` says it has moved
 // this level -- the host's AI drove it, or a player did -- so the client should
 // show the host's pose rather than its own parked body; the turret yaw applies
-// either way.
+// either way. Destroyed slots remain in the snapshot after their bodies go.
 struct EnemyHumveeSnapshot {
     uint8_t index = 0;
     uint8_t hostDriven = 0;
-    uint8_t padding[2] = {};
+    uint8_t dead = 0;
+    uint8_t padding[1] = {};
     // Chassis body centre and orientation, as the host's solver returns them.
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;

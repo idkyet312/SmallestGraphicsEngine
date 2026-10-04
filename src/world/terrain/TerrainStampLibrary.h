@@ -127,6 +127,15 @@ inline std::string TerrainLevelBakeName(const std::string& folder) {
     return folder + "/" + folder + kTerrainStampBakeSuffix;
 }
 
+// Each merge revision owns its PNG so undo can reload an earlier surface.
+// These use ordinary atlas layers; the whole-level bake slot stays independent.
+inline bool IsTerrainAutoMergeStampFilename(const std::string& filename) {
+    if (!IsTerrainStampFilename(filename)) return false;
+    const size_t slash = filename.find('/');
+    return slash != std::string::npos &&
+        filename.compare(slash + 1, 10, "HM_Merged_") == 0;
+}
+
 inline std::vector<std::string> DiscoverTerrainStampNames() {
     std::vector<std::string> names;
     std::error_code error;

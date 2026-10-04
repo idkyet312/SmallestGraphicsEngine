@@ -2683,7 +2683,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // until AFTER the player has deployed. Dotting the vehicle itself is
         // independent of that timing -- the emplacement is on the map whether or
         // not anyone is manning it yet.
-        for (const Transform& humvee : g_levelHumveeSpawns) {
+        for (size_t index = 0; index < g_levelHumveeSpawns.size(); ++index) {
+            if (!HumveeAlive(index)) continue;
+            const Transform& humvee = g_levelHumveeSpawns[index];
             XMFLOAT3 spot{ humvee.position[0],
                            humvee.position[1] + 2.2f,
                            humvee.position[2] };

@@ -1060,6 +1060,7 @@ public:
             g_humveeModel &&
             g_levelPlacesHumvee) {
             for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+                if (!HumveeAlive(index)) continue;
                 PrepareHumveeModelForRender(index);
                 DrawSceneNodeShadow(
                     g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,

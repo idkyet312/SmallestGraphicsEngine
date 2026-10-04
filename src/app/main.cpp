@@ -99,6 +99,7 @@
 #include "CombatSystem.h"
 #include "EnemySystem.h"
 #include "VehicleSystem.h"
+#include "VehicleBlast.h"
 #include "AATurretCharge.h"
 #include "RopeSwing.h"
 #include "DeploymentPlanner.h"
@@ -136,6 +137,7 @@ using namespace DirectX;
 #include "private/SceneModels.h"
 #include "private/EnemyTanks.h"
 #include "private/PrefabWorld.h"
+#include "private/HumveeCollision.h"
 #include "private/WorldCollision.h"
 #include "private/Objectives.h"
 #include "private/LevelEnvironment.h"
@@ -634,6 +636,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     BootTimer::Log("Initialising visibility buffer");
     visBuffer.deferResolvePipeline =
         ShaderCacheDX12::BootCompilesPending(&g_shaderCompileProgress);
+    char highQualityLensOverride[8] = {};
+    if (GetEnvironmentVariableA("SGE_HIGH_QUALITY_LENS", highQualityLensOverride,
+            static_cast<DWORD>(sizeof(highQualityLensOverride))) > 0)
+        visBuffer.highQualityLensEnabled = highQualityLensOverride[0] != '0';
     const bool visibilityBufferReady = visBuffer.Init(
         g_dx12.screenWidth, g_dx12.screenHeight, SCR_WIDTH, SCR_HEIGHT);
     ThrowIfFailed(g_dx12.commandList->Close());
@@ -1217,6 +1223,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_levelEditor.MarkRuntimeSynchronized();
         }
 
+        if (g_terrain.SetEditorSculptPreview(
+                IsEditorEditing() && !g_game.loading.Active()
+                    ? g_levelEditor.TerrainStampPreview() : nullptr))
+            shadowMap.InvalidateCachedCascades();
+
         if (IsEditorEditing() && !cameraLocked &&
             !ImGui::GetIO().WantCaptureKeyboard) {
             const float speed = ((FocusedKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f)
@@ -1309,6 +1320,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_showPauseSettings = false;
         }
         if (g_gamePaused && !MultiplayerActive()) deltaTime = 0.0f;
+        auto& rangeFeedback = g_game.world.Prefabs().shootingRange.feedbackSeconds;
+        rangeFeedback = (std::max)(0.0f, rangeFeedback - deltaTime);
 
         // A downed player keeps simulating. Their health is zero, but they are
         // not out: remote bodies have to keep moving so they can watch a
@@ -1530,6 +1543,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DLSS::GetSettings().rayReconstruction = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
                 scene.enableVolumetricFog = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HQ_LENS", nullptr, 0) > 0)
+                visBuffer.highQualityLensEnabled = true;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOAO", nullptr, 0) > 0)
                 scene.enableAmbientOcclusion = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOSVGF", nullptr, 0) > 0)
@@ -1651,6 +1666,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " vbGpuMs="
                                 << g_profiler.GpuScopeMs("Visibility Buffer")
                                 << " gpuFrameMs=" << g_profiler.GpuFrameMs()
+                                << " lensMs=" << g_profiler.GpuScopeMs("Lens Flare")
+                                << " hqLens=" << visBuffer.highQualityLensEnabled
                                 << " genericMs=" << g_profiler.GpuScopeMs("VB Shade Generic")
                                 << " terrainResolveMs=" << g_profiler.GpuScopeMs("VB Terrain Resolve")
                                 << " replayMs="
@@ -2827,9 +2844,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         bandit->IsShotgunner() ? net::InfantryWeapon::Shotgun
                         : bandit->IsSniper()   ? net::InfantryWeapon::Sniper
                                                : net::InfantryWeapon::Rifle;
+                    const size_t shotStart = scene.projectiles.size();
                     FireInfantryShot(shotOrigin, shotDirection, weapon,
                                      bandit->faction == Faction::Bandit,
                                      /*hostReplica=*/false);
+                    if (bandit->turretGunner && bandit->mountedVehicleIndex >= 0)
+                        for (size_t i = shotStart; i < scene.projectiles.size(); ++i)
+                            scene.projectiles[i].sourceHumvee =
+                                bandit->mountedVehicleIndex;
                     // Any actor's gunfire is audible to the AI, not just the
                     // player's. Without this a marine could only ever notice a
                     // bandit inside its 160-degree vision cone -- and a
@@ -3230,13 +3252,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bool struck = false;
                     bool hostileTargetStruck = false;
                     const float radius = 0.22f;
+                    CollisionMeshRayHit humveeHit;
+                    const bool hitHumvee = HitHumveeSegment(
+                        projectile.previousPosition, projectile.position,
+                        radius, humveeHit,
+                        projectile.sourceHumvee >= 0
+                            ? static_cast<size_t>(projectile.sourceHumvee)
+                            : kNoHumvee);
+                    if (hitHumvee) projectile.position = impact = humveeHit.point;
                     size_t barrelIndex = 0;
                     XMFLOAT3 candidate;
                     if (g_banditLoaded) {
                         for (const auto& bandit : g_bandits) {
                             if (bandit && bandit->BlocksProjectile(
                                     projectile.previousPosition, projectile.position,
-                                    radius)) {
+                                    radius, &candidate)) {
+                                impact = candidate;
                                 struck = true;
                                 hostileTargetStruck =
                                     bandit->faction == Faction::Bandit;
@@ -3314,6 +3345,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             radius, candidate)) {
                         impact = candidate;
                         struck = true;
+                    }
+                    if (!struck && hitHumvee) {
+                        impact = humveeHit.point;
+                        struck = true;
+                        hostileTargetStruck = true;
                     }
                     if (struck) {
                         if (hostileTargetStruck) recordAccuracyHit();
@@ -3565,13 +3601,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                     g_boatPosition);
                             }
                         }
-                        // The AA emplacement is a blast target as well, so a
-                        // planted charge is a valid answer to it rather than
-                        // grinding its 900 HP down with rifle fire. Only the
-                        // barrel chain reaction used to reach it; a charge stuck
-                        // to the gun itself did nothing. C4 and rockets are
-                        // demolitions and one is enough, while a frag still only
-                        // chips the mount -- same split the comm tower uses below.
+                        // Missiles join C4 and friendly rockets as demolitions:
+                        // a close hit destroys the gun; a frag only chips it.
                         for (size_t ti = 0;
                              ti < g_game.vehicles.aaTurrets.size(); ++ti) {
                             if (!g_game.vehicles.aaTurrets[ti].Active()) continue;
@@ -3588,27 +3619,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             const float reach = enemyRadius +
                                 VehicleSystem::AATurretMountHeight;
                             if (distance < reach) {
-                                const float falloff = 1.0f - distance / reach;
-                                // C4 or a friendly rocket on or beside the gun
-                                // kills outright: full health with no falloff.
-                                // Falloff measured from the mount origin left a
-                                // charge on the barrel ~18% short of 900 HP, and
-                                // a rocket's 500 never got there at all. The
-                                // zone covers the whole gun -- mount height
-                                // plus barrel, so a charge on the tip of a
-                                // raised barrel counts -- and a rocket stopped
-                                // on the 2 m hit sphere (~3.1 m out) lands well
-                                // inside it. Past that it is scaled splash.
-                                const bool demolition = c4Blast ||
-                                    (projectile.rocket && !projectile.hostile);
-                                const bool direct = demolition && distance <
-                                    VehicleSystem::AATurretMountHeight +
-                                    VehicleSystem::AATurretBarrelLength + 0.5f;
-                                const float damage = direct
-                                    ? VehicleSystem::AATurretMaxHealth
-                                    : (demolition
-                                           ? VehicleSystem::AATurretMaxHealth
-                                           : enemyDamage) * falloff;
+                                const float damage = SGE::AATurretBlastDamage(
+                                    distance, enemyRadius, enemyDamage,
+                                    c4Blast, projectile.rocket,
+                                    projectile.missile, projectile.hostile);
                                 DamageAATurret(ti, damage, turret,
                                                projectile.playerOwned || c4Blast,
                                                projectile.netGrenadeId != 0,
@@ -3616,6 +3630,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                                        : net::kInvalidPlayerId);
                             }
                         }
+                        if (projectile.missile &&
+                            (!MultiplayerActive() ||
+                             g_netSession.CurrentRole() != net::Role::Client))
+                            DestroyHumveesFromMissileBlast(
+                                center, enemyRadius, projectile.playerOwned);
                         // Enemy tanks answer to explosives only, measured to
                         // the hull rather than the prefab origin. A tank's own
                         // shells (hostile) do not hurt the column.
@@ -3890,6 +3909,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const float bulletRadius = projectile.flame
                     ? 0.24f
                     : std::max(0.12f, scene.projectileScale * 0.5f);
+                CollisionMeshRayHit humveeHit;
+                const bool hitHumvee = HitHumveeSegment(
+                    projectile.previousPosition, projectile.position,
+                    bulletRadius, humveeHit,
+                    projectile.sourceHumvee >= 0
+                        ? static_cast<size_t>(projectile.sourceHumvee)
+                        : kNoHumvee);
+                // Bound the actor/world sweep first: someone behind the
+                // Humvee must never take a hit before the hull stops the round.
+                if (hitHumvee) projectile.position = humveeHit.point;
                 // Water no longer stops a round: it only marks where the round
                 // went in. Detected up front, outside the impact chain, so a
                 // surface crossing never consumes the frame's collision test --
@@ -4382,10 +4411,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     }
                 }
                 uint64_t prefabEntityId = 0;
+                const bool scoringRound = projectile.playerOwned && !projectile.grenade &&
+                    !projectile.rocket && !projectile.remoteCharge &&
+                    !projectile.flame && !projectile.laser && !projectile.harpoon;
                 if (HitPrefabColliderSegment(projectile.previousPosition,
                         projectile.position, bulletRadius, hit,
                         &prefabEntityId, &normal,
-                        /*fencePanelsTransparent=*/true)) {
+                        /*fencePanelsTransparent=*/true,
+                        /*ignoreAATurretColliders=*/false,
+                        /*preciseShootingTargets=*/scoringRound)) {
+                    if (scoringRound)
+                        ScorePlayerShootingTarget(prefabEntityId,
+                            projectile.previousPosition, hit);
                     projectile.position = hit;
                     scene.SpawnBulletImpact(hit, normal);
                     if (projectile.laser) scene.StopLaserBeamAt(hit);
@@ -4625,6 +4662,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (projectile.harpoon) scene.ShowHarpoonTether(terrainHit);
                     if (projectile.flame) scene.SpawnCarriedFire(terrainHit);
                     stopProjectileAt(terrainHit);
+                } else if (hitHumvee) {
+                    scene.SpawnBulletImpact(humveeHit.point, humveeHit.normal);
+                    PlayMetalHitAudio(humveeHit.point, 0.8f);
+                    if (projectile.laser) scene.StopLaserBeamAt(humveeHit.point);
+                    if (projectile.harpoon) scene.ShowHarpoonTether(humveeHit.point);
+                    stopProjectileAt(humveeHit.point);
                 } else if (projectile.hostile) {
                     // Player is tested last. Any world or character mesh in
                     // front consumes the shot first, preventing wall penetration.
@@ -5331,6 +5374,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool lateSky = scene.enableSkyDepthTest && usingVisibility &&
             IsSceneScreen() && !g_game.loading.Active() &&
             !visibilityDebugActive && !bentGTAODiagnosticActive;
+        visBuffer.sunLensRadiusUV = 0.5f * tanf(XMConvertToRadians(
+            scene.sunAngularRadiusDegrees)) /
+            tanf(XMConvertToRadians(scene.EffectiveCameraFOV()) * 0.5f);
         visBuffer.SetSunLens(
             scene.enableSunLens && !deploymentHideAtmosphere,
             scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
@@ -5713,12 +5759,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     "Content/Models/Humvee/humvee.fbx",
                     g_dx12.device, g_dx12.commandList, 1.0f, false, true);
                 if (g_humveeModel) {
+                    g_humveeTurretNode.reset();
                     for (const auto& child : g_humveeModel->children)
                         if (child && child->name == "HumveeTurret") {
                             g_humveeTurretNode = child;
                             break;
                     }
                     ConfigureHumveeBounds();
+                    BuildHumveeProjectileCollision();
                     g_humveeShadowModel = GLBImporter::MergeSceneForDepth(
                         g_humveeModel, g_dx12.device);
                     std::cout << "Humvee FBX ready at center\n";
@@ -5827,7 +5875,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // asset's skin binds no geometry; ApplyInsertionAirframe selects
             // node animation instead of a palette when no vertices are skinned.
             g_blackHawkAirframeModel[1] = GLBImporter::LoadGLBSkinned(
-                "Content/Models/NewBlackHawk/NewBlackHawk.glb",
+                "Content/Models/NewBlackHawk/helicopterWithFront.glb",
                 g_dx12.device, g_dx12.commandList,
                 g_blackHawkAirframeSkeleton[1]);
             if (g_blackHawkAirframeModel[1]) {

@@ -594,6 +594,20 @@ int main() {
         // up-facing triangles and no underside at all -- so it needs
         // forceDoubleSided; without it the no-cull forward pass shades the slab
         // inside-out.
+        const PrefabAsset* target = shipped.Find("props/shooting_target_01");
+        CHECK(target != nullptr);
+        if (target) {
+            CHECK(target->error.empty());
+            CHECK(target->collision == "mesh");
+            CHECK(target->components.at("shootingTarget").at("centers").size() == 2);
+            const auto savedPath = root / "scoring_round_trip.json";
+            CHECK(PrefabRegistry::Save(*target, savedPath).ok);
+            nlohmann::json saved;
+            std::ifstream(savedPath) >> saved;
+            CHECK(saved.at("components").at("shootingTarget") ==
+                  target->components.at("shootingTarget"));
+        }
+
         const PrefabAsset* carpark = shipped.Find("props/carpark_asphalt");
         CHECK(carpark != nullptr);
         if (carpark) {

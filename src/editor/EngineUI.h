@@ -16,6 +16,7 @@
 #include "UISearchFilter.h"  // settings-search text matching
 #include "MoneySystem.h"     // wallet readout + floating payout popups
 #include "RankSystem.h"      // rank badge, XP bar and promotion banner
+#include "ShootingTarget.h"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -89,6 +90,7 @@ MoneySystem& PlayerMoney();
 // The career rank, on the same terms and for the same reason: the XP bar and
 // the promotion banner both read live state that moves mid-frame.
 RankSystem& PlayerRank();
+const ShootingRangeScore* PlayerShootingRangeScore();
 
 // Aircraft objective status for the HUD. Unlike the tower this one moves, so it
 // reports the airframe's current world position for a tracking marker alongside
@@ -302,6 +304,33 @@ inline void RenderPlayerHUD(const Scene& scene) {
                 draw->AddLine(ImVec2(x, kStripY + size.y + 2.0f),
                               ImVec2(x, kStripY + size.y + 5.0f), tint, 1.0f);
             }
+        }
+    }
+
+    if (const ShootingRangeScore* range = PlayerShootingRangeScore()) {
+        // Use the confirmed score's timer so every new target hit restarts the
+        // popup, even while ADS hides the reticle or the hit marker has faded.
+        constexpr float kPopupSeconds = 0.8f;
+        const float elapsed = ShootingRangeScore::kFeedbackDurationSeconds -
+            range->feedbackSeconds;
+        if (range->lastHit.points > 0 && range->feedbackSeconds > 0.0f &&
+            elapsed >= 0.0f && elapsed < kPopupSeconds) {
+            char line[16];
+            snprintf(line, sizeof(line), "+%u", range->lastHit.points);
+            const float progress = elapsed / kPopupSeconds;
+            const float pop = (std::max)(0.0f, 1.0f - elapsed / 0.12f);
+            const float fontSize = ImGui::GetFontSize() * 1.7f *
+                (1.0f + 0.25f * pop * pop);
+            ImFont* font = ImGui::GetFont();
+            const ImVec2 textSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, line);
+            const ImVec2 position(io.DisplaySize.x * 0.5f - textSize.x * 0.5f,
+                io.DisplaySize.y * 0.5f - 24.0f - textSize.y - 22.0f * progress);
+            const float fade = (std::min)(1.0f,
+                (kPopupSeconds - elapsed) / 0.3f);
+            draw->AddText(font, fontSize, ImVec2(position.x + 1.5f, position.y + 1.5f),
+                IM_COL32(0, 0, 0, static_cast<int>(220.0f * fade)), line);
+            draw->AddText(font, fontSize, position,
+                IM_COL32(255, 220, 120, static_cast<int>(255.0f * fade)), line);
         }
     }
 
@@ -2905,6 +2934,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     ImGui::Checkbox("Enable Sun Lens",
                                     &scene.enableSunLens);
                     if (scene.enableSunLens) {
+                        ImGui::BeginDisabled(!vb.qualityLensPipelineReady);
+                        ImGui::Checkbox("High Quality Lens", &vb.highQualityLensEnabled);
+                        ImGui::EndDisabled();
+                        ImGui::TextDisabled("Coated aperture ghosts, fine sun rays, smoother occlusion");
                         ImGui::SliderFloat("Sun Angular Radius",
                             &scene.sunAngularRadiusDegrees,
                             0.10f, 1.00f, "%.2f deg");

@@ -4,7 +4,7 @@
   "name": "Black Hawk (Transport)",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/NewBlackHawk/NewBlackHawk.glb",
+      "path": "Content/Models/NewBlackHawk/helicopterWithFront.glb",
       "defaultScale": [1.0, 1.0, 1.0],
       "targetSize": 0.0,
       "castShadow": true,

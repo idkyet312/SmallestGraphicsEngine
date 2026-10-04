@@ -284,11 +284,16 @@ static void ConfigureBlackHawkBounds() {
 
 // Depth-first search for a node by name.
 static std::shared_ptr<SceneNode> FindNodeByName(
-    const std::shared_ptr<SceneNode>& node, const std::string& name) {
+    const std::shared_ptr<SceneNode>& node, const std::string& name,
+    bool requireMeshChild = false) {
     if (!node) return nullptr;
-    if (node->name == name) return node;
+    if (node->name == name && (!requireMeshChild ||
+        std::any_of(node->children.begin(), node->children.end(),
+            [](const std::shared_ptr<SceneNode>& child) {
+                return child && child->mesh;
+            }))) return node;
     for (const auto& child : node->children)
-        if (auto found = FindNodeByName(child, name)) return found;
+        if (auto found = FindNodeByName(child, name, requireMeshChild)) return found;
     return nullptr;
 }
 
@@ -511,9 +516,9 @@ static void ApplyInsertionAirframe(InsertionAirframe airframe) {
         if (g_blackHawkRotorBone >= 0) UpdateBlackHawkPalette();
     } else {
         // Rotating the node the disc hangs from. The importer keeps glTF node
-        // names, so 'Bone' is the authored joint node with the rotor mesh as
-        // its child.
-        g_newBlackHawkRotorNode = FindNodeByName(g_blackHawkModel, "Bone");
+        // names. The front-seat export also has an empty 'Bone', so require
+        // the mesh child to select the joint that actually carries the disc.
+        g_newBlackHawkRotorNode = FindNodeByName(g_blackHawkModel, "Bone", true);
         if (g_newBlackHawkRotorNode)
             std::cout << "Insertion airframe rotor node ready\n";
     }

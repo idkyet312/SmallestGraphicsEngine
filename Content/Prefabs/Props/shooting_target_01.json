@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 2,
+  "id": "props/shooting_target_01",
+  "name": "Shooting Target 01",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/ShootingTarget_01/ShootingTarget_01.glb",
+      "defaultScale": [
+        1,
+        1,
+        1
+      ],
+      "targetSize": 0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1,
+      "materialViewFillStrength": 0,
+      "forceDoubleSided": false
+    },
+    "collision": {
+      "shape": "mesh"
+    },
+    "shootingTarget": {
+      "faceZ": 0.0127956,
+      "centers": [
+        { "name": "HEAD", "position": [-0.01294, 1.56139], "radii": [0.08860, 0.10566] },
+        { "name": "TORSO", "position": [-0.00272, 0.92014], "radii": [0.21354, 0.35462] }
+      ],
+      "rings": [
+        { "radius": 0.25, "points": 10 },
+        { "radius": 0.50, "points": 9 },
+        { "radius": 0.75, "points": 8 },
+        { "radius": 1.00, "points": 7 }
+      ]
+    }
+  }
+}

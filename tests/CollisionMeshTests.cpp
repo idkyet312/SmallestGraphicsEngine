@@ -62,6 +62,41 @@ static std::vector<float> MakeBox(float minimum, float maximum, bool inward) {
 }
 
 int main() {
+    {
+        // Humvee projectile sweeps use the posed visual mesh, including the
+        // cabin roof above the physics chassis. Long segments must stop at
+        // the first surface for both rifle rounds and rockets.
+        CollisionMesh hull;
+        CHECK(BuildCollisionMesh(MakeBox(-1.0f, 1.0f, false), hull));
+        CollisionMeshInstance vehicle;
+        const XMMATRIX size = XMMatrixScaling(2.4f, 1.2f, 1.1f);
+        InitializeCollisionMeshInstance(vehicle, hull,
+            size * XMMatrixTranslation(20.0f, 3.0f, -7.0f));
+        for (float radius : { 0.12f, 0.22f }) {
+            CollisionMeshRayHit hit;
+            CHECK(CollisionMeshInstanceRaycast(vehicle,
+                { -1000.0f, 3.0f, -7.0f }, { 1000.0f, 3.0f, -7.0f },
+                radius, hit));
+            CHECK(NearlyEqual(hit.point.x, 17.6f, 0.23f));
+            CHECK(hit.normal.x < -0.99f);
+            CHECK(!CollisionMeshInstanceRaycast(vehicle,
+                { -1000.0f, 6.0f, -7.0f }, { 1000.0f, 6.0f, -7.0f },
+                radius, hit));
+            CHECK(CollisionMeshInstanceRaycast(vehicle,
+                { 20.0f, 100.0f, -7.0f }, { 20.0f, -100.0f, -7.0f },
+                radius, hit));
+            CHECK(NearlyEqual(hit.point.y, 4.2f, 0.23f));
+            CHECK(hit.normal.y > 0.99f);
+        }
+        InitializeCollisionMeshInstance(vehicle, hull, size *
+            XMMatrixRotationY(XM_PIDIV2) * XMMatrixTranslation(40, 3, 10));
+        CollisionMeshRayHit hit;
+        CHECK(CollisionMeshInstanceRaycast(vehicle,
+            { 40, 3, -100 }, { 40, 3, 100 }, 0.12f, hit));
+        CHECK(NearlyEqual(hit.point.z, 7.6f, 0.13f));
+        CHECK(!CollisionMeshInstanceRaycast(vehicle,
+            { -1000, 3, -7 }, { 1000, 3, -7 }, 0.12f, hit));
+    }
     // --- Empty and degenerate input ---------------------------------------
     {
         CollisionMesh mesh;

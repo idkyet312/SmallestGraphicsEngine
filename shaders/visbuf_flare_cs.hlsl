@@ -85,12 +85,134 @@ float3 GhostElement(float2 uv, float2 center, float radius, float dispersion) {
     return element;
 }
 
+#if defined(SGE_HIGH_QUALITY_LENS)
+// A bounded source footprint keeps neighbouring lamps and coarse bloom mips
+// from changing every ghost's colour. Outside the sensor, use the sun's own
+// radiance instead of stretching the last column of bloom across the lens.
+float3 SolarSource() {
+    uint w, h;
+    bloomInput.GetDimensions(w, h);
+    float2 texel = 1.0 / float2(w, h);
+    float3 source = SampleBloom(sunUV, 1.0) * 0.4;
+    source += SampleBloom(sunUV + float2(texel.x, 0.0) * 2.0, 1.0) * 0.15;
+    source += SampleBloom(sunUV - float2(texel.x, 0.0) * 2.0, 1.0) * 0.15;
+    source += SampleBloom(sunUV + float2(0.0, texel.y) * 2.0, 1.0) * 0.15;
+    source += SampleBloom(sunUV - float2(0.0, texel.y) * 2.0, 1.0) * 0.15;
+    float outside = max(max(-sunUV.x, sunUV.x - 1.0),
+                        max(-sunUV.y, sunUV.y - 1.0));
+    source = lerp(source, max(sunTint, 0.0) * sunEnergy,
+                  smoothstep(0.0, 0.06, outside));
+    // Bound HDR energy smoothly so an exposed disc cannot blow out the frame.
+    return source * (12.0 / (12.0 + max(Luminance(source), 0.0)));
+}
+
+float3 CoatedGhost(float2 uv, float2 center, float radius, float rotation,
+                   float defocus, float rimWeight) {
+    float2 p = (uv - center) * float2(aspect, 1.0);
+    float r = length(p);
+    float footprint = 1.25 / float(flareSize.y);
+    float softness = max(footprint, radius * defocus);
+    float dispersion = min(ghostDispersion, 0.03);
+    // Most pixels miss the aperture entirely; avoid the profile read and
+    // the angular work across the rest of the half-resolution target.
+    if (r > radius * (1.0 + dispersion) + softness)
+        return 0.0;
+    float angle = atan2(p.y, p.x) + rotation;
+    const float sector = 0.78539816;
+    float polygon = cos(0.39269908) /
+        cos(fmod(angle + 6.28318531, sector) - 0.39269908);
+    float3 result = 0.0;
+    float2 local = p / max(radius * 2.0, 1e-4) + 0.5;
+    float textureDetail = ghostProfile.SampleLevel(linearClamp, local, 0.0);
+    [unroll]
+    for (int c = 0; c < 3; ++c) {
+        // Defocused reflections overlap spectrally; a large split turns each
+        // aperture into three separate rainbow outlines.
+        float scale = 1.0 + (1.0 - float(c)) * dispersion;
+        // Defocus rounds blade corners and spreads the rim over several
+        // pixels, so dispersion reads as a coating instead of a rainbow outline.
+        float edge = radius * scale * lerp(polygon, 1.0, 0.35);
+        float coverage = 1.0 - smoothstep(edge - softness, edge + softness, r);
+        float q = r / max(edge, 1e-4);
+        float rimWidth = max(0.16 + defocus, footprint / max(edge, 1e-4));
+        float rim = exp(-pow((q - 0.84) / rimWidth, 2.0));
+        float interior = exp(-q * q * 2.0);
+        // Most elements are diffuse filled reflections; only one carries a
+        // faint coating rim, so the chain cannot read as repeated outlines.
+        result[c] = coverage * (interior * 0.14 + rim * rimWeight * 0.035) *
+                    lerp(0.9, 1.1, saturate(textureDetail));
+    }
+    return result;
+}
+
+float3 QualityFeatures(float2 uv) {
+    float3 source = SolarSource();
+    float3 result = 0.0;
+    float2 axis = 0.5 - sunUV;
+    const float scales[4] = { 0.32, 1.06, 1.78, 2.24 };
+    const float radii[4] = { 0.022, 0.073, 0.155, 0.036 };
+    const float weights[4] = { 0.65, 0.52, 0.16, 0.38 };
+    const float defocus[4] = { 0.12, 0.22, 0.38, 0.16 };
+    const float rims[4] = { 0.0, 0.6, 0.0, 0.0 };
+    const float3 coatings[4] = {
+        float3(1.0, 0.86, 0.64), float3(0.68, 0.82, 0.94),
+        float3(0.88, 0.74, 0.84), float3(0.66, 0.82, 0.96)
+    };
+    float axisFade = smoothstep(0.025, 0.20, length(axis * float2(aspect, 1.0)));
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        float2 center = sunUV + axis * scales[i];
+        float2 fromAxis = center - 0.5;
+        float attenuation = 1.0 / (1.0 + dot(fromAxis, fromAxis) * 2.0);
+        result += CoatedGhost(uv, center, radii[i], float(i) * 0.19,
+                              defocus[i], rims[i]) * coatings[i] * weights[i] *
+            attenuation * source * ghostIntensity * axisFade * 0.45;
+    }
+    float2 p = (uv - sunUV) * float2(aspect, 1.0);
+    float r = length(p);
+    // A bright compact core and faint shoulder preserve silhouettes around
+    // the source instead of adding an almost uniform amber sheet.
+    float glare = exp(-r * r * 180.0) * 0.11 + exp(-r * 7.0) * 0.016;
+    result += source * glare * haloIntensity;
+    float3 ringRadii = float3(0.243, 0.245, 0.247);
+    float3 ringDelta = (r - ringRadii) / max(0.060, 1.5 / float(flareSize.y));
+    float3 ring = exp(-ringDelta * ringDelta) * exp(-r * 2.0);
+    // A halo's brightest arc faces the optical centre. Breaking its uniform
+    // circumference keeps it from reading as a circle drawn over the scene.
+    float2 opticalAxis = axis * float2(aspect, 1.0);
+    float arc = 0.35 + 0.65 * saturate(0.5 + 0.5 *
+        dot(p, opticalAxis) / max(r * length(opticalAxis), 1e-5));
+    result += source * float3(0.85, 0.91, 1.0) * ring * arc * haloIntensity * 0.008;
+
+    // Nine blades produce eighteen opposite rays. Cartesian distances avoid
+    // angular aliasing at the centre, and pixel footprints soften narrow rays.
+    float spikes = 0.0;
+    float footprint = 1.0 / float(flareSize.y);
+    [unroll]
+    for (int blade = 0; blade < 9; ++blade) {
+        float angle = float(blade) * 0.34906585 + 0.12;
+        float2 direction = float2(cos(angle), sin(angle));
+        float along = abs(dot(p, direction));
+        float across = abs(dot(p, float2(-direction.y, direction.x)));
+        float rayWidth = footprint + 0.0012 + along * 0.012;
+        spikes += exp(-pow(across / rayWidth, 2.0)) *
+                  exp(-along * 24.0) * (1.0 - exp(-r * 80.0));
+    }
+    result += source * spikes * starburstIntensity * 0.045;
+    return result * sunPresence;
+}
+#endif
+
 [numthreads(8, 8, 1)]
 void FeatureGenCS(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
     if (pixel.x >= flareSize.x || pixel.y >= flareSize.y) return;
     float2 uv = (float2(pixel) + 0.5) / float2(flareSize);
 
+#if defined(SGE_HIGH_QUALITY_LENS)
+    flareOutput[pixel] = float4(
+        sunPresence > 0.001 && sunEnergy > 0.001 ? QualityFeatures(uv) : 0.0, 1.0);
+#else
     float3 result = 0.0;
     // sunPresence already folds in the off-screen ramp and the elevation fade,
     // so a single early-out here covers every reason the flare should be absent
@@ -209,6 +331,7 @@ void FeatureGenCS(uint3 threadID : SV_DispatchThreadID) {
     }
 
     flareOutput[pixel] = float4(result * sunPresence, 1.0);
+#endif
 }
 
 [numthreads(8, 8, 1)]
@@ -223,6 +346,18 @@ void StreakCS(uint3 threadID : SV_DispatchThreadID) {
         return;
     }
 
+#if defined(SGE_HIGH_QUALITY_LENS)
+    float2 p = (uv - sunUV) * float2(aspect, 1.0);
+    float extent = max(streakLength * aspect, 1e-4);
+    float along = abs(p.x) / extent;
+    float envelope = exp(-along * 3.5) * (1.0 - smoothstep(0.75, 1.0, along));
+    float coreWidth = max(1.5 / float(flareSize.y), 0.002);
+    float core = exp(-pow(p.y / coreWidth, 2.0));
+    float shoulder = exp(-abs(p.y) / (coreWidth * 3.5)) * 0.12;
+    float3 streak = SolarSource() * float3(0.32, 0.60, 1.0) *
+        (core + shoulder) * envelope * streakIntensity * sunPresence * 0.19;
+    flareOutput[pixel] = float4(existing + streak, 1.0);
+#else
     // The anamorphic streak: the signature of the look. A horizontal-only blur
     // of the bloom pyramid, so every bright object in frame smears sideways the
     // way a cylindrical front element makes it.
@@ -250,6 +385,7 @@ void StreakCS(uint3 threadID : SV_DispatchThreadID) {
     const float3 streakTint = float3(0.38, 0.62, 1.0);
     flareOutput[pixel] = float4(
         existing + streak * streakTint * streakIntensity * sunPresence, 1.0);
+#endif
 }
 
 [numthreads(8, 8, 1)]
@@ -265,6 +401,14 @@ void BlurCS(uint3 threadID : SV_DispatchThreadID) {
     // smooth and is unharmed by it.
     float2 step = blurDirection == 0u ? float2(texel.x, 0.0)
                                       : float2(0.0, texel.y);
+#if defined(SGE_HIGH_QUALITY_LENS)
+    // A smaller reconstruction filter retains aperture rims and diffraction
+    // rays that a broad blur erases at half resolution.
+    float3 sum = flareInput.SampleLevel(linearClamp, uv, 0.0).rgb * 0.5;
+    sum += flareInput.SampleLevel(linearClamp, uv - step * 0.75, 0.0).rgb * 0.25;
+    sum += flareInput.SampleLevel(linearClamp, uv + step * 0.75, 0.0).rgb * 0.25;
+    flareOutput[pixel] = float4(sum, 1.0);
+#else
     float3 sum = 0.0;
     float weightSum = 0.0;
     [unroll]
@@ -275,4 +419,5 @@ void BlurCS(uint3 threadID : SV_DispatchThreadID) {
         weightSum += weight;
     }
     flareOutput[pixel] = float4(sum / max(weightSum, 1e-4), 1.0);
+#endif
 }

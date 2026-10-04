@@ -449,6 +449,7 @@ DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX HumveeWorldMatrix(size_t index);
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 size_t LevelHumveeCount();
+bool HumveeAlive(size_t index);
 void PrepareHumveeModelForRender(size_t index);
 void HumveeHeadlightPose(size_t index, DirectX::XMFLOAT3& position,
                          DirectX::XMFLOAT3& direction);
@@ -471,6 +472,7 @@ inline int AddHumveeHeadlights(Scene& scene) {
     int added = 0;
     for (size_t index = 0; index < LevelHumveeCount() &&
          scene.clusteredRenderer.lights.size() < 64; ++index) {
+        if (!HumveeAlive(index)) continue;
         PointLightDX12 headlight;
         HumveeHeadlightPose(index, headlight.position,
                             headlight.spotDirection);
@@ -2899,6 +2901,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
         g_levelPlacesHumvee) {
         for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+            if (!HumveeAlive(index)) continue;
             PrepareHumveeModelForRender(index);
             const XMMATRIX world = HumveeWorldMatrix(index);
             if (visibilityExtensionsOnly)

@@ -632,9 +632,19 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      uint64_t* hitEntityId,
                                      XMFLOAT3* hitNormal,
                                      bool fencePanelsTransparent,
-                                     bool ignoreAATurretColliders) {
+                                     bool ignoreAATurretColliders,
+                                     bool preciseShootingTargets) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
+    // Targets use the centerline from the first contact test. Sweeping a wide
+    // sphere would stop a round before it reaches the board and lose its score.
+    const auto collisionRadius = [&](uint64_t entityId) {
+        if (preciseShootingTargets) {
+            for (const auto& target : g_game.world.Prefabs().shootingTargets)
+                if (target.entityId == entityId) return 0.0f;
+        }
+        return radius;
+    };
     const auto isTurretEntity = [&](uint64_t entityId) {
         if (!ignoreAATurretColliders || entityId == 0) return false;
         for (const auto& turret : g_game.vehicles.aaTurrets)
@@ -657,8 +667,8 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         // would stop at an invisible plane across the hangar doorway.
         if (g_meshCollisionEntities.count(collider.entityId)) continue;
         XMFLOAT3 candidate;
-        if (!PrefabColliderIntersectsSegment(collider, start, end, radius,
-                                             &candidate)) continue;
+        if (!PrefabColliderIntersectsSegment(collider, start, end,
+                collisionRadius(collider.entityId), &candidate)) continue;
         const float dx = candidate.x - start.x;
         const float dy = candidate.y - start.y;
         const float dz = candidate.z - start.z;
@@ -676,7 +686,8 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
         if (isTurretEntity(instance.entityId)) continue;
         CollisionMeshRayHit meshHit;
-        if (!CollisionMeshInstanceRaycast(instance, start, end, radius, meshHit))
+        if (!CollisionMeshInstanceRaycast(instance, start, end,
+                collisionRadius(instance.entityId), meshHit))
             continue;
         const float dx = meshHit.point.x - start.x;
         const float dy = meshHit.point.y - start.y;
@@ -691,6 +702,25 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         }
     }
     return struck;
+}
+
+static void ScorePlayerShootingTarget(uint64_t entityId,
+                                     const XMFLOAT3& start, const XMFLOAT3& exactHit) {
+    auto& prefabs = g_game.world.Prefabs();
+    if (prefabs.shootingTargets.empty()) return;
+    const auto target = std::find_if(prefabs.shootingTargets.begin(),
+        prefabs.shootingTargets.end(), [entityId](const auto& value) {
+            return value.entityId == entityId;
+        });
+    if (target == prefabs.shootingTargets.end()) return;
+
+    XMFLOAT3 obstruction;
+    if (g_destruction.HitTestSegment(start, exactHit, 0.0f, obstruction) ||
+        (!g_emptyLevelMode && HitTerrainSegment(start, exactHit, 0.0f, obstruction)))
+        return;
+    const ShootingTargetHit scored = ScoreShootingTarget(*target, exactHit);
+    prefabs.shootingRange.Record(entityId, scored);
+    if (scored.points > 0) scene.TriggerHitMarker();
 }
 
 static XMFLOAT3 GrenadeFallbackNormal(const Projectile& grenade) {
@@ -814,6 +844,9 @@ static bool HitGrenadeCollision(const Projectile& grenade, float radius,
     if (HitAATurretSegment(start, end, radius, candidate, hitTurretIndex))
         accept(candidate, radialNormal(
             candidate, g_game.vehicles.aaTurrets[hitTurretIndex].position));
+    CollisionMeshRayHit humveeHit;
+    if (HitHumveeSegment(start, end, radius, humveeHit))
+        accept(humveeHit.point, humveeHit.normal);
 
     size_t barrelIndex = 0;
     if (HitExplosiveBarrelSegment(

@@ -14,6 +14,7 @@
 #include <assimp/scene.h>
 #include <nlohmann/json.hpp>
 #include "CookedAssetPaths.h"
+#include "ShootingTarget.h"
 #include "EngineLogger.h"
 #ifdef _WIN32
 #include <Windows.h>
@@ -396,6 +397,8 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
         }
         if (components.contains("script"))
             prefab.scriptPath = components.at("script").value("path", "");
+        if (components.contains("shootingTarget"))
+            ReadShootingTarget(components.at("shootingTarget"));
         if (prefab.id.empty()) throw std::runtime_error("id is empty");
         if (prefab.basePrefabId.empty() && !IsSafeRelative(prefab.modelPath))
             throw std::runtime_error("model path must be project-relative without '..'");
