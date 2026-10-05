@@ -57,6 +57,54 @@ static void UpdateHelicopterHoverAudio() {
                                   alarmVolume, 1.0f);
 }
 
+static void UpdateBoatEngineAudio(float deltaTime) {
+    struct EngineMotion {
+        XMFLOAT3 previous{};
+        float load = 0.0f;
+        bool valid = false;
+    };
+    static EngineMotion patrol, insertion;
+    const VehicleSystem& vehicles = g_game.vehicles;
+    const bool audible = IsGameplayScreen() && !g_game.loading.Active() &&
+        (scene.player.godMode || scene.player.health > 0.0f);
+    auto update = [&](GunAudio& sound, EngineMotion& motion,
+                      const XMFLOAT3& position, bool active,
+                      bool driven, float fullSpeed) {
+        if (!audible || !active) {
+            sound.StopLoop();
+            motion = {};
+            return;
+        }
+        float targetLoad = 0.0f;
+        if (motion.valid && deltaTime > 0.0001f) {
+            const float dx = position.x - motion.previous.x;
+            const float dz = position.z - motion.previous.z;
+            targetLoad = (std::min)(1.0f,
+                std::sqrt(dx * dx + dz * dz) / (deltaTime * fullSpeed));
+        }
+        if (driven && !vehicles.boatBrake)
+            targetLoad = (std::max)(targetLoad, std::abs(vehicles.boatThrottle) * 0.4f);
+        // Observed motion covers AI, insertion phases and replicated boats.
+        // Ignore vertical wave bob and ease RPM so snapshot corrections do
+        // not turn into abrupt pitch jumps.
+        motion.load += (targetLoad - motion.load) *
+            (1.0f - std::exp(-4.0f * (std::clamp)(deltaTime, 0.0f, 0.25f)));
+        motion.previous = position;
+        motion.valid = true;
+        sound.SetLoopAt(true, position.x, position.y, position.z,
+            0.24f + motion.load * 0.30f, 0.85f + motion.load * 0.50f, 110.0f);
+    };
+    update(g_patrolBoatEngineAudio, patrol, g_boatPosition,
+        g_levelPatrolBoatEnabled && g_boatModel && !g_boatDead && !g_boatSunk,
+        vehicles.drivingBoat, VehicleSystem::BoatForwardSpeed);
+    update(g_insertionBoatEngineAudio, insertion, vehicles.insertionBoatPosition,
+        g_insertionBoatModel && vehicles.insertionBoatVisible &&
+        vehicles.insertionBoatHealth > 0.0f && !g_insertionChoicePending &&
+        !vehicles.InsertionBoatIsFoundering() && !vehicles.InsertionBoatIsSunk() &&
+        vehicles.insertionBoatPhase != VehicleSystem::InsertionBoatPhase::Gone,
+        vehicles.drivingInsertionBoat, VehicleSystem::InsertionBoatApproachSpeed);
+}
+
 static void UpdateFireLoopAudio() {
     if (!IsGameplayScreen() || g_game.loading.Active()) {
         g_fireLoopAudio.SetLoop(false);
@@ -369,7 +417,7 @@ static void BakeRuntimeSplineEntities() {
 }
 
 static void SynchronizeEditorRuntime(bool play);
-static void ApplyTerrainSplatMap(const LevelDefinition& level);
+static void ApplyTerrainSplatMap(const LevelDefinition& level, bool force = false);
 static void StartLevelEditor(HWND hwnd,
                              const std::filesystem::path& levelPath = {});
 static void StopEditorPlaytest();
@@ -438,6 +486,56 @@ static void ResetSprintStamina() {
 // same command list, and the HDRI upload, IBL prefilter and cloud-noise bake
 // share one recording session (see the comments inside).
 static bool g_sceneRenderAssetsReady = false;
+static TerrainTextureLayers g_requestedTerrainTextures =
+    TerrainTexturePreset(LevelMapType::Tropical);
+static bool g_terrainTexturesPending = false;
+static void RequestTerrainTextures(const LevelDefinition& level) {
+    g_requestedTerrainTextures = ResolveTerrainTextureLayers(
+        level.mapType, level.terrainTextureLayers);
+    g_terrainTexturesPending = g_requestedTerrainTextures != g_terrain.textureLayers;
+}
+
+static void ApplyPendingTerrainTextures() {
+    if (!g_terrainTexturesPending || !g_sceneRenderAssetsReady ||
+        !g_terrain.supported) return;
+    g_terrainTexturesPending = false;
+    ProfilerDX12::CpuScope materialProfile(g_profiler, "Terrain/MaterialUpload");
+    // Called before BeginFrame, like scene initialization and the sky swap.
+    // Both the forward and async resolve readers must retire before rebinding.
+    WaitForDirectQueueIdleIsolated();
+    WaitForFenceCPU(g_dx12.computeFence.Get(), g_dx12.computeFenceValue);
+    const auto previousLayers = g_terrain.textureLayers;
+    const auto previousAlbedo = g_terrain.terrainAlbedoArray;
+    const auto previousNormal = g_terrain.terrainNormalArray;
+    const auto previousRoughness = g_terrain.terrainRoughnessArray;
+    const auto previousUploads = g_terrain.terrainUploads;
+    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.commandList->Reset(
+        g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    g_terrain.textureLayers = g_requestedTerrainTextures;
+    const bool uploaded = g_terrain.CreateTerrainTextureArrays(mainShader);
+    ThrowIfFailed(g_dx12.commandList->Close());
+    ID3D12CommandList* lists[] = { g_dx12.commandList.Get() };
+    g_dx12.commandQueue->ExecuteCommandLists(1, lists);
+    WaitForDirectQueueIdleIsolated();
+    if (!uploaded) {
+        g_terrain.textureLayers = previousLayers;
+        g_terrain.terrainAlbedoArray = previousAlbedo;
+        g_terrain.terrainNormalArray = previousNormal;
+        g_terrain.terrainRoughnessArray = previousRoughness;
+        g_terrain.terrainUploads = previousUploads;
+        SGE_LOG("LogRender", EngineLog::Level::Error,
+            "Terrain texture upload failed; previous material retained");
+        return;
+    }
+    g_terrain.ReleaseUploadHeaps();
+    visBuffer.SetTerrainTextures(g_terrain.terrainAlbedoArray.Get(),
+        g_terrain.terrainNormalArray.Get(), g_terrain.terrainRoughnessArray.Get(),
+        g_terrain.terrainSplatMap.Get());
+    visBuffer.InvalidateTemporalHistory();
+    shadowMap.InvalidateCachedCascades();
+    SGE_LOG("LogRender", EngineLog::Level::Display, "Terrain textures applied");
+}
 // Set by a level start, consumed in the frame loop before BeginFrame opens the
 // frame's command list. The build below resets that list and its allocator, so
 // running it from the menu button -- which is called from inside the ImGui
@@ -473,7 +571,9 @@ static void EnsureSceneRenderAssets() {
         ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
         ThrowIfFailed(g_dx12.commandList->Reset(
             g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+        g_terrain.textureLayers = g_requestedTerrainTextures;
         terrainReady = g_terrain.Init(mainShader);
+        g_terrainTexturesPending = false;
         ThrowIfFailed(g_dx12.commandList->Close());
         {
             ID3D12CommandList* terrainLists[] = { g_dx12.commandList.Get() };
@@ -716,7 +816,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     // Built-in levels carry no sidecar, so this clears any map left over from a
     // painted custom level rather than letting it bleed across a level change.
-    ApplyTerrainSplatMap(customLevel ? *customLevel : LevelDefinition{});
+    ApplyTerrainSplatMap(customLevel ? *customLevel : LevelDefinition{}, true);
     g_grass.ClearRuntimeExclusions();
     g_game.ResetLevelState();
     g_enemySystem.ResetLevelCounters();
@@ -794,7 +894,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // The hub opens at sunset. Applied without touching g_selectedTimeOfDay:
     // that is the mission's choice, and the next deployment screen re-applies
     // it, so the base's light never leaks into the run planned from it.
-    if (g_baseMode) ApplyTimeOfDay(TimeOfDay::Dusk);
+    if (g_baseMode) ApplyTimeOfDay(
+        g_game.world.Level().mapType == LevelMapType::Snowy
+            ? TimeOfDay::Noon : TimeOfDay::Dusk);
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
     // Re-aim the insertion at the spawn the player actually got. ResetLevelState

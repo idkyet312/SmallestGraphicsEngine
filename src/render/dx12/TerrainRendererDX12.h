@@ -6,6 +6,7 @@
 #include "LevelDefinition.h"
 #include "TerrainStampLibrary.h"
 #include "TerrainStampMerge.h"
+#include "TerrainRockProtection.h"
 #include "EngineLogger.h"
 #include "TextureUploadArenaDX12.h"
 #include <algorithm>
@@ -128,6 +129,8 @@ public:
     inline static std::array<size_t, FRAME_COUNT> dirtyAtlasLast_{};
     std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
+    UINT terrainTextureSlot_ = ~0u;
+    TerrainTextureLayers textureLayers = TerrainTexturePreset(LevelMapType::Tropical);
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -355,7 +358,8 @@ public:
                a.operation == b.operation && a.value == b.value &&
                a.strength == b.strength && a.texture == b.texture &&
                a.rotation == b.rotation && a.replace == b.replace &&
-               a.baseHeight == b.baseHeight && a.edgeFalloff == b.edgeFalloff;
+               a.baseHeight == b.baseHeight && a.edgeFalloff == b.edgeFalloff &&
+               a.runtimeDestruction == b.runtimeDestruction;
     }
 
     // Appended only for drawing: cursor picking, baking and shoreline queries
@@ -399,6 +403,7 @@ public:
         if (stamp.operation == TerrainSculptOperation::Heightmap)
             EnsureHeightStampLoaded(stamp.texture);
         s_sculptStamps.push_back(stamp);
+        s_sculptStamps.back().runtimeDestruction = true;
         // Runtime blast/crash deformation is local. Rebuilding the ocean's
         // whole shoreline distance field for one of them costs seconds and
         // cannot change the authored coastline in a meaningful way; only a
@@ -539,7 +544,7 @@ public:
         // from here while the surface is displaced there, so the two branches
         // have to appear at the same point in the chain.
         if (IsFlat(params.terrainStyle))
-            return ApplySculpt(2.5f /* landLift */, x, z, sculpt);
+            return ApplySculpt(2.5f /* landLift */, x, z, sculpt, params);
 
         float px = x * 0.08f, py = z * 0.08f;
         float sum = 0.0f, amp = 0.5f;
@@ -656,7 +661,7 @@ public:
             float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);
             h = h + (padHeight - h) * pad;
         }
-        return ApplySculpt(h, x, z, sculpt);
+        return ApplySculpt(h, x, z, sculpt, params);
     }
 
     // Boolean-style crater cut: flat floor, steep wall, raised ejecta lip, so
@@ -699,6 +704,12 @@ public:
     // cannot drift. Must match ApplySculpt in terrain_ms.hlsl.
     static float ApplySculpt(float h, float x, float z,
         const std::vector<TerrainSculptStamp>& sculpt) {
+        return ApplySculpt(h, x, z, sculpt, Params{});
+    }
+
+    static float ApplySculpt(float h, float x, float z,
+        const std::vector<TerrainSculptStamp>& sculpt, const Params& params) {
+        float destructionWeight = -1.0f;
         for (const TerrainSculptStamp& stamp : sculpt) {
             if (stamp.operation == TerrainSculptOperation::Heightmap) {
                 float relief = 0.0f, coverage = 0.0f;
@@ -714,17 +725,33 @@ public:
             const float dx = x - stamp.x;
             const float dz = z - stamp.z;
             const float distance = sqrtf(dx * dx + dz * dz);
+            const bool protect = stamp.runtimeDestruction &&
+                (stamp.operation == TerrainSculptOperation::Crater ||
+                 (stamp.operation == TerrainSculptOperation::Add && stamp.value < 0)) &&
+                distance <= stamp.radius *
+                    (stamp.operation == TerrainSculptOperation::Crater ? 1.18f : 1.0f);
+            if (protect && destructionWeight < 0.0f) {
+                const float rock = s_rockMaskActive ? SampleTerrainRockMask(
+                    s_stampAtlas.data() + kTerrainStampAtlasTexels + 2,
+                    kTerrainRockMaskResolution,
+                    x / (176.0f * (std::max)(0.01f, params.islandScaleX)) + 0.5f,
+                    z / (176.0f * (std::max)(0.01f, params.islandScaleZ)) + 0.5f) : 0;
+                destructionWeight = TerrainDestructionWeight(rock);
+            }
             if (stamp.operation == TerrainSculptOperation::Crater) {
-                h = ApplyCraterCut(h, distance, stamp.radius, stamp.value,
+                const float cut = ApplyCraterCut(h, distance, stamp.radius, stamp.value,
                                    stamp.strength, stamp.edgeFalloff,
                                    stamp.baseHeight);
+                h = protect ? BlendTerrainDestruction(h, cut, destructionWeight) : cut;
                 continue;
             }
             float weight = 1.0f - distance / stamp.radius;
             weight = weight < 0.0f ? 0.0f : (weight > 1.0f ? 1.0f : weight);
             weight = weight * weight * (3.0f - 2.0f * weight);
-            if (stamp.operation == TerrainSculptOperation::Add)
+            if (stamp.operation == TerrainSculptOperation::Add) {
+                if (protect) weight *= destructionWeight;
                 h += stamp.value * weight;
+            }
             else {
                 const float blend = (std::min)(1.0f, stamp.strength * weight);
                 h += (stamp.value - h) * blend;
@@ -752,8 +779,9 @@ public:
                     IID_PPV_ARGS(&sculptBuffers[frame])))) return false;
             UploadSculptStamps(frame);
         }
-        // Atlas layers plus the appended high-resolution bake slot.
-        desc.Width = static_cast<UINT64>(kTerrainStampAtlasTexels) *
+        // The rock mask shares the atlas's existing per-frame upload lifetime.
+        desc.Width = static_cast<UINT64>(kTerrainStampAtlasTexels + 2 +
+            kTerrainRockMaskTexels) *
             sizeof(uint16_t);
         for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
             if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
@@ -777,7 +805,9 @@ public:
             const TerrainSculptStamp& source = i < s_sculptStamps.size()
                 ? s_sculptStamps[i] : *editorSculptPreview_;
             destination[i] = { source.x, source.z, source.radius,
-                static_cast<UINT>(source.operation), source.value, source.strength,
+                static_cast<UINT>(source.operation) |
+                    (source.runtimeDestruction ? 0x80000000u : 0u),
+                source.value, source.strength,
                 FindHeightStampLayer(source.texture), source.rotation,
                 source.replace, source.baseHeight, source.edgeFalloff };
         }
@@ -995,6 +1025,16 @@ public:
     // constraint and solves it the same way -- SetSculptStamps only touches CPU
     // state and the GPU work happens later in the frame.
     void StageTerrainSplatMap(const uint8_t* rgba, UINT resolution) {
+        EnsureStampLibrary();
+        const auto mask = BuildTerrainRockMask(rgba, resolution);
+        s_rockMaskActive = std::any_of(mask.begin(), mask.end(),
+            [](uint16_t value) { return value != 0; });
+        s_stampAtlas[kTerrainStampAtlasTexels] = s_rockMaskActive ? 1u : 0u;
+        s_stampAtlas[kTerrainStampAtlasTexels + 1] = 0;
+        std::copy(mask.begin(), mask.end(),
+            s_stampAtlas.begin() + kTerrainStampAtlasTexels + 2);
+        MarkStampAtlasDirty(kTerrainStampAtlasTexels, 2 + kTerrainRockMaskTexels);
+        ++s_stampAtlasRevision;
         if (!rgba || resolution == 0) {
             pendingSplatPixels_.clear();
             pendingSplatResolution_ = 0;
@@ -1148,12 +1188,22 @@ public:
         std::array<std::vector<uint8_t>, 3> maps;
         for (auto& map : maps) map.resize(layerBytes * layers);
 
-        const std::array<std::array<float, 3>, layers> baseColors = {{
+        const auto tropicalLayers = TerrainTexturePreset(LevelMapType::Tropical);
+        std::array<bool, layers> legacyLayer{};
+        for (UINT layer = 0; layer < layers; ++layer)
+            legacyLayer[layer] = !textureLayers[layer].custom &&
+                textureLayers[layer].albedo == tropicalLayers[layer].albedo;
+        std::array<std::array<float, 3>, layers> baseColors = {{
             {{ 0.25f, 0.43f, 0.12f }},
             {{ 0.34f, 0.20f, 0.10f }},
             {{ 0.72f, 0.58f, 0.36f }},
             {{ 0.31f, 0.32f, 0.30f }}
         }};
+        for (UINT layer = 0; layer < layers; ++layer)
+            if (!legacyLayer[layer])
+                baseColors[layer] = textureLayers[layer].albedo.find("snow_") !=
+                    std::string::npos ? std::array<float, 3>{ 0.78f, 0.82f, 0.86f }
+                                     : std::array<float, 3>{ 0.5f, 0.5f, 0.5f };
         const std::array<float, layers> baseRoughness = {
             0.88f, 0.94f, 0.82f, 0.76f
         };
@@ -1195,22 +1245,29 @@ public:
                     maps[0][offset + 3] = 255;
                 }
                 if (normalMap) {
-                    const float dx = height(static_cast<int>(x) + 1,
-                        static_cast<int>(y), layer) - height(
-                        static_cast<int>(x) - 1, static_cast<int>(y), layer);
-                    const float dy = height(static_cast<int>(x),
-                        static_cast<int>(y) + 1, layer) - height(
-                        static_cast<int>(x), static_cast<int>(y) - 1, layer);
-                    const float strength = layer == 2 ? 2.0f
-                        : (layer == 3 ? 5.5f : 3.8f);
-                    XMVECTOR vectorNormal = XMVector3Normalize(XMVectorSet(
-                        -dx * strength, -dy * strength, 1.0f, 0.0f));
-                    XMFLOAT3 normal;
-                    XMStoreFloat3(&normal, vectorNormal);
-                    maps[1][offset + 0] = byte(normal.x * 0.5f + 0.5f);
-                    maps[1][offset + 1] = byte(normal.y * 0.5f + 0.5f);
-                    maps[1][offset + 2] = byte(normal.z * 0.5f + 0.5f);
-                    maps[1][offset + 3] = 255;
+                    if (!legacyLayer[layer]) {
+                        maps[1][offset + 0] = 128;
+                        maps[1][offset + 1] = 128;
+                        maps[1][offset + 2] = 255;
+                        maps[1][offset + 3] = 255;
+                    } else {
+                        const float dx = height(static_cast<int>(x) + 1,
+                            static_cast<int>(y), layer) - height(
+                            static_cast<int>(x) - 1, static_cast<int>(y), layer);
+                        const float dy = height(static_cast<int>(x),
+                            static_cast<int>(y) + 1, layer) - height(
+                            static_cast<int>(x), static_cast<int>(y) - 1, layer);
+                        const float strength = layer == 2 ? 2.0f
+                            : (layer == 3 ? 5.5f : 3.8f);
+                        XMVECTOR vectorNormal = XMVector3Normalize(XMVectorSet(
+                            -dx * strength, -dy * strength, 1.0f, 0.0f));
+                        XMFLOAT3 normal;
+                        XMStoreFloat3(&normal, vectorNormal);
+                        maps[1][offset + 0] = byte(normal.x * 0.5f + 0.5f);
+                        maps[1][offset + 1] = byte(normal.y * 0.5f + 0.5f);
+                        maps[1][offset + 2] = byte(normal.z * 0.5f + 0.5f);
+                        maps[1][offset + 3] = 255;
+                    }
                 }
                 if (roughness) {
                     maps[2][offset + 0] = 255;
@@ -1225,25 +1282,26 @@ public:
         // Load the Poly Haven CC0 scans first. Procedural pixels are expensive
         // enough to make startup look hung on a busy machine, and successful
         // loads replace every byte anyway, so generate only failed channels.
-        auto resolveTerrainMap = [](const char* folder, const char* file) {
+        auto resolveTerrainMap = [](const std::string& file) {
             for (const std::filesystem::path root : {
-                    std::filesystem::path("Content/Models"),
-                    std::filesystem::path("build/Content/Models"),
-                    std::filesystem::path("../Content/Models") }) {
-                const std::filesystem::path path = root / folder / file;
+                    std::filesystem::path("."),
+                    std::filesystem::path("build"),
+                    std::filesystem::path("..") }) {
+                const std::filesystem::path path = root / file;
                 if (std::filesystem::exists(path)) return path.string();
             }
-            return std::string(file);
+            return file;
         };
-        auto loadTerrainSlice = [&](const char* folder, const char* file,
+        auto loadTerrainSlice = [&](const std::string& file,
                                     UINT layer, std::vector<uint8_t>& target,
                                     bool normalSource, bool roughnessSource,
                                     bool ambientOcclusionSource = false,
                                     bool heightSource = false) {
             std::vector<unsigned char> source;
             int width = 0, heightPixels = 0;
+            if (file.empty()) return false;
             if (!GLBImporter::LoadPixelsRGBA(
-                    resolveTerrainMap(folder, file), source, width, heightPixels) ||
+                    resolveTerrainMap(file), source, width, heightPixels) ||
                 width <= 0 || heightPixels <= 0) return false;
             for (UINT y = 0; y < side; ++y) for (UINT x = 0; x < side; ++x) {
                 const int sx0 = static_cast<int>((uint64_t)x * width / side);
@@ -1270,8 +1328,9 @@ public:
                     // The grass displacement scan is centred around 83/255.
                     // Centre it at neutral height so it does not win every
                     // transition against layers without a displacement scan.
-                    const float centred = 128.0f +
-                        (static_cast<float>(sums[0] / count) - 83.0f) * 0.8f;
+                    const float centred = legacyLayer[layer] ? 128.0f +
+                        (static_cast<float>(sums[0] / count) - 83.0f) * 0.8f
+                        : static_cast<float>(sums[0] / count);
                     target[destination + 3] = byte(centred / 255.0f);
                 } else if (ambientOcclusionSource) {
                     target[destination + 0] =
@@ -1292,7 +1351,7 @@ public:
                     target[destination + 1] = byte(decoded.y * 0.5f + 0.5f);
                     target[destination + 2] = byte(decoded.z * 0.5f + 0.5f);
                 } else {
-                    if (layer == 3) {
+                    if (layer == 3 && legacyLayer[layer]) {
                         // The near-black rock scan reads as a black cutout next
                         // to the beach. Lift its luminance and reduce the warm
                         // cast while retaining the scan's cracks and grain.
@@ -1305,7 +1364,7 @@ public:
                         target[destination + 1] = byte(coastalRock);
                         target[destination + 2] = byte(coastalRock * 0.92f);
                     } else {
-                        const float exposure = layer == 0 ? 1.25f : 1.0f;
+                        const float exposure = layer == 0 && legacyLayer[layer] ? 1.25f : 1.0f;
                         target[destination + 0] = byte(
                             static_cast<float>(sums[0] / count) / 255.0f * exposure);
                         target[destination + 1] = byte(
@@ -1319,40 +1378,16 @@ public:
             }
             return true;
         };
-        struct TerrainAsset {
-            const char* folder;
-            const char* albedo;
-            const char* normal;
-            const char* roughness;
-            const char* ambientOcclusion;
-            const char* height;
-        };
-        static constexpr TerrainAsset assets[layers] = {
-            { "Grass3/Grass004_2K-JPG", "Grass004_2K-JPG_Color.jpg",
-              "Grass004_2K-JPG_NormalGL.jpg",
-              "Grass004_2K-JPG_Roughness.jpg",
-              "Grass004_2K-JPG_AmbientOcclusion.jpg",
-              "Grass004_2K-JPG_Displacement.jpg" },
-            { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
-              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png",
-              nullptr, nullptr },
-            { "terrain/aerial_beach_01", "aerial_beach_01_diff_2k.png",
-              "aerial_beach_01_nor_gl_2k.png",
-              "aerial_beach_01_rough_2k.png",
-              "aerial_beach_01_ao_2k.png", nullptr },
-            { "terrain/dark_rock", "dark_rock_diff_1k.png",
-              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png",
-              nullptr, nullptr }
-        };
+        const auto& assets = textureLayers;
         for (UINT layer = 0; layer < layers; ++layer) {
             const bool albedoLoaded = loadTerrainSlice(
-                assets[layer].folder, assets[layer].albedo, layer,
+                assets[layer].albedo, layer,
                 maps[0], false, false);
             const bool normalLoaded = loadTerrainSlice(
-                assets[layer].folder, assets[layer].normal, layer,
+                assets[layer].normal, layer,
                 maps[1], true, false);
             const bool roughnessLoaded = loadTerrainSlice(
-                assets[layer].folder, assets[layer].roughness, layer,
+                assets[layer].roughness, layer,
                 maps[2], false, true);
             fillFallbackSlice(layer, !albedoLoaded, !normalLoaded,
                               !roughnessLoaded);
@@ -1360,17 +1395,17 @@ public:
                 for (size_t texel = 0; texel < layerBytes; texel += 4)
                     maps[2][static_cast<size_t>(layer) * layerBytes + texel + 3] = 128;
             }
-            const bool aoLoaded = !assets[layer].ambientOcclusion ||
-                loadTerrainSlice(assets[layer].folder,
+            const bool aoLoaded = assets[layer].ambientOcclusion.empty() ||
+                loadTerrainSlice(
                     assets[layer].ambientOcclusion, layer,
                     maps[2], false, false, true);
-            const bool heightLoaded = !assets[layer].height ||
-                loadTerrainSlice(assets[layer].folder,
+            const bool heightLoaded = assets[layer].height.empty() ||
+                loadTerrainSlice(
                     assets[layer].height, layer, maps[2], false, false,
                     false, true);
             if (!albedoLoaded || !normalLoaded || !roughnessLoaded ||
                 !aoLoaded || !heightLoaded) {
-                std::cerr << "Terrain PBR: " << assets[layer].folder
+                std::cerr << "Terrain PBR: layer " << layer << " " << assets[layer].albedo
                           << " maps missing (albedo=" << albedoLoaded
                           << ", normal=" << normalLoaded
                           << ", roughness=" << roughnessLoaded
@@ -1396,7 +1431,11 @@ public:
             return false;
         }
 
-        const UINT slot = shader.ReservePersistentMaterialSrvs();
+        // A material edit runs only after the queues are idle. Reuse this table
+        // so repeated edits cannot exhaust the persistent descriptor heap.
+        if (terrainTextureSlot_ == ~0u)
+            terrainTextureSlot_ = shader.ReservePersistentMaterialSrvs();
+        const UINT slot = terrainTextureSlot_;
         if (slot == ~0u) {
             std::cerr << "Terrain PBR: persistent descriptor allocation failed\n";
             return false;
@@ -1542,7 +1581,9 @@ private:
         s_stampLoadState.assign(s_stampNames.size(), 0u);
         s_stampWriteTimes.assign(
             s_stampNames.size(), std::filesystem::file_time_type{});
-        s_stampAtlas.assign(kTerrainStampAtlasTexels, 32768u);
+        s_stampAtlas.assign(kTerrainStampAtlasTexels + 2 +
+            kTerrainRockMaskTexels, 0u);
+        std::fill_n(s_stampAtlas.begin(), kTerrainStampAtlasTexels, 32768u);
     }
 
     static UINT FindHeightStampLayer(const std::string& texture) {
@@ -1780,6 +1821,7 @@ private:
     inline static std::vector<std::filesystem::file_time_type>
         s_stampWriteTimes;
     inline static std::vector<uint16_t> s_stampAtlas;
+    inline static bool s_rockMaskActive = false;
     // Residency of the single bake slot, mirroring s_stampLoadState /
     // s_stampWriteTimes for the atlas layers. s_bakeName is which bake is
     // currently resident, so switching levels reloads rather than showing the

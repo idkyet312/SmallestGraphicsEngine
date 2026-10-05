@@ -456,6 +456,49 @@ public:
         loopVoice_->SetFrequencyRatio((std::max)(0.5f, (std::min)(2.0f, pitch)));
     }
 
+    // Unlike a one-shot, a moving engine needs its pan refreshed without
+    // resubmitting the buffer; otherwise each update restarts the recording.
+    void SetLoopAt(bool enabled, float x, float y, float z,
+                   float volume = 1.0f, float pitch = 1.0f,
+                   float maxDistance = 60.0f) {
+        SetLoop(enabled, volume, pitch);
+        if (!loopVoice_ || !AudioDevice::SpatialReady()) return;
+        const UINT32 channels = AudioDevice::OutputChannels();
+        if (channels == 0 || channels > 8 || format_.nChannels == 0 ||
+            format_.nChannels > 8) return;
+        X3DAUDIO_EMITTER emitter = {};
+        emitter.ChannelCount = 1;
+        emitter.CurveDistanceScaler = (std::max)(1.0f, maxDistance);
+        emitter.Position = { x, y, z };
+        emitter.OrientFront = { 0.0f, 0.0f, 1.0f };
+        emitter.OrientTop = { 0.0f, 1.0f, 0.0f };
+        emitter.InnerRadius = 4.0f;
+        emitter.InnerRadiusAngle = X3DAUDIO_PI / 4.0f;
+        static const X3DAUDIO_DISTANCE_CURVE_POINT points[] = {
+            { 0.0f, 1.0f }, { 0.1f, 1.0f }, { 1.0f, 0.0f }
+        };
+        static X3DAUDIO_DISTANCE_CURVE rolloff = {
+            const_cast<X3DAUDIO_DISTANCE_CURVE_POINT*>(points), 3
+        };
+        emitter.pVolumeCurve = &rolloff;
+        float pointMatrix[8] = {};
+        X3DAUDIO_DSP_SETTINGS dsp = {};
+        dsp.SrcChannelCount = 1;
+        dsp.DstChannelCount = channels;
+        dsp.pMatrixCoefficients = pointMatrix;
+        X3DAudioCalculate(AudioDevice::Handle(), &AudioDevice::Listener(),
+            &emitter, X3DAUDIO_CALCULATE_MATRIX, &dsp);
+        // Downmix multichannel recordings to the same point emitter so a
+        // stereo asset does not bypass spatial attenuation or double its gain.
+        float matrix[64] = {};
+        for (UINT32 source = 0; source < format_.nChannels; ++source)
+            for (UINT32 dest = 0; dest < channels; ++dest)
+                matrix[source * channels + dest] =
+                    pointMatrix[dest] / format_.nChannels;
+        loopVoice_->SetOutputMatrix(AudioDevice::BusVoice(bus_),
+            format_.nChannels, channels, matrix);
+    }
+
     void StopLoop() {
         if (!loopVoice_) return;
         loopVoice_->Stop();

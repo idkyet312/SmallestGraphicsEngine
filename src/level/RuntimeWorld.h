@@ -79,6 +79,7 @@ public:
         if (terrainSculpt_.size() >= kMaxTerrainSculptStamps)
             terrainSculpt_.erase(terrainSculpt_.begin());
         terrainSculpt_.push_back(stamp);
+        terrainSculpt_.back().runtimeDestruction = true;
         ++terrainRevision_;
     }
 

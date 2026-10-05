@@ -194,6 +194,8 @@ private:
     // Allocates the splatmap on first paint. Returns false if the level has no
     // usable island extent to map against.
     bool EnsureTerrainSplatMap();
+    void RenderTerrainMaterials();
+    bool BrowseTerrainTexture(std::string& path);
     // Grow the terrain tile grid by one row/column on a side (0=+X,1=-X,2=+Z,
     // 3=-Z), shifting the grid origin so the new tiles land on that side.
     void ExtendTerrain(int direction);

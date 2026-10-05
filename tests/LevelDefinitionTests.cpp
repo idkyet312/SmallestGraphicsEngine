@@ -91,9 +91,114 @@ int main() {
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
     const auto good = root / "roundtrip.json";
+    {
+        LevelDefinition grass = MakeFlatLevelTemplate();
+        grass.mapType = LevelMapType::GrassGround;
+        const auto layers = TerrainTexturePreset(grass.mapType);
+        const auto tropical = TerrainTexturePreset(LevelMapType::Tropical);
+        CHECK(layers[0].albedo.find("grass_ground_diff_2k.jpg") != std::string::npos);
+        CHECK(layers[0].normal.find("grass_ground_nor_gl_2k.png") != std::string::npos);
+        CHECK(layers[0].roughness.find("grass_ground_rough_2k.png") != std::string::npos);
+        CHECK(layers[0].ambientOcclusion.find("grass_ground_ao_2k.jpg") != std::string::npos);
+        CHECK(layers[0].height.find("grass_ground_disp_2k.png") != std::string::npos);
+        CHECK(layers[1] == tropical[1]);
+        CHECK(layers[3] == tropical[3]);
+        CHECK(layers[2].albedo.find("coast_sand_05_diff_2k.jpg") != std::string::npos);
+        CHECK(layers[2].normal.find("coast_sand_05_nor_gl_2k.png") != std::string::npos);
+        CHECK(layers[2].roughness.find("coast_sand_05_rough_2k.png") != std::string::npos);
+        CHECK(layers[2].ambientOcclusion.find("coast_sand_05_ao_2k.jpg") != std::string::npos);
+        CHECK(layers[2].height.find("coast_sand_05_disp_2k.png") != std::string::npos);
+        const auto sourceRoot = std::filesystem::path(__FILE__).parent_path().parent_path();
+        for (size_t i : { size_t(0), size_t(2) })
+            for (const auto& path : { layers[i].albedo, layers[i].normal,
+                    layers[i].roughness, layers[i].ambientOcclusion, layers[i].height })
+                CHECK(std::filesystem::exists(sourceRoot / path));
+        const auto grassPath = root / "grass-ground-roundtrip.json";
+        CHECK(SaveLevel(grass, grassPath).ok);
+        const auto restored = LoadLevel(grassPath);
+        CHECK(restored.ok);
+        CHECK(restored.level.mapType == LevelMapType::GrassGround);
+        CHECK(restored.level.terrainAutoFoliage);
+        CHECK(ResolveTerrainTextureLayers(restored.level.mapType,
+            restored.level.terrainTextureLayers) == layers);
+        grass.terrainTextureLayers[0] = { true, "Content/Textures/custom-grass.png",
+            "", "", "", "" };
+        CHECK(ResolveTerrainTextureLayers(grass.mapType, grass.terrainTextureLayers)[0]
+            == grass.terrainTextureLayers[0]);
+        grass.terrainTextureLayers[2] = { true, "Content/Textures/custom-sand.png",
+            "", "", "", "" };
+        CHECK(ResolveTerrainTextureLayers(grass.mapType, grass.terrainTextureLayers)[2]
+            == grass.terrainTextureLayers[2]);
+    }
+    {
+        LevelDefinition snow = MakeFlatLevelTemplate();
+        snow.mapType = LevelMapType::Snowy;
+        snow.terrainAutoFoliage = false;
+        auto layers = ResolveTerrainTextureLayers(snow.mapType, snow.terrainTextureLayers);
+        CHECK(layers[0].albedo.find("snow_02_diff_2k.jpg") != std::string::npos);
+        CHECK(layers[1].albedo == layers[0].albedo);
+        CHECK(layers[0].ambientOcclusion.find("snow_02_ao_2k.jpg") != std::string::npos);
+        CHECK(layers[3].albedo.find("dark_rock") != std::string::npos);
+        snow.terrainTextureLayers[2] = { true, "Content/Textures/custom.png",
+            "Content/Textures/normal.png", "Content/Textures/rough.png", "",
+            "Content/Textures/height.png" };
+        const auto snowPath = root / "snow-roundtrip.json";
+        CHECK(SaveLevel(snow, snowPath).ok);
+        const auto restored = LoadLevel(snowPath);
+        CHECK(restored.ok);
+        CHECK(restored.level.mapType == LevelMapType::Snowy);
+        CHECK(!restored.level.terrainAutoFoliage);
+        CHECK(restored.level.terrainTextureLayers == snow.terrainTextureLayers);
+        layers = ResolveTerrainTextureLayers(restored.level.mapType,
+            restored.level.terrainTextureLayers);
+        CHECK(layers[2].albedo == "Content/Textures/custom.png");
+        CHECK(layers[2].height == "Content/Textures/height.png");
+        CHECK(layers[2].ambientOcclusion.empty());
+        snow.terrainTextureLayers[2].custom = false;
+        CHECK(ResolveTerrainTextureLayers(snow.mapType, snow.terrainTextureLayers)[2]
+            == TerrainTexturePreset(LevelMapType::Snowy)[2]);
+        snow.terrainTextureLayers[2].custom = true;
+        snow.terrainTextureLayers[2].albedo = "Content/../outside.png";
+        CHECK(!ValidateLevel(snow).ok);
+        CHECK(!IsTerrainTexturePath("C:/snow.png"));
+        CHECK(!IsTerrainTexturePath("Content//snow.png"));
+        CHECK(IsTerrainTexturePath(""));
+        // A snowy file without explicit foliage/material keys still picks the preset.
+        { std::ofstream file(snowPath); file << R"json({"schemaVersion":1,"name":"snow",
+            "mapType":"snowy","terrain":{"heightScale":3.0},"entities":[
+            {"id":1,"name":"Spawn","type":"player_spawn","transform":{"position":[0,4,0],
+            "rotation":[0,0,0],"scale":[1,1,1]}}]})json"; }
+        const auto minimal = LoadLevel(snowPath);
+        if (!minimal.ok) std::cerr << minimal.error << '\n';
+        CHECK(minimal.ok);
+        CHECK(!minimal.level.terrainAutoFoliage);
+        nlohmann::json bad;
+        { std::ifstream file(snowPath); file >> bad; }
+        bad["mapType"] = "snwoy";
+        { std::ofstream file(snowPath); file << bad; }
+        CHECK(!LoadLevel(snowPath).ok);
+        bad["mapType"] = "snowy";
+        bad["terrain"]["materials"] = nlohmann::json::array({nullptr});
+        { std::ofstream file(snowPath); file << bad; }
+        CHECK(!LoadLevel(snowPath).ok);
+        const auto sourceRoot = std::filesystem::path(__FILE__).parent_path().parent_path();
+        const auto island = LoadLevel(sourceRoot / "Content/Levels/snow1.json");
+        CHECK(island.ok);
+        CHECK(island.level.name == "snow1");
+        CHECK(island.level.mapType == LevelMapType::Snowy);
+        CHECK(!island.level.terrainAutoFoliage);
+        for (const auto& texture : TerrainTexturePreset(LevelMapType::Snowy))
+            for (const auto& path : { texture.albedo, texture.normal,
+                    texture.roughness, texture.ambientOcclusion, texture.height })
+                if (!path.empty()) CHECK(std::filesystem::exists(sourceRoot / path));
+    }
     CHECK(SaveLevel(level, good).ok);
     LevelLoadResult loaded = LoadLevel(good);
     CHECK(loaded.ok);
+    CHECK(loaded.level.mapType == LevelMapType::Tropical);
+    CHECK(loaded.level.terrainAutoFoliage);
+    CHECK(ResolveTerrainTextureLayers(loaded.level.mapType, loaded.level.terrainTextureLayers)
+        == TerrainTexturePreset(LevelMapType::Tropical));
     CHECK(loaded.level.entities.size() == level.entities.size());
     CHECK(loaded.level.entities[4].id == level.entities[4].id);
     CHECK(loaded.level.entities[27].type == LevelEntityType::GrassPatch);

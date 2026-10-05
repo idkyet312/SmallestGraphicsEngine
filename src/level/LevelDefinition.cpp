@@ -404,6 +404,17 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
+    if (level.mapType != LevelMapType::Tropical &&
+        level.mapType != LevelMapType::Snowy && level.mapType != LevelMapType::Custom &&
+        level.mapType != LevelMapType::GrassGround)
+        result.errors.push_back("unknown map type");
+    for (const auto& layer : level.terrainTextureLayers) {
+        if (!layer.custom) continue;
+        for (const std::string* path : { &layer.albedo, &layer.normal,
+                &layer.roughness, &layer.ambientOcclusion, &layer.height })
+            if (!IsTerrainTexturePath(*path))
+                result.errors.push_back("terrain texture paths must be relative to Content/");
+    }
     if (level.terrainSculpt.size() > kMaxTerrainSculptStamps)
         result.errors.push_back("terrain sculpt supports at most " +
             std::to_string(kMaxTerrainSculptStamps) + " stamps");
@@ -575,8 +586,34 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         level.patrolBoatEnabled = root.value("patrolBoatEnabled", true);
         level.virtualShadowMaps = root.value("virtualShadowMaps", true);
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
+        const std::string mapType = root.value("mapType", std::string("tropical"));
+        if (mapType == "tropical") level.mapType = LevelMapType::Tropical;
+        else if (mapType == "snowy") level.mapType = LevelMapType::Snowy;
+        else if (mapType == "custom") level.mapType = LevelMapType::Custom;
+        else if (mapType == "grass_ground") level.mapType = LevelMapType::GrassGround;
+        else throw std::runtime_error("unknown mapType: " + mapType);
         {
             const json& terrainRoot = root.at("terrain");
+            level.terrainAutoFoliage = terrainRoot.value("autoFoliage",
+                level.mapType != LevelMapType::Snowy);
+            if (terrainRoot.contains("materials")) {
+                const auto& materials = terrainRoot.at("materials");
+                if (!materials.is_array() || materials.size() != 4)
+                    throw std::runtime_error("terrain materials must contain four layers");
+                for (size_t i = 0; i < 4; ++i) {
+                    const auto& source = materials.at(i);
+                    if (source.is_null()) continue;
+                    if (!source.is_object())
+                        throw std::runtime_error("terrain material must be an object or null");
+                    auto& layer = level.terrainTextureLayers[i];
+                    layer.custom = true;
+                    layer.albedo = source.value("albedo", std::string{});
+                    layer.normal = source.value("normal", std::string{});
+                    layer.roughness = source.value("roughness", std::string{});
+                    layer.ambientOcclusion = source.value("ambientOcclusion", std::string{});
+                    layer.height = source.value("height", std::string{});
+                }
+            }
             // Absent on every level authored before flat mode existed, and
             // false is exactly the procedural island they were built as.
             level.terrainFlat = terrainRoot.value("flat", false);
@@ -864,6 +901,20 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         // Only levels that actually use splines gain the key, so files authored
         // before this feature round-trip unchanged.
         if (!splines.empty()) root["splines"] = std::move(splines);
+        if (level.mapType != LevelMapType::Tropical)
+            root["mapType"] = LevelMapTypeName(level.mapType);
+        if (!level.terrainAutoFoliage || level.mapType != LevelMapType::Tropical)
+            root["terrain"]["autoFoliage"] = level.terrainAutoFoliage;
+        json materials = json::array();
+        bool customMaterials = false;
+        for (const auto& layer : level.terrainTextureLayers) {
+            if (!layer.custom) { materials.push_back(nullptr); continue; }
+            customMaterials = true;
+            materials.push_back({ {"albedo", layer.albedo},
+                {"normal", layer.normal}, {"roughness", layer.roughness},
+                {"ambientOcclusion", layer.ambientOcclusion}, {"height", layer.height} });
+        }
+        if (customMaterials) root["terrain"]["materials"] = std::move(materials);
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
         std::filesystem::path temporary = path;
         temporary += ".tmp";

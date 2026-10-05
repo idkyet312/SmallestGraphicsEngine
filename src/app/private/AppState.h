@@ -913,6 +913,8 @@ GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
 GunAudio                    g_helicopterHoverAudio;
+GunAudio                    g_patrolBoatEngineAudio;
+GunAudio                    g_insertionBoatEngineAudio;
 // Cockpit alarm on the insertion BlackHawk, looped while it is critically
 // damaged so the player hears the failure before they see the ground.
 GunAudio                    g_blackHawkAlarmAudio;

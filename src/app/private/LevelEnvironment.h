@@ -273,7 +273,8 @@ static void RebuildScalableEnvironment() {
     };
     {
         ProfilerDX12::CpuScope grassProfile(g_profiler, "Editor/GrassScatter");
-        g_grass.Initialize(terrainSampler, grassSpan, grassCount,
+        const bool autoFoliage = g_game.world.Level().terrainAutoFoliage;
+        g_grass.Initialize(terrainSampler, grassSpan, autoFoliage ? grassCount : 0,
             0.0f, grassExclusions, grassPatches,
             !g_customLevelMode, meshBlocked);
     }

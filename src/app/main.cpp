@@ -449,6 +449,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                      AudioBus::Voices);
     g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3",
                                       AudioBus::Ambience);
+    g_patrolBoatEngineAudio.Initialize("Content/Audio/Boat/boat_engine_loop.wav",
+                                       AudioBus::Ambience);
+    g_insertionBoatEngineAudio.Initialize("Content/Audio/Boat/boat_engine_loop.wav",
+                                          AudioBus::Ambience);
     g_blackHawkAlarmAudio.Initialize(
         "Content/Audio/freesound_community-siren-alert-96052.mp3");
     // Grass footsteps. Add a Grass03.wav and bump kFootstepVariantCount to
@@ -4922,6 +4926,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_sceneDescriptorResetPending = false;
         }
         if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
+        ApplyPendingTerrainTextures();
 
         // Virtual shadows replace the cascade atlas rather than augmenting it,
         // so the cascade textures are freed while they are on -- worth ~192 MB
@@ -4963,6 +4968,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
         // ?? begin frame ??
         UpdateRemoteInsertionVisuals(deltaTime);
+        UpdateBoatEngineAudio(deltaTime);
 
         // Timed on its own: BeginFrame blocks on the frame fence, so folding it
         // into the setup scope below would report a GPU stall as CPU work. Read
@@ -8660,6 +8666,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // (GunAudio::Shutdown, read of freed memory) whenever any of these four had
     // loaded -- a helicopter, the Black Hawk alarm or a fire in the level.
     g_helicopterHoverAudio.Shutdown();
+    g_patrolBoatEngineAudio.Shutdown();
+    g_insertionBoatEngineAudio.Shutdown();
     g_blackHawkAlarmAudio.Shutdown();
     g_fireLoopAudio.Shutdown();
     g_fireIgnitionAudio.Shutdown();

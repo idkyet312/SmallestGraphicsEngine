@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "name": "snow1",
+  "mapType": "snowy",
+  "insertionMode": "spawn",
+  "patrolBoatEnabled": false,
+  "terrain": {
+    "heightScale": 7.0,
+    "flat": false,
+    "tilesX": 24,
+    "tilesZ": 24,
+    "islandScaleX": 1.3,
+    "islandScaleZ": 1.15,
+    "autoFoliage": false,
+    "sculpt": [
+      { "x": -28.0, "z": -26.0, "radius": 24.0, "operation": "add", "value": 18.0, "strength": 1.0 },
+      { "x": 22.0, "z": -42.0, "radius": 20.0, "operation": "add", "value": 15.0, "strength": 1.0 },
+      { "x": -42.0, "z": 14.0, "radius": 18.0, "operation": "add", "value": 10.0, "strength": 1.0 },
+      { "x": 0.0, "z": 26.0, "radius": 8.0, "operation": "flatten", "value": 2.5, "strength": 1.0 },
+      { "x": 13.0, "z": 24.0, "radius": 8.0, "operation": "flatten", "value": 2.5, "strength": 1.0 }
+    ]
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Snow test spawn",
+      "enabled": true,
+      "transform": { "position": [0.0, 4.2, 26.0], "rotation": [-8.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0] }
+    },
+    {
+      "id": 2,
+      "type": "wood_house",
+      "name": "Snow test cabin",
+      "enabled": true,
+      "transform": { "position": [13.0, 2.5, 24.0], "rotation": [0.0, -90.0, 0.0], "scale": [1.0, 1.0, 1.0] }
+    }
+  ]
+}

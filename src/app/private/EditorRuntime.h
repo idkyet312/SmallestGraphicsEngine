@@ -12,7 +12,8 @@
 //
 // Resolution is part of the identity check because clearing a level's painting
 // leaves the revision alone but drops the resolution to zero.
-static void ApplyTerrainSplatMap(const LevelDefinition& level) {
+static void ApplyTerrainSplatMap(const LevelDefinition& level, bool force) {
+    RequestTerrainTextures(level);
     // SGE_SPLAT_TEST owns the splatmap for the whole session; letting a level
     // load overwrite its checkerboard would defeat the diagnostic.
     static const bool splatTestActive =
@@ -27,7 +28,9 @@ static void ApplyTerrainSplatMap(const LevelDefinition& level) {
                         level.terrainSplatRGBA.size() == expected;
     const uint32_t revision = usable ? level.terrainSplatRevision : 0u;
     const uint32_t resolution = usable ? level.terrainSplatResolution : 0u;
-    if (appliedOnce && revision == appliedRevision &&
+    // Revisions are local to each level, so a load must refresh even when two
+    // maps happen to have the same paint revision and resolution.
+    if (!force && appliedOnce && revision == appliedRevision &&
         resolution == appliedResolution)
         return;
     appliedOnce = true;

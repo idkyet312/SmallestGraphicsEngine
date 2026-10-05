@@ -1,0 +1,15 @@
+boat_engine_loop.wav
+
+Title: Diesel engine boat 4 loop 100307.wav
+Creator: LG
+Source: https://freesound.org/people/LG/sounds/91533/
+Downloaded audio: https://cdn.freesound.org/previews/91/91533_36188-hq.mp3
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+License URL: https://creativecommons.org/licenses/by/4.0/
+
+Downloaded October 5, 2026 from Freesound's publicly available HQ MP3 preview.
+Adapted for the game: decoded to 48 kHz mono PCM16 WAV, removed DC offset,
+crossfaded the loop boundary over 30 ms and normalized the peak to 0.8.
+
+Credit: "Diesel engine boat 4 loop 100307.wav" by LG, via Freesound,
+licensed under CC BY 4.0. Adapted as described above.

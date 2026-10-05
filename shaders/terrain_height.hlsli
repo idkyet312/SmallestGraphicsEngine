@@ -187,25 +187,70 @@ float ApplyCraterCut(float h, float distance, float radius, float depth,
     return cut + lip * depth * 0.075;
 }
 
+// Appended after the height atlas and bake slot, using the same frame buffer.
+// Layout mirrors StageTerrainSplatMap: uint active, then 512^2 UNORM16 texels.
+static const uint kTerrainRockMaskByteOffset =
+    (kMaxTerrainStampTextures * kTerrainStampResolution * kTerrainStampResolution +
+     kTerrainStampBakeResolution * kTerrainStampBakeResolution) * 2;
+static const uint kTerrainRockMaskResolution = 512;
+
+float LoadTerrainRockMask(uint2 texel) {
+    uint element = texel.y * kTerrainRockMaskResolution + texel.x;
+    uint packed = terrainStampAtlas.Load(kTerrainRockMaskByteOffset + 4 +
+        (element >> 1) * 4);
+    uint value = (element & 1) != 0 ? packed >> 16 : packed & 0xffff;
+    return value * (1.0 / 65535.0);
+}
+
+float TerrainDestructionWeight(float2 xz) {
+    if (terrainStampAtlas.Load(kTerrainRockMaskByteOffset) == 0) return 1.0;
+    float2 uv = xz / (176.0 * max(float2(islandScaleX, islandScaleZ), 0.01)) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0)) return 1.0;
+    float2 p = clamp(uv * kTerrainRockMaskResolution - 0.5,
+                     0.0, float(kTerrainRockMaskResolution - 1));
+    uint2 p0 = uint2(p);
+    uint2 p1 = min(p0 + 1, kTerrainRockMaskResolution - 1);
+    float2 f = frac(p);
+    float upper = lerp(LoadTerrainRockMask(p0),
+        LoadTerrainRockMask(uint2(p1.x, p0.y)), f.x);
+    float lower = lerp(LoadTerrainRockMask(uint2(p0.x, p1.y)),
+        LoadTerrainRockMask(p1), f.x);
+    float rock = saturate(lerp(upper, lower, f.y));
+    return 1.0 - rock * rock * (3.0 - 2.0 * rock);
+}
+
 float ApplySculpt(float h, float2 xz) {
+    float destructionWeight = -1.0;
     for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
         TerrainSculptStamp stamp = terrainSculpt[stampIndex];
+        bool runtimeDestruction = (stamp.operation & 0x80000000u) != 0u;
+        stamp.operation &= 0x7fffffffu;
         if (stamp.operation == 2) {
             float2 sampled = SampleTerrainStamp(stamp, xz);
             h += sampled.x + (stamp.baseHeight - h) * (sampled.y * stamp.replace);
             continue;
         }
         float distance = length(xz - stamp.centerRadius.xy);
+        bool protect = runtimeDestruction &&
+            (stamp.operation == 3 || (stamp.operation == 0 && stamp.value < 0.0)) &&
+            distance <= stamp.centerRadius.z * (stamp.operation == 3 ? 1.18 : 1.0);
+        if (protect && destructionWeight < 0.0)
+            destructionWeight = TerrainDestructionWeight(xz);
         if (stamp.operation == 3) {
-            h = ApplyCraterCut(h, distance, stamp.centerRadius.z, stamp.value,
+            float cut = ApplyCraterCut(h, distance, stamp.centerRadius.z, stamp.value,
                                stamp.strength, stamp.edgeFalloff,
                                stamp.baseHeight);
+            // Preserve both the floor and ejecta lip on painted bedrock.
+            h = !protect || destructionWeight >= 1.0 ? cut :
+                (destructionWeight <= 0.0 ? h : lerp(h, cut, destructionWeight));
             continue;
         }
         float weight = saturate(1.0 - distance / stamp.centerRadius.z);
         weight = weight * weight * (3.0 - 2.0 * weight);
-        if (stamp.operation == 0)
+        if (stamp.operation == 0) {
+            if (protect) weight *= destructionWeight;
             h += stamp.value * weight;
+        }
         else
             h = lerp(h, stamp.value, saturate(stamp.strength * weight));
     }

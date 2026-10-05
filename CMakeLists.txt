@@ -807,6 +807,10 @@ if(BUILD_TESTING)
 
     # Craters and furrows reaching a client, once each, including the backlog a
     # player joining mid-session is handed.
+    add_executable(TerrainRockProtectionTests tests/TerrainRockProtectionTests.cpp)
+    target_link_libraries(TerrainRockProtectionTests PRIVATE SGEProjectHeaders)
+    add_test(NAME TerrainRockProtectionTests COMMAND TerrainRockProtectionTests)
+
     add_executable(NetTerrainSyncTests tests/NetTerrainSyncTests.cpp)
     target_link_libraries(NetTerrainSyncTests PRIVATE SGEProjectHeaders)
     add_test(NAME NetTerrainSyncTests COMMAND NetTerrainSyncTests)

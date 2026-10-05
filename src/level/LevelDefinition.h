@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include "TerrainMaterials.h"
 
 enum class LevelEntityType {
     PlayerSpawn,
@@ -117,6 +118,9 @@ struct TerrainSculptStamp {
     // Defaulted to the value that used to be hardcoded, so levels authored
     // before this was tunable load and render unchanged.
     float edgeFalloff = 0.82f;
+    // Transient gameplay cuts respect painted bedrock; authoring brushes do
+    // not. Deliberately omitted from level serialization.
+    bool runtimeDestruction = false;
 };
 
 // A circle where the automatically scattered ground cover is suppressed.
@@ -210,6 +214,9 @@ inline constexpr int kDeploymentZoneCount = 20;
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
+    LevelMapType mapType = LevelMapType::Tropical;
+    TerrainTextureLayers terrainTextureLayers{};
+    bool terrainAutoFoliage = true;
     // Which insertion delivers the player. PlayerChoice puts the map's arrival
     // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;

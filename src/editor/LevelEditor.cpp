@@ -703,6 +703,130 @@ bool LevelEditor::BrowseSaveAs() {
     return SaveTo(path);
 }
 
+bool LevelEditor::BrowseTerrainTexture(std::string& path) {
+    wchar_t selected[MAX_PATH] = {};
+    OPENFILENAMEW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = GetActiveWindow();
+    dialog.lpstrFilter = L"Texture images\0*.png;*.jpg;*.jpeg;*.tga;*.bmp\0\0";
+    dialog.lpstrFile = selected;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(selected));
+    dialog.lpstrTitle = L"Choose Terrain Texture";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if (!GetOpenFileNameW(&dialog)) return false;
+    try {
+        const std::filesystem::path source = std::filesystem::canonical(selected);
+        int width = 0, height = 0, channels = 0;
+        if (!stbi_info(source.string().c_str(), &width, &height, &channels))
+            throw std::runtime_error("unsupported or damaged image");
+        const auto content = std::filesystem::weakly_canonical("Content");
+        const auto relative = source.lexically_relative(content);
+        const std::string packaged = "Content/" + relative.generic_string();
+        if (!relative.empty() && IsTerrainTexturePath(packaged)) {
+            path = packaged;
+        } else {
+            const std::filesystem::path directory = "Content/Textures/Terrain/Imported";
+            std::filesystem::create_directories(directory);
+            auto destination = directory / source.filename();
+            unsigned suffix = 1;
+            while (std::filesystem::exists(destination))
+                destination = directory / (source.stem().string() + "_" +
+                    std::to_string(suffix++) + source.extension().string());
+            std::filesystem::copy_file(source, destination);
+            path = destination.generic_string();
+        }
+        status_ = "Terrain texture: " + path;
+        return true;
+    } catch (const std::exception& error) {
+        status_ = "Texture import failed: " + std::string(error.what());
+        return false;
+    }
+}
+
+void LevelEditor::RenderTerrainMaterials() {
+    const char* types[] = { "Tropical", "Snowy", "Custom", "Grass Ground" };
+    int type = static_cast<int>(level_.mapType);
+    ImGui::TextUnformatted("Auto material type");
+    ImGui::SetNextItemWidth(-1.0f);
+    {
+        const LevelDefinition before = level_;
+        if (ImGui::Combo("##TerrainAutoMaterialType", &type, types, IM_ARRAYSIZE(types))) {
+            level_.mapType = static_cast<LevelMapType>(type);
+            level_.terrainAutoFoliage = level_.mapType != LevelMapType::Snowy;
+            MarkChanged(before);
+        }
+    }
+    if (!ImGui::CollapsingHeader("Auto Material Settings")) return;
+    {
+        const LevelDefinition before = level_;
+        if (ImGui::Checkbox("Automatic grass & flowers", &level_.terrainAutoFoliage))
+            MarkChanged(before);
+    }
+    ImGui::TextWrapped("Textures follow the automatic height/slope blend and material "
+        "painting. Custom layers stay assigned when the map type changes.");
+    ImGui::TextDisabled("Foliage changes apply on Save / Play.");
+    const bool snow = level_.mapType == LevelMapType::Snowy;
+    const char* names[] = { snow ? "Snow / inland" : "Grass / inland",
+        snow ? "Trampled snow / patches" : "Dirt / patches",
+        snow ? "Snow / shore" : "Sand / shore", "Rock / cliffs" };
+    const TerrainTextureLayers preset = TerrainTexturePreset(level_.mapType);
+    for (size_t i = 0; i < 4; ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::TreeNode(names[i])) {
+            auto& layer = level_.terrainTextureLayers[i];
+            bool custom = layer.custom;
+            const LevelDefinition before = level_;
+            if (ImGui::Checkbox("Custom textures", &custom)) {
+                if (custom) layer = preset[i];
+                layer.custom = custom;
+                MarkChanged(before);
+            }
+            const auto effective = ResolveTerrainTextureLayers(
+                level_.mapType, level_.terrainTextureLayers);
+            if (!layer.custom) {
+                ImGui::TextWrapped("%s", effective[i].albedo.c_str());
+            } else {
+                const char* channels[] = { "Color", "Normal (OpenGL)", "Roughness",
+                    "Ambient occlusion", "Height / displacement" };
+                std::string* paths[] = { &layer.albedo, &layer.normal,
+                    &layer.roughness, &layer.ambientOcclusion, &layer.height };
+                for (int channel = 0; channel < 5; ++channel) {
+                    ImGui::PushID(channel);
+                    ImGui::TextUnformatted(channels[channel]);
+                    char buffer[1025] = {};
+                    strncpy_s(buffer, paths[channel]->c_str(), _TRUNCATE);
+                    ImGui::SetNextItemWidth(-65.0f);
+                    if (ImGui::InputTextWithHint("##Texture", "Content/... (Enter to apply)",
+                            buffer, sizeof(buffer), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                        if (IsTerrainTexturePath(buffer)) {
+                            const LevelDefinition old = level_;
+                            *paths[channel] = buffer;
+                            MarkChanged(old);
+                        } else status_ = "Use a relative Content/ texture path, or Browse.";
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse")) {
+                        const LevelDefinition old = level_;
+                        if (BrowseTerrainTexture(*paths[channel])) MarkChanged(old);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TextWrapped("Empty normal/roughness maps use neutral defaults. "
+                    "Empty AO/height maps disable those channels. Height maps blend "
+                    "surface layers; sculpt tools change the island elevation.");
+                if (ImGui::Button("Reset layer to map preset")) {
+                    const LevelDefinition old = level_;
+                    layer = {};
+                    MarkChanged(old);
+                }
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
 bool LevelEditor::BrowseImportModel() {
     wchar_t selected[MAX_PATH] = {};
     OPENFILENAMEW dialog = {};
@@ -916,6 +1040,9 @@ bool LevelEditor::EnvironmentChanged(const LevelDefinition& before) const {
 
 bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
     if (before.terrainHeightScale != level_.terrainHeightScale ||
+        before.mapType != level_.mapType ||
+        before.terrainTextureLayers != level_.terrainTextureLayers ||
+        before.terrainAutoFoliage != level_.terrainAutoFoliage ||
         before.terrainFlat != level_.terrainFlat ||
         before.terrainTilesX != level_.terrainTilesX ||
         before.terrainTilesZ != level_.terrainTilesZ ||
@@ -3067,6 +3194,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SetNextWindowPos(ImVec2(305, 325), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
     ImGui::Begin("Terrain Sculpt");
+    RenderTerrainMaterials();
+    ImGui::Separator();
     if (!terrainStampLibraryScanned_) {
         terrainStampNames_ = DiscoverTerrainStampNames();
         terrainStampSelection_ = (std::min)(terrainStampSelection_,
@@ -3244,7 +3373,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
 
     if (terrainTool_ == 5) {
         ImGui::SeparatorText("Material Paint");
-        const char* kLayers[] = { "Grass", "Dirt", "Sand", "Rock" };
+        const bool snow = level_.mapType == LevelMapType::Snowy;
+        const char* kLayers[] = { snow ? "Snow" : "Grass",
+            snow ? "Trampled snow" : "Dirt", snow ? "Shore snow" : "Sand", "Rock" };
         ImGui::Combo("Layer", &terrainPaintLayer_, kLayers,
                      IM_ARRAYSIZE(kLayers));
         ImGui::SliderFloat("Paint opacity", &terrainPaintStrength_, 0.05f, 1.0f,

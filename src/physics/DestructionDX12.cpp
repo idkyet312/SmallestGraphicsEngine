@@ -5710,6 +5710,11 @@ void DestructionDX12::UndermineSupports(const XMFLOAT3& worldPosition,
             // is judged by its base rather than its centre.
             const float halfHeight =
                 (chunk.maximum.y - chunk.minimum.y) * 0.5f;
+            // Painted bedrock can preserve footing inside the nominal crater
+            // floor. Test the actual cut before releasing its foundation.
+            if (m->terrainSampler && m->terrainSampler(position.x, position.z) >=
+                    position.y - halfHeight - kUnderminedSlack)
+                continue;
             if (position.y - halfHeight < groundHeightAfter - kUnderminedSlack)
                 continue;
 

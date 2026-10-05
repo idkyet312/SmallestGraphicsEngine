@@ -188,7 +188,8 @@ static void ScatterDandelions(
     // against. On a level plane nearly every candidate survives, which measured
     // 1227 instances against the island's ~404 and put the grass pass at 28 ms
     // a frame. Authored Dandelion entities are still honoured below.
-    const int clusterCount = g_baseMode ? 0 : (g_stressTestMode ? 420 : 180);
+    const int clusterCount = g_baseMode || !g_game.world.Level().terrainAutoFoliage
+        ? 0 : (g_stressTestMode ? 420 : 180);
     const float span = g_stressTestMode ? 196.0f : 96.0f;
     g_dandelionInstances.reserve(clusterCount * 7);
     for (int cluster = 0; cluster < clusterCount; ++cluster) {

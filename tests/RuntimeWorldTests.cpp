@@ -19,6 +19,7 @@ int main() {
     world.ReplaceLevel(authored);
     CHECK(world.Level().name == "Runtime Test");
     CHECK(world.TerrainSculpt().size() == authored.terrainSculpt.size());
+    CHECK(!world.TerrainSculpt().back().runtimeDestruction);
     CHECK(world.LevelRevision() == initialLevelRevision + 1);
 
     LevelDefinition edited = world.Level();
@@ -48,6 +49,7 @@ int main() {
     CHECK(world.TerrainSculpt().size() == kMaxTerrainSculptStamps);
     CHECK(world.TerrainSculpt().back().x ==
           static_cast<float>(kMaxTerrainSculptStamps + 7));
+    CHECK(world.TerrainSculpt().back().runtimeDestruction);
     const size_t transientTerrainCount = world.TerrainSculpt().size();
     LevelDefinition settingsOnly = world.Level();
     settingsOnly.dxrDDGI.intensity = 0.75f;
