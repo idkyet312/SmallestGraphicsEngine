@@ -1,6 +1,8 @@
 #ifndef TERRAIN_PBR_HLSLI
 #define TERRAIN_PBR_HLSLI
 
+#include "terrain_pom.hlsli"
+
 // Array slices: grass, dirt, sand, rock. World-space triplanar projection avoids
 // stretching on cliffs and needs no terrain UV seams.
 struct TerrainPBR {
@@ -9,6 +11,9 @@ struct TerrainPBR {
     float roughness;
     float metallic;
     float occlusion;
+#ifdef SGE_TERRAIN_POM_DEPTH
+    float3 reliefPosition;
+#endif
 };
 
 float TerrainBlendNoise(float2 p) {
@@ -62,16 +67,19 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     weights = pow(weights, 1.35);
     weights = weights / dot(weights, 1.0);
 
-    // Splatmap painting is implemented in the visibility resolve only. The
-    // forward path shares rootParams[7] with every material in the engine, so
-    // binding a fourth terrain SRV here would change the descriptor stride for
-    // every draw; that plumbing is deliberately deferred.
-    //
-    // This block mirrors TerrainVBLayerWeights in visbuf_resolve_cs.hlsl so the
-    // two copies stay readable as one algorithm. Keep them in sync.
+    // Visibility relief also needs the painted weights before writing depth.
+    // Keep this override in sync with TerrainVBLayerWeights in the resolve.
 #if SGE_TERRAIN_FORWARD_SPLAT
     if (terrainSplatEnabled != 0) {
         float2 splatUV = worldPos.xz * terrainSplatInvExtent + 0.5;
+#if SGE_TERRAIN_SPLAT_WRAP_SAMPLER
+        // The shared graphics sampler wraps. Clamping to texel centres gives
+        // the same border weights as the resolve's clamp sampler.
+        uint splatWidth, splatHeight;
+        terrainSplatMap.GetDimensions(splatWidth, splatHeight);
+        float2 edge = 0.5 / float2(splatWidth, splatHeight);
+        splatUV = clamp(splatUV, edge, 1.0 - edge);
+#endif
         float4 painted =
             terrainSplatMap.SampleLevel(terrainSplatSampler, splatUV, 0);
         float coverage = max(max(painted.x, painted.y),
@@ -232,6 +240,8 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // Skipping a layer whose weight is below 8-bit resolution leaves the blend
     // visually identical.
     const float kLayerEpsilon = 0.002;
+    float3 layerPositions[4] = { worldPos, worldPos, worldPos, worldPos };
+    const float3 viewDirection = (viewPos - worldPos) / max(cameraDistance, 1e-4);
 
     // Height-blend pre-pass. The packed map's .a channel is this layer's height
     // proxy, and it must be known for EVERY contributing layer before any of
@@ -244,12 +254,29 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         const TriplanarGrads heightGrads =
             TerrainTriplanarGrads(worldPos, scales[heightLayer]);
         if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
-        layerHeights[heightLayer] = SampleTerrainArray(
-            metalRoughMap, worldPos, projectionWeights, heightLayer,
+        if (((uint)materialTime & 1u) != 0 && cameraDistance < 28.0)
+            layerPositions[heightLayer] = TerrainPOMPosition(
+                metalRoughMap, texSampler, worldPos, geometricNormal,
+                projectionWeights, heightLayer, layerWeights[heightLayer],
+                scales[heightLayer], heightGrads.zyDx, heightGrads.zyDy,
+                heightGrads.xzDx, heightGrads.xzDy, heightGrads.xyDx,
+                heightGrads.xyDy, viewDirection, cameraDistance);
+        const float sampledHeight = SampleTerrainArray(
+            metalRoughMap, layerPositions[heightLayer], projectionWeights, heightLayer,
             scales[heightLayer], heightGrads).a;
+        layerHeights[heightLayer] = TerrainPOMBlendHeight(
+            sampledHeight, heightLayer, (uint)materialTime >> 1u, projectionWeights);
     }
     const float4 blendWeights =
         TerrainHeightBlend(layerWeights, layerHeights);
+#ifdef SGE_TERRAIN_POM_DEPTH
+    // Blend displacements, not absolute positions: skipped layers contribute
+    // zero relief and cannot pull the hit toward the world origin.
+    result.reliefPosition = worldPos;
+    [unroll] for (uint hitLayer = 0; hitLayer < 4; ++hitLayer)
+        result.reliefPosition +=
+            (layerPositions[hitLayer] - worldPos) * blendWeights[hitLayer];
+#endif
 
     [unroll] for (uint layer = 0; layer < 4; ++layer) {
         const float weight = blendWeights[layer];
@@ -260,13 +287,13 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
             TerrainTriplanarGrads(worldPos, scales[layer]);
         if (weight <= kLayerEpsilon) continue;
         result.albedo += SampleTerrainArray(
-            albedoMap, worldPos, projectionWeights, layer, scales[layer],
+            albedoMap, layerPositions[layer], projectionWeights, layer, scales[layer],
             grads).rgb * weight;
         result.normal += SampleTerrainNormalLayer(
-            worldPos, geometricNormal, projectionWeights, layer,
+            layerPositions[layer], geometricNormal, projectionWeights, layer,
             scales[layer], normalStrengths[layer], grads) * weight;
         const float4 packedPBR = SampleTerrainArray(
-            metalRoughMap, worldPos, projectionWeights, layer,
+            metalRoughMap, layerPositions[layer], projectionWeights, layer,
             scales[layer], grads);
         result.roughness += packedPBR.g * weight;
         result.metallic += packedPBR.b * weight;

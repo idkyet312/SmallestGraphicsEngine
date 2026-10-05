@@ -101,6 +101,8 @@ inline uint64_t IncludeHash() {
             L"shaders/foliage_brdf.hlsli",
             L"shaders/palm_wind.hlsli",
             L"shaders/terrain_pbr.hlsli",
+            L"shaders/terrain_pom.hlsli",
+            L"shaders/terrain_visibility_id.hlsli",
             L"shaders/virtual_shadow_types.hlsli",
             L"shaders/virtual_shadow_sample.hlsli",
         };

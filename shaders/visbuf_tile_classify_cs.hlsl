@@ -37,7 +37,7 @@ RWStructuredBuffer<uint> terrainTiles : register(u1);
 // through the CPU and no readback stalls the frame.
 RWByteAddressBuffer dispatchArgs : register(u2);
 
-#define VB_TERRAIN_ID 0xFFFFFFFFu
+#include "terrain_visibility_id.hlsli"
 
 // One group per tile, one thread per pixel in that tile -- the same 8x8 shape
 // the resolve uses, so a tile here is exactly a thread group there.
@@ -69,7 +69,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID,
         // Background (id 0) goes to the generic half: it owns the sky path and
         // the motion-vector write for empty pixels, so a tile of pure sky still
         // needs a generic thread group.
-        if (id == VB_TERRAIN_ID) gsHasTerrain = 1u;
+        if (IsTerrainVisibilityID(id)) gsHasTerrain = 1u;
         else                     gsHasGeneric = 1u;
     }
     GroupMemoryBarrierWithGroupSync();

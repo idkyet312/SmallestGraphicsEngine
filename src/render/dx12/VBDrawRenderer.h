@@ -1181,6 +1181,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         // Mirrors SetTerrainMaterial: terrain scans are OpenGL normal maps, and
         // the authored footpaths are built-in levels only.
         vb.SetTerrainMaterialParams(g_customLevelMode ? 0.0f : 3.0f, -1.0f);
+        vb.terrainPOM = scene.terrainPOM;
+        vb.terrainNeutralHeightBlendMask = g_terrain.neutralHeightBlendMask;
         // Any paint staged since the last frame is copied here, where the
         // command list is open, and before SetTerrainTextures reads the
         // resource pointer so a new texture is picked up the same frame.
@@ -1200,6 +1202,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
                                      kShoreOuter * sp.islandScaleZ);
         }
     }
+    const bool terrainPOMDepth = scene.terrainPOM && scene.terrainPOMDepthOffset &&
+        !scene.meshletWireframe && g_terrain.VisibilityPOMDepthSupported();
     if (scene.useMeshTerrain && g_terrain.VisibilitySupported() &&
         vb.TerrainVisibilityReady()) {
         ProfilerDX12::Scope terrainScope(
@@ -1223,7 +1227,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
             shader.SetCamera(scene.camera.VisualPosition());
             vb.SetTerrainProjection(proj);
-            if (g_terrain.DrawVisibility(shader, terrainParams)) {
+            if (g_terrain.DrawVisibility(shader, terrainParams,
+                    terrainPOMDepth, !g_customLevelMode)) {
                 vb.terrainVisibilityActiveThisFrame = true;
                 viewState.terrainParams = terrainParams;
             }
@@ -1438,7 +1443,9 @@ inline bool ReplayVBDepth(Scene& scene, ShaderDX12& shader,
         shader.SetMatrices(XMMatrixIdentity(), state.view, state.proj,
                            state.lightSpace);
         shader.SetCamera(scene.camera.VisualPosition());
-        g_terrain.DrawVisibility(shader, state.terrainParams);
+        g_terrain.DrawVisibility(shader, state.terrainParams,
+            scene.terrainPOM && scene.terrainPOMDepthOffset && !scene.meshletWireframe,
+            !g_customLevelMode);
         shader.NextDrawCall();
     }
     vb.EndDepthReplay(cmd);

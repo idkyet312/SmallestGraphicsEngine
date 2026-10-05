@@ -254,6 +254,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
                 -Fo ${CMAKE_BINARY_DIR}/terrain_ps.cso
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
                 ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pom.hlsli
         COMMENT "Compiling triplanar terrain PBR pixel shader"
     )
     add_custom_command(
@@ -264,7 +265,31 @@ if(USE_DX12 AND DXC_EXECUTABLE)
                 -Fo ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
                 ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pom.hlsli
         COMMENT "Compiling HDR triplanar terrain PBR pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main -D SGE_TERRAIN_PBR=1
+                -D SGE_TERRAIN_POM_DEPTH=1 -I ${CMAKE_SOURCE_DIR}/shaders
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pom.hlsli
+        COMMENT "Compiling terrain POM depth-offset pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth_hdr.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main -D SGE_TERRAIN_PBR=1
+                -D SGE_TERRAIN_POM_DEPTH=1 -D SGE_HDR_TARGET=1
+                -I ${CMAKE_SOURCE_DIR}/shaders
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth_hdr.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pom.hlsli
+        COMMENT "Compiling HDR terrain POM depth-offset pixel shader"
     )
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
@@ -273,6 +298,21 @@ if(USE_DX12 AND DXC_EXECUTABLE)
                 -Fo ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_ps.hlsl
         COMMENT "Compiling terrain visibility-ID pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_visibility_ps_pom_depth.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
+                -D SGE_TERRAIN_VISIBILITY_POM_DEPTH=1 -D SGE_TERRAIN_POM_DEPTH=1
+                -I ${CMAKE_SOURCE_DIR}/shaders
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_visibility_ps_pom_depth.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_ps.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_pom_depth.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_id.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_height.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pom.hlsli
+        COMMENT "Compiling visibility terrain POM depth-offset pixel shader"
     )
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/wire_green_ps.cso
@@ -359,7 +399,10 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
         ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
+        ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth.cso
+        ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth_hdr.cso
         ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
+        ${CMAKE_BINARY_DIR}/terrain_visibility_ps_pom_depth.cso
         ${CMAKE_BINARY_DIR}/wire_green_ps.cso
         ${CMAKE_BINARY_DIR}/water_vs.cso
         ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
@@ -904,7 +947,10 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_shadow_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_shadow_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_pom_depth.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_pom_depth_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_pom_depth_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_visibility_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_visibility_ps_pom_depth.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_visibility_ps_pom_depth.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_vs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_vs.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_hdr.cso

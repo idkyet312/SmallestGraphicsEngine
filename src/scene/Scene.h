@@ -1260,6 +1260,9 @@ struct Scene {
     // that survives past the close-range detail fade. Off by default -- it
     // changes the heightfield, and collision is sampled from the same function.
     bool  terrainDetailRelief = false;
+    // Close-range material relief; does not alter the heightfield or collision.
+    bool  terrainPOM          = false;
+    bool  terrainPOMDepthOffset = false;
     // Hollow-inspired projected-error tessellation and stitched tile edges.
     // Opt-in so the legacy distance LOD remains the default rendering path.
     bool  terrainErrorLOD      = false;

@@ -2208,7 +2208,8 @@ public:
     // to the pixel shader: 0/3 are the existing ordinary/authored-path values,
     // and +4 sets the relief bit on either of them.
     void SetTerrainMaterial(bool showAuthoredPaths = false,
-                            bool detailRelief = false) {
+                            bool detailRelief = false, bool pom = false,
+                            UINT neutralHeightBlendMask = 0) {
         ActivateMaterialBinding(false);
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
@@ -2222,6 +2223,10 @@ public:
         data.normalYSign = -1.0f;
         data.materialType = (showAuthoredPaths ? 3.0f : 0.0f) +
                             (detailRelief ? 4.0f : 0.0f);
+        // Terrain has no animation; the existing time slot carries the toggle
+        // and neutral blend mask without moving shared material cbuffer fields.
+        data.materialTime = static_cast<float>((pom ? 1u : 0u) |
+            ((neutralHeightBlendMask & 15u) << 1u));
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

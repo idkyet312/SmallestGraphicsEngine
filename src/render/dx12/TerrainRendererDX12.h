@@ -84,9 +84,14 @@ public:
     ComPtr<ID3D12PipelineState> psoWireframeMSAA;
     ComPtr<ID3D12PipelineState> psoHDR;
     ComPtr<ID3D12PipelineState> psoWireframeHDR;
+    ComPtr<ID3D12PipelineState> psoPOMDepth;
+    ComPtr<ID3D12PipelineState> psoPOMDepthHDR;
+    ComPtr<ID3D12PipelineState> psoPOMDepthMSAA;
     // Writes terrain IDs into the R32G32_UINT visibility buffer instead of
     // shading. Optional: if this PSO is missing the forward path still runs.
     ComPtr<ID3D12PipelineState> psoVisibility;
+    ComPtr<ID3D12PipelineState> psoVisibilityPOMDepth;
+    std::array<UINT, FRAME_COUNT> visibilityPOMTextureSlots_{};
     // Depth only, no pixel shader and no render target, for the shadow passes.
     // Terrain was previously absent from shadow rendering entirely, so hills
     // blocked nothing -- barely noticeable for the sun, which comes in at a
@@ -131,11 +136,13 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
     UINT terrainTextureSlot_ = ~0u;
     TerrainTextureLayers textureLayers = TerrainTexturePreset(LevelMapType::Tropical);
+    UINT neutralHeightBlendMask = 0;
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw terrain tiles as wireframe
     bool hdrTargetEnabled = false;
+    bool pomDepthOffsetEnabled = false;
 
     void ReleaseUploadHeaps() {
         for (auto& upload : terrainUploads) upload.Reset();
@@ -214,6 +221,41 @@ public:
         stream.sample.value.Count = 1;
         stream.raster.value.MultisampleEnable = FALSE;
 
+        // Separate PSOs keep the default shader and its early-depth behaviour
+        // intact. Build once; changing the toggle only selects a cached PSO.
+        {
+            ComPtr<ID3DBlob> depthPs, depthHdrPs;
+            if (SUCCEEDED(ReadCompiledShaderDX12(
+                    L"shaders/terrain_ps_pom_depth.cso", &depthPs)) &&
+                SUCCEEDED(ReadCompiledShaderDX12(
+                    L"shaders/terrain_ps_pom_depth_hdr.cso", &depthHdrPs))) {
+                stream.ps.value = { depthPs->GetBufferPointer(), depthPs->GetBufferSize() };
+                const HRESULT depthHr = device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoPOMDepth));
+                stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                stream.ps.value = { depthHdrPs->GetBufferPointer(), depthHdrPs->GetBufferSize() };
+                const HRESULT depthHdrHr = device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoPOMDepthHDR));
+                if (FAILED(depthHr) || FAILED(depthHdrHr)) {
+                    psoPOMDepth.Reset();
+                    psoPOMDepthHDR.Reset();
+                    std::cerr << "Terrain POM depth PSO unavailable (using texture-only POM)\n";
+                } else if (msaaSupported) {
+                    stream.ps.value = { depthPs->GetBufferPointer(), depthPs->GetBufferSize() };
+                    stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    stream.sample.value.Count = MSAADX12::SampleCount;
+                    stream.raster.value.MultisampleEnable = TRUE;
+                    if (FAILED(device2->CreatePipelineState(
+                            &streamDesc, IID_PPV_ARGS(&psoPOMDepthMSAA))))
+                        psoPOMDepthMSAA.Reset();
+                }
+            }
+            stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stream.sample.value.Count = 1;
+            stream.raster.value.MultisampleEnable = FALSE;
+        }
+
         // Visibility variant: same AS/MS, a pixel shader that writes only IDs,
         // and the R32G32_UINT visibility target. Built last among the solid
         // PSOs so the raster/depth state above is still the default one.
@@ -230,6 +272,17 @@ public:
                     std::cerr << "Terrain visibility PSO creation failed "
                                  "(non-fatal; terrain stays forward)\n";
                     psoVisibility.Reset();
+                }
+            }
+            ComPtr<ID3DBlob> visDepthPs;
+            if (psoVisibility && SUCCEEDED(ReadCompiledShaderDX12(
+                    L"shaders/terrain_visibility_ps_pom_depth.cso", &visDepthPs))) {
+                stream.ps.value = { visDepthPs->GetBufferPointer(),
+                                    visDepthPs->GetBufferSize() };
+                if (FAILED(device2->CreatePipelineState(
+                        &streamDesc, IID_PPV_ARGS(&psoVisibilityPOMDepth)))) {
+                    std::cerr << "Terrain VB POM depth PSO unavailable\n";
+                    psoVisibilityPOMDepth.Reset();
                 }
             }
             stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
@@ -293,6 +346,12 @@ public:
         }
 
         if (!CreateTerrainTextureArrays(shader) || !CreateSculptBuffers()) return false;
+        // The splat resource can change while previous frames are in flight.
+        // Each frame slot gets its own table, just like the sculpt uploads.
+        for (UINT& slot : visibilityPOMTextureSlots_) {
+            slot = shader.ReservePersistentMaterialSrvs();
+            if (slot == ~0u) psoVisibilityPOMDepth.Reset();
+        }
 
         // SGE_SPLAT_TEST=1 uploads a rock/grass checkerboard covering the whole
         // island. It exists to validate the world->UV mapping independently of
@@ -1163,14 +1222,14 @@ public:
         g_dx12.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source,
                                               nullptr);
 
-        // The resolve is a compute shader, so this lands in NON_PIXEL unlike
-        // the forward-sampled layer arrays above.
+        // Both the compute resolve and opt-in visibility relief read weights.
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = terrainSplatMap.Get();
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         barrier.Transition.StateAfter =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_dx12.commandList->ResourceBarrier(1, &barrier);
 
@@ -1193,6 +1252,10 @@ public:
         for (UINT layer = 0; layer < layers; ++layer)
             legacyLayer[layer] = !textureLayers[layer].custom &&
                 textureLayers[layer].albedo == tropicalLayers[layer].albedo;
+        // Dirt and sand previously blended with a neutral height. Their new
+        // displacement scans drive POM without changing those authored borders.
+        neutralHeightBlendMask = (legacyLayer[1] ? 2u : 0u) |
+                                 (legacyLayer[2] ? 4u : 0u);
         std::array<std::array<float, 3>, layers> baseColors = {{
             {{ 0.25f, 0.43f, 0.12f }},
             {{ 0.34f, 0.20f, 0.10f }},
@@ -1328,7 +1391,7 @@ public:
                     // The grass displacement scan is centred around 83/255.
                     // Centre it at neutral height so it does not win every
                     // transition against layers without a displacement scan.
-                    const float centred = legacyLayer[layer] ? 128.0f +
+                    const float centred = legacyLayer[layer] && layer == 0 ? 128.0f +
                         (static_cast<float>(sums[0] / count) - 83.0f) * 0.8f
                         : static_cast<float>(sums[0] / count);
                     target[destination + 3] = byte(centred / 255.0f);
@@ -1466,6 +1529,9 @@ public:
         commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
         ID3D12PipelineState* solid = hdrTargetEnabled
             ? psoHDR.Get() : (msaaEnabled ? psoMSAA.Get() : pso.Get());
+        if (pomDepthOffsetEnabled && !wireframe && POMDepthOffsetSupported())
+            solid = hdrTargetEnabled ? psoPOMDepthHDR.Get()
+                : (msaaEnabled ? psoPOMDepthMSAA.Get() : psoPOMDepth.Get());
         ID3D12PipelineState* wire = hdrTargetEnabled
             ? psoWireframeHDR.Get()
             : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
@@ -1483,9 +1549,21 @@ public:
         commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
     }
 
+    bool POMDepthOffsetSupported() const {
+        // Forward terrain has no painted-layer binding. Keep painted maps on
+        // their current path rather than silently replacing their materials.
+        return supported && psoPOMDepth && psoPOMDepthHDR &&
+            (!msaaEnabled || psoPOMDepthMSAA) && !terrainSplatMap;
+    }
+
     bool VisibilitySupported() const {
         return supported && psoVisibility;
     }
+
+    bool VisibilityPOMDepthSupported() const {
+        return VisibilitySupported() && psoVisibilityPOMDepth;
+    }
+
 
     // Rasterizes terrain into the visibility buffer: same amplification/mesh
     // shaders and therefore the same clipmap, culling and LOD as Draw(), but
@@ -1539,20 +1617,48 @@ public:
         return true;
     }
 
-    bool DrawVisibility(ShaderDX12& shader, const Params& params) {
+    bool DrawVisibility(ShaderDX12& shader, const Params& params,
+                        bool pomDepthOffset = false,
+                        bool showAuthoredPaths = false) {
         if (!VisibilitySupported() || !shader.rootSignature) return false;
-        // The visibility pixel shader samples nothing, but the amplification and
-        // mesh shaders still read the matrix/camera/sculpt bindings through the
-        // shared root signature, so the same tables Draw() needs are bound here.
+        // AS/MS share the main graphics bindings; relief also samples the packed
+        // height array and optional paint through the material table.
         shader.RebindGraphicsResourceTables();
         commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
-        commandList6->SetPipelineState(psoVisibility.Get());
+        const bool relief = pomDepthOffset && VisibilityPOMDepthSupported();
+        if (relief) {
+            D3D12_CPU_DESCRIPTOR_HANDLE source, destination;
+            D3D12_GPU_DESCRIPTOR_HANDLE unused, table;
+            ShaderDX12::SrvHandlesAt(terrainTextureSlot_, source, unused);
+            ShaderDX12::SrvHandlesAt(
+                visibilityPOMTextureSlots_[g_dx12.frameIndex], destination, table);
+            g_dx12.device->CopyDescriptorsSimple(3, destination, source,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            destination.ptr += 3 * g_dx12.cbvSrvUavDescriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC splatSrv = {};
+            splatSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            splatSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            splatSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            splatSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                terrainSplatMap.Get(), &splatSrv, destination);
+            commandList6->SetGraphicsRootDescriptorTable(7, table);
+        }
+        commandList6->SetPipelineState(
+            relief ? psoVisibilityPOMDepth.Get() : psoVisibility.Get());
         Params drawParams = params;
         drawParams.sculptCount = RenderSculptCount();
         drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
         UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
+        if (relief) {
+            // Matches the relief-only TerrainParams suffix in terrain_height.
+            const UINT reliefParams[4] = {
+                neutralHeightBlendMask & 15u, showAuthoredPaths ? 1u : 0u,
+                terrainSplatMap ? 1u : 0u, 0u };
+            commandList6->SetGraphicsRoot32BitConstants(8, 4, reliefParams, 16);
+        }
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         commandList6->SetGraphicsRootShaderResourceView(

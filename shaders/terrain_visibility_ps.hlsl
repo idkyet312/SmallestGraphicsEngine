@@ -7,9 +7,12 @@
 // world position comes from depth, and the triplanar material is a pure
 // function of world position and that normal.
 //
-// Deliberately minimal: no texture fetches, no lighting. All of that moves to
-// the resolve, which runs once per visible pixel instead of once per rasterized
-// fragment. Avoiding overdraw on the clipmap rings is the entire point.
+// The default variant samples nothing. Opt-in relief traces packed height
+// here to participate in depth testing; material shading stays in the resolve.
+
+#ifdef SGE_TERRAIN_VISIBILITY_POM_DEPTH
+#include "terrain_visibility_pom_depth.hlsli"
+#endif
 
 // Matches terrain_ms.hlsl OutVertex.
 struct PS_INPUT {
@@ -35,8 +38,31 @@ uint PackTerrainNormal(float3 normal) {
     return quantized.x | (quantized.y << 16u);
 }
 
+#ifdef SGE_TERRAIN_VISIBILITY_POM_DEPTH
+struct PS_OUTPUT {
+    uint2 visibility : SV_Target0;
+    float depth : SV_Depth;
+};
+
+PS_OUTPUT main(PS_INPUT input) {
+    PS_OUTPUT output;
+    const float3 normal = normalize(input.normal);
+    const float3 hit = TerrainVisibilityPOMHit(input.fragPos, normal);
+    output.visibility = uint2(VB_TERRAIN_ID, PackTerrainNormal(normal));
+    output.depth = input.position.z;
+    if (any(hit != input.fragPos)) {
+        float4 clip = mul(mul(float4(hit, 1.0), view), projection);
+        if (clip.w > 1e-5) {
+            output.depth = saturate(clip.z / clip.w);
+            output.visibility.x = asuint(input.position.z) | 0x80000000u;
+        }
+    }
+    return output;
+}
+#else
 uint2 main(PS_INPUT input) : SV_Target0 {
     // 0xFFFFFFFF is the reserved terrain ID. Zero stays background, and real
     // draw calls are stored as drawCallID + 1, so they can never reach it.
     return uint2(0xFFFFFFFFu, PackTerrainNormal(normalize(input.normal)));
 }
+#endif

@@ -279,9 +279,15 @@ float SpotShadowVisibility(int shadowIndex, float3 worldPos) {
 }
 
 struct PS_INPUT {
+#ifdef SGE_TERRAIN_POM_DEPTH
+    noperspective centroid float4 position : SV_POSITION;
+    centroid float3 fragPos : TEXCOORD0;
+    centroid float3 normal : TEXCOORD1;
+#else
     float4 position : SV_POSITION;
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
+#endif
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
@@ -750,7 +756,15 @@ float ViewmodelSeeThroughAlpha(float3 fragPos, float3 eyePos, float strength) {
                 saturate(strength));
 }
 
-#ifdef SGE_EXTENSION_MOTION
+#ifdef SGE_TERRAIN_POM_DEPTH
+struct PS_OUTPUT {
+    float4 color : SV_Target0;
+    // Relief is centred on the neutral height and can move toward the eye,
+    // so conservative greater-depth output would reject valid protrusions.
+    float depth : SV_Depth;
+};
+#define RETURN_COLOR(albedo, alphaV) { PS_OUTPUT o; o.color = float4(albedo, alphaV); o.depth = terrainRasterDepth; return o; }
+#elif defined(SGE_EXTENSION_MOTION)
 struct PS_OUTPUT {
     float4 color : SV_Target0;
     float2 motion : SV_Target1;
@@ -770,12 +784,15 @@ float2 ComputeMotion(PS_INPUT input) {
 #include "terrain_pbr.hlsli"
 #endif
 
-#ifdef SGE_EXTENSION_MOTION
+#if defined(SGE_EXTENSION_MOTION) || defined(SGE_TERRAIN_POM_DEPTH)
 PS_OUTPUT main(PS_INPUT input)
 #else
 float4 main(PS_INPUT input) : SV_TARGET
 #endif
 {
+#ifdef SGE_TERRAIN_POM_DEPTH
+    float terrainRasterDepth = input.position.z;
+#endif
 #if defined(SGE_BINDLESS_MATERIALS) && !defined(SGE_TERRAIN_PBR)
     Texture2D<float4> bindlessAlbedoMap = ResourceDescriptorHeap[
         NonUniformResourceIndex(bindlessTextureIndices.x)];
@@ -845,6 +862,14 @@ float4 main(PS_INPUT input) : SV_TARGET
 #ifdef SGE_TERRAIN_PBR
     TerrainPBR terrain = SampleTerrainPBR(input.fragPos, normal,
                                           length(viewPos - input.fragPos));
+#ifdef SGE_TERRAIN_POM_DEPTH
+    const float4 reliefClip = mul(mul(float4(terrain.reliefPosition, 1.0), view), projection);
+    if (reliefClip.w > 1e-5) {
+        terrainRasterDepth = saturate(reliefClip.z / reliefClip.w);
+        input.fragPos = terrain.reliefPosition;
+        input.fragPosLightSpace = mul(float4(input.fragPos, 1.0), lightSpaceMatrix);
+    }
+#endif
     // Terrain albedo uses an sRGB SRV, so hardware has already decoded it.
     albedo = max(terrain.albedo, 0.0) * objectColor;
 #else

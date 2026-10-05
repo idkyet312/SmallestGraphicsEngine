@@ -2490,6 +2490,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     g_meshShader.wireframe = scene.meshletWireframe;
     g_terrain.wireframe = scene.meshletWireframe;
+    g_terrain.pomDepthOffsetEnabled =
+        scene.terrainPOM && scene.terrainPOMDepthOffset;
     static thread_local ForwardStaticBatchQueueDX12 staticBatches;
 
     // Floor: visibility owns the flat floor in hybrid mode. Mesh terrain rides
@@ -2508,7 +2510,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.SetMatrices(model, view, proj, lightSpace);
     if (scene.useMeshTerrain && g_terrain.supported) {
         shader.SetTerrainMaterial(!g_customLevelMode,
-                                  scene.terrainDetailRelief);
+                                  scene.terrainDetailRelief, scene.terrainPOM,
+                                  g_terrain.neutralHeightBlendMask);
     } else if (floorMaterial && floorMaterial->baseColorTexture) {
         shader.SetObjectMaterial(scene.floor.color,
                                  true,

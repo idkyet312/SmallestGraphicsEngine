@@ -2416,7 +2416,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // "water"/"ocean" for the wave sliders.
     if (UISearchHeader("Rendering Settings", 0,
                        "floor clear color wireframe collision volumes "
-                       "mesh shader terrain height detail relief error lod "
+                       "mesh shader terrain height detail relief error lod pom parallax depth offset "
                        "specular vsync helicopter blackhawk spotlight fog "
                        "shadows cascades bias shadow size distance far "
                        "raytracing rtx dxr svgf atrous denoise "
@@ -2548,6 +2548,20 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     "and craters dense while coarsening flat ground, and stitches "
                     "fine tile edges to coarser neighbours instead of hiding "
                     "internal cracks with skirts.");
+            ImGui::Checkbox("Terrain POM", &scene.terrainPOM);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Adds close-range depth to terrain materials using their "
+                    "height maps. Fades with distance; collision stays unchanged.");
+            ImGui::BeginDisabled(!scene.terrainPOM);
+            ImGui::Checkbox("POM Depth Offset", &scene.terrainPOMDepthOffset);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Writes the terrain relief into scene depth for surface "
+                    "intersections. Collision and silhouettes stay unchanged. "
+                    "Uses the visibility buffer, including painted terrain; "
+                    "costs extra raster work.");
+            ImGui::EndDisabled();
         }
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
 

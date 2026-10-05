@@ -16,7 +16,7 @@
 Texture2D<uint2> visIds : register(t0);
 Texture2D<float> jitteredDepth : register(t1);
 
-static const uint kTerrainId = 0xFFFFFFFFu;
+#include "terrain_visibility_id.hlsli"
 
 float4 VSMain(uint id : SV_VertexID) : SV_Position {
     const float2 uv = float2((id << 1) & 2, id & 2);
@@ -29,13 +29,13 @@ float PSMain(float4 position : SV_Position) : SV_Depth {
     visIds.GetDimensions(width, height);
     if (p.x == 0 || p.y == 0 || p.x >= (int)width - 1 || p.y >= (int)height - 1)
         return jitteredDepth[p];
-    if (visIds[p].x == kTerrainId) return jitteredDepth[p];
+    if (IsTerrainVisibilityID(visIds[p].x)) return jitteredDepth[p];
     if (visIds[p].x == 0u) return 1.0;
     float depth = 1.0;
     [unroll] for (int y = -1; y <= 1; ++y) {
         [unroll] for (int x = -1; x <= 1; ++x) {
             const int2 q = p + int2(x, y);
-            if (visIds[q].x == kTerrainId) depth = min(depth, jitteredDepth[q]);
+            if (IsTerrainVisibilityID(visIds[q].x)) depth = min(depth, jitteredDepth[q]);
         }
     }
     return depth;

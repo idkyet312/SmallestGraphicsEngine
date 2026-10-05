@@ -42,6 +42,7 @@ SamplerState lutSampler : register(s0);
 SamplerState dirtSampler : register(s1);
 
 #include "color_grade.hlsli"
+#include "terrain_visibility_id.hlsli"
 
 cbuffer PostConstants : register(b0) {
     uint2 outputSize;
@@ -314,6 +315,12 @@ float3 CinematicInput(uint2 pixel) {
 uint2 StableSurfaceID(uint2 pixel) {
     uint2 rawID = surfaceIDs.Load(int3(pixel, 0));
     if (rawID.x == 0u) return uint2(0u, 0u);
+
+    // Relief IDs carry depth, not a draw-call index. Never use changing depth
+    // bits as temporal identity or address the draw buffer with them. Retain
+    // the existing non-relief path when the feature is off.
+    if (rawID.x != VB_TERRAIN_ID && IsTerrainVisibilityID(rawID.x))
+        return uint2(VB_TERRAIN_ID, rawID.y);
 
     DrawCallData dc = drawCalls[rawID.x - 1u];
     return uint2(asuint(dc.useNormalMap),

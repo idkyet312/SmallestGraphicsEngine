@@ -795,6 +795,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     double particleBenchmarkGpuMs = 0.0;
     const bool terrainLODBenchmark =
         GetEnvironmentVariableA("SGE_TERRAIN_LOD_BENCHMARK", nullptr, 0) > 0;
+    // Also lets automated captures exercise the same toggle as the terrain UI.
+    if (GetEnvironmentVariableA("SGE_TERRAIN_POM", nullptr, 0) > 0)
+        scene.terrainPOM = true;
+    if (GetEnvironmentVariableA("SGE_TERRAIN_POM_DEPTH", nullptr, 0) > 0) {
+        scene.terrainPOM = true;
+        scene.terrainPOMDepthOffset = true;
+    }
     UINT terrainLODBenchmarkFrames = 0;
     bool terrainLODBenchmarkComplete = false;
     std::vector<double> terrainLODScopeSamples;
@@ -879,6 +886,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     size_t vortexSmokePeakBarrelBodies = 0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
         visibilitySmokeEnabled = true;
+        // Shares the UI parity mode's post-processing restrictions for captures.
+        if (GetEnvironmentVariableA("SGE_VISIBILITY_PARITY", nullptr, 0) > 0)
+            visBuffer.validationMode = true;
         scene.enableHDRISky =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_HDRI", nullptr, 0) > 0;
         scene.enableSkyDepthTest =

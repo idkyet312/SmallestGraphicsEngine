@@ -163,9 +163,14 @@ struct alignas(256) VBFrameConstants {
     // 1 / full island extent per axis, mapping world XZ to splat UV. Appended
     // after the matrix so its 16-byte alignment is preserved.
     XMFLOAT2 terrainSplatInvExtent;
-    XMFLOAT2 terrainSplatPad;
+    // Reuses half of the splat padding; following VSM constants keep their offset.
+    UINT     terrainPOMEnabled;
+    UINT     terrainNeutralHeightBlendMask;
     VirtualShadows::Constants virtualShadows;
 };
+static_assert(offsetof(VBFrameConstants, terrainPOMEnabled) ==
+              offsetof(VBFrameConstants, terrainSplatInvExtent) + sizeof(XMFLOAT2),
+              "Terrain POM must occupy the existing splat padding");
 
 struct alignas(256) VBPostConstants {
     UINT outputWidth;
@@ -269,6 +274,8 @@ public:
     // the same layer weights (built-in footpaths) and normal-map handedness.
     float terrainMaterialType = 0.0f;
     float terrainNormalYSign = 1.0f;
+    bool terrainPOM = false;
+    UINT terrainNeutralHeightBlendMask = 0;
     // Non-owning terrain layer arrays, supplied by TerrainRendererDX12.
     ID3D12Resource* terrainAlbedoArray = nullptr;
     ID3D12Resource* terrainNormalArray = nullptr;
@@ -3401,7 +3408,8 @@ public:
         fc.terrainSplatInvExtent = splatUsable
             ? XMFLOAT2(0.5f / terrainSplatExtentX, 0.5f / terrainSplatExtentZ)
             : XMFLOAT2(0.0f, 0.0f);
-        fc.terrainSplatPad = XMFLOAT2(0.0f, 0.0f);
+        fc.terrainPOMEnabled = terrainPOM ? 1u : 0u;
+        fc.terrainNeutralHeightBlendMask = terrainNeutralHeightBlendMask;
         frameConstantBuffer.CopyData(ViewFrameIndex(), fc);
 
         // A toggle can leave old history describing samples from a different

@@ -18,6 +18,14 @@ cbuffer TerrainParams : register(b6) {
     int originTileZ;
     uint terrainStyle;
     uint detailRelief;
+#ifdef SGE_TERRAIN_VISIBILITY_POM_DEPTH
+    // The graphics root signature already reserves 20 words. AS/MS consume
+    // the unchanged 16-word prefix; only the relief visibility PS reads these.
+    uint pomNeutralHeightBlendMask;
+    uint pomShowAuthoredPaths;
+    uint pomSplatEnabled;
+    float pomPadding;
+#endif
 };
 
 // Must match SculptGPU in TerrainRendererDX12.h (44 bytes).

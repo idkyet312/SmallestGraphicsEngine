@@ -53,7 +53,9 @@ cbuffer FrameConstants : register(b0) {
     // 1 / full island extent per axis. Maps world XZ to splat UV; appended
     // after the matrix so the matrix keeps its 16-byte alignment.
     float2 terrainSplatInvExtent;
-    float2 terrainSplatPad;
+    // Reuses half of the splat padding; following VSM constants keep their offset.
+    uint   terrainPOMEnabled;
+    uint   terrainNeutralHeightBlendMask;
 #endif
 #if SGE_VIRTUAL_SHADOWS
     VirtualShadowConstants virtualShadows;
@@ -256,10 +258,9 @@ Texture2D<float4> terrainSplatMap : register(t91);
 // s2 clamps. s0 wraps, which would repeat paint across the island edge.
 SamplerState terrainSplatSampler : register(s2);
 
-// Reserved visibility ID. The visibility buffer stores drawCallID + 1 in .x, so
-// real geometry occupies 1..0xFFFFFFFE. Terrain claims the top of the range
-// rather than an index near zero, which would collide with real draw calls.
-#define VB_TERRAIN_ID 0xFFFFFFFFu
+// Relief terrain IDs also retain the original surface depth for material POM.
+#include "terrain_visibility_id.hlsli"
+#define VB_SURFACE_ID(id) TerrainVisibilitySurfaceID(id)
 
 // The terrain-enabled resolve is compiled twice and dispatched twice, so a
 // terrain frame never pays for terrain on every pixel:
@@ -281,6 +282,10 @@ SamplerState terrainSplatSampler : register(s2);
 #endif
 #endif
 
+
+#ifndef VB_SURFACE_ID
+#define VB_SURFACE_ID(id) (id)
+#endif
 
 #ifndef SGE_RESOLVE_TILE_LIST
 #define SGE_RESOLVE_TILE_LIST 0
@@ -1843,6 +1848,8 @@ void ComputeUVGradients(float3 wp0, float3 wp1, float3 wp2,
 
 #if SGE_TERRAIN_VISIBILITY
 // ---- Terrain triplanar shading (compute port of terrain_pbr.hlsli) ----
+
+#include "terrain_pom.hlsli"
 //
 // The forward header cannot be included here for two reasons. It calls ddx/ddy,
 // which do not exist in a compute shader, and it reads materialType and
@@ -2081,6 +2088,8 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     result.metallic = 0.0;
     result.occlusion = 0.0;
     const float kLayerEpsilon = 0.002;
+    float3 layerPositions[4] = { worldPos, worldPos, worldPos, worldPos };
+    const float3 viewDirection = (cameraPos - worldPos) / max(cameraDistance, 1e-4);
     // No quad-derivative constraint here, so the weight test can gate the
     // gradient computation as well -- unlike the forward path, which must
     // evaluate gradients unconditionally to keep ddx/ddy uniform across a quad.
@@ -2101,20 +2110,29 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
         const TerrainVBGrads heightGrads =
             TerrainVBTriplanarGrads(worldDx, worldDy, scales[heightLayer]);
+        if (terrainPOMEnabled != 0 && cameraDistance < 28.0)
+            layerPositions[heightLayer] = TerrainPOMPosition(
+                terrainMetalRoughArray, texSampler, worldPos, geometricNormal,
+                projectionWeights, heightLayer, layerWeights[heightLayer],
+                scales[heightLayer], heightGrads.zyDx, heightGrads.zyDy,
+                heightGrads.xzDx, heightGrads.xzDy, heightGrads.xyDx,
+                heightGrads.xyDy, viewDirection, cameraDistance);
 #ifdef SGE_TERRAIN_PACKED_REUSE
         packedLayers[heightLayer] = SampleTerrainVBArray(
-            terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
+            terrainMetalRoughArray, layerPositions[heightLayer], projectionWeights, heightLayer,
             scales[heightLayer], heightGrads);
         const float sampledHeight = packedLayers[heightLayer].a;
 #else
         const float sampledHeight = SampleTerrainVBArray(
-            terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
+            terrainMetalRoughArray, layerPositions[heightLayer], projectionWeights, heightLayer,
             scales[heightLayer], heightGrads).a;
 #endif
-        if (heightLayer == 0) layerHeights.x = sampledHeight;
-        else if (heightLayer == 1) layerHeights.y = sampledHeight;
-        else if (heightLayer == 2) layerHeights.z = sampledHeight;
-        else layerHeights.w = sampledHeight;
+        const float blendHeight = TerrainPOMBlendHeight(
+            sampledHeight, heightLayer, terrainNeutralHeightBlendMask, projectionWeights);
+        if (heightLayer == 0) layerHeights.x = blendHeight;
+        else if (heightLayer == 1) layerHeights.y = blendHeight;
+        else if (heightLayer == 2) layerHeights.z = blendHeight;
+        else layerHeights.w = blendHeight;
     }
     const float4 blendWeights =
         TerrainVBHeightBlend(layerWeights, layerHeights);
@@ -2125,10 +2143,10 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         const TerrainVBGrads grads =
             TerrainVBTriplanarGrads(worldDx, worldDy, scales[layer]);
         result.albedo += SampleTerrainVBArray(
-            terrainAlbedoArray, worldPos, projectionWeights, layer,
+            terrainAlbedoArray, layerPositions[layer], projectionWeights, layer,
             scales[layer], grads).rgb * weight;
         result.normal += SampleTerrainVBNormalLayer(
-            worldPos, geometricNormal, projectionWeights, layer,
+            layerPositions[layer], geometricNormal, projectionWeights, layer,
             scales[layer], normalStrengths[layer], grads) * weight;
 #ifdef SGE_TERRAIN_PACKED_REUSE
         float4 packedPBR = packedLayers[layer];
@@ -2136,11 +2154,11 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         // Those layers still need the original shading fetch.
         if (layerWeights[layer] <= kLayerEpsilon)
             packedPBR = SampleTerrainVBArray(
-                terrainMetalRoughArray, worldPos, projectionWeights, layer,
+                terrainMetalRoughArray, layerPositions[layer], projectionWeights, layer,
                 scales[layer], grads);
 #else
         const float4 packedPBR = SampleTerrainVBArray(
-            terrainMetalRoughArray, worldPos, projectionWeights, layer,
+            terrainMetalRoughArray, layerPositions[layer], projectionWeights, layer,
             scales[layer], grads);
 #endif
         result.roughness += packedPBR.g * weight;
@@ -3098,7 +3116,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     // background, the debug views and the enhanced-visuals clears below. Return
     // before any of that so this dispatch writes terrain pixels only and leaves
     // everything else exactly as the generic half left it.
-    if (visValue.x != VB_TERRAIN_ID) return;
+    if (!IsTerrainVisibilityID(visValue.x)) return;
 #endif
 
 #if SGE_ENHANCED_VISUALS
@@ -3133,7 +3151,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
             for (int i = 0; i < 4; ++i) {
                 int2 tap = clamp(int2(pixel) + offsets[i], int2(0, 0),
                                  int2(screenWidth - 1, screenHeight - 1));
-                if (visBuffer.Load(int3(tap, 0)).x != visValue.x) {
+                if (VB_SURFACE_ID(visBuffer.Load(int3(tap, 0)).x) !=
+                    VB_SURFACE_ID(visValue.x)) {
                     isEdge = true;
                     break;
                 }
@@ -3156,7 +3175,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         if (visValue.x == 0u) {
             outputColor[pixel] = float4(0.0, 0.0, 0.0, 1.0);
         } else {
-            uint key = visValue.x * 1664525u + visValue.y * 1013904223u;
+            uint key = VB_SURFACE_ID(visValue.x) * 1664525u + visValue.y * 1013904223u;
             float3 idColor = float3(key & 255u, (key >> 8u) & 255u,
                                     (key >> 16u) & 255u) / 255.0;
             outputColor[pixel] = float4(idColor, 1.0);
@@ -3208,7 +3227,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     // stale reprojection, which TAA smears. This is a handful of instructions
     // with no texture work, so it costs nothing against the terrain path it
     // replaces.
-    if (visValue.x == VB_TERRAIN_ID) {
+    if (IsTerrainVisibilityID(visValue.x)) {
         if (enableMotionVectors != 0u) {
             float terrainDepth = depthBuffer.Load(int3(pixel, 0));
             float3 terrainWorldPos = ReconstructTerrainWorldPos(pixel, terrainDepth);
@@ -3234,11 +3253,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     // reserved ID carries the packed geometric normal in .y instead of a
     // primitive index; world position comes from depth, exactly as it would for
     // a triangle whose barycentrics were already resolved.
-    if (visValue.x == VB_TERRAIN_ID) {
+    if (IsTerrainVisibilityID(visValue.x)) {
         float terrainDepth = depthBuffer.Load(int3(pixel, 0));
         float3 terrainWorldPos = ReconstructTerrainWorldPos(pixel, terrainDepth);
+        // Lighting/motion use the displaced depth. Materials use the original
+        // surface point carried by relief IDs, so their existing POM march is
+        // not applied a second time to an already displaced position.
+        float3 terrainBaseWorldPos = ReconstructTerrainWorldPos(pixel,
+            TerrainVisibilityBaseDepth(visValue.x, terrainDepth));
         float3 terrainGeoNormal = DecodeTerrainVBNormal(visValue.y);
-        float terrainCameraDistance = length(cameraPos - terrainWorldPos);
+        float terrainCameraDistance = length(cameraPos - terrainBaseWorldPos);
 
         float2 terrainMotion = 0.0;
         if (enableMotionVectors != 0u) {
@@ -3259,7 +3283,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         }
 
         TerrainVBPBR terrainPBR = SampleTerrainVBPBR(
-            pixel, terrainWorldPos, terrainGeoNormal, terrainCameraDistance);
+            pixel, terrainBaseWorldPos, terrainGeoNormal, terrainCameraDistance);
 
         // debugViewMode 7: terrain layer weights as flat colour, bypassing all
         // lighting and texturing. Material weights are hard to read through lit
@@ -3268,7 +3292,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         // Painted texels appear as flat blocks against the noisy procedural
         // background, which is what makes a world->UV error obvious.
         if (debugViewMode == 7u) {
-            const float4 w = TerrainVBLayerWeights(terrainWorldPos,
+            const float4 w = TerrainVBLayerWeights(terrainBaseWorldPos,
                                                    terrainGeoNormal);
             float3 debugSplat = w.x * float3(0.15, 0.85, 0.15) +   // grass
                                 w.y * float3(0.75, 0.35, 0.10) +   // dirt
@@ -3305,7 +3329,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         // surface key derived from the quantised world position instead. It is
         // stable frame to frame for a static surface, which is what the
         // temporal accumulator actually needs.
-        uint3 terrainCell = asuint(int3(floor(terrainWorldPos * 4.0)));
+        uint3 terrainCell = asuint(int3(floor(terrainBaseWorldPos * 4.0)));
         uint2 terrainStableID = uint2(
             VB_TERRAIN_ID,
             MatVarHashUint(terrainCell.x ^

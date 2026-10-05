@@ -126,6 +126,38 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The generic terrain twin excludes terrain shading after split dispatch.
+    // Compile the terrain-only half too: this is where the POM march actually
+    // lives, including FXC's restrictions on dynamically indexed arrays.
+    const std::string terrainOnlyCode =
+        "#define SGE_TERRAIN_ONLY_RESOLVE 1\n" + terrainCode;
+    ComPtr<ID3DBlob> terrainOnlyBlob;
+    errors.Reset();
+    const HRESULT terrainOnlyHr = D3DCompile(
+        terrainOnlyCode.c_str(), terrainOnlyCode.size(), shaderPath.c_str(), nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1", compileFlags, 0,
+        &terrainOnlyBlob, &errors);
+    if (FAILED(terrainOnlyHr)) {
+        std::cerr << "Terrain-only resolve failed to compile: "
+                  << (errors ? (const char*)errors->GetBufferPointer() : "unknown")
+                  << "\n";
+        return 1;
+    }
+    ComPtr<ID3D11ShaderReflection> terrainReflection;
+    CHECK(SUCCEEDED(D3DReflect(terrainOnlyBlob->GetBufferPointer(),
+        terrainOnlyBlob->GetBufferSize(), __uuidof(ID3D11ShaderReflection),
+        reinterpret_cast<void**>(terrainReflection.GetAddressOf()))));
+    if (terrainReflection) {
+        auto* constants = terrainReflection->GetConstantBufferByName("FrameConstants");
+        D3D11_SHADER_VARIABLE_DESC extent = {}, pom = {}, padding = {};
+        CHECK(SUCCEEDED(constants->GetVariableByName("terrainSplatInvExtent")->GetDesc(&extent)));
+        CHECK(SUCCEEDED(constants->GetVariableByName("terrainPOMEnabled")->GetDesc(&pom)));
+        CHECK(SUCCEEDED(constants->GetVariableByName("terrainNeutralHeightBlendMask")->GetDesc(&padding)));
+        CHECK(pom.StartOffset == extent.StartOffset + 8u);
+        CHECK(pom.Size == 4u);
+        CHECK(padding.StartOffset == pom.StartOffset + 4u);
+    }
+
     const size_t size = blob->GetBufferSize();
     const char* bytes = static_cast<const char*>(blob->GetBufferPointer());
 
