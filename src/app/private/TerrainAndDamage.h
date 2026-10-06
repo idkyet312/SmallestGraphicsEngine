@@ -170,6 +170,11 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
     // to the clipmap topology, so it ORs onto whichever they selected.
     if (scene.terrainFlat)
         params.terrainStyle |= TerrainRendererDX12::kStyleFlat;
+    // Editing (not playtesting): keep the fine rings on the free camera.
+    // Gameplay keeps the coarser, cheaper whole-tile snap.
+    if (g_game.session.Screen() == GameScreen::LevelEditor &&
+        !g_levelEditor.IsPlaying())
+        params.terrainStyle |= TerrainRendererDX12::kStyleCameraSnap;
     const bool deploymentOverview =
         (params.terrainStyle & TerrainRendererDX12::kStyleDeploymentOverview) != 0u;
     if (!deploymentOverview &&
@@ -365,35 +370,11 @@ static void ApplyRuntimeTerrainStamp(const TerrainSculptStamp& stamp,
     {
         ProfilerDX12::CpuScope craterFoliageProfile(
             g_profiler, "Crater/Foliage");
-        // Keep turf over ordinary soil cuts. Once the new floor reaches the
-        // sand layer (or lower), clear the full visible cut so blades are not
-        // left standing over exposed beach or submerged ground. A furrow keeps
-        // the tighter span it has always used: it is a shallow scrape, and
-        // clearing out to its lip strips turf the wreck never touched.
-        const float grassSpan = isCrater ? 1.18f : 0.6f;
-        bool sandExposed = g_grass.TerrainSandExposed(stamp.x, stamp.z);
-        if (isCrater && !sandExposed) {
-            // A cut on a bank can reach sand on one side while its centre stays
-            // grassy. Check the floor and lower wall before keeping the turf.
-            constexpr float directions[][2] = {
-                { 1.0f, 0.0f }, { 0.7071f, 0.7071f }, { 0.0f, 1.0f },
-                { -0.7071f, 0.7071f }, { -1.0f, 0.0f },
-                { -0.7071f, -0.7071f }, { 0.0f, -1.0f },
-                { 0.7071f, -0.7071f }
-            };
-            for (const auto& direction : directions) {
-                if (g_grass.TerrainSandExposed(
-                        stamp.x + direction[0] * stamp.radius * 0.7f,
-                        stamp.z + direction[1] * stamp.radius * 0.7f)) {
-                    sandExposed = true;
-                    break;
-                }
-            }
-        }
-        if (sandExposed) {
-            g_grass.AddRuntimeExclusion(
-                stamp.x, stamp.z, stamp.radius * grassSpan);
-        }
+        // Ground cover cannot stay planted after its ground is cut, even if
+        // the new surface is still grass-coloured soil. Fern draws share this
+        // exclusion with grass; include the crater lip and the full gouge.
+        g_grass.AddRuntimeExclusion(stamp.x, stamp.z,
+            stamp.radius * (isCrater ? 1.18f : 1.0f));
         // Trees still use a tight radius so the blast does not fell every palm
         // out to the crater's ejecta lip.
         g_trees.ApplyExplosion({ stamp.x, impactY, stamp.z },

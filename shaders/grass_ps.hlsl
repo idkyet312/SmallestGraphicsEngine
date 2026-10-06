@@ -37,7 +37,7 @@ cbuffer CameraBuffer : register(b2) {
 
 cbuffer ObjectBuffer : register(b3) {
     float3 objectColor;
-    float useTexture;
+    float matchGroundColor; // CPU useTexture slot; grass remains untextured
     float metalness;
     float roughness;
     float useNormalMap;
@@ -179,23 +179,20 @@ float4 ShadeGrass(PS_INPUT input) {
         lerp(0.88, 1.10, input.colorVariation),
         variationStrength);
     float3 albedo = saturate(objectColor * tint * brightness);
-    // The authored grass albedo is neutral grey (R=G=B), so all of the field's
-    // green came from transmissionTint below -- which is gated on backNdotL and
-    // therefore only ever reached blades facing AWAY from the sun. That left the
-    // sun-facing half rendering the raw grey while the shaded half looked
-    // correct. Fold the same leaf tint into the albedo so both sides carry the
-    // colour, and let transmission add its warmth on top rather than being the
-    // only source of it.
-    // Normalised to unit luminance so it recolours without darkening: the raw
-    // tint averages well below 1 and would dim the whole field.
+    // The manual material was authored as neutral grey. Keep its leaf grade
+    // at unit luminance so both sides carry green without dimming the field.
     static const float3 kLeafTint = float3(0.72, 0.98, 0.50);
     static const float kLeafTintLuma =
         dot(kLeafTint, float3(0.2126, 0.7152, 0.0722));
-    albedo *= kLeafTint / kLeafTintLuma;
-    float albedoLuma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
-    // Desaturating toward luminance is what greyed the lit side: on the dim half
-    // it is invisible, but direct sun amplifies it. Keep the blades' own colour.
-    albedo = lerp(albedoLuma.xxx, albedo, 0.95);
+    // Automatic grass already carries the selected terrain scan's colour.
+    // Applying the legacy leaf grade again would turn Grass Ground yellow-green.
+    if (matchGroundColor < 0.5) {
+        albedo *= kLeafTint / kLeafTintLuma;
+        float albedoLuma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+        // Desaturating toward luminance is what greyed the lit side: on the dim
+        // half it is invisible, but direct sun amplifies it. Keep its own colour.
+        albedo = lerp(albedoLuma.xxx, albedo, 0.95);
+    }
 
     // Blades are two-sided cards; flip the normal to face the camera so the
     // back of a blade doesn't go black.
@@ -250,8 +247,8 @@ float4 ShadeGrass(PS_INPUT input) {
 
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
-    // albedo already carries kLeafTint, so tinting again here would push the
-    // back-lit half doubly green against the front.
+    // Albedo already carries the leaf colour; tinting again here would push
+    // the back-lit half doubly green against the front.
     result += albedo * lightColor *
               backNdotL * tipTransmission * max(normalYSign, 0.0) *
               lerp(0.35, 1.0, shadowVisibility);

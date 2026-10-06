@@ -70,6 +70,7 @@ static bool LoadDandelionModel() {
     material->foliageShading = true;
     material->alphaCutoff = 0.20f;
     material->disableOcclusionCulling = true;
+    material->foliageAuthoredColor = material->baseColorFactor;
 
     std::vector<unsigned char> albedo;
     int aw = 0, ah = 0;
@@ -86,6 +87,8 @@ static bool LoadDandelionModel() {
             albedo[i + 3] = static_cast<unsigned char>(
                 std::clamp((darkness - 5) * 8, 0, 255));
         }
+        material->foliageTextureMean = FoliageTextureMean(
+            albedo, material->alphaCutoff);
         material->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
             g_dx12.device.Get(), g_dx12.commandList.Get(), albedo, aw, ah,
             material->uploadHeaps);
@@ -210,7 +213,7 @@ static void ScatterDandelions(
             const float distance = std::sqrt(random01()) * 2.8f;
             const float x = cx + std::cos(angle) * distance;
             const float z = cz + std::sin(angle) * distance;
-            if (excluded(x, z)) continue;
+            if (excluded(x, z) || g_grass.RuntimeExcluded(x, z)) continue;
             if (random01() > g_grass.TerrainGrassDensity(x, z)) continue;
             const float y = terrainSampler(x, z);
             if (y < 0.22f) continue;
@@ -244,6 +247,7 @@ static void ScatterDandelions(
                 entity.type != LevelEntityType::Dandelion) continue;
             const float x = entity.transform.position[0];
             const float z = entity.transform.position[2];
+            if (g_grass.RuntimeExcluded(x, z)) continue;
             if (g_grass.TerrainGrassDensity(x, z) <= 0.0f) continue;
             const float y = terrainSampler(x, z);
             const float authoredScale = (std::max)(0.05f, entity.transform.scale[1]);

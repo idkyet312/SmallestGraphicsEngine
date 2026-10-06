@@ -1075,7 +1075,8 @@ inline void RenderPlayerHUD(const Scene& scene) {
             char c4Label[24];
             if (scene.AmmoEnforced())
                 snprintf(c4Label, sizeof(c4Label), "C4 %d",
-                         scene.player.Magazine(GunModel::kRemoteChargeWeapon));
+                         scene.player.Magazine(GunModel::kRemoteChargeWeapon) +
+                         scene.player.Reserve(GunModel::kRemoteChargeWeapon));
             else
                 snprintf(c4Label, sizeof(c4Label), "C4 unlimited");
             const ImVec2 c4Size = hudTextSize(c4Label);
@@ -4340,7 +4341,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                            "player interaction push radius material")) {
         ImGui::SeparatorText("Material");
         bool foliageMaterialChanged =
-            ImGui::ColorEdit3("Grass Albedo", &g_grass.Albedo().x);
+            ImGui::Checkbox("Match Auto Material Grass", &g_grass.MatchGroundColor());
+        foliageMaterialChanged |= ImGui::ColorEdit3(
+            g_grass.MatchGroundColor() ? "Grass Tint" : "Grass Albedo",
+            g_grass.MatchGroundColor() ? &g_grass.GroundTint().x
+                                      : &g_grass.Albedo().x);
         foliageMaterialChanged |= ImGui::SliderFloat(
             "Grass Roughness", &g_grass.Roughness(), 0.04f, 1.0f);
         foliageMaterialChanged |= ImGui::SliderFloat(

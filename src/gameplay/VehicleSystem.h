@@ -71,8 +71,7 @@ struct VehicleSystem {
     static constexpr float AATurretMountHeight = 1.85f;
 
     // One emplacement. Held in a vector rather than as loose fields on the
-    // system, so a level can carry several: the comm tower's gun plus any the
-    // designer drops in from the editor's turret prefab.
+    // system, so a level can carry several independently authored turret prefabs.
     struct AATurret {
         DirectX::XMFLOAT3 position{};
         float yaw = 0.0f;
@@ -83,8 +82,8 @@ struct VehicleSystem {
         int shotsLeftInBurst = 0;
         // Barrels spin down after firing; cosmetic, drives the muzzle glow.
         float heat = 0.0f;
-        // Set for emplacements placed from a level prefab; 0 for the scripted
-        // comm-tower gun. The ordinal separates several turrets nested in one
+        // Set for emplacements placed from a level prefab; 0 for unbound guns.
+        // The ordinal separates several turrets nested in one
         // entity. Together they let a prefab rebuild find the gun it placed
         // last time instead of stacking a fresh one on top of it.
         uint64_t prefabEntityId = 0;
@@ -681,6 +680,21 @@ public:
     DirectX::XMFLOAT3 boatCenter{ 0.0f, 0.0f, 0.0f };
     float boatYaw = 0.0f;
     float boatRoll = 0.0f;
+    struct BoatPhysicsState {
+        uint32_t handle = 0;
+        bool hasPose = false;
+        DirectX::XMFLOAT4 rotation = {0,0,0,1};
+        DirectX::XMFLOAT3 velocity = {};
+    };
+    BoatPhysicsState boatPhysics;
+    BoatPhysicsState insertionBoatPhysics;
+    static DirectX::XMMATRIX BoatOrientation(const BoatPhysicsState& physics,
+                                              float roll, float yaw) {
+        using namespace DirectX;
+        return XMMatrixRotationZ(roll) * (physics.hasPose
+            ? XMMatrixRotationQuaternion(XMLoadFloat4(&physics.rotation))
+            : XMMatrixRotationY(yaw));
+    }
     float boatPatrolTime = 0.0f;
     float boatHealth = BoatMaxHealth;
     bool boatDead = false;
@@ -689,7 +703,7 @@ public:
 
     static constexpr float BoatHalfBeam = 1.5f;
     static constexpr float BoatHalfLength = 4.5f;
-    static constexpr float BoatFloatDepth = 0.75f;
+    static constexpr float BoatFloatDepth = 0.30f;
     static constexpr float BoatDeckOffset = 0.45f - BoatFloatDepth;
     static constexpr float BoatBoardReach = 2.5f;
     static constexpr float BoatForwardSpeed = 18.0f;
@@ -859,6 +873,22 @@ public:
                                        float playerHeight, bool jumping = false) const {
         if (!insertionBoatVisible || InsertionBoatIsSunk() ||
             insertionBoatPhase == InsertionBoatPhase::Gone) return false;
+        if (insertionBoatPhysics.hasPose) {
+            using namespace DirectX;
+            const XMMATRIX orientation = BoatOrientation(insertionBoatPhysics,
+                insertionBoatRoll, insertionBoatYaw);
+            if (XMVectorGetY(XMVector3TransformNormal(XMVectorSet(0,1,0,0),
+                    orientation)) < 0.45f) return false;
+            XMFLOAT3 local;
+            XMStoreFloat3(&local, XMVector3TransformNormal(
+                XMVectorSet(player.x - insertionBoatPosition.x,
+                    player.y - playerHeight - insertionBoatPosition.y + insertionBoatSinkOffset,
+                    player.z - insertionBoatPosition.z, 0), XMMatrixTranspose(orientation)));
+            const float above = local.y - insertionBoatDeckOffset;
+            return std::abs(local.x) <= BoatHalfBeam + 0.15f &&
+                std::abs(local.z) <= BoatHalfLength + 0.15f &&
+                above >= -0.4f && above <= (jumping ? 2.0f : 0.4f);
+        }
         const float dx = player.x - insertionBoatPosition.x;
         const float dz = player.z - insertionBoatPosition.z;
         const float localX = dx * std::cos(insertionBoatYaw) - dz * std::sin(insertionBoatYaw);
@@ -921,8 +951,7 @@ public:
             insertionBoatRideSide, insertionBoatRideHeight,
             insertionBoatRideForward, 0.0f);
         const DirectX::XMMATRIX orientation =
-            DirectX::XMMatrixRotationRollPitchYaw(0.0f, insertionBoatYaw,
-                                                  insertionBoatRoll);
+            BoatOrientation(insertionBoatPhysics, insertionBoatRoll, insertionBoatYaw);
         DirectX::XMFLOAT3 rotated{};
         DirectX::XMStoreFloat3(&rotated,
                                DirectX::XMVector3TransformNormal(offset, orientation));
@@ -983,6 +1012,7 @@ public:
         insertionBoatBobTime += dt;
         insertionBoatDroppedPlayer = false;
         insertionBoatJustSank = false;
+        if (insertionBoatPhysics.handle != 0 && insertionBoatCaptured) return;
         // insertionBoatBailedOut is deliberately NOT cleared here: it is raised
         // from the input handler, which runs earlier in the frame, so clearing
         // it now would drop the event before the release code sees it. The
@@ -1981,6 +2011,8 @@ public:
         boatPosition = boatCenter;
         boatYaw = 0.0f;
         boatRoll = 0.0f;
+        boatPhysics = {};
+        insertionBoatPhysics = {};
         boatPatrolTime = 0.0f;
         boatHealth = BoatMaxHealth;
         boatDead = false;

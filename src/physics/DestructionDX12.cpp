@@ -15,6 +15,7 @@
 #include "NvBlastTkGroup.h"
 #include "NvBlastTypes.h"
 #include "PhysicsImpactPolicy.h"
+#include "BoatPhysics.h"
 #include "ProfilerDX12.h"
 #include <box3d/box3d.h>
 
@@ -763,6 +764,15 @@ struct DestructionDX12::Impl {
     std::vector<VehicleRuntime> vehicles;
     std::vector<VehicleRuntime> groundVehicles;
     uint32_t nextGroundVehicleHandle = 1;
+    struct BoatRuntime {
+        uint32_t handle = 0;
+        b3BodyId body = b3_nullBodyId;
+        float throttle = 0.0f, steering = 0.0f, waterY = 0.0f;
+        bool brake = true;
+        bool afloat = true;
+    };
+    std::vector<BoatRuntime> boatBodies;
+    uint32_t nextBoatHandle = 1;
 
     // Destroying the bodies takes their wheel joints with them.
     static void DestroyVehicleBodies(VehicleRuntime& vehicle) {
@@ -4197,6 +4207,7 @@ void DestructionDX12::Shutdown() {
             instance.body = b3_nullBodyId;
     m->vehicles.clear();
     m->groundVehicles.clear();
+    m->boatBodies.clear();
     if (m->terrainHeightField) {
         b3DestroyHeightField(m->terrainHeightField);
         m->terrainHeightField = nullptr;
@@ -4623,6 +4634,14 @@ void DestructionDX12::Update(float dt) {
         physicsStepped = true;
         m->RefreshPinnedHarpoonJoints();
         m->ApplyWaterBuoyancy();
+        for (const Impl::BoatRuntime& boat : m->boatBodies) {
+            SGE::BoatPhysics::ApplyForces(boat.body, boat.throttle, boat.steering,
+                boat.brake, [&](float x, float z, float& surface) {
+                    surface = boat.waterY;
+                    return boat.afloat &&
+                        (!m->terrainSampler || m->terrainSampler(x, z) < surface);
+                });
+        }
         m->ApplyVortices(step);
         m->ApplyEnemyHover(step);
         m->RelaxAuthoredRagdolls(step);
@@ -5861,6 +5880,59 @@ static std::atomic<uint32_t>& NextPropHandle() {
 // rotated about Y, and the collider they replace stores a single yaw. The body
 // is free to tumble on every axis once it is moving -- that restriction is on
 // the spawn pose, not the simulation.
+uint32_t DestructionDX12::CreateBoatBody(const XMFLOAT3& position,
+                                        const XMFLOAT4& rotation,
+                                        const XMFLOAT3& velocity) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
+    const b3BodyId body = SGE::BoatPhysics::Create(m->world,
+        {position.x, position.y, position.z},
+        {{rotation.x, rotation.y, rotation.z}, rotation.w},
+        {velocity.x, velocity.y, velocity.z}, CollisionCategoryProp);
+    if (B3_IS_NULL(body)) return 0;
+    uint32_t handle = m->nextBoatHandle++;
+    if (handle == 0) handle = m->nextBoatHandle++;
+    m->boatBodies.push_back({handle, body});
+    return handle;
+}
+
+void DestructionDX12::SetBoatBodyInput(uint32_t handle, float throttle,
+                                       float steering, bool brake, float waterY, bool afloat) {
+    if (!m || handle == 0) return;
+    for (Impl::BoatRuntime& boat : m->boatBodies) {
+        if (boat.handle != handle) continue;
+        boat.throttle = (std::clamp)(throttle, -1.0f, 1.0f);
+        boat.steering = (std::clamp)(steering, -1.0f, 1.0f);
+        boat.brake = brake;
+        boat.waterY = waterY;
+        boat.afloat = afloat;
+        return;
+    }
+}
+
+bool DestructionDX12::GetBoatBodyPose(uint32_t handle, DestructionBodyPose& pose) const {
+    if (!m || !m->initialized || handle == 0) return false;
+    for (const Impl::BoatRuntime& boat : m->boatBodies) {
+        if (boat.handle != handle) continue;
+        const b3Pos p = b3Body_GetPosition(boat.body);
+        const b3Quat q = b3Body_GetRotation(boat.body);
+        const b3Vec3 v = b3Body_GetLinearVelocity(boat.body);
+        pose.position = {(float)p.x, (float)p.y, (float)p.z};
+        pose.rotation = {q.v.x, q.v.y, q.v.z, q.s};
+        pose.linearVelocity = {v.x, v.y, v.z};
+        return true;
+    }
+    return false;
+}
+
+void DestructionDX12::DestroyBoatBody(uint32_t handle) {
+    if (!m || handle == 0) return;
+    const auto it = std::find_if(m->boatBodies.begin(), m->boatBodies.end(),
+        [handle](const Impl::BoatRuntime& boat) { return boat.handle == handle; });
+    if (it == m->boatBodies.end()) return;
+    b3DestroyBody(it->body);
+    m->boatBodies.erase(it);
+}
+
 uint32_t DestructionDX12::CreatePropBody(
     const XMFLOAT3& worldPosition, const XMFLOAT3& halfExtents,
     float yawRadians, float density) {

@@ -156,7 +156,7 @@ public:
               2.10f, 0.055f, 6.0f, 1800.0f, 0.55f, 0.22f, 1.0f, 1.0f,
               1.0f, 1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "procedural/weapons/arc_laser_cutter", "" },
-            { "remote_c4", "Remote C4", 5, 3, 0, 0, 1.80f, 0.48f,
+            { "remote_c4", "Remote C4", 5, 1, 2, 2, 5.0f, 0.48f,
               1.0f, 0.0f, 0.55f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 0.0f, false,
               "Content/Models/C4/C4_bomb/source/c4.glb", "" },

@@ -7,12 +7,19 @@ PalmTrees                   g_trees;
 GrassField                  g_grass;
 
 void MatchFoliageMaterialToGrass() {
-    const XMFLOAT3 grassAlbedo = g_grass.Albedo();
+    const bool matchGround = g_grass.MatchGroundColor() &&
+        g_terrain.grassLayerAlbedoReady;
+    const XMFLOAT3 grassAlbedo = matchGround
+        ? g_grass.GroundMatchedAlbedo(g_terrain.grassLayerAlbedo)
+        : g_grass.Albedo();
     const XMFLOAT4 matchedAlbedo(
         grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
     const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material) {
         if (!material) return;
+        // Fern leaf recovery uses this colour directly. An inverse RGB texture
+        // grade becomes pink there, so keep the actual grass hue in the material.
         material->baseColorFactor = matchedAlbedo;
+        material->foliageMatchGrassColor = matchGround;
         material->roughnessFactor = g_grass.Roughness();
         material->ambientScale = g_grass.AmbientScale();
         // Alpha foliage has no ORM or normal map, so these packed material
@@ -21,8 +28,15 @@ void MatchFoliageMaterialToGrass() {
         material->normalYSign = g_grass.TransmissionStrength();
         material->viewFillStrength = g_grass.ColorVariation();
     };
-    // Palm leaves carry their own texture and lighting grade. Grass's 2x sun
-    // response and transmission tuning flatten their crowns into bright green.
+    // Retint only palm leaves. Their lighting grade and bark remain authored;
+    // borrowing grass's direct/transmission strengths flattens the crowns.
+    for (const auto& material : PalmModel::Materials()) {
+        if (!material || !material->foliageShading) continue;
+        material->baseColorFactor = matchGround
+            ? FoliageColorMatchingGrass(material->foliageAuthoredColor,
+                material->foliageTextureMean, grassAlbedo)
+            : material->foliageAuthoredColor;
+    }
     if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
                                     const std::shared_ptr<SceneNode>& node) -> void {

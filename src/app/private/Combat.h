@@ -61,7 +61,9 @@ static bool ShootPlayerWeapon() {
         g_gunAudio.Play(1.0f, pitch);
     } else if (GunModel::C4Selected()) {
         scene.ThrowRemoteCharge();
-        g_reloadAudio.Play(0.38f, 1.24f);
+        // Preparing the next charge uses the normal reload gate and HUD timer.
+        if (scene.BeginReload(slot)) PlayReloadSound();
+        else g_reloadAudio.Play(0.38f, 1.24f);
     } else if (GunModel::FlamethrowerSelected()) {
         scene.ShootFlameBurst();
     } else if (GunModel::LaserSelected()) {

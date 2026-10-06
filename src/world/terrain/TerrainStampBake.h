@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <new>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -100,7 +101,7 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     unsigned char* (*compress)(unsigned char*, int, int*, int),
     TerrainSculptStamp& outStamp,
     uint32_t resolution = kTerrainStampBakeResolution,
-    const TerrainBakeBounds& region = {}) {
+    const TerrainBakeBounds& region = {}) try {
     TerrainBakeResult result;
     if (stamps.empty()) {
         result.error = "No sculpt stamps to bake.";
@@ -111,8 +112,8 @@ TerrainBakeResult BakeTerrainSculptToStamp(
         return result;
     }
 
-    if (resolution < 2 || resolution > kTerrainStampBakeResolution) {
-        result.error = "Invalid bake resolution.";
+    if (!IsTerrainStampBakeResolution(resolution)) {
+        result.error = "Bake resolution must be between 2 and 16384 pixels.";
         return result;
     }
     const TerrainBakeBounds bounds = region.valid ? region : TerrainSculptBounds(stamps);
@@ -137,8 +138,6 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     // stamp, so it writes at the dedicated slot's resolution. At 512 a level
     // sculpted across 500 m resolved to ~1 m/texel and averaged its own detail
     // away; 4096 puts that at ~12 cm, finer than the clipmap can draw.
-    std::vector<uint16_t> gray(static_cast<size_t>(resolution) * resolution, 0);
-
     // Sample the stack, tracking the range so the 16-bit codomain is used fully
     // rather than clipping tall terrain or wasting bits on a flat level.
     std::vector<float> heights(static_cast<size_t>(resolution) * resolution);
@@ -177,12 +176,15 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     // that range and store the half-range as the stamp's value.
     const float midHeight = (minHeight + maxHeight) * 0.5f;
     const float halfRange = (std::max)((maxHeight - minHeight) * 0.5f, 1e-4f);
+    std::vector<uint16_t> gray(heights.size());
     for (size_t i = 0; i < heights.size(); ++i) {
         const float normalized = (heights[i] - midHeight) / halfRange;
         const float encoded = (normalized * 0.5f + 0.5f) * 65535.0f;
         gray[i] = static_cast<uint16_t>(
             (std::min)(65535.0f, (std::max)(0.0f, encoded)) + 0.5f);
     }
+    // A 16K float grid is 1 GiB; release it before PNG compression allocates.
+    std::vector<float>().swap(heights);
 
     // Resolved like any other stamp name, so "Map/HM_Baked_Map.png" lands in
     // that map's folder and a bare name still lands in the shared library.
@@ -217,5 +219,9 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     result.texture = outputName;
     result.bakedStamps = stamps.size();
     result.metresPerTexel = (halfSpan * 2.0f) / static_cast<float>(resolution);
+    return result;
+} catch (const std::bad_alloc&) {
+    TerrainBakeResult result;
+    result.error = "Not enough memory for this bake resolution. Choose a smaller size.";
     return result;
 }

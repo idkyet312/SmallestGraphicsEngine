@@ -284,7 +284,7 @@ static bool HitInsertionBlackHawkSegment(
     return HitSphereAtSegment(center, 5.0f, start, end, radius, hit);
 }
 
-static bool HitBoatHullAtSegment(const XMFLOAT3& position, float yaw,
+static bool HitBoatHullAtSegment(const XMFLOAT3& position, CXMMATRIX orientation,
                                  const XMFLOAT3& start, const XMFLOAT3& end,
                                  float radius, XMFLOAT3& hit) {
     // Low, flat hull -- a single generous sphere at deck height would engulf
@@ -292,24 +292,30 @@ static bool HitBoatHullAtSegment(const XMFLOAT3& position, float yaw,
     const XMVECTOR a = XMLoadFloat3(&start);
     const XMVECTOR b = XMLoadFloat3(&end);
     const XMVECTOR center = XMLoadFloat3(&position);
-    const XMVECTOR ab = b - a;
-    const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
-    float t = lengthSq > 1e-6f
-        ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
-    t = (std::max)(0.0f, (std::min)(1.0f, t));
-    const XMVECTOR closest = a + ab * t;
-    const XMVECTOR offset = closest - center;
-    const float sinYaw = std::sin(yaw), cosYaw = std::cos(yaw);
-    XMFLOAT3 offsetF; XMStoreFloat3(&offsetF, offset);
-    const float localX = offsetF.x * cosYaw - offsetF.z * sinYaw;
-    const float localZ = offsetF.x * sinYaw + offsetF.z * cosYaw;
-    const float localY = offsetF.y;
-    constexpr float halfBeam = 1.5f, halfLength = 4.5f, hullHeight = 1.1f;
-    if (std::fabs(localX) > halfBeam + radius ||
-        std::fabs(localZ) > halfLength + radius ||
-        localY < -hullHeight - radius || localY > radius)
-        return false;
-    XMStoreFloat3(&hit, closest);
+    const XMMATRIX inverse = XMMatrixTranspose(orientation);
+    XMFLOAT3 localA, localB;
+    XMStoreFloat3(&localA, XMVector3TransformNormal(a - center, inverse));
+    XMStoreFloat3(&localB, XMVector3TransformNormal(b - center, inverse));
+    const float origin[] = {localA.x,localA.y,localA.z};
+    const float delta[] = {localB.x-localA.x,localB.y-localA.y,localB.z-localA.z};
+    const float minimum[] = {-kBoatDeckHalfBeam-radius,-kBoatFloatDepth-radius,
+                              -kBoatDeckHalfLength-radius};
+    const float maximum[] = {kBoatDeckHalfBeam+radius,0.45f+radius,
+                              kBoatDeckHalfLength+radius};
+    float entry = 0, exit = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(delta[axis]) < 1e-6f) {
+            if (origin[axis] < minimum[axis] || origin[axis] > maximum[axis]) return false;
+            continue;
+        }
+        float nearT = (minimum[axis] - origin[axis]) / delta[axis];
+        float farT = (maximum[axis] - origin[axis]) / delta[axis];
+        if (nearT > farT) std::swap(nearT,farT);
+        entry = (std::max)(entry,nearT);
+        exit = (std::min)(exit,farT);
+        if (entry > exit) return false;
+    }
+    XMStoreFloat3(&hit, XMVectorLerp(a,b,entry));
     return true;
 }
 
@@ -317,7 +323,8 @@ static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                            float radius, XMFLOAT3& hit) {
     if (!g_levelPatrolBoatEnabled || !g_boatModel || g_boatDead) return false;
     return HitBoatHullAtSegment(
-        g_boatPosition, g_boatYaw, start, end, radius, hit);
+        g_boatPosition, VehicleSystem::BoatOrientation(g_game.vehicles.boatPhysics,
+            g_boatRoll,g_boatYaw), start, end, radius, hit);
 }
 
 static bool HitOccupiedInsertionBoatSegment(
@@ -330,7 +337,8 @@ static bool HitOccupiedInsertionBoatSegment(
     XMFLOAT3 position = vehicles.insertionBoatPosition;
     position.y -= vehicles.insertionBoatSinkOffset;
     return HitBoatHullAtSegment(
-        position, vehicles.insertionBoatYaw, start, end, radius, hit);
+        position, VehicleSystem::BoatOrientation(vehicles.insertionBoatPhysics,
+            vehicles.insertionBoatRoll,vehicles.insertionBoatYaw), start, end, radius, hit);
 }
 
 static void PlayBanditDeathEvents();
@@ -1317,36 +1325,69 @@ struct BoatPlatformPose {
     float yaw = 0.0f;
     float sinkDepth = 0.0f;
     float deckOffset = kBoatDeckOffset;
+    XMFLOAT4 rotation = {0,0,0,1};
+    bool tilted = false;
 };
 
 static BoatPlatformPose CurrentBoatPlatformPose() {
-    return { g_boatPosition, g_boatYaw, g_boatSinkDepth };
+    const auto& physics = g_game.vehicles.boatPhysics;
+    return {g_boatPosition, g_boatYaw, g_boatSinkDepth, kBoatDeckOffset,
+            physics.rotation, physics.hasPose};
+}
+
+static BoatPlatformPose CurrentInsertionBoatPlatformPose() {
+    const auto& boat = g_game.vehicles;
+    return {boat.insertionBoatPosition, boat.insertionBoatYaw,
+        boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset,
+        boat.insertionBoatPhysics.rotation, boat.insertionBoatPhysics.hasPose};
+}
+
+static XMMATRIX BoatPlatformOrientation(const BoatPlatformPose& pose) {
+    return pose.tilted ? XMMatrixRotationQuaternion(XMLoadFloat4(&pose.rotation))
+                       : XMMatrixRotationY(pose.yaw);
+}
+
+static XMFLOAT3 BoatPlatformLocal(const XMFLOAT3& point, const BoatPlatformPose& pose) {
+    XMFLOAT3 result;
+    XMStoreFloat3(&result, XMVector3TransformNormal(
+        XMLoadFloat3(&point) - XMLoadFloat3(&pose.position) +
+            XMVectorSet(0,pose.sinkDepth,0,0),
+        XMMatrixTranspose(BoatPlatformOrientation(pose))));
+    return result;
+}
+
+static float BoatDeckHeightAt(const BoatPlatformPose& pose, float x, float z) {
+    const XMVECTOR up = XMVector3TransformNormal(XMVectorSet(0,1,0,0),
+                                                 BoatPlatformOrientation(pose));
+    const float uy = XMVectorGetY(up);
+    if (uy < 0.45f) return -FLT_MAX;
+    return pose.position.y - pose.sinkDepth + (pose.deckOffset -
+        XMVectorGetX(up) * (x - pose.position.x) -
+        XMVectorGetZ(up) * (z - pose.position.z)) / uy;
 }
 
 static float BoatDeckY(const BoatPlatformPose& pose) {
+    // The centre stays useful as an exit/camera reference even when capsized.
     return pose.position.y - pose.sinkDepth + pose.deckOffset;
 }
 
 static bool BoatDeckSupports(const XMFLOAT3& position, float feetY,
                              const BoatPlatformPose& pose, float padding,
                              float verticalTolerance = 0.35f) {
-    const float dx = position.x - pose.position.x;
-    const float dz = position.z - pose.position.z;
-    const float sinYaw = std::sin(pose.yaw);
-    const float cosYaw = std::cos(pose.yaw);
-    const float localX = dx * cosYaw - dz * sinYaw;
-    const float localZ = dx * sinYaw + dz * cosYaw;
-    return std::abs(localX) <= kBoatDeckHalfBeam + padding &&
-           std::abs(localZ) <= kBoatDeckHalfLength + padding &&
-           std::abs(feetY - BoatDeckY(pose)) <= verticalTolerance;
+    const XMFLOAT3 local = BoatPlatformLocal({position.x, feetY, position.z}, pose);
+    return std::abs(local.x) <= kBoatDeckHalfBeam + padding &&
+           std::abs(local.z) <= kBoatDeckHalfLength + padding &&
+           std::abs(feetY - BoatDeckHeightAt(pose, position.x, position.z))
+               <= verticalTolerance;
 }
 
 static void TransformWithBoat(XMFLOAT3& position,
                               const BoatPlatformPose& oldPose,
                               const BoatPlatformPose& newPose) {
-    position = VehicleSystem::CarryBoatPosition(position,
-        oldPose.position, oldPose.yaw, BoatDeckY(oldPose),
-        newPose.position, newPose.yaw, BoatDeckY(newPose));
+    const XMFLOAT3 local = BoatPlatformLocal(position, oldPose);
+    XMStoreFloat3(&position, XMVector3TransformNormal(XMLoadFloat3(&local),
+        BoatPlatformOrientation(newPose)) + XMLoadFloat3(&newPose.position) -
+            XMVectorSet(0,newPose.sinkDepth,0,0));
 }
 
 static constexpr int kBoatGunnerMount = -1;
@@ -1361,13 +1402,18 @@ static bool CarryBoatDeckPlayer(const BoatPlatformPose& oldPose,
         (scene.camera.IsGrounded || carryJumpingPassenger) &&
         BoatDeckSupports(scene.camera.Position, playerFeet, oldPose, 0.35f,
                          carryJumpingPassenger ? 2.0f : 0.28f)) {
+        if (BoatDeckHeightAt(newPose, newPose.position.x, newPose.position.z) == -FLT_MAX) {
+            scene.camera.IsGrounded = false;
+            return false;
+        }
         const XMFLOAT3 previousPlayerPosition = scene.camera.Position;
         TransformWithBoat(scene.camera.Position, oldPose, newPose);
         g_game.playerMovement.ApplyPlatformDisplacement({
             scene.camera.Position.x - previousPlayerPosition.x,
             scene.camera.Position.y - previousPlayerPosition.y,
             scene.camera.Position.z - previousPlayerPosition.z });
-        scene.camera.FloorY = BoatDeckY(newPose);
+        scene.camera.FloorY = BoatDeckHeightAt(newPose,
+            scene.camera.Position.x, scene.camera.Position.z);
         return true;
     }
     return false;
@@ -1397,24 +1443,41 @@ static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
     }
 }
 
-static float BoatFootprintGroundHeight(const BoatPlatformPose& pose) {
-    float height = GroundHeightAt(pose.position.x, pose.position.z);
-    for (float x : { -kBoatDeckHalfBeam, kBoatDeckHalfBeam })
-        for (float z : { -kBoatDeckHalfLength, kBoatDeckHalfLength }) {
-            const float wx = pose.position.x + x * std::cos(pose.yaw) +
-                             z * std::sin(pose.yaw);
-            const float wz = pose.position.z - x * std::sin(pose.yaw) +
-                             z * std::cos(pose.yaw);
-            height = (std::max)(height, GroundHeightAt(wx, wz));
-        }
-    return height;
+static void ReleaseBoatBody(VehicleSystem::BoatPhysicsState& state) {
+    if (state.handle != 0) g_destruction.DestroyBoatBody(state.handle);
+    state.handle = 0;
 }
 
-static bool BoatMovesOntoShore(const BoatPlatformPose& oldPose,
-                              const BoatPlatformPose& newPose, float waterY) {
-    const float newGround = BoatFootprintGroundHeight(newPose);
-    return newGround > waterY - kBoatFloatDepth &&
-           newGround > BoatFootprintGroundHeight(oldPose) + 0.001f;
+static bool UpdateBoatBody(VehicleSystem::BoatPhysicsState& state,
+    XMFLOAT3& position, float& yaw, float& roll, float waterY, bool driven,
+    bool afloat = true) {
+    VehicleSystem& boats = g_game.vehicles;
+    DestructionBodyPose pose;
+    if (!g_destruction.GetBoatBodyPose(state.handle, pose)) {
+        XMFLOAT4 rotation = state.rotation;
+        if (!state.hasPose)
+            XMStoreFloat4(&rotation, XMQuaternionRotationMatrix(
+                XMMatrixRotationZ(roll) * XMMatrixRotationY(yaw)));
+        const XMFLOAT3 velocity = state.hasPose ? state.velocity : XMFLOAT3{
+            std::sin(yaw) * boats.boatSpeed, 0, std::cos(yaw) * boats.boatSpeed};
+        XMStoreFloat4(&rotation, XMQuaternionNormalize(XMLoadFloat4(&rotation)));
+        state.handle = g_destruction.CreateBoatBody(position, rotation, velocity);
+        if (!g_destruction.GetBoatBodyPose(state.handle, pose)) return false;
+    }
+    position = pose.position;
+    state.rotation = pose.rotation;
+    state.velocity = pose.linearVelocity;
+    state.hasPose = true;
+    roll = 0.0f;
+    XMFLOAT3 forward;
+    XMStoreFloat3(&forward, XMVector3TransformNormal(XMVectorSet(0,0,1,0),
+        XMMatrixRotationQuaternion(XMLoadFloat4(&state.rotation))));
+    yaw = std::atan2(forward.x, forward.z);
+    if (driven) boats.boatSpeed = pose.linearVelocity.x * forward.x +
+        pose.linearVelocity.y * forward.y + pose.linearVelocity.z * forward.z;
+    g_destruction.SetBoatBodyInput(state.handle, driven ? boats.boatThrottle : 0.0f,
+        driven ? boats.boatSteering : 0.0f, !driven || boats.boatBrake, waterY, afloat);
+    return true;
 }
 
 static void UpdateBoat(float dt) {
@@ -1428,12 +1491,33 @@ static void UpdateBoat(float dt) {
             const float blend = wasCaptured
                 ? 1.0f - std::exp(-12.0f * (std::max)(0.0f, dt)) : 1.0f;
             g_boatPosition.x += (remote->x - g_boatPosition.x) * blend;
+            g_boatPosition.y += (remote->y - g_boatPosition.y) * blend;
             g_boatPosition.z += (remote->z - g_boatPosition.z) * blend;
             g_boatYaw += std::atan2(std::sin(remote->yaw - g_boatYaw),
                 std::cos(remote->yaw - g_boatYaw)) * blend;
+            auto& physics = g_game.vehicles.boatPhysics;
+            ReleaseBoatBody(physics);
+            physics.hasPose = true;
+            XMStoreFloat4(&physics.rotation, XMQuaternionSlerp(
+                XMLoadFloat4(&physics.rotation),
+                XMQuaternionNormalize(XMVectorSet(
+                    remote->qx,remote->qy,remote->qz,remote->qw)), blend));
+            physics.velocity = {remote->vx,remote->vy,remote->vz};
+            g_boatRoll = 0;
         }
     }
     if (g_boatDead) {
+        if (g_game.vehicles.boatPhysics.handle != 0) {
+            UpdateBoatBody(g_game.vehicles.boatPhysics, g_boatPosition, g_boatYaw,
+                g_boatRoll, g_ocean.GetSurfaceY(), false, false);
+            if (g_boatPosition.y < g_ocean.GetSurfaceY() - 3.2f) {
+                g_boatSunk = true;
+                ReleaseBoatBody(g_game.vehicles.boatPhysics);
+            }
+            CarryBoatOccupants(oldPose);
+            return;
+        }
+        ReleaseBoatBody(g_game.vehicles.boatPhysics);
         if (g_boatSunk) return;
         // Settle into the water rather than falling: sink depth grows and
         // levels off, with a slow list to one side as it goes under.
@@ -1451,18 +1535,17 @@ static void UpdateBoat(float dt) {
         VehicleSystem& boat = g_game.vehicles;
         const bool localSimulation = !boat.boatRemoteDriven &&
             (!ClientOwnedByHost() || boat.drivingBoat);
-        if (localSimulation) boat.StepDrivenBoat(dt);
         const float waterY = g_ocean.GetSurfaceY();
-        // Check the hull footprint, not just its centre, so the bow cannot
-        // drive onto the beach while the helm is still over water.
-        if (localSimulation && BoatMovesOntoShore(oldPose, CurrentBoatPlatformPose(), waterY)) {
-            g_boatPosition = oldPose.position;
-            g_boatYaw = oldPose.yaw;
-            boat.boatSpeed = 0.0f;
+        if (localSimulation) {
+            if (!UpdateBoatBody(boat.boatPhysics, g_boatPosition, g_boatYaw,
+                    g_boatRoll, waterY + g_ocean.WaveHeightAt(
+                        g_boatPosition.x, g_boatPosition.z), boat.drivingBoat)) {
+                boat.StepDrivenBoat(dt);
+                g_boatPosition.y = waterY;
+            }
+        } else {
+            ReleaseBoatBody(boat.boatPhysics);
         }
-        g_boatPosition.y = waterY +
-            g_ocean.WaveHeightAt(g_boatPosition.x, g_boatPosition.z);
-        g_boatRoll *= std::exp(-2.0f * (std::max)(0.0f, dt));
         CarryBoatOccupants(oldPose);
         return;
     }

@@ -18,6 +18,9 @@ ProfilerDX12                g_profiler;
 static bool                 g_profileDumpEnabled = false;
 static bool                 g_profileDumpWritten = false;
 static UINT                 g_profileDumpFrame = 0;
+// SGE_PROFILE_DUMP_FRAME=<n> settles n frames first (default 240) -- a level
+// with an insertion flight needs thousands before gameplay is on screen.
+static UINT                 g_profileDumpWarmupFrames = 240;
 static bool                 g_forceTerrainErrorLOD = false;
 UINT                        g_forwardDrawCalls = 0;
 UINT                        g_shadowDrawCalls = 0;
@@ -595,6 +598,10 @@ constexpr float              kBoatCrewRise = 0.20f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;
+// The local player's body at the boat helm. Kept out of g_bandits: that list
+// feeds AI targeting, squads, HUD markers and projectile hits, none of which
+// should see a purely visual stand-in for the player.
+static std::unique_ptr<SkinnedEnemy> g_boatDriverBody;
 // Every AI actor plays its authored arm animation instead of having both hands
 // solved onto the rifle: the gun layer and its two arm IK solves are skipped
 // and the clip's own arms come through unmodified. The weapon stays loaded,
@@ -1131,6 +1138,7 @@ struct HumveeGameplayState {
     XMFLOAT4 drawRotation{ 0.0f, 0.0f, 0.0f, 1.0f };
     float netTurretYaw = 0.0f;
     bool netTurretSeen = false;
+    bool netFriendlyGunner = false;
 };
 static std::vector<HumveeGameplayState> g_humveeGameplay;
 static std::shared_ptr<SceneNode> g_houseTemplate;

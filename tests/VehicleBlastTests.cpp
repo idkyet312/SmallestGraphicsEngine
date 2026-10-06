@@ -9,6 +9,24 @@ static void Check(bool ok, const char* message) {
 
 int main() {
     using namespace DirectX;
+    for (const float maxHealth : {900.0f, 1500.0f, 2400.0f}) {
+        float health = maxHealth;
+        health -= SGE::TankC4BlastDamage(0.0f, 5.4f, maxHealth);
+        Check(health > 0.0f && health == maxHealth * 0.5f,
+              "one attached C4 must leave a full-health tank alive at half HP");
+        health -= SGE::TankC4BlastDamage(0.0f, 5.4f, maxHealth);
+        Check(health <= 0.0f,
+              "the second attached C4 must destroy the tank for any authored HP");
+        Check(SGE::TankC4BlastDamage(1.49f, 5.4f, maxHealth) == maxHealth * 0.5f,
+              "a charge close to the hull must retain direct-hit damage");
+        const float splash = SGE::TankC4BlastDamage(3.0f, 5.4f, maxHealth);
+        Check(splash > 0.0f && splash < maxHealth * 0.5f,
+              "nearby C4 splash must be weaker than an attached charge");
+        Check(SGE::TankC4BlastDamage(5.4f, 5.4f, maxHealth) == 0.0f &&
+              SGE::TankC4BlastDamage(7.0f, 5.4f, maxHealth) == 0.0f &&
+              SGE::TankC4BlastDamage(0.0f, 0.0f, maxHealth) == 0.0f,
+              "C4 outside its blast radius or with no radius must not hurt tanks");
+    }
     VehicleSystem vehicles;
     const size_t target = vehicles.PlaceAATurret({ 0.0f, 0.0f, 0.0f });
     const float radius = 14.0f; // Default deploy-screen missile kill radius.

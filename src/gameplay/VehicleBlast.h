@@ -4,6 +4,15 @@
 
 namespace SGE {
 
+inline float TankC4BlastDamage(float surfaceDistance, float radius,
+                               float maxHealth) {
+    if (radius <= 0.0f || surfaceDistance >= radius) return 0.0f;
+    // Two attached charges destroy any authored hull, independent of its HP.
+    const float directDamage = maxHealth * 0.5f;
+    return surfaceDistance < 1.5f ? directDamage
+        : directDamage * 0.6f * (1.0f - surfaceDistance / radius);
+}
+
 inline float AATurretBlastDamage(float distance, float radius, float fragDamage,
                                 bool c4, bool rocket, bool missile, bool hostile) {
     const float reach = radius + VehicleSystem::AATurretMountHeight;

@@ -347,6 +347,9 @@ int main() {
     patrol.captured = 1;
     patrol.x = -35.0f; patrol.y = 0.2f; patrol.z = 90.0f;
     patrol.yaw = -1.2f;
+    patrol.qx = 0.15f; patrol.qy = -0.5f;
+    patrol.qz = 0.25f; patrol.qw = 0.8f;
+    patrol.vx = 2; patrol.vy = -1; patrol.vz = 7;
     const size_t vehicleStart = wire.size();
     host.PublishVehicles(helicopters, boat, patrol);
     host.Update(NetSession::kNetTickSeconds, local);
@@ -375,6 +378,9 @@ int main() {
     Check(remotePatrol && remotePatrol->captured == 1 &&
           remotePatrol->x == patrol.x && remotePatrol->yaw == patrol.yaw,
           "client must receive the captured military boat's pose");
+    Check(remotePatrol && remotePatrol->qx == patrol.qx &&
+          remotePatrol->qz == patrol.qz && remotePatrol->vy == patrol.vy,
+          "client must receive a boat's physical tilt and momentum");
 
     // A later join receives the host's current active state on its first tick.
     NetSession lateClient;
@@ -430,6 +436,19 @@ int main() {
     client.Update(0.0f, local);
     Check(!client.RemotePatrolBoat()->captured,
           "nonfinite military boat packet must be rejected");
+    invalid = vehicleMessage;
+    invalid.tick = vehicleMessage.tick + 1;
+    invalid.patrolBoat.qz = std::numeric_limits<float>::quiet_NaN();
+    Receive(3, invalid);
+    client.Update(0.0f, local);
+    Check(!client.RemotePatrolBoat()->captured,
+          "nonfinite boat rotations must be rejected");
+    invalid.patrolBoat.qx = invalid.patrolBoat.qy = invalid.patrolBoat.qz =
+        invalid.patrolBoat.qw = 0;
+    Receive(3, invalid);
+    client.Update(0.0f, local);
+    Check(!client.RemotePatrolBoat()->captured,
+          "a zero boat quaternion must be rejected");
 
     // A client's bought marines: the client asks, the host lands them. The
     // request must arrive intact from a known peer and nowhere else.
@@ -466,6 +485,8 @@ int main() {
     enemies.enemyCount = 2;
     enemies.enemies[0].id = 10;
     enemies.enemies[0].marine = 1;
+    enemies.enemies[0].humveeCrewSeat = 0;
+    enemies.enemies[0].humveeCrewVehicle = 2;
     enemies.enemies[1].id = 11;
     Receive(3, enemies);
     client.Update(0.0f, local);
@@ -473,6 +494,33 @@ int main() {
           client.RemoteEnemies()[0].marine &&
           !client.RemoteEnemies()[1].marine,
           "enemy snapshot must carry the marine flag");
+    Check(client.RemoteEnemies()[0].humveeCrewSeat == 0 &&
+          client.RemoteEnemies()[0].humveeCrewVehicle == 2 &&
+          client.RemoteEnemies()[1].humveeCrewSeat == 0xFF,
+          "marine Humvee seats must survive replication");
+    enemies.tick = 2;
+    enemies.enemies[0].humveeCrewSeat = 2;
+    Receive(3, enemies);
+    client.Update(0.0f, local);
+    Check(client.RemoteEnemies()[0].humveeCrewSeat == 2,
+          "a marine passenger must retain its seat");
+    enemies.tick = 3;
+    enemies.enemies[0].humveeCrewSeat = 0xFF;
+    enemies.enemies[0].humveeCrewVehicle = 0xFF;
+    Receive(3, enemies);
+    client.Update(0.0f, local);
+    Check(client.RemoteEnemies()[0].humveeCrewSeat == 0xFF &&
+          client.RemoteEnemies()[0].humveeCrewVehicle == 0xFF,
+          "disembarking must clear the replicated seat");
+    ServerArmorStateMessage crewArmor;
+    crewArmor.tick = 1;
+    crewArmor.humveeCount = 1;
+    crewArmor.humvees[0].index = 2;
+    crewArmor.humvees[0].friendlyGunner = 1;
+    Receive(3, crewArmor);
+    client.Update(0.0f, local);
+    Check(client.RemoteArmor() && client.RemoteArmor()->humvees[0].friendlyGunner == 1,
+          "gunner control must replicate independently of visible infantry");
 
     client.Shutdown();
     Check(client.RemoteEscapeBoat() == nullptr,

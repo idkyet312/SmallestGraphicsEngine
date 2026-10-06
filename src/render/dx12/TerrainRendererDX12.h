@@ -136,6 +136,8 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
     UINT terrainTextureSlot_ = ~0u;
     TerrainTextureLayers textureLayers = TerrainTexturePreset(LevelMapType::Tropical);
+    XMFLOAT3 grassLayerAlbedo{};
+    bool grassLayerAlbedoReady = false;
     UINT neutralHeightBlendMask = 0;
     bool supported = false;
     bool msaaSupported = false;
@@ -528,6 +530,10 @@ public:
     // lodNear is target pixel error and lodStep is viewport height in this mode;
     // the legacy path retains their distance-band meanings.
     static constexpr UINT kStyleErrorLOD = 16u;
+    // bit 5 (32) = camera-centred clipmap snap for the level editor: the fine
+    // rings follow the free camera to within 8 m instead of one coarsest tile
+    // (128 m at 8 rings), at the cost of holding outer rings at finer LOD.
+    static constexpr UINT kStyleCameraSnap = 32u;
     static bool IsFlat(UINT terrainStyle) {
         return (terrainStyle & kStyleFlat) != 0u;
     }
@@ -537,8 +543,27 @@ public:
     static bool IsClipmap(UINT terrainStyle) {
         return (terrainStyle & kStyleClipmap) != 0u;
     }
+    // CPU mirror of ResolveClipmapTile's shared snap in terrain_as.hlsl.
+    static bool CameraSnapActive(const Params& params) {
+        return (params.terrainStyle & kStyleCameraSnap) != 0u &&
+               (params.terrainStyle & kStyleErrorLOD) == 0u;
+    }
+    static float ClipmapSnapGrid(const Params& params) {
+        const UINT rings = (std::max)(1u, params.tilesZ);
+        const float coarsestTile =
+            params.tileSize * static_cast<float>(1u << (rings - 1u));
+        return CameraSnapActive(params) ? coarsestTile * 0.125f : coarsestTile;
+    }
+    static float ClipmapSnap(float coordinate, const Params& params) {
+        const float snapGrid = ClipmapSnapGrid(params);
+        return CameraSnapActive(params)
+            ? std::floor(coordinate / snapGrid + 0.5f) * snapGrid
+            : std::floor(coordinate / snapGrid) * snapGrid;
+    }
 
     static uint64_t SculptRevision() { return s_sculptRevision; }
+    static uint64_t StampAtlasRevision() { return s_stampAtlasRevision; }
+    uint64_t EditorPreviewRevision() const { return editorPreviewRevision_; }
     static uint64_t BathymetryRevision() { return s_bathymetryRevision; }
 
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
@@ -839,15 +864,13 @@ public:
             UploadSculptStamps(frame);
         }
         // The rock mask shares the atlas's existing per-frame upload lifetime.
-        desc.Width = static_cast<UINT64>(kTerrainStampAtlasTexels + 2 +
-            kTerrainRockMaskTexels) *
-            sizeof(uint16_t);
+        desc.Width = static_cast<UINT64>(s_stampAtlas.size()) * sizeof(uint16_t);
         for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
             if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
                     D3D12_HEAP_FLAG_NONE, &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                     IID_PPV_ARGS(&stampAtlasBuffers[frame])))) return false;
-            UploadStampAtlas(frame);
+            if (!UploadStampAtlas(frame)) return false;
         }
         return true;
     }
@@ -892,10 +915,31 @@ public:
                 std::abs(stamp.baseHeight) + std::abs(stamp.value) + 12.0f);
     }
 
-    void UploadStampAtlas(UINT frame) {
-        if (frame >= FRAME_COUNT || !stampAtlasBuffers[frame] ||
-            uploadedStampAtlasRevision_[frame] == s_stampAtlasRevision)
-            return;
+    bool UploadStampAtlas(UINT frame) {
+        if (frame >= FRAME_COUNT || !stampAtlasBuffers[frame]) return false;
+        if (uploadedStampAtlasRevision_[frame] == s_stampAtlasRevision) return true;
+        const UINT64 requiredBytes = UINT64(s_stampAtlas.size()) * sizeof(uint16_t);
+        if (stampAtlasBuffers[frame]->GetDesc().Width != requiredBytes) {
+            // Reuse the existing frame-slot lifetime: MoveToNextFrame already
+            // waited for this slot. Other in-flight slots keep their resources
+            // until their own reuse; changing bake size adds no GPU wait.
+            D3D12_HEAP_PROPERTIES heap = {};
+            heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC desc = stampAtlasBuffers[frame]->GetDesc();
+            desc.Width = requiredBytes;
+            ComPtr<ID3D12Resource> replacement;
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                    D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&replacement)))) {
+                SGE_LOG("LogTerrain", EngineLog::Level::Error,
+                    "Unable to allocate terrain bake buffer (" +
+                    std::to_string(requiredBytes) + " bytes).");
+                return false;
+            }
+            stampAtlasBuffers[frame] = std::move(replacement);
+            uploadedStampAtlasRevision_[frame] = 0;
+        }
         // Copy only the texels that actually changed. The atlas is 67 MB once
         // the 4K bake slot is included, and a stamp load dirties one 512 layer
         // (0.5 MB) or the bake slot; copying the whole buffer per frame-in-
@@ -909,18 +953,18 @@ public:
         if (uploadedStampAtlasRevision_[frame] != 0 &&
             dirtyAtlasFirst_[frame] <= dirtyAtlasLast_[frame]) {
             firstTexel = dirtyAtlasFirst_[frame];
-            lastTexel = dirtyAtlasLast_[frame] + 1;
+            lastTexel = (std::min)(dirtyAtlasLast_[frame] + 1, s_stampAtlas.size());
         }
         if (firstTexel >= lastTexel) {
             uploadedStampAtlasRevision_[frame] = s_stampAtlasRevision;
-            return;
+            return true;
         }
         void* destination = nullptr;
         // Map with an empty read range: this is an upload heap and nothing
         // reads back, so the driver must not fault the old contents in.
         D3D12_RANGE readRange{ 0, 0 };
         if (FAILED(stampAtlasBuffers[frame]->Map(0, &readRange, &destination)))
-            return;
+            return false;
         const size_t offset = firstTexel * sizeof(uint16_t);
         const size_t bytes = (lastTexel - firstTexel) * sizeof(uint16_t);
         std::memcpy(static_cast<uint8_t*>(destination) + offset,
@@ -932,6 +976,7 @@ public:
         // inverted range, which is what the check above reads as "nothing".
         dirtyAtlasFirst_[frame] = s_stampAtlas.size();
         dirtyAtlasLast_[frame] = 0;
+        return true;
     }
 
     // Widens every frame's pending dirty span to cover a region just written
@@ -1089,7 +1134,7 @@ public:
         s_rockMaskActive = std::any_of(mask.begin(), mask.end(),
             [](uint16_t value) { return value != 0; });
         s_stampAtlas[kTerrainStampAtlasTexels] = s_rockMaskActive ? 1u : 0u;
-        s_stampAtlas[kTerrainStampAtlasTexels + 1] = 0;
+        s_stampAtlas[kTerrainStampAtlasTexels + 1] = uint16_t(s_bakeResolution);
         std::copy(mask.begin(), mask.end(),
             s_stampAtlas.begin() + kTerrainStampAtlasTexels + 2);
         MarkStampAtlasDirty(kTerrainStampAtlasTexels, 2 + kTerrainRockMaskTexels);
@@ -1478,6 +1523,24 @@ public:
             }
         }
 
+        // Average the uploaded grass slice, including exposure/fallbacks. Decode
+        // before averaging to match the terrain's sRGB SRV rather than its JPEG.
+        std::array<float, 256> linearValues{};
+        for (size_t i = 0; i < linearValues.size(); ++i) {
+            const float encoded = static_cast<float>(i) / 255.0f;
+            linearValues[i] = encoded <= 0.04045f ? encoded / 12.92f
+                : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+        }
+        double grassSum[3] = {};
+        for (size_t texel = 0; texel < layerBytes; texel += 4)
+            for (size_t channel = 0; channel < 3; ++channel)
+                grassSum[channel] += linearValues[maps[0][texel + channel]];
+        const double grassTexels = static_cast<double>(side) * side;
+        const XMFLOAT3 grassMean(
+            static_cast<float>(grassSum[0] / grassTexels),
+            static_cast<float>(grassSum[1] / grassTexels),
+            static_cast<float>(grassSum[2] / grassTexels));
+
         if (!CreateTextureArray(maps[0], side, layers, true,
                                 terrainAlbedoArray, terrainUploads[0])) {
             std::cerr << "Terrain PBR: failed to create albedo texture array\n";
@@ -1518,6 +1581,10 @@ public:
         g_dx12.device->CreateShaderResourceView(terrainNormalArray.Get(), &srv, cpu);
         cpu.ptr += stride;
         g_dx12.device->CreateShaderResourceView(terrainRoughnessArray.Get(), &srv, cpu);
+        // Publish only after a successful material upload; a failed edit keeps
+        // the previous terrain textures and their matching blade colour.
+        grassLayerAlbedo = grassMean;
+        grassLayerAlbedoReady = true;
         return true;
     }
 
@@ -1540,7 +1607,7 @@ public:
         drawParams.sculptCount = RenderSculptCount();
         drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
-        UploadStampAtlas(g_dx12.frameIndex);
+        if (!UploadStampAtlas(g_dx12.frameIndex)) return;
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
@@ -1607,7 +1674,7 @@ public:
         drawParams.sculptCount = RenderSculptCount();
         drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
-        UploadStampAtlas(g_dx12.frameIndex);
+        if (!UploadStampAtlas(g_dx12.frameIndex)) return false;
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
@@ -1650,7 +1717,7 @@ public:
         drawParams.sculptCount = RenderSculptCount();
         drawParams.sculptMaxDisplacement = RenderSculptMaxDisplacement();
         UploadSculptStamps(g_dx12.frameIndex);
-        UploadStampAtlas(g_dx12.frameIndex);
+        if (!UploadStampAtlas(g_dx12.frameIndex)) return false;
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         if (relief) {
             // Matches the relief-only TerrainParams suffix in terrain_height.
@@ -1687,9 +1754,11 @@ private:
         s_stampLoadState.assign(s_stampNames.size(), 0u);
         s_stampWriteTimes.assign(
             s_stampNames.size(), std::filesystem::file_time_type{});
-        s_stampAtlas.assign(kTerrainStampAtlasTexels + 2 +
-            kTerrainRockMaskTexels, 0u);
+        s_stampAtlas.assign(TerrainStampBufferTexels(s_bakeResolution), 0u);
         std::fill_n(s_stampAtlas.begin(), kTerrainStampAtlasTexels, 32768u);
+        std::fill(s_stampAtlas.begin() + kTerrainStampBakeOffset,
+            s_stampAtlas.end(), 32768u);
+        s_stampAtlas[kTerrainStampAtlasTexels + 1] = uint16_t(s_bakeResolution);
     }
 
     static UINT FindHeightStampLayer(const std::string& texture) {
@@ -1806,15 +1875,27 @@ private:
             "Terrain stamp loaded: " + path.string() + " (" +
             std::to_string(width) + "x" + std::to_string(height) + ")");
 
-        // A bake covers the whole sculpted level, so it resolves into the
-        // dedicated 4K region past the atlas rather than being box-filtered
-        // down to a 512 layer like a hand-placed stamp.
+        // Preserve the bake's native resolution instead of reducing it to 4K.
         const bool isBake = layer == kTerrainStampBakeLayer;
+        if (isBake && (width != height || !IsTerrainStampBakeResolution(uint32_t(width)))) {
+            SGE_LOG("LogTerrain", EngineLog::Level::Error,
+                "Terrain bake must be square and between 2 and 16384 pixels: " + path.string());
+            loadState = 2u;
+            if (!writeTimeError) writeTimeRecord = writeTime;
+            return UINT_MAX;
+        }
+        if (isBake && s_bakeResolution != uint32_t(width)) {
+            std::vector<uint16_t> resized(TerrainStampBufferTexels(uint32_t(width)), 32768u);
+            std::copy_n(s_stampAtlas.begin(), kTerrainStampBakeOffset, resized.begin());
+            s_stampAtlas.swap(resized);
+            s_bakeResolution = uint32_t(width);
+            s_stampAtlas[kTerrainStampAtlasTexels + 1] = uint16_t(s_bakeResolution);
+            MarkStampAtlasDirty(kTerrainStampAtlasTexels, 2);
+        }
         const uint32_t side = isBake
-            ? kTerrainStampBakeResolution : kTerrainStampResolution;
+            ? s_bakeResolution : kTerrainStampResolution;
         const size_t layerOffset = isBake
-            ? static_cast<size_t>(kMaxTerrainStampTextures) *
-                  kTerrainStampResolution * kTerrainStampResolution
+            ? kTerrainStampBakeOffset
             : layer * static_cast<size_t>(kTerrainStampResolution) *
                   kTerrainStampResolution;
         // Box filter over each output texel's exact source footprint. This used
@@ -1823,7 +1904,9 @@ private:
         // again. Averaging the real footprint stays correct whatever the source
         // dimensions and atlas resolution are, and first use of a stamp reads
         // each source texel exactly once.
-        for (uint32_t y = 0; y < side; ++y) {
+        if (isBake) {
+            std::copy(source.begin(), source.end(), s_stampAtlas.begin() + layerOffset);
+        } else for (uint32_t y = 0; y < side; ++y) {
             const int y0 = static_cast<int>(static_cast<uint64_t>(y) * height /
                                             side);
             const int y1 = (std::max)(y0 + 1,
@@ -1885,7 +1968,7 @@ private:
         // visible ground.
         const bool isBake = layer == kTerrainStampBakeLayer;
         const uint32_t side = isBake
-            ? kTerrainStampBakeResolution : kTerrainStampResolution;
+            ? s_bakeResolution : kTerrainStampResolution;
         const float fx = u * (side - 1u);
         const float fy = v * (side - 1u);
         const uint32_t x0 = static_cast<uint32_t>(fx);
@@ -1893,8 +1976,7 @@ private:
         const uint32_t x1 = (std::min)(x0 + 1u, side - 1u);
         const uint32_t y1 = (std::min)(y0 + 1u, side - 1u);
         const size_t base = isBake
-            ? static_cast<size_t>(kMaxTerrainStampTextures) *
-                  kTerrainStampResolution * kTerrainStampResolution
+            ? kTerrainStampBakeOffset
             : static_cast<size_t>(layer) *
                   kTerrainStampResolution * kTerrainStampResolution;
         const auto texel = [&](uint32_t tx, uint32_t ty) {
@@ -1942,6 +2024,7 @@ public:
     }
 private:
     inline static std::string s_bakeName;
+    inline static uint32_t s_bakeResolution = kTerrainStampBakeResolution;
     inline static uint8_t s_bakeLoadState = 0u;
     inline static std::filesystem::file_time_type s_bakeWriteTime;
     inline static uint64_t s_sculptRevision = 1;

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -30,6 +31,9 @@
 static const UINT SHADOW_MAP_SIZE = 4096;
 static const UINT SHADOW_MAX_DRAWS = 12288;
 static const UINT SHADOW_MAX_INSTANCES = 12288;
+// One skinned actor drawn into every shadow pass in addition to the bandit
+// list (the player's boat-helm body). Owned by the app; null when unused.
+inline SkinnedEnemy* g_shadowExtraActor = nullptr;
 
 static constexpr D3D12_RESOURCE_STATES SHADOW_SHADER_READ_STATE =
     static_cast<D3D12_RESOURCE_STATES>(
@@ -738,6 +742,43 @@ public:
     VirtualShadowMapDX12 virtualMaps;
     bool virtualDepthAttempted = false;
     bool drawingVirtualPages = false;
+
+    static bool VirtualTerrainLive() {
+        static const bool live =
+            GetEnvironmentVariableA("SGE_VSM_TERRAIN_LIVE", nullptr, 0) > 0;
+        return live;
+    }
+
+    // Everything the terrain's shadow depth depends on, minus the camera.
+    // Terrain LOD follows the camera too, but a page re-rendered from another
+    // position measured identical (100 m sweep, diff at the noise floor), so
+    // only real height-field changes invalidate.
+    struct VirtualTerrainKey {
+        uint64_t sculpt = 0, stampAtlas = 0, preview = 0;
+        TerrainRendererDX12::Params params{};
+        bool operator==(const VirtualTerrainKey& other) const {
+            return sculpt == other.sculpt && stampAtlas == other.stampAtlas &&
+                preview == other.preview &&
+                std::memcmp(&params, &other.params, sizeof(params)) == 0;
+        }
+    };
+    VirtualTerrainKey virtualTerrainKey{};
+
+    // Cheap backstop for every terrain edit path (craters, editor sculpts,
+    // stamp re-bakes, level params) instead of trusting each call site to
+    // remember InvalidateCachedCascades now that pages hold terrain.
+    void InvalidateVirtualPagesOnTerrainChange() {
+        if (VirtualTerrainLive()) return;
+        VirtualTerrainKey key;
+        key.sculpt = TerrainRendererDX12::SculptRevision();
+        key.stampAtlas = TerrainRendererDX12::StampAtlasRevision();
+        key.preview = g_terrain.EditorPreviewRevision();
+        key.params = CurrentTerrainParams();
+        if (!(key == virtualTerrainKey)) {
+            virtualMaps.pages.Invalidate();
+            virtualTerrainKey = key;
+        }
+    }
     UINT size = SHADOW_MAP_SIZE;
     bool initialized = false;
     UINT cachedCascadesThisFrame = 0;
@@ -957,8 +998,17 @@ public:
             part == ShadowScenePart::Static || part == ShadowScenePart::SpotStatic;
         const bool drawDynamic = part == ShadowScenePart::All ||
             part == ShadowScenePart::Dynamic || part == ShadowScenePart::SpotLive;
+        // Terrain is baked into cached VSM pages rather than redrawn into all
+        // 16 resident pages every frame (measured 2.42 -> 1.30 ms on
+        // Islandv10). RenderVirtualTerrainKey invalidates the pages whenever
+        // the height field's inputs change. SGE_VSM_TERRAIN_LIVE restores the
+        // per-frame redraw for A/B.
+        const bool terrainInStaticPage =
+            drawingVirtualPages && !VirtualTerrainLive();
         const bool drawTerrain = part == ShadowScenePart::All ||
-            part == ShadowScenePart::Static || part == ShadowScenePart::SpotLive;
+            part == ShadowScenePart::Static ||
+            (part == ShadowScenePart::SpotLive && !terrainInStaticPage) ||
+            (part == ShadowScenePart::SpotStatic && terrainInStaticPage);
         // Terrain first, while the main graphics root signature can still be
         // bound: it runs on the mesh-shader pipeline and needs slots that
         // DepthOnlyShaderDX12 does not declare. drawShader.Use() below then
@@ -980,6 +1030,8 @@ public:
             // reads once the GPU runs the list, including the final shading.
             // Centring the shadow clipmap on the light needs a per-draw camera
             // slot (or the origin passed through TerrainParams) first.
+            ProfilerDX12::Scope terrainScope(g_profiler, "Shadow/Terrain",
+                                             g_dx12.commandList.Get());
             g_terrain.DrawShadow(*terrainShader, CurrentTerrainParams());
         }
         drawShader.Use();
@@ -1261,10 +1313,9 @@ public:
             }
         }
 
-        if (drawDynamic && bandits) for (const auto& banditOwner : *bandits) {
-            SkinnedEnemy* bandit = banditOwner.get();
+        const auto drawActorShadow = [&](SkinnedEnemy* bandit) {
             if (!bandit || (!bandit->castsShadow && !bandit->Dead()) || !bandit->CanRender())
-                continue;
+                return;
             const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
             const XMMATRIX model = bandit->MeshWorldMatrix();
             for (const auto& prim : bandit->model.node->mesh->primitives) {
@@ -1281,7 +1332,11 @@ public:
                 }
                 drawShader.NextDrawCall();
             }
-        }
+        };
+        if (drawDynamic && bandits)
+            for (const auto& banditOwner : *bandits) drawActorShadow(banditOwner.get());
+        if (drawDynamic && g_shadowExtraActor && g_shadowExtraActor->visible)
+            drawActorShadow(g_shadowExtraActor);
 
         if (drawDynamic) for (auto& p : scene.projectiles) {
             if (!p.active) continue;
@@ -1637,6 +1692,8 @@ public:
                     D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
             for (UINT cascade = 1; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
                 if (!refreshCascade[cascade]) continue;
+                ProfilerDX12::Scope refreshScope(g_profiler,
+                    "Shadow/Far Refresh", g_dx12.commandList.Get());
                 const UINT cacheIndex = cascade - 1;
                 transition(cachedFarShadowMap.Get(),
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1667,8 +1724,14 @@ public:
                 nearDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
             g_dx12.commandList->OMSetRenderTargets(
                 0, nullptr, FALSE, &nearDsv);
-            DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
-                bandits, cascadeMatrices[0], false, terrainShader);
+            {
+                ProfilerDX12::Scope nearScope(g_profiler, "Shadow/Cascade 0",
+                                              g_dx12.commandList.Get());
+                DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                    bandits, cascadeMatrices[0], false, terrainShader);
+            }
+            ProfilerDX12::Scope farDynamicScope(g_profiler,
+                "Shadow/Far Copy + Dynamic", g_dx12.commandList.Get());
 
             for (UINT cascade = 1; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
                 const UINT cacheIndex = cascade - 1;
@@ -1708,6 +1771,7 @@ public:
                 // the cascade/spot constants referenced earlier in the list.
                 virtualDepthShader.BeginFrame();
                 virtualDepthShader.SetPalmWindFrame(g_trees.GetWindFrame());
+                InvalidateVirtualPagesOnTerrainChange();
                 drawingVirtualPages = true;
                 virtualMaps.Render(scene,
                     [&](const XMMATRIX& matrix, bool live) {

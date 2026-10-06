@@ -101,7 +101,7 @@ int main() {
     // Pinned so that changing PlayerSnapshot and forgetting the bump -- which
     // would have two builds silently misreading each other's bytes -- fails
     // here instead of in a session.
-    Check(kProtocolVersion == 30, "protocol version was not bumped");
+    Check(kProtocolVersion == 32, "protocol version was not bumped");
     static_assert(std::is_trivially_copyable<ChargeStickData>::value,
                   "charge attachment must be memcpy-able");
     static_assert(std::is_trivially_copyable<ClientChargeStuckMessage>::value,
@@ -180,14 +180,11 @@ int main() {
     static_assert(offsetof(PlayerSnapshot, reviveProgress) % 4 == 0,
                   "reviveProgress must stay 4-byte aligned");
 
-    // `killer` cost four bytes per enemy, not zero: id is a uint16, so the flag
-    // bytes were already full and alignment re-padded to the next float. Pinned
-    // so the next flag added here is a deliberate decision about datagram size
-    // rather than a surprise -- the first three uint8s after `id` are free, the
-    // fourth is not.
-    static_assert(offsetof(EnemySnapshot, x) == 8,
+    // Crew vehicle and seat extend the flags past the previous padding;
+    // pin the extra four bytes and keep the datagram-size check below.
+    static_assert(offsetof(EnemySnapshot, x) == 12,
                   "EnemySnapshot layout changed unexpectedly");
-    static_assert(sizeof(EnemySnapshot) == 36,
+    static_assert(sizeof(EnemySnapshot) == 40,
                   "EnemySnapshot size changed unexpectedly");
     // `marine` rides in the padding `killer` left, so it costs nothing.
     static_assert(offsetof(EnemySnapshot, marine) == 5,
@@ -427,6 +424,8 @@ int main() {
         enemiesSent.enemies[i].aimYaw = -0.25f * i;
         enemiesSent.enemies[i].health = 100.0f - i;
         enemiesSent.enemies[i].moving = static_cast<uint8_t>(i % 2);
+        enemiesSent.enemies[i].humveeCrewSeat = static_cast<uint8_t>(i % 3);
+        enemiesSent.enemies[i].humveeCrewVehicle = static_cast<uint8_t>(i / 3);
         enemiesSent.enemies[i].dead = static_cast<uint8_t>(i == 5 ? 1 : 0);
         enemiesSent.enemies[i].killer =
             i == 5 ? static_cast<PlayerId>(2) : kInvalidPlayerId;
@@ -457,6 +456,9 @@ int main() {
               "enemy killer lost");
         Check(enemiesReceived.enemies[i].dead == enemiesSent.enemies[i].dead,
               "enemy dead flag lost");
+        Check(enemiesReceived.enemies[i].humveeCrewSeat == enemiesSent.enemies[i].humveeCrewSeat &&
+              enemiesReceived.enemies[i].humveeCrewVehicle == enemiesSent.enemies[i].humveeCrewVehicle,
+              "marine crew seat lost");
     }
 
     // A terrain cut through raw bytes. Every field here drives either the

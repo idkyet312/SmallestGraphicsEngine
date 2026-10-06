@@ -75,6 +75,7 @@ int main() {
     // Flip off the default so the round-trip below actually proves the flag is
     // written and read back, rather than comparing false to false.
     level.terrainFlat = true;
+    level.terrainAutoGrassDensity = 0.35f;
     level.dxrDDGI.enabled = true;
     level.dxrDDGI.surfaceSpacing = 2.5f;
     level.dxrDDGI.surfaceOffset = 0.4f;
@@ -172,6 +173,7 @@ int main() {
         if (!minimal.ok) std::cerr << minimal.error << '\n';
         CHECK(minimal.ok);
         CHECK(!minimal.level.terrainAutoFoliage);
+        CHECK(minimal.level.terrainAutoGrassDensity == 1.0f);
         nlohmann::json bad;
         { std::ifstream file(snowPath); file >> bad; }
         bad["mapType"] = "snwoy";
@@ -197,6 +199,7 @@ int main() {
     CHECK(loaded.ok);
     CHECK(loaded.level.mapType == LevelMapType::Tropical);
     CHECK(loaded.level.terrainAutoFoliage);
+    CHECK(loaded.level.terrainAutoGrassDensity == 0.35f);
     CHECK(ResolveTerrainTextureLayers(loaded.level.mapType, loaded.level.terrainTextureLayers)
         == TerrainTexturePreset(LevelMapType::Tropical));
     CHECK(loaded.level.entities.size() == level.entities.size());
@@ -284,8 +287,36 @@ int main() {
     CHECK(bakedTerrainLoaded.level.terrainSculpt.size() == 1);
     CHECK(bakedTerrainLoaded.level.terrainSculpt[0].radius == 512.0f);
     LevelDefinition oversizedBrush = level;
-    oversizedBrush.terrainSculpt[0].radius = 512.0f;
+    oversizedBrush.terrainSculpt[0].radius = kMaxTerrainSculptBrushRadius + 1.0f;
     CHECK(!ValidateLevel(oversizedBrush).ok);
+    LevelDefinition largeBrush = level;
+    largeBrush.terrainSculpt[0].radius = kMaxTerrainSculptBrushRadius;
+    largeBrush.terrainSculpt[1].radius = kMaxTerrainSculptBrushRadius;
+    const auto largeBrushPath = root / "large_brush.json";
+    CHECK(SaveLevel(largeBrush, largeBrushPath).ok);
+    const LevelLoadResult loadedLargeBrush = LoadLevel(largeBrushPath);
+    CHECK(loadedLargeBrush.ok);
+    CHECK(loadedLargeBrush.level.terrainSculpt[1].radius == kMaxTerrainSculptBrushRadius);
+    LevelDefinition noAutoGrass = level;
+    noAutoGrass.terrainAutoGrassDensity = 0.0f;
+    CHECK(ValidateLevel(noAutoGrass).ok);
+    const auto noAutoGrassPath = root / "no_auto_grass.json";
+    CHECK(SaveLevel(noAutoGrass, noAutoGrassPath).ok);
+    const LevelLoadResult loadedNoAutoGrass = LoadLevel(noAutoGrassPath);
+    CHECK(loadedNoAutoGrass.ok);
+    CHECK(loadedNoAutoGrass.level.terrainAutoGrassDensity == 0.0f);
+    LevelDefinition invalidGrassDensity = level;
+    invalidGrassDensity.terrainAutoGrassDensity = 8.1f;
+    CHECK(!ValidateLevel(invalidGrassDensity).ok);
+    invalidGrassDensity.terrainAutoGrassDensity = -0.1f;
+    CHECK(!ValidateLevel(invalidGrassDensity).ok);
+    LevelDefinition denseGrass = level;
+    denseGrass.terrainAutoGrassDensity = 8.0f;
+    const auto denseGrassPath = root / "dense_grass.json";
+    CHECK(SaveLevel(denseGrass, denseGrassPath).ok);
+    const auto loadedDenseGrass = LoadLevel(denseGrassPath);
+    CHECK(loadedDenseGrass.ok);
+    CHECK(loadedDenseGrass.level.terrainAutoGrassDensity == 8.0f);
     LevelDefinition oversizedBake = bakedTerrain;
     oversizedBake.terrainSculpt[0].radius =
         kMaxBakedTerrainStampRadius + 1.0f;

@@ -150,6 +150,7 @@ inline constexpr size_t kMaxTerrainSculptStamps = 1024;
 // a whole island. The shader stores radius as a float and supports this larger
 // footprint without increasing the per-vertex loop cost.
 inline constexpr float kMaxBakedTerrainStampRadius = 4096.0f;
+inline constexpr float kMaxTerrainSculptBrushRadius = 150.0f;
 
 // Upper bound on the DDGI probe count a level may request.
 //
@@ -217,6 +218,7 @@ struct LevelDefinition {
     LevelMapType mapType = LevelMapType::Tropical;
     TerrainTextureLayers terrainTextureLayers{};
     bool terrainAutoFoliage = true;
+    float terrainAutoGrassDensity = 1.0f;
     // Which insertion delivers the player. PlayerChoice puts the map's arrival
     // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;

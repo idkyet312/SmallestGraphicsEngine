@@ -84,6 +84,8 @@ struct RemoteEnemy {
     // Mirrors HostEnemyState::crouching -- see there for why this has to be
     // on the wire at all.
     bool crouching = false;
+    uint8_t humveeCrewSeat = 0xFF;
+    uint8_t humveeCrewVehicle = 0xFF;
 };
 
 // A demolition charge another player planted, and the order to fire one
@@ -177,6 +179,8 @@ struct HostEnemyState {
     // host runs the only AI, so a client that never learns the decision was
     // made can never play CrouchIdleAim/CrouchWalk* for that body.
     bool crouching = false;
+    uint8_t humveeCrewSeat = 0xFF;
+    uint8_t humveeCrewVehicle = 0xFF;
 };
 
 // A client's squad, landed by the host where that client's transport set down.
@@ -2784,7 +2788,11 @@ private:
             !std::isfinite(boat.yaw) || !std::isfinite(boat.bobTime)) return;
         const auto& patrol = message.patrolBoat;
         if (patrol.captured > 1 || !Finite3(patrol.x, patrol.y, patrol.z) ||
-            !std::isfinite(patrol.yaw)) return;
+            !std::isfinite(patrol.yaw) || !Finite3(patrol.qx,patrol.qy,patrol.qz) ||
+            !std::isfinite(patrol.qw) || !Finite3(patrol.vx,patrol.vy,patrol.vz)) return;
+        const float boatRotationLength = patrol.qx * patrol.qx + patrol.qy * patrol.qy +
+            patrol.qz * patrol.qz + patrol.qw * patrol.qw;
+        if (boatRotationLength < 0.25f || boatRotationLength > 4.0f) return;
         for (uint8_t i = 0; i < kEnemyHelicopterCount; ++i) {
             const EnemyHelicopterSnapshot& in = message.helicopters[i];
             // Unreliable, so a corrupt or partial packet must not be allowed to
@@ -2950,6 +2958,8 @@ private:
                 out.killer = source.killer;
                 out.marine = source.marine ? 1 : 0;
                 out.crouching = source.crouching ? 1 : 0;
+                out.humveeCrewSeat = source.humveeCrewSeat;
+                out.humveeCrewVehicle = source.humveeCrewVehicle;
             }
             transport_->Send(peer, &message, sizeof(message),
                              Channel::Unreliable);
@@ -3010,6 +3020,11 @@ private:
             enemy.killer = incoming.killer;
             enemy.marine = incoming.marine != 0;
             enemy.crouching = incoming.crouching != 0;
+            if (enemy.marine && incoming.humveeCrewSeat < 3 &&
+                incoming.humveeCrewVehicle != 0xFF) {
+                enemy.humveeCrewSeat = incoming.humveeCrewSeat;
+                enemy.humveeCrewVehicle = incoming.humveeCrewVehicle;
+            }
             remoteEnemies_.push_back(enemy);
         }
     }

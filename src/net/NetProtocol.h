@@ -98,7 +98,9 @@ namespace net {
 // 28: grenade kind 3 carries player-designated bombardment missiles.
 // 29: Humvee armor snapshots carry destruction in a former padding byte.
 // 30: captured military patrol boats share their pose and driver's seat.
-inline constexpr uint32_t kProtocolVersion = 30;
+// 31: boats replicate full rigid-body orientation and velocity.
+// 32: marine snapshots identify their Humvee and crew seat.
+inline constexpr uint32_t kProtocolVersion = 32;
 
 // A magic word in the hello guards against something other than this game
 // connecting to the port and having its bytes read as a handshake.
@@ -405,6 +407,8 @@ struct EnemySnapshot {
     // again rather than hiding it -- there is nothing static_assert-ed
     // against this size, so that is the whole cost.
     uint8_t crouching = 0;
+    uint8_t humveeCrewSeat = 0xFF;
+    uint8_t humveeCrewVehicle = 0xFF;
     float x = 0.0f, y = 0.0f, z = 0.0f;
     // Radians, matching SkinnedEnemy. Both are sent because the upper body aims
     // independently of the legs, and a client that guessed one from the other
@@ -459,6 +463,8 @@ struct PatrolBoatSnapshot {
     uint8_t padding[3] = {};
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float yaw = 0.0f;
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
 };
 
 struct ServerVehicleStateMessage {
@@ -512,7 +518,7 @@ struct EnemyHumveeSnapshot {
     uint8_t index = 0;
     uint8_t hostDriven = 0;
     uint8_t dead = 0;
-    uint8_t padding[1] = {};
+    uint8_t friendlyGunner = 0;
     // Chassis body centre and orientation, as the host's solver returns them.
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;

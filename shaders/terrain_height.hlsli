@@ -45,18 +45,22 @@ ByteAddressBuffer terrainStampAtlas : register(t11);
 
 static const uint kTerrainStampResolution = 512;
 static const uint kMaxTerrainStampTextures = 64;
-static const uint kTerrainStampBakeResolution = 4096;
 static const uint kTerrainStampBakeLayer = kMaxTerrainStampTextures;
+static const uint kTerrainStampAtlasTexels =
+    kMaxTerrainStampTextures * kTerrainStampResolution * kTerrainStampResolution;
+static const uint kTerrainRockMaskResolution = 512;
+static const uint kTerrainRockMaskByteOffset = kTerrainStampAtlasTexels * 2;
+static const uint kTerrainStampBakeOffset = kTerrainStampAtlasTexels + 2 +
+    kTerrainRockMaskResolution * kTerrainRockMaskResolution;
 
 uint TerrainStampResolution(uint layer) {
     return layer == kTerrainStampBakeLayer
-        ? kTerrainStampBakeResolution : kTerrainStampResolution;
+        ? terrainStampAtlas.Load(kTerrainRockMaskByteOffset) >> 16 : kTerrainStampResolution;
 }
 
 float LoadTerrainStamp(uint layer, uint2 texel) {
     uint base = layer == kTerrainStampBakeLayer
-        ? kMaxTerrainStampTextures * kTerrainStampResolution *
-              kTerrainStampResolution
+        ? kTerrainStampBakeOffset
         : layer * kTerrainStampResolution * kTerrainStampResolution;
     uint side = TerrainStampResolution(layer);
     uint element = base + texel.y * side + texel.x;
@@ -195,12 +199,8 @@ float ApplyCraterCut(float h, float distance, float radius, float depth,
     return cut + lip * depth * 0.075;
 }
 
-// Appended after the height atlas and bake slot, using the same frame buffer.
-// Layout mirrors StageTerrainSplatMap: uint active, then 512^2 UNORM16 texels.
-static const uint kTerrainRockMaskByteOffset =
-    (kMaxTerrainStampTextures * kTerrainStampResolution * kTerrainStampResolution +
-     kTerrainStampBakeResolution * kTerrainStampBakeResolution) * 2;
-static const uint kTerrainRockMaskResolution = 512;
+// Fixed mask region before the variable-size bake, using the same frame buffer.
+// Header: low 16 bits active, high 16 bits bake side, then 512^2 UNORM16 texels.
 
 float LoadTerrainRockMask(uint2 texel) {
     uint element = texel.y * kTerrainRockMaskResolution + texel.x;
@@ -211,7 +211,7 @@ float LoadTerrainRockMask(uint2 texel) {
 }
 
 float TerrainDestructionWeight(float2 xz) {
-    if (terrainStampAtlas.Load(kTerrainRockMaskByteOffset) == 0) return 1.0;
+    if ((terrainStampAtlas.Load(kTerrainRockMaskByteOffset) & 0xffff) == 0) return 1.0;
     float2 uv = xz / (176.0 * max(float2(islandScaleX, islandScaleZ), 0.01)) + 0.5;
     if (any(uv < 0.0) || any(uv > 1.0)) return 1.0;
     float2 p = clamp(uv * kTerrainRockMaskResolution - 0.5,

@@ -450,6 +450,48 @@ static void ResolvePlayerWorldObjectCollisions(
     // temporary floor when landing on it; sides push the player out in hull-local
     // space as the patrol boat turns.
     const auto resolveBoat = [&](const BoatPlatformPose& pose) {
+        if (pose.tilted) {
+            const XMFLOAT3 localFeet = BoatPlatformLocal({position.x,feet,position.z}, pose);
+            const float deck = BoatDeckHeightAt(pose, position.x, position.z);
+            if (std::abs(localFeet.x) <= kBoatDeckHalfBeam + radius &&
+                std::abs(localFeet.z) <= kBoatDeckHalfLength + radius &&
+                deck <= feet + kStepHeight && deck >= feet - 0.25f) {
+                floorY = (std::max)(floorY, deck);
+                return;
+            }
+            // Sample the upright player capsule against the rotated hull. This
+            // keeps a beached boat's collision with its visible roll and pitch.
+            for (int sample = 0; sample < 3; ++sample) {
+                const float height = radius + (playerHeight - 2.0f * radius) * sample * 0.5f;
+                const XMFLOAT3 local = BoatPlatformLocal(
+                    {position.x,feet + height,position.z}, pose);
+                const XMFLOAT3 closest{
+                    (std::clamp)(local.x,-kBoatDeckHalfBeam,kBoatDeckHalfBeam),
+                    (std::clamp)(local.y,-kBoatFloatDepth,0.45f),
+                    (std::clamp)(local.z,-kBoatDeckHalfLength,kBoatDeckHalfLength)};
+                XMVECTOR delta = XMLoadFloat3(&local) - XMLoadFloat3(&closest);
+                float distance = XMVectorGetX(XMVector3Length(delta));
+                if (distance >= radius) continue;
+                float push = radius - distance + 0.002f;
+                if (distance > 1e-4f) {
+                    delta /= distance;
+                } else {
+                    const float px = kBoatDeckHalfBeam - std::abs(local.x);
+                    const float pz = kBoatDeckHalfLength - std::abs(local.z);
+                    delta = px < pz
+                        ? XMVectorSet(std::copysign(1.0f,local.x),0,0,0)
+                        : XMVectorSet(0,0,std::copysign(1.0f,local.z),0);
+                    push += (std::min)(px,pz);
+                }
+                const XMVECTOR worldPush = XMVector3TransformNormal(delta * push,
+                    BoatPlatformOrientation(pose));
+                position.x += XMVectorGetX(worldPush);
+                position.z += XMVectorGetZ(worldPush);
+                if (XMVectorGetY(worldPush) > 0.0f)
+                    floorY = (std::max)(floorY, feet + XMVectorGetY(worldPush));
+            }
+            return;
+        }
         const float boatY = pose.position.y - pose.sinkDepth;
         const float top = BoatDeckY(pose);
         const float bottom = boatY - kBoatHullHeight;
@@ -484,8 +526,7 @@ static void ResolvePlayerWorldObjectCollisions(
     const VehicleSystem& boat = g_game.vehicles;
     if (boat.insertionBoatVisible &&
         g_insertionBoatModel && !boat.InsertionBoatIsSunk())
-        resolveBoat({boat.insertionBoatPosition, boat.insertionBoatYaw,
-                     boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset});
+        resolveBoat(CurrentInsertionBoatPlatformPose());
 }
 
 // How far above the feet a walkable surface still counts as floor to step onto

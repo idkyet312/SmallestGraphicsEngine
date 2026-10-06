@@ -550,8 +550,8 @@ XMMATRIX BoatWorldMatrix() {
     return XMMatrixTranslation(-g_boatModelCenter.x, -g_boatModelMinY,
                                -g_boatModelCenter.z) *
            XMMatrixScaling(g_boatModelScale, g_boatModelScale, g_boatModelScale) *
-           XMMatrixRotationZ(g_boatRoll) *
-           XMMatrixRotationY(g_boatYaw) *
+           VehicleSystem::BoatOrientation(g_game.vehicles.boatPhysics,
+                                           g_boatRoll, g_boatYaw) *
            XMMatrixTranslation(g_boatPosition.x,
                                g_boatPosition.y - g_boatSinkDepth,
                                g_boatPosition.z);
@@ -570,6 +570,15 @@ static XMFLOAT3 BoatTurretMountWorld() {
     // Plus kBoatCrewRise, the same lift every other actor on the deck gets, so
     // the rig sits on the planking instead of inside it.
     const float sx = std::sin(g_boatYaw), cz = std::cos(g_boatYaw);
+    if (g_game.vehicles.boatPhysics.hasPose) {
+        XMFLOAT3 mount;
+        XMStoreFloat3(&mount, XMVector3TransformNormal(
+            XMVectorSet(0,kBoatDeckOffset + kBoatCrewRise,0.4f,0),
+            VehicleSystem::BoatOrientation(g_game.vehicles.boatPhysics,
+                g_boatRoll,g_boatYaw)) + XMLoadFloat3(&g_boatPosition) -
+                XMVectorSet(0,g_boatSinkDepth,0,0));
+        return mount;
+    }
     return { g_boatPosition.x + sx * 0.4f,
              g_boatPosition.y - g_boatSinkDepth + kBoatDeckOffset +
                  kBoatCrewRise,
@@ -617,8 +626,8 @@ XMMATRIX InsertionBoatWorldMatrix() {
            XMMatrixScaling(vehicles.insertionBoatModelScale,
                            vehicles.insertionBoatModelScale,
                            vehicles.insertionBoatModelScale) *
-           XMMatrixRotationZ(vehicles.insertionBoatRoll) *
-           XMMatrixRotationY(vehicles.insertionBoatYaw) *
+           VehicleSystem::BoatOrientation(vehicles.insertionBoatPhysics,
+               vehicles.insertionBoatRoll, vehicles.insertionBoatYaw) *
            XMMatrixTranslation(
                vehicles.insertionBoatPosition.x,
                vehicles.insertionBoatPosition.y - vehicles.insertionBoatSinkOffset,

@@ -147,8 +147,8 @@ struct alignas(256) ObjectBufferDX12 {
     float normalTexW = 1.0f;
     float normalTexH = 1.0f;
     float specularScale = 1.0f;
-    float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean, 8/9=glass
-    float materialTime = 0.0f; // animated procedural materials
+    float materialType = 0.0f; // 0=ordinary, 1/2=water, 4=grass-matched foliage, 8/9=glass
+    float materialTime = 0.0f; // animation time; matched foliage uses texture luminance
     // > 0.5: add emissiveMap * emissiveFactor after lighting. Takes one of the
     // three padding floats that filled the gap below, so the uint4 that follows
     // keeps its byte-96 start.
@@ -2235,11 +2235,13 @@ public:
     void SetGrassMaterial(const XMFLOAT3& albedo, float roughness,
                           float ambientScale, float directLightScale,
                           float transmissionStrength, float colorVariation,
-                          float normalFalloff = 1.0f) {
+                          float normalFalloff = 1.0f,
+                          bool matchGroundColor = false) {
         ActivateMaterialBinding(false);
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = albedo;
+        data.useTexture = matchGroundColor ? 1.0f : 0.0f;
         data.roughness = std::clamp(roughness, 0.04f, 1.0f);
         data.opacity = 1.0f;
         data.ambientScale = (std::max)(ambientScale, 0.0f);
@@ -2300,6 +2302,15 @@ public:
         data.specularScale = specularScale;
         data.materialType = materialType;
         data.materialTime = materialTime;
+        if (cacheOwner && cacheOwner->foliageMatchGrassColor &&
+            foliageShading && alphaCut) {
+            // Foliage does not animate through the water material slots. Reuse
+            // them so colour matching cannot move the shared cbuffer layout.
+            data.materialType = 4.0f;
+            const XMFLOAT3& mean = cacheOwner->foliageTextureMean;
+            data.materialTime = (std::max)(
+                0.2126f * mean.x + 0.7152f * mean.y + 0.0722f * mean.z, 1e-4f);
+        }
         data.viewmodelSeeThrough = viewmodelSeeThrough;
         data.seeThroughNear = viewmodelSeeThroughNear;
         data.seeThroughFar = viewmodelSeeThroughFar;

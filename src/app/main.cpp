@@ -302,6 +302,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_profileDumpEnabled =
         GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
+    {
+        char warmup[32] = {};
+        if (GetEnvironmentVariableA("SGE_PROFILE_DUMP_FRAME", warmup,
+                                    sizeof(warmup)) > 0)
+            g_profileDumpWarmupFrames =
+                static_cast<UINT>(std::strtoul(warmup, nullptr, 10));
+    }
     g_forceTerrainErrorLOD =
         GetEnvironmentVariableA("SGE_TERRAIN_ERROR_LOD", nullptr, 0) > 0;
     // Virtual shadows are on by default; SGE_VSM_OFF opts a run back out to
@@ -835,6 +842,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.debugViewMode = atoi(text);
         if (GetEnvironmentVariableA("SGE_CAPTURE_WATER_QUALITY", text, sizeof(text)) > 0)
             scene.waterQuality = static_cast<WaterQuality>((std::clamp)(atoi(text), 0, 2));
+        // Perf A/B on a real level: half-res scalar AO (temporal bent-normal
+        // GTAO ignores halfResolutionAO, so it is dropped with it).
+        if (GetEnvironmentVariableA("SGE_CAPTURE_AO_HALF", nullptr, 0) > 0) {
+            scene.halfResolutionAO = true;
+            scene.temporalBentNormalGTAO = false;
+        }
     }
     // SGE_CAPTURE_SWEEP="dyaw,dx,dz" moves the camera by that much per frame,
     // arriving at SGE_CAPTURE_POSE on the captured frame. A still camera lets
@@ -1339,6 +1352,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (g_gamePaused && !MultiplayerActive()) deltaTime = 0.0f;
         auto& rangeFeedback = g_game.world.Prefabs().shootingRange.feedbackSeconds;
         rangeFeedback = (std::max)(0.0f, rangeFeedback - deltaTime);
+
+        // Publish only at an update boundary: the camera and insertion must
+        // settle before rendering, including warm restarts with no asset load.
+        if (g_insertionChoicePending && !g_game.loading.Active() &&
+            !g_pendingEnvironmentRebuild && !g_prefabRebuildRequested &&
+            !scene.rebuildDestructionRequested &&
+            !g_game.commands.Pending(GameCommand::ResetLevelRuntime))
+            g_deploymentPlanningVisible = true;
+        ProcessDeploymentRestart(hwnd);
 
         // A downed player keeps simulating. Their health is zero, but they are
         // not out: remote bodies have to keep moving so they can watch a
@@ -2102,10 +2124,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 const XMFLOAT3 previousBoatPosition =
                     g_game.vehicles.insertionBoatPosition;
-                const BoatPlatformPose previousBoatPose{
-                    previousBoatPosition, g_game.vehicles.insertionBoatYaw,
-                    g_game.vehicles.insertionBoatSinkOffset,
-                    g_game.vehicles.insertionBoatDeckOffset};
+                const BoatPlatformPose previousBoatPose = CurrentInsertionBoatPlatformPose();
                 if (g_game.vehicles.insertionBoatCaptured &&
                     scene.waterQuality != WaterQuality::Ultra)
                     g_game.vehicles.insertionBoatWaterY = g_ocean.GetSurfaceY() +
@@ -2124,6 +2143,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     waterRenderer);
             }
             UpdatePlayerBoat();
+            UpdateBoatDriverBody(deltaTime);
             ReleaseManualInsertionBoatSquad();
             // After both transports, so whichever one raised the flag this
             // frame is honoured. Outside the g_insertionBoatModel guard on
@@ -2276,6 +2296,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     !SpawnBoatTurretGunner());
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
+            UpdateMarineHumveeCrew();
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             static std::unordered_map<SkinnedEnemy*,
                 std::pair<XMFLOAT3, float>> lastVisibleTarget;
@@ -2428,6 +2449,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // A client's marines follow that client's body, not the host.
                 // Its owner gone (left, or the level reset its body) and they
                 // fall back to the host rather than standing where they landed.
+                if (ClientOwnedByHost() || bandit->networkControlled) continue;
+                if (bandit->humveeCrew.Mounted() && !bandit->humveeCrew.Gunner()) {
+                    PoseHumveeMarine(*bandit, deltaTime);
+                    continue;
+                }
                 if (bandit->faction == Faction::Marine) {
                     if (bandit->Awareness() ==
                         SkinnedEnemy::AwarenessState::Combat) {
@@ -2685,6 +2711,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             static_cast<size_t>(bandit->mountedVehicleIndex));
                     }
                     const bool playerControlsTurret = g_drivingHumvee &&
+                        bandit->faction != Faction::Marine &&
                         bandit->mountedVehicleIndex >= 0 &&
                         g_activeHumveeIndex == static_cast<size_t>(
                             bandit->mountedVehicleIndex);
@@ -2883,11 +2910,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const XMFLOAT3 leadVelocity =
                     targetIsPlayer ? g_playerVelocity : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
                 const bool playerControlsMountedTurret = g_drivingHumvee &&
+                    bandit->faction != Faction::Marine &&
                     bandit->turretGunner &&
                     bandit->mountedVehicleIndex >= 0 &&
                     g_activeHumveeIndex == static_cast<size_t>(
                         bandit->mountedVehicleIndex);
                 const bool fired = !playerControlsMountedTurret &&
+                    (!bandit->humveeCrew.Gunner() || haveTarget) &&
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection,
@@ -2931,6 +2960,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
+                    if (bandit->humveeCrew.Gunner() && g_humveeTurretNode) {
+                        const size_t vehicle = static_cast<size_t>(bandit->humveeCrew.vehicle);
+                        PrepareHumveeModelForRender(vehicle);
+                        const XMMATRIX turretWorld =
+                            XMLoadFloat4x4(&g_humveeTurretNode->globalTransform) *
+                            HumveeWorldMatrix(vehicle);
+                        XMStoreFloat3(&shotOrigin, XMVector3TransformCoord(
+                            XMVectorSet(0.0f, 72.0f, 338.0f, 1.0f), turretWorld));
+                        const XMVECTOR aim = XMLoadFloat3(&target) - XMLoadFloat3(&shotOrigin);
+                        if (XMVectorGetX(XMVector3LengthSq(aim)) > 0.001f)
+                            XMStoreFloat3(&shotDirection, XMVector3Normalize(aim));
+                    }
                     const net::InfantryWeapon weapon =
                         bandit->IsShotgunner() ? net::InfantryWeapon::Shotgun
                         : bandit->IsSniper()   ? net::InfantryWeapon::Sniper
@@ -4937,6 +4978,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
         ApplyPendingTerrainTextures();
+        MatchFoliageMaterialToGrass();
 
         // Virtual shadows replace the cascade atlas rather than augmenting it,
         // so the cascade textures are freed while they are on -- worth ~192 MB
@@ -5030,13 +5072,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // houses, barrels and vehicles as well as loading missing prefabs.
             SynchronizeEditorRuntimeVisual(true);
         }
-        // Deployment is prepared when the level starts so its state survives
-        // the load, but it is only a visible screen after all existing scene
-        // rebuild work has finished. This also covers warm loads, which do not
-        // enter the level loading state at all.
-        if (g_insertionChoicePending && !g_game.loading.Active() &&
-            !g_pendingEnvironmentRebuild && !g_prefabRebuildRequested)
-            g_deploymentPlanningVisible = true;
         // The planning map is an overhead view, not the player's eyes: a
         // pistol floating over the island reads as a stray render.
         scene.drawViewmodel = !g_insertionChoicePending;
@@ -5169,6 +5204,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (IsSceneScreen() && !g_game.loading.Active()) {
             SyncEnemyTankPoses(deltaTime);
             SyncEnemyHumveePoses(deltaTime);
+            RefreshHumveeMarinePoses(0.0f);
         }
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
@@ -6590,6 +6626,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
+        const bool sceneReadyToRender = IsSceneScreen() &&
+            !g_game.loading.Active() &&
+            (!g_insertionChoicePending || DeploymentPlanningVisible());
 
         // The Humvee spotlight is added before clustered-light culling and
         // removed after the last consumer. Its caster list is rebuilt from the
@@ -6597,12 +6636,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // helicopter spotlight in the frame.
         g_spotShadowCasters.clear();
         const int headlightsInLightList = AddVehicleHeadlights(scene);
-        if (IsSceneScreen() && !g_game.loading.Active() &&
-            usingRaytracing) {
+        if (sceneReadyToRender && usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (IsSceneScreen() && !g_game.loading.Active() &&
-                   usingVisibility) {
+        } else if (sceneReadyToRender && usingVisibility) {
             // Each pass gets its own sibling scope. ProfilerDX12::Scope is a flat
             // begin/end timestamp pair with no nesting or child subtraction, so a
             // scope that encloses another double-counts it: this block used to
@@ -6769,7 +6806,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     lightSpace, shadowResource, true, !grassMSAAActive,
                     jitterExtensions);
             }
-        } else if (IsSceneScreen() && !g_game.loading.Active()) {
+        } else if (sceneReadyToRender) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized &&
@@ -6825,7 +6862,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ? scene.GetProjectionMatrix()
             : scene.GetUnjitteredProjectionMatrix();
         if (renderedScene && !bentGTAODiagnosticActive &&
-            AnySkinnedActorsToDraw()) {
+            (AnySkinnedActorsToDraw() || BoatDriverBodyVisible())) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
             // Bandits and their guns are the draws that own motion PSOs, so
@@ -6847,6 +6884,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         extensionProj, fogLightSpace, true);
                 }
                 DrawSniperLaser(*bandit, scene, mainShader, geo, fogLightSpace);
+            }
+            if (BoatDriverBodyVisible()) {
+                g_boatDriverBody->Draw(mainShader, scene.GetViewMatrix(),
+                                       extensionProj, fogLightSpace);
+                if (g_boatDriverBody->HasGunPose() && GunModel::Loaded()) {
+                    mainShader.Use(false);
+                    DrawMeshAt(GunModel::Mesh(), mainShader,
+                        g_boatDriverBody->GunWorldMatrix(), scene.GetViewMatrix(),
+                        extensionProj, fogLightSpace, true);
+                }
             }
             visBuffer.EndMotionDraws(g_dx12.commandList.Get());
             mainShader.SetExtensionMotionEnabled(false);
@@ -6931,17 +6978,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (renderedScene && !bentGTAODiagnosticActive && grassMSAAActive) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Grass 4x MSAA", g_dx12.commandList.Get());
-            grassMSAA.Begin(g_dx12.commandList.Get());
-            RenderGrassForward(scene, mainShader, scene.GetViewMatrix(),
-                extensionProj, fogLightSpace, fogShadowResource,
-                mainShader.GetHDRMSAAGrassPipelineState());
+            {
+                ProfilerDX12::Scope drawProfile(
+                    g_profiler, "Grass/Draw", g_dx12.commandList.Get());
+                grassMSAA.Begin(g_dx12.commandList.Get());
+                RenderGrassForward(scene, mainShader, scene.GetViewMatrix(),
+                    extensionProj, fogLightSpace, fogShadowResource,
+                    mainShader.GetHDRMSAAGrassPipelineState());
+            }
 
             // Resolve the independently sampled grass against opaque scene
             // depth, then reopen HDR for shared AO and fog.
             visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
-            grassMSAA.Composite(g_dx12.commandList.Get(),
-                visBuffer.GetOutputResource(), visBuffer.GetMotionResource(),
-                g_dx12.depthStencilBuffer.Get());
+            {
+                ProfilerDX12::Scope compositeProfile(
+                    g_profiler, "Grass/Composite", g_dx12.commandList.Get());
+                grassMSAA.Composite(g_dx12.commandList.Get(),
+                    visBuffer.GetOutputResource(), visBuffer.GetMotionResource(),
+                    g_dx12.depthStencilBuffer.Get());
+            }
             visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
         }
 
@@ -7645,29 +7700,70 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // per-pass numbers unreadable from an automated/headless run.
         if (g_profileDumpEnabled && !g_profileDumpWritten &&
             IsSceneScreen() && !g_game.loading.Active()) {
-            if (++g_profileDumpFrame > 240) {
+            // One frame is noise (clock ramps, streaming, a DLSS history
+            // reset); average a window so A/B runs compare like with like.
+            static constexpr UINT kProfileDumpWindow = 120;
+            struct ProfileAccum {
+                std::vector<std::string> order;
+                std::unordered_map<std::string, double> sum;
+                void Add(const std::vector<ProfilerSampleDX12>& samples) {
+                    for (const auto& sample : samples) {
+                        auto [it, inserted] = sum.emplace(sample.name, 0.0);
+                        if (inserted) order.push_back(sample.name);
+                        it->second += sample.milliseconds;
+                    }
+                }
+            };
+            static ProfileAccum gpuAccum, cpuAccum, recordingAccum;
+            static std::vector<double> gpuFrames, cpuFrames, waitFrames,
+                wallFrames;
+            if (++g_profileDumpFrame > g_profileDumpWarmupFrames) {
+                gpuAccum.Add(g_profiler.GpuSamples());
+                cpuAccum.Add(g_profiler.CpuSamples());
+                recordingAccum.Add(g_profiler.RecordingSamples());
+                gpuFrames.push_back(g_profiler.GpuFrameMs());
+                cpuFrames.push_back(g_profiler.CpuFrameMs());
+                waitFrames.push_back(g_profiler.CpuFrameWaitMs());
+                wallFrames.push_back(g_profiler.CpuFrameWallMs());
+            }
+            if (gpuFrames.size() >= kProfileDumpWindow) {
+                const double n = static_cast<double>(gpuFrames.size());
+                auto avg = [n](const std::vector<double>& values) {
+                    double total = 0.0;
+                    for (double value : values) total += value;
+                    return total / n;
+                };
+                auto p95 = [](std::vector<double> values) {
+                    std::sort(values.begin(), values.end());
+                    return values[static_cast<size_t>(
+                        static_cast<double>(values.size() - 1) * 0.95)];
+                };
                 std::ofstream dump("profile_dump.log", std::ios::trunc);
-                dump << "GPU frame: " << g_profiler.GpuFrameMs()
-                     << " ms\nCPU frame: " << g_profiler.CpuFrameMs()
-                     << " ms\nCPU wait: " << g_profiler.CpuFrameWaitMs()
+                dump << "frames averaged: " << gpuFrames.size()
+                     << " (after " << g_profileDumpWarmupFrames
+                     << " warm-up)\nGPU frame: " << avg(gpuFrames)
+                     << " ms (p95 " << p95(gpuFrames)
+                     << ")\nCPU frame: " << avg(cpuFrames)
+                     << " ms (p95 " << p95(cpuFrames)
+                     << ")\nCPU wait: " << avg(waitFrames)
                      << " ms (present + fence)\nCPU wall: "
-                     << g_profiler.CpuFrameWallMs()
-                     << " ms\n--- GPU passes ---\n";
+                     << avg(wallFrames) << " ms (p95 " << p95(wallFrames)
+                     << ")\n--- GPU passes ---\n";
                 double total = 0.0;
-                for (const auto& sample : g_profiler.GpuSamples()) {
-                    dump << sample.name << ": " << sample.milliseconds << " ms\n";
-                    total += sample.milliseconds;
+                for (const auto& name : gpuAccum.order) {
+                    const double ms = gpuAccum.sum[name] / n;
+                    dump << name << ": " << ms << " ms\n";
+                    total += ms;
                 }
                 dump << "--- sum of passes: " << total << " ms ---\n";
                 // CPU scopes and VRAM too: a slow frame is either GPU work,
                 // CPU work, or the card paging -- and only these tell which.
                 dump << "--- CPU scopes ---\n";
-                for (const auto& sample : g_profiler.CpuSamples())
-                    dump << sample.name << ": " << sample.milliseconds
-                         << " ms\n";
+                for (const auto& name : cpuAccum.order)
+                    dump << name << ": " << cpuAccum.sum[name] / n << " ms\n";
                 dump << "--- recording (nested, do not sum) ---\n";
-                for (const auto& sample : g_profiler.RecordingSamples())
-                    dump << sample.name << ": " << sample.milliseconds
+                for (const auto& name : recordingAccum.order)
+                    dump << name << ": " << recordingAccum.sum[name] / n
                          << " ms\n";
                 const VideoMemoryStatsDX12 vram = GetVideoMemoryStatsDX12();
                 dump << "--- VRAM: " << (vram.usageBytes >> 20) << " / "
@@ -7723,6 +7819,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 writeStats("frame", terrainLODFrameSamples);
                 writeStats("shadow", terrainLODShadowSamples);
                 writeStats("terrain_resolve", terrainResolveSamples);
+                {
+                    // Where the camera sits inside the clipmap decides which
+                    // ring is underfoot; mirrors ResolveClipmapTile's snap.
+                    const auto tp = CurrentTerrainParams();
+                    const float snap = TerrainRendererDX12::ClipmapSnapGrid(tp);
+                    const XMFLOAT3 eye = scene.camera.Position;
+                    const float centreX = TerrainRendererDX12::ClipmapSnap(eye.x, tp);
+                    const float centreZ = TerrainRendererDX12::ClipmapSnap(eye.z, tp);
+                    log << "camera_xz=" << eye.x << ',' << eye.z << '\n'
+                        << "island_scale=" << tp.islandScaleX << '\n'
+                        << "rings=" << tp.tilesZ << '\n'
+                        << "snap_m=" << snap << '\n'
+                        << "camera_offset_m=" << (std::max)(
+                               std::abs(eye.x - centreX), std::abs(eye.z - centreZ))
+                        << '\n'
+                        << "ring0_half_span_m=" << tp.tilesX * 0.5f * tp.tileSize << '\n';
+                }
                 log << "packed_reuse=" << (GetEnvironmentVariableA(
                     "SGE_TERRAIN_PACKED_REUSE", nullptr, 0) > 0) << '\n'
                     << "shadow_depth_only=" << (GetEnvironmentVariableA(

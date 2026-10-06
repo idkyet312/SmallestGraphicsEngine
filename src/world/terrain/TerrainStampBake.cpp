@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <climits>
+#include <memory>
 
 namespace {
 
@@ -48,10 +50,12 @@ bool WriteGray16PNG(const std::filesystem::path& path,
                     unsigned char* (*compress)(unsigned char*, int, int*, int)) {
     if (!compress || width == 0 || height == 0) return false;
     if (gray.size() != static_cast<size_t>(width) * height) return false;
+    const size_t rawSize = size_t(height) * (1 + size_t(width) * 2);
+    if (rawSize > INT_MAX) return false;
 
     // Raw scanlines: one filter byte (0 = None) then big-endian 16-bit samples.
     std::vector<unsigned char> raw;
-    raw.reserve(static_cast<size_t>(height) * (1 + static_cast<size_t>(width) * 2));
+    raw.reserve(rawSize);
     for (uint32_t y = 0; y < height; ++y) {
         raw.push_back(0);
         const uint16_t* row = gray.data() + static_cast<size_t>(y) * width;
@@ -62,9 +66,10 @@ bool WriteGray16PNG(const std::filesystem::path& path,
     }
 
     int compressedLength = 0;
-    unsigned char* compressed = compress(
-        raw.data(), static_cast<int>(raw.size()), &compressedLength, 8);
+    std::unique_ptr<unsigned char, decltype(&free)> compressed(compress(
+        raw.data(), static_cast<int>(raw.size()), &compressedLength, 8), &free);
     if (!compressed || compressedLength <= 0) return false;
+    std::vector<unsigned char>().swap(raw);
 
     std::vector<unsigned char> png;
     const unsigned char signature[8] = { 137, 'P', 'N', 'G', 13, 10, 26, 10 };
@@ -85,10 +90,10 @@ bool WriteGray16PNG(const std::filesystem::path& path,
     ihdr[11] = 0;   // adaptive filtering
     ihdr[12] = 0;   // no interlace
     PushChunk(png, "IHDR", ihdr, sizeof(ihdr));
-    PushChunk(png, "IDAT", compressed, static_cast<size_t>(compressedLength));
+    PushChunk(png, "IDAT", compressed.get(), static_cast<size_t>(compressedLength));
     PushChunk(png, "IEND", nullptr, 0);
 
-    free(compressed);
+    compressed.reset();
 
     FILE* file = nullptr;
     if (fopen_s(&file, path.string().c_str(), "wb") != 0 || !file) return false;

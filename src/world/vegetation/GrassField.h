@@ -47,6 +47,7 @@
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
 #include "StaticBufferDX12.h"
+#include "GrassDamageRanges.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -231,10 +232,8 @@ public:
         return m_instances ? m_instances->GetGPUVirtualAddress() : 0;
     }
 
-    // One INSTANCE range per patch of field near the camera. The renderer issues a
-    // draw per entry, and distant patches are simply never submitted. This is a few
-    // dozen tests over CELLS, not a walk over every blade, so the per-frame CPU cost
-    // is negligible -- which is the whole point.
+    // Intact patches use one instance range; damaged patches use cached surviving
+    // runs. Visibility tests cells, never individual blades, each frame.
     struct DrawRange { UINT firstInstance, instanceCount; };
     void GetVisible(std::vector<DrawRange>& out) const {
         out.clear();
@@ -246,14 +245,13 @@ public:
             const float dx = c.cx - m_eye.x;
             const float dz = c.cz - m_eye.z;
             if (dx * dx + dz * dz > reachSq) continue;
-            if (RuntimeCellExcluded(c.cx, c.cz)) continue;
             // Density trims each cell's contiguous instance run. Blades are
             // stored tuft-contiguous, so a fractional cut drops whole tufts and
             // reads as natural thinning -- no buffer rebuild, safe to change
             // while frames are in flight.
             const UINT count = (std::max)(1u,
                 (UINT)((float)c.bladeCount * m_density));
-            out.push_back({ c.firstBlade, count });
+            c.damage.AppendVisible(c.firstBlade, count, out);
         }
     }
 
@@ -284,9 +282,20 @@ public:
     void AddRuntimeExclusion(float x, float z, float radius) {
         if (radius <= 0.0f) return;
         m_runtimeExclusions.push_back({ x, z, radius });
+        for (Cell& cell : m_cells) {
+            if (!GrassDamageRanges::CircleIntersectsCell(
+                    cell.cx, cell.cz, kCellSize * 0.5f, x, z, radius)) continue;
+            cell.damage.ExcludeCircle(cell.firstBlade, cell.bladeCount,
+                x, z, radius, [this](uint32_t i) -> const Blade& {
+                    return m_blades[i];
+                });
+        }
     }
 
-    void ClearRuntimeExclusions() { m_runtimeExclusions.clear(); }
+    void ClearRuntimeExclusions() {
+        m_runtimeExclusions.clear();
+        for (Cell& cell : m_cells) cell.damage.Clear();
+    }
 
     bool RuntimeExcluded(float x, float z, float padding = 0.0f) const {
         for (const RuntimeExclusion& exclusion : m_runtimeExclusions) {
@@ -464,6 +473,13 @@ public:
     // Material controls. These feed the grass-specific pixel shader every draw,
     // so editor changes are immediate and require no blade-buffer rebuild.
     XMFLOAT3& Albedo()             { return m_albedo; }
+    bool& MatchGroundColor()       { return m_matchGroundColor; }
+    XMFLOAT3& GroundTint()         { return m_groundTint; }
+    XMFLOAT3 GroundMatchedAlbedo(const XMFLOAT3& groundAlbedo) const {
+        return XMFLOAT3(groundAlbedo.x * m_groundTint.x,
+                        groundAlbedo.y * m_groundTint.y,
+                        groundAlbedo.z * m_groundTint.z);
+    }
     float& Roughness()             { return m_roughness; }
     float& AmbientScale()          { return m_ambientScale; }
     float& DirectLightScale()      { return m_directLightScale; }
@@ -475,6 +491,7 @@ public:
     float& NormalFalloff()         { return m_normalFalloff; }
     void ResetMaterial() {
         m_albedo = XMFLOAT3(0.078431f, 0.078431f, 0.078431f);
+        m_groundTint = XMFLOAT3(1.0f, 1.0f, 1.0f);
         m_roughness = 1.0f;
         m_ambientScale = 1.239f;
         m_directLightScale = 2.0f;
@@ -510,19 +527,6 @@ private:
         float radius = 0.0f;
     };
 
-    bool RuntimeCellExcluded(float centerX, float centerZ) const {
-        constexpr float halfCell = kCellSize * 0.5f;
-        for (const RuntimeExclusion& exclusion : m_runtimeExclusions) {
-            const float dx = (std::max)(
-                std::abs(exclusion.x - centerX) - halfCell, 0.0f);
-            const float dz = (std::max)(
-                std::abs(exclusion.z - centerZ) - halfCell, 0.0f);
-            if (dx * dx + dz * dz <= exclusion.radius * exclusion.radius)
-                return true;
-        }
-        return false;
-    }
-
     static constexpr int  kSegments = 4;       // authored vertical segments
     // A blade is a strip: (kSegments + 1) rows of 2 vertices, tapering to a point.
     static constexpr int  kVertsPerBlade = (kSegments + 1) * 2;
@@ -552,6 +556,7 @@ private:
         float  cx = 0.0f, cz = 0.0f;   // centre, world space
         UINT   firstBlade = 0;
         UINT   bladeCount = 0;
+        GrassDamageRanges damage;
     };
 
     // Cheap deterministic hash -> [0, 1). A fixed seed keeps the field identical
@@ -1063,7 +1068,11 @@ private:
             inst.push_back(bi);
         }
 
-        const UINT instSize = (UINT)(inst.size() * sizeof(BladeInstance));
+        // 8x auto density can plant tens of millions of blades; refuse rather
+        // than wrap the 32-bit buffer size into a short, mis-indexed buffer.
+        const uint64_t instBytes = uint64_t(inst.size()) * sizeof(BladeInstance);
+        if (instBytes > UINT_MAX) return false;
+        const UINT instSize = (UINT)instBytes;
         if (!CreateStaticBufferDX12(g_dx12.device.Get(), inst.data(), instSize,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_instances,
                 "GrassInstanceBuffer"))
@@ -1097,6 +1106,8 @@ private:
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
     XMFLOAT3 m_albedo = { 0.078431f, 0.078431f, 0.078431f };
+    bool m_matchGroundColor = false;
+    XMFLOAT3 m_groundTint = { 1.0f, 1.0f, 1.0f };
     float m_roughness = 1.0f;
     float m_ambientScale = 1.239f;
     float m_directLightScale = 2.0f;

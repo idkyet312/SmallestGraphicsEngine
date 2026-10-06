@@ -3,6 +3,7 @@
 // player, and a per-frame bone-palette upload buffer, and knows how to draw
 // itself through the mesh-shader path with skinning enabled.
 #include "BanditWeapon.h"
+#include "HumveeCrew.h"
 #include "SkinnedFBXImporter.h"
 #include "AnimationRuntime.h"
 #include "DirectionalLocomotion.h"
@@ -197,6 +198,7 @@ public:
     bool              stepTrackingStarted = false;
     bool              turretGunner = false;
     int               mountedVehicleIndex = 0;
+    HumveeCrewSeat     humveeCrew;
     int               burstShotsRemaining = 0;
     // Loadout. Set at spawn; drives engagement range, aim delay, and how main
     // turns a "fired" result into projectiles.
@@ -1260,6 +1262,43 @@ public:
         PlayClip("Idle");
         anim.Advance(dt);
         ComputePose(dt);
+    }
+
+    void PrepareHumveeRide() {
+        hasCoverTarget_ = inCover_ = false;
+        throwPlaying_ = throwReleasePending_ = throwReleaseReady_ = false;
+        preparingShot_ = false;
+        stationaryAimTime_ = 0.0f;
+        burstShotsRemaining = 0;
+        navigationPath_.clear();
+    }
+
+    void UpdateHumveePassenger(float dt, const DirectX::XMFLOAT3& seatPosition,
+                               float vehicleYaw) {
+        if (dead_) return;
+        position = seatPosition;
+        yaw = aimYaw = vehicleYaw;
+        aimPitch = 0.0f;
+        knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
+        PrepareHumveeRide();
+        directionalMoving_ = false;
+        aiCrouching_ = true;
+        crouchBlend_ = 1.0f;
+        playedCrouchClip_ = model.FindClip("CrouchIdleAim") != nullptr;
+        PlayClip(playedCrouchClip_ ? "CrouchIdleAim" : "Idle");
+        anim.Advance(dt);
+        ComputePose(dt);
+    }
+
+    void EndHumveeRide() {
+        humveeCrew.Clear();
+        turretGunner = false;
+        aiCrouching_ = false;
+        aiCrouchTimer_ = 0.0f;
+        crouchBlend_ = 0.0f;
+        playedCrouchClip_ = false;
+        stepTrackingStarted = false;
+        PrepareHumveeRide();
     }
 
     // ---- Rappel descent -----------------------------------------------------

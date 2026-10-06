@@ -69,8 +69,7 @@ static void ToggleHumveeDriving() {
 static BoatPlatformPose PlayerBoatPlatformPose() {
     const VehicleSystem& boat = g_game.vehicles;
     if (boat.drivingInsertionBoat)
-        return {boat.insertionBoatPosition, boat.insertionBoatYaw,
-                boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset};
+        return CurrentInsertionBoatPlatformPose();
     return CurrentBoatPlatformPose();
 }
 
@@ -85,11 +84,17 @@ static void ExitPlayerBoat() {
     scene.camera.VerticalVelocity = 0.0f;
     // Leave on the stern deck, where the existing platform collision takes
     // over on the next frame, instead of dropping the player in the sea.
-    scene.camera.Position = {
-        pose.position.x - std::sin(pose.yaw) * 2.5f,
-        BoatDeckY(pose) + scene.camera.PlayerHeight,
-        pose.position.z - std::cos(pose.yaw) * 2.5f };
-    scene.camera.FloorY = BoatDeckY(pose);
+    const bool capsized = BoatDeckHeightAt(pose,pose.position.x,pose.position.z) == -FLT_MAX;
+    const XMVECTOR exitLocal = capsized
+        ? XMVectorSet(kBoatDeckHalfBeam + 0.8f,0,0,0)
+        : XMVectorSet(0,pose.deckOffset,-2.5f,0);
+    XMStoreFloat3(&scene.camera.Position, XMVector3TransformNormal(exitLocal,
+        BoatPlatformOrientation(pose)) + XMLoadFloat3(&pose.position) -
+            XMVectorSet(0,pose.sinkDepth,0,0));
+    scene.camera.FloorY = capsized
+        ? GroundHeightAt(scene.camera.Position.x,scene.camera.Position.z)
+        : BoatDeckHeightAt(pose,scene.camera.Position.x,scene.camera.Position.z);
+    scene.camera.Position.y = scene.camera.FloorY + scene.camera.PlayerHeight;
     scene.camera.IsGrounded = true;
 }
 
@@ -160,7 +165,8 @@ static void UpdatePlayerBoat() {
     const float roll = boat.drivingInsertionBoat ? boat.insertionBoatRoll : boat.boatRoll;
     const XMVECTOR centreOffset = XMVector3TransformNormal(
         XMVectorSet(0.0f, bounds.centerHeight, 0.0f, 0.0f),
-        XMMatrixRotationZ(roll) * XMMatrixRotationY(pose.yaw));
+        VehicleSystem::BoatOrientation(boat.drivingInsertionBoat
+            ? boat.insertionBoatPhysics : boat.boatPhysics, roll, pose.yaw));
     const XMVECTOR target = XMLoadFloat3(&pose.position) + centreOffset -
         XMVectorSet(0.0f, pose.sinkDepth, 0.0f, 0.0f);
     XMStoreFloat3(&scene.camera.Position,
@@ -173,6 +179,49 @@ static void UpdatePlayerBoat() {
     scene.camera.Up = {0.0f, 1.0f, 0.0f};
     scene.camera.FloorY = BoatDeckY(pose);
     scene.camera.VerticalVelocity = 0.0f;
+}
+
+// Behind the centre console, facing the bow. Both hulls are MilitaryBoatv2
+// normalised to 9 m: the console spans model z -2.5..0 (|x| <= 0.68) with open
+// floor from -2.5 to -3.0 before the aft structure, and the stern is -z (the
+// outboards hang below z -3.5). Model z -2.75 is local -2.85.
+static constexpr float kBoatHelmLocalZ = -2.85f;
+
+static bool BoatDriverBodyVisible() {
+    return g_boatDriverBody && g_boatDriverBody->visible;
+}
+
+// The orbit camera shows the boat from outside, so the helm needs a body.
+static void UpdateBoatDriverBody(float dt) {
+    const VehicleSystem& boat = g_game.vehicles;
+    const bool driving = boat.drivingBoat || boat.drivingInsertionBoat;
+    if (g_boatDriverBody) g_boatDriverBody->visible = false;
+    if (!driving || !g_marineModel.valid) return;
+    const BoatPlatformPose pose = PlayerBoatPlatformPose();
+    XMFLOAT3 helm;
+    XMStoreFloat3(&helm, XMVector3TransformNormal(
+        XMVectorSet(0.0f, 0.0f, kBoatHelmLocalZ, 0.0f),
+        BoatPlatformOrientation(pose)) + XMLoadFloat3(&pose.position));
+    const float deckY = BoatDeckHeightAt(pose, helm.x, helm.z);
+    if (deckY == -FLT_MAX) return;   // capsized: nobody stands at the helm
+    helm.y = deckY + kBoatCrewRise;
+
+    // Re-init when a level load replaced the marine rig.
+    if (!g_boatDriverBody || g_boatDriverBody->model.node != g_marineModel.node) {
+        auto body = std::make_unique<SkinnedEnemy>();
+        if (!body->Init(g_marineModel)) return;
+        body->faction = Faction::Marine;
+        body->damageTakenScale = 0.0f;
+        body->leftArmReach = g_banditLeftArmReach;
+        g_boatDriverBody = std::move(body);
+        g_shadowExtraActor = g_boatDriverBody.get();
+    }
+    // Look out over the bow, level with the deck.
+    const XMFLOAT3 ahead(helm.x + std::sin(pose.yaw) * 30.0f,
+                         helm.y + 1.4f,
+                         helm.z + std::cos(pose.yaw) * 30.0f);
+    g_boatDriverBody->visible = true;
+    g_boatDriverBody->UpdateMounted(dt, helm, ahead);
 }
 
 static void DrawBoatDrivingPrompt() {
@@ -219,18 +268,32 @@ static void RefreshInsertionBoatPassenger() {
 
 static void UpdateInsertionBoatPlatform(const BoatPlatformPose& oldPose) {
     VehicleSystem& boat = g_game.vehicles;
-    if (!boat.insertionBoatVisible || boat.insertionBoatPassengerPlacementPending) return;
-    BoatPlatformPose pose{boat.insertionBoatPosition, boat.insertionBoatYaw,
-                          boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset};
-    if (boat.drivingInsertionBoat && !boat.InsertionBoatIsFoundering() &&
-        BoatMovesOntoShore(oldPose, pose, boat.insertionBoatWaterY)) {
-        boat.insertionBoatPosition.x = oldPose.position.x;
-        boat.insertionBoatPosition.z = oldPose.position.z;
-        boat.insertionBoatYaw = oldPose.yaw;
-        boat.boatSpeed = 0.0f;
-        pose.position = boat.insertionBoatPosition;
-        pose.yaw = boat.insertionBoatYaw;
+    if (!boat.insertionBoatVisible || boat.InsertionBoatIsSunk()) {
+        ReleaseBoatBody(boat.insertionBoatPhysics);
+        return;
     }
+    if (boat.insertionBoatPassengerPlacementPending) return;
+    if (boat.insertionBoatCaptured && !boat.InsertionBoatIsFoundering() &&
+        !boat.InsertionBoatIsSunk()) {
+        UpdateBoatBody(boat.insertionBoatPhysics, boat.insertionBoatPosition,
+            boat.insertionBoatYaw, boat.insertionBoatRoll,
+            boat.insertionBoatWaterY, boat.drivingInsertionBoat);
+    } else if (boat.insertionBoatPhysics.handle != 0 && boat.InsertionBoatIsFoundering()) {
+        UpdateBoatBody(boat.insertionBoatPhysics, boat.insertionBoatPosition,
+            boat.insertionBoatYaw, boat.insertionBoatRoll,
+            boat.insertionBoatWaterY, false, false);
+        boat.insertionBoatSinkOffset = 0;
+        if (boat.insertionBoatPosition.y < boat.insertionBoatWaterY -
+                VehicleSystem::InsertionBoatSinkDepth) {
+            boat.insertionBoatPhase = VehicleSystem::InsertionBoatPhase::Sunk;
+            boat.insertionBoatJustSank = true;
+            ReleaseBoatBody(boat.insertionBoatPhysics);
+        }
+    } else {
+        ReleaseBoatBody(boat.insertionBoatPhysics);
+        if (!boat.insertionBoatCaptured) boat.insertionBoatPhysics = {};
+    }
+    const BoatPlatformPose pose = CurrentInsertionBoatPlatformPose();
     const bool aboard = boat.insertionBoatCarryingPlayer && !boat.drivingInsertionBoat;
     const bool carried = CarryBoatDeckPlayer(oldPose, pose, aboard);
     if (carried && aboard) {
@@ -251,8 +314,7 @@ static void ReleaseManualInsertionBoatSquad() {
     if (ground < boat.insertionBoatWaterY - 0.2f ||
         std::abs(player.y - scene.camera.PlayerHeight - ground) > 0.4f ||
         BoatDeckSupports(player, player.y - scene.camera.PlayerHeight,
-            {boat.insertionBoatPosition, boat.insertionBoatYaw,
-             boat.insertionBoatSinkOffset, boat.insertionBoatDeckOffset}, 0.35f, 0.5f)) return;
+            CurrentInsertionBoatPlatformPose(), 0.35f, 0.5f)) return;
     // Taking the helm bypasses the scripted beach arrival. Land the squad
     // once the player actually steps ashore at their chosen destination.
     boat.insertionBoatManualSquadPending = false;
@@ -400,7 +462,8 @@ static void UpdateFootsteps(float dt) {
     for (auto& bandit : g_bandits) {
         if (!bandit || bandit->Dead()) continue;
         // Rappelling and mounted actors are not walking.
-        if (bandit->Rappelling() || bandit->turretGunner) continue;
+        if (bandit->Rappelling() || bandit->turretGunner ||
+            bandit->humveeCrew.Mounted()) continue;
 
         const XMFLOAT3 position = bandit->position;
         if (!bandit->stepTrackingStarted) {

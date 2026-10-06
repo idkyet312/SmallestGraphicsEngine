@@ -428,9 +428,7 @@ static void DamageEnemyTanksFromBlast(const XMFLOAT3& center, float reach,
         const float falloff = 1.0f - surface / reach;
         float damage = 0.0f;
         if (remoteCharge) {
-            // A charge stuck to the hull is a kill; one nearby still guts it.
-            damage = surface < 1.5f ? tank.maxHealth
-                                    : tank.maxHealth * 0.6f * falloff;
+            damage = SGE::TankC4BlastDamage(surface, reach, tank.maxHealth);
         } else if (rocket) {
             damage = kEnemyTankRocketDamage * (surface < 1.0f ? 1.0f : falloff);
         } else if (missile) {

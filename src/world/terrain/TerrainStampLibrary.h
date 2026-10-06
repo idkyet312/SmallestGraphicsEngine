@@ -7,6 +7,7 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include "TerrainRockProtection.h"
 
 inline constexpr size_t kMaxTerrainStampTextures = 64;
 // 512 gives a 64 m stamp a sample every 12.5 cm, comfortably finer than the
@@ -23,19 +24,30 @@ inline constexpr uint32_t kTerrainStampResolution = 512;
 //
 // Raising the shared resolution to fix that is the wrong trade: every one of
 // the 64 layers would pay it (4096 across the board is 2.1 GB). Instead the
-// baked stamp gets one dedicated high-resolution region appended after the
-// atlas, addressed by kTerrainStampBakeLayer. 4096^2 * 2B = 33.5 MB for the
-// single slot, which doubles the stamp memory rather than multiplying it by 64.
+// baked stamp gets one dedicated region after the atlas and rock mask,
+// addressed by kTerrainStampBakeLayer. The default is 4096; its dimensions
+// follow the baked PNG up to 16K without enlarging the 64 shared layers.
 inline constexpr uint32_t kTerrainStampBakeResolution = 4096;
+inline constexpr uint32_t kMaxTerrainStampBakeResolution = 16384;
 inline constexpr uint32_t kTerrainStampBakeLayer = kMaxTerrainStampTextures;
 
-// Texel count of the atlas plus the bake slot: the size of the buffer the
-// shader indexes. The bake region starts at kMaxTerrainStampTextures * 512^2.
+// The shared atlas keeps its fixed size regardless of the chosen bake size.
 inline constexpr size_t kTerrainStampAtlasTexels =
     static_cast<size_t>(kMaxTerrainStampTextures) *
-        kTerrainStampResolution * kTerrainStampResolution +
-    static_cast<size_t>(kTerrainStampBakeResolution) *
-        kTerrainStampBakeResolution;
+        kTerrainStampResolution * kTerrainStampResolution;
+// Keep the mask at a fixed offset; only the final bake region changes size.
+// The header packs rock-mask activity in the low 16 bits and bake side in high.
+inline constexpr size_t kTerrainStampBakeOffset =
+    kTerrainStampAtlasTexels + 2 + kTerrainRockMaskTexels;
+
+inline constexpr bool IsTerrainStampBakeResolution(uint32_t side) {
+    return side >= 2 && side <= kMaxTerrainStampBakeResolution;
+}
+
+inline constexpr size_t TerrainStampBufferTexels(uint32_t bakeSide) {
+    // ByteAddressBuffer.Load reads whole words, including the last odd texel.
+    return (kTerrainStampBakeOffset + size_t(bakeSide) * bakeSide + 1) & ~size_t(1);
+}
 
 inline const std::filesystem::path& TerrainStampDirectory() {
     static const std::filesystem::path directory =

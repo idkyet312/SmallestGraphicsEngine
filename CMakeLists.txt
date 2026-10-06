@@ -804,6 +804,18 @@ if(BUILD_TESTING)
     target_link_libraries(SunHorizonFadeTests PRIVATE SGEProjectHeaders)
     add_test(NAME SunHorizonFadeTests COMMAND SunHorizonFadeTests)
 
+    add_executable(FoliageColorTests tests/FoliageColorTests.cpp)
+    target_link_libraries(FoliageColorTests PRIVATE SGEProjectHeaders)
+    add_test(NAME FoliageColorTests COMMAND FoliageColorTests)
+
+    add_executable(GrassDamageTests tests/GrassDamageTests.cpp)
+    target_link_libraries(GrassDamageTests PRIVATE SGEProjectHeaders)
+    add_test(NAME GrassDamageTests COMMAND GrassDamageTests)
+
+    add_executable(BoatPhysicsTests tests/BoatPhysicsTests.cpp)
+    target_link_libraries(BoatPhysicsTests PRIVATE SGEProjectHeaders box3d)
+    add_test(NAME BoatPhysicsTests COMMAND BoatPhysicsTests)
+
     # Pure struct/bitfield checks -- no device, no socket, no content root.
     add_executable(PlayerInputTests tests/PlayerInputTests.cpp)
     target_link_libraries(PlayerInputTests PRIVATE SGEProjectHeaders)

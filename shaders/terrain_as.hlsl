@@ -37,6 +37,31 @@ static const uint kClipmapFlag = 2u;
 // Matches TerrainRendererDX12::kStyleDeploymentOverview.
 static const uint kDeploymentOverviewFlag = 8u;
 static const uint kErrorLODFlag = 16u;
+// Matches TerrainRendererDX12::kStyleCameraSnap (level editor only).
+static const uint kCameraSnapFlag = 32u;
+
+// Camera snap: the editor camera flies anywhere, and the gameplay snap (one
+// coarsest tile, 128 m at 8 rings) can leave it standing far outside the fine
+// rings. Capping ring r at LOD R-1-r keeps every vertex lattice no coarser than
+// the outer ring's LOD-0 spacing, base * 2^(R-1) / 8, so the shared origin can
+// snap to that instead and round to the camera: at 8 rings it stays within 8 m
+// of the camera, inside ring 0. Error LOD can collapse a tile to one quad, so
+// it always keeps the whole-tile snap.
+bool CameraSnapActive() {
+    return (terrainStyle & kCameraSnapFlag) != 0u &&
+           (terrainStyle & kErrorLODFlag) == 0u;
+}
+
+uint ClipmapMaxLOD(uint ring, uint R) {
+    return min(3u, R - 1u - min(ring, R - 1u));
+}
+
+float2 ClipmapCentre(float2 viewXZ, uint R, float base) {
+    float snapGrid = base * (float)(1u << (R - 1));
+    if (!CameraSnapActive()) return floor(viewXZ / snapGrid) * snapGrid;
+    snapGrid *= 0.125;
+    return floor(viewXZ / snapGrid + 0.5) * snapGrid;
+}
 
 groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
@@ -132,7 +157,6 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
     // the camera moves. One shared origin keeps every ring boundary and every
     // hole on common tile lines -- verified gap-free and overlap-free for
     // R = 2..8 at random camera positions.
-    float snapGrid = base * (float)(1u << (R - 1));
     // Normal rendering follows its bound viewpoint. The deployment overview
     // instead pins every terrain pass to the island: its camera can sit
     // kilometres away, and following it would waste the fine rings on empty
@@ -140,7 +164,7 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
     const bool islandCentered =
         (terrainStyle & kDeploymentOverviewFlag) != 0u;
     float2 clipmapCenter = islandCentered ? float2(0.0, 0.0) : viewPos.xz;
-    float2 snapped = floor(clipmapCenter / snapGrid) * snapGrid;
+    float2 snapped = ClipmapCentre(clipmapCenter, R, base);
     originXZ = snapped + (float2(lx, lz) - (float)(G / 2)) * t;
     sizeOut = t;
     ringOut = ring;
@@ -155,11 +179,10 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
 bool ResolveClipmapTileAt(float2 samplePoint, uint G, uint R, float base,
                           out float2 originXZ, out float sizeOut,
                           out uint ringOut, out uint lxOut, out uint lzOut) {
-    float snapGrid = base * (float)(1u << (R - 1));
     const bool islandCentered =
         (terrainStyle & kDeploymentOverviewFlag) != 0u;
     float2 clipmapCenter = islandCentered ? float2(0.0, 0.0) : viewPos.xz;
-    float2 snapped = floor(clipmapCenter / snapGrid) * snapGrid;
+    float2 snapped = ClipmapCentre(clipmapCenter, R, base);
 
     [loop]
     for (uint ring = 0; ring < R; ++ring) {
@@ -420,6 +443,16 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             // slide onto the coarse grid instead of popping.
             if (!deploymentOverview && !errorLOD)
                 morph = smoothstep(0.7, 1.0, frac(lodF));
+            // Camera snap only keeps lattices up to ClipmapMaxLOD world-aligned.
+            // A capped tile also stops morphing: its morph target would be the
+            // next-coarser lattice, which the finer snap no longer aligns.
+            if (clipmap && !deploymentOverview && CameraSnapActive()) {
+                const uint maxLOD = ClipmapMaxLOD(ring, tilesZ);
+                if (lod >= maxLOD) {
+                    lod = maxLOD;
+                    morph = 0.0;
+                }
+            }
 
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);

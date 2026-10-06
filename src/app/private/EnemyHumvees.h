@@ -27,14 +27,159 @@ static constexpr float kEnemyHumveeDetectRange = 130.0f;
 // Where it stops closing: inside the gunner's effective range, outside the
 // distance at which a player can simply walk up and throw something in.
 static constexpr float kEnemyHumveeStandoff = 26.0f;
-static constexpr float kEnemyHumveeMaxThrottle = 0.75f;   // ~7 m/s
+static constexpr float kEnemyHumveeMaxThrottle = 0.75f;   // ~14 m/s
 static constexpr float kEnemyHumveeSteerSign = -1.0f;
 // Nose to chassis centre, metres (GroundVehicleSpec::chassisHalfExtents.x).
 static constexpr float kEnemyHumveeHalfLength = 2.2f;
 
+static bool HumveeHasFriendlyGunner(size_t index) {
+    if (ClientOwnedByHost() && index < g_humveeGameplay.size() &&
+        g_humveeGameplay[index].netFriendlyGunner) return true;
+    for (const auto& actor : g_bandits)
+        if (actor && !actor->Dead() && actor->faction == Faction::Marine &&
+            actor->humveeCrew.Gunner() &&
+            actor->humveeCrew.vehicle == static_cast<int>(index)) return true;
+    return false;
+}
+
+static XMFLOAT3 HumveeMarineSeatPosition(const SkinnedEnemy& actor) {
+    const size_t index = static_cast<size_t>(actor.humveeCrew.vehicle);
+    if (actor.humveeCrew.Gunner()) return HumveeTurretMountWorld(index);
+    XMFLOAT4X4 pose;
+    if (!HumveeVisualPose(index, pose)) return actor.position;
+    const XMVECTOR offset = actor.humveeCrew.seat == 1
+        ? XMVectorSet(-0.65f, -0.45f, -0.48f, 1.0f)
+        : XMVectorSet(0.75f, -0.45f, 0.48f, 1.0f);
+    XMFLOAT3 position;
+    XMStoreFloat3(&position, XMVector3TransformCoord(offset, XMLoadFloat4x4(&pose)));
+    return position;
+}
+
+static void PoseHumveeMarine(SkinnedEnemy& actor, float dt) {
+    if (actor.Dead() || !actor.humveeCrew.Mounted()) return;
+    const size_t index = static_cast<size_t>(actor.humveeCrew.vehicle);
+    if (!HumveeAlive(index)) return;
+    const XMFLOAT3 seat = HumveeMarineSeatPosition(actor);
+    if (actor.humveeCrew.Gunner()) {
+        XMFLOAT3 target = index < g_humveeGameplay.size()
+            ? g_humveeGameplay[index].aimPoint : seat;
+        if (ClientOwnedByHost()) {
+            const float reach = 100.0f * std::cos(actor.aimPitch);
+            target = { seat.x + std::sin(actor.aimYaw) * reach,
+                       seat.y + actor.footOffset + 1.48f +
+                           std::sin(actor.aimPitch) * 100.0f,
+                       seat.z + std::cos(actor.aimYaw) * reach };
+        }
+        actor.UpdateMounted(dt, seat, target);
+    } else {
+        XMFLOAT4X4 pose;
+        XMFLOAT3 forward;
+        if (!HumveeVisualPose(index, pose, nullptr, &forward)) return;
+        actor.UpdateHumveePassenger(dt, seat, std::atan2(-forward.x, -forward.z));
+    }
+}
+
+static void RefreshHumveeMarinePoses(float dt) {
+    for (auto& actor : g_bandits)
+        if (actor) PoseHumveeMarine(*actor, dt);
+}
+
+// Seat ownership stays on each actor, so actor removal cannot leave stale pointers.
+static void UpdateMarineHumveeCrew() {
+    if (ClientOwnedByHost() || IsEditorEditing()) return;
+    struct Driver { bool present = false; net::PlayerId owner = net::kInvalidPlayerId; };
+    static std::vector<Driver> drivers;
+    drivers.assign(g_humveeGameplay.size(), Driver{});
+    if (g_drivingHumvee && g_activeHumveeIndex < drivers.size() &&
+        !scene.player.downed && (scene.player.godMode || scene.player.health > 0.0f))
+        drivers[g_activeHumveeIndex] = { true, g_netSession.LocalId() };
+    if (g_netSession.CurrentRole() == net::Role::Host) {
+        g_netSession.GetRemotePlayers(g_humveeSeatScratch);
+        for (const net::RemotePlayer& remote : g_humveeSeatScratch)
+            if (remote.vehicle.kind == net::DrivenVehicleKind::Humvee &&
+                remote.vehicle.index < drivers.size() && !remote.downed &&
+                remote.health > 0.0f)
+                drivers[remote.vehicle.index] = { true, remote.id };
+    }
+    for (auto& actor : g_bandits) {
+        if (!actor || !actor->humveeCrew.Mounted()) continue;
+        const int vehicle = actor->humveeCrew.vehicle;
+        if (!actor->Dead() && !actor->Held() &&
+            static_cast<size_t>(vehicle) < drivers.size() &&
+            drivers[vehicle].present && HumveeAlive(static_cast<size_t>(vehicle))) continue;
+        if (!actor->Dead()) {
+            XMFLOAT4X4 pose;
+            if (HumveeVisualPose(static_cast<size_t>(vehicle), pose)) {
+                const float side = actor->humveeCrew.seat == 2 ? 1.0f : -1.0f;
+                XMStoreFloat3(&actor->position, XMVector3TransformCoord(
+                    XMVectorSet(actor->humveeCrew.seat == 2 ? 1.0f : -0.8f,
+                                0.0f, side * 2.6f, 1.0f), XMLoadFloat4x4(&pose)));
+                actor->position.y = GroundHeightAt(actor->position.x, actor->position.z);
+            }
+        }
+        actor->EndHumveeRide();
+    }
+    for (size_t index = 0; index < drivers.size(); ++index) {
+        if (!drivers[index].present || !HumveeAlive(index)) continue;
+        XMFLOAT4X4 pose;
+        XMFLOAT3 centre;
+        if (!HumveeVisualPose(index, pose, &centre)) continue;
+        uint8_t occupied = 0;
+        for (const auto& actor : g_bandits) {
+            if (!actor || actor->Dead()) continue;
+            if (actor->turretGunner && actor->mountedVehicleIndex == static_cast<int>(index))
+                occupied |= 1u;
+            if (actor->humveeCrew.Mounted() && actor->humveeCrew.vehicle == static_cast<int>(index))
+                occupied |= static_cast<uint8_t>(1u << actor->humveeCrew.seat);
+        }
+        // A passenger takes over when the gunner is lost.
+        if ((occupied & 1u) == 0) {
+            for (auto& actor : g_bandits) {
+                if (!actor || actor->Dead() || !actor->humveeCrew.Mounted() ||
+                    actor->humveeCrew.vehicle != static_cast<int>(index)) continue;
+                occupied &= static_cast<uint8_t>(~(1u << actor->humveeCrew.seat));
+                actor->humveeCrew.Clear();
+                actor->humveeCrew.TryBoard(static_cast<int>(index), occupied);
+                actor->turretGunner = true;
+                actor->mountedVehicleIndex = static_cast<int>(index);
+                actor->PrepareHumveeRide();
+                occupied |= 1u;
+                break;
+            }
+        }
+        while (occupied != 7u) {
+            SkinnedEnemy* nearest = nullptr;
+            float bestDistance = 5.5f * 5.5f;
+            for (auto& actor : g_bandits) {
+                if (!actor || actor->faction != Faction::Marine || actor->networkControlled ||
+                    actor->Dead() || actor->Held() || actor->Rappelling() ||
+                    actor->turretGunner || actor->humveeCrew.Mounted()) continue;
+                if (actor->leashOwner != net::kInvalidPlayerId &&
+                    actor->leashOwner != drivers[index].owner) continue;
+                const float dx = actor->position.x - centre.x;
+                const float dz = actor->position.z - centre.z;
+                if (std::abs(actor->position.y - centre.y) > 3.0f) continue;
+                const float distance = dx * dx + dz * dz;
+                if (distance > bestDistance) continue;
+                nearest = actor.get();
+                bestDistance = distance;
+            }
+            if (!nearest || !nearest->humveeCrew.TryBoard(static_cast<int>(index), occupied)) break;
+            nearest->turretGunner = nearest->humveeCrew.Gunner();
+            nearest->mountedVehicleIndex = static_cast<int>(index);
+            nearest->PrepareHumveeRide();
+            occupied |= static_cast<uint8_t>(1u << nearest->humveeCrew.seat);
+        }
+    }
+    for (auto& actor : g_bandits)
+        if (actor && !actor->Dead() && actor->humveeCrew.Mounted())
+            actor->position = HumveeMarineSeatPosition(*actor);
+}
+
 static bool HumveeHasLiveGunner(size_t vehicleIndex) {
     for (const auto& bandit : g_bandits)
-        if (bandit && !bandit->networkControlled && bandit->turretGunner &&
+        if (bandit && bandit->faction == Faction::Bandit &&
+            !bandit->networkControlled && bandit->turretGunner &&
             !bandit->Dead() && bandit->mountedVehicleIndex >= 0 &&
             static_cast<size_t>(bandit->mountedVehicleIndex) == vehicleIndex)
             return true;
@@ -232,9 +377,10 @@ static void SyncEnemyHumveePoses(float dt) {
         for (size_t index = 0; index < g_humveeGameplay.size(); ++index) {
             HumveeGameplayState& state = g_humveeGameplay[index];
             if (!state.remoteDriven || !state.netPosed) continue;
-            state.turretYaw += std::atan2(
-                std::sin(state.netTurretYaw - state.turretYaw),
-                std::cos(state.netTurretYaw - state.turretYaw)) * ease;
+            if (!HumveeHasFriendlyGunner(index))
+                state.turretYaw += std::atan2(
+                    std::sin(state.netTurretYaw - state.turretYaw),
+                    std::cos(state.netTurretYaw - state.turretYaw)) * ease;
             XMStoreFloat3(&state.drawPosition, XMVectorLerp(
                 XMLoadFloat3(&state.drawPosition),
                 XMLoadFloat3(&state.netPosition), ease));
@@ -251,7 +397,7 @@ static void SyncEnemyHumveePoses(float dt) {
         HumveeGameplayState& state = g_humveeGameplay[index];
         const bool playerDriving =
             g_drivingHumvee && g_activeHumveeIndex == index;
-        if (state.netTurretSeen && !playerDriving) {
+        if (state.netTurretSeen && (!playerDriving || HumveeHasFriendlyGunner(index))) {
             state.turretYaw += std::atan2(
                 std::sin(state.netTurretYaw - state.turretYaw),
                 std::cos(state.netTurretYaw - state.turretYaw)) * ease;

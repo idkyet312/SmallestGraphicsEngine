@@ -763,6 +763,12 @@ void LevelEditor::RenderTerrainMaterials() {
         if (ImGui::Checkbox("Automatic grass & flowers", &level_.terrainAutoFoliage))
             MarkChanged(before);
     }
+    {
+        const LevelDefinition before = level_;
+        const bool changed = ImGui::SliderFloat("Auto grass density",
+            &level_.terrainAutoGrassDensity, 0.0f, 8.0f, "%.2fx");
+        TrackItemEdit(before, changed);
+    }
     ImGui::TextWrapped("Textures follow the automatic height/slope blend and material "
         "painting. Custom layers stay assigned when the map type changes.");
     ImGui::TextDisabled("Foliage changes apply on Save / Play.");
@@ -1043,6 +1049,7 @@ bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
         before.mapType != level_.mapType ||
         before.terrainTextureLayers != level_.terrainTextureLayers ||
         before.terrainAutoFoliage != level_.terrainAutoFoliage ||
+        before.terrainAutoGrassDensity != level_.terrainAutoGrassDensity ||
         before.terrainFlat != level_.terrainFlat ||
         before.terrainTilesX != level_.terrainTilesX ||
         before.terrainTilesZ != level_.terrainTilesZ ||
@@ -3215,7 +3222,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SameLine();
     if (ImGui::RadioButton("Stamp", &terrainTool_, 6)) { foliageTool_ = 0; splineTool_ = 0; }
     if (terrainTool_ != 6) {
-        ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
+        ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f,
+            kMaxTerrainSculptBrushRadius, "%.1f m");
         ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
         ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
     } else {
@@ -3277,7 +3285,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         } else if (!terrainStampNames_.empty()) {
             ImGui::TextDisabled("Preview unavailable for this stamp.");
         }
-        ImGui::SliderFloat("Stamp radius", &terrainStampRadius_, 1.0f, 64.0f, "%.1f m");
+        ImGui::SliderFloat("Stamp radius", &terrainStampRadius_, 1.0f, 640.0f, "%.1f m");
         ImGui::SliderFloat("Stamp height", &terrainStampHeight_, -32.0f, 32.0f, "%.1f m");
         ImGui::SliderFloat("Rotation", &terrainStampRotation_, 0.0f, 360.0f, "%.0f deg");
         ImGui::SliderFloat("Edge falloff", &terrainStampEdgeFalloff_,
@@ -3320,6 +3328,18 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             "Undo/redo preserve each stroke. Only this local region is rebaked;\n"
             "distant edits and the whole-level bake stay intact.\n"
             "Resampling can soften fine detail. Performance gains are unmeasured.");
+    const int bakeSizes[] = {512, 1024, 2048, 4096, 8192, 16384};
+    if (ImGui::BeginCombo("Bake resolution", std::to_string(terrainBakeResolution_).c_str())) {
+        for (int size : bakeSizes) {
+            if (ImGui::Selectable(std::to_string(size).c_str(), terrainBakeResolution_ == size))
+                terrainBakeResolution_ = size;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::InputInt("Custom bake size (px)", &terrainBakeResolution_, 256, 1024);
+    terrainBakeResolution_ = (std::max)(2, (std::min)(
+        int(kMaxTerrainStampBakeResolution), terrainBakeResolution_));
+    ImGui::TextDisabled("%d x %d, 16-bit heightmap", terrainBakeResolution_, terrainBakeResolution_);
     ImGui::BeginDisabled(level_.terrainSculpt.empty());
     if (ImGui::Button("Clear Sculpt")) {
         const LevelDefinition before = level_;
@@ -3347,7 +3367,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         TerrainSculptStamp baked;
         const TerrainBakeResult result = BakeTerrainSculptToStamp(
             level_.terrainSculpt, terrainHeight,
-            bakeName, &stbi_zlib_compress, baked);
+            bakeName, &stbi_zlib_compress, baked, uint32_t(terrainBakeResolution_));
         if (!result.ok) {
             status_ = "Bake failed: " + result.error;
         } else {
@@ -3355,8 +3375,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             MarkChanged(before);
             char message[192];
             std::snprintf(message, sizeof(message),
-                "Baked %zu stamps into %s (%.2f m/texel). Undo to restore them.",
-                result.bakedStamps, result.texture.c_str(),
+                "Baked %zu stamps into %s at %dx%d (%.2f m/texel). Undo to restore them.",
+                result.bakedStamps, result.texture.c_str(), terrainBakeResolution_, terrainBakeResolution_,
                 result.metresPerTexel);
             status_ = message;
         }
@@ -3364,9 +3384,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Replace every sculpt stamp with one baked heightmap covering the\n"
-            "same ground. Bakes at 4096 into a dedicated slot, so the result\n"
-            "stays finer than the terrain can draw at normal level sizes;\n"
-            "the stamps stay in the undo stack.");
+            "same ground at the chosen resolution, up to 16384 x 16384.\n"
+            "Higher sizes preserve more detail and take longer to bake.\n"
+            "The stamps stay in the undo stack.");
     ImGui::EndDisabled();
     if (terrainTool_ != 6)
         ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");

@@ -404,6 +404,9 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
+    if (!std::isfinite(level.terrainAutoGrassDensity) ||
+        level.terrainAutoGrassDensity < 0.0f || level.terrainAutoGrassDensity > 8.0f)
+        result.errors.push_back("terrain autoGrassDensity must be between 0 and 8");
     if (level.mapType != LevelMapType::Tropical &&
         level.mapType != LevelMapType::Snowy && level.mapType != LevelMapType::Custom &&
         level.mapType != LevelMapType::GrassGround)
@@ -450,7 +453,7 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
         const float maxStampRadius =
             stamp.operation == TerrainSculptOperation::Heightmap
-                ? kMaxBakedTerrainStampRadius : 64.0f;
+                ? kMaxBakedTerrainStampRadius : kMaxTerrainSculptBrushRadius;
         if (!std::isfinite(stamp.x) || !std::isfinite(stamp.z) ||
             !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
             !std::isfinite(stamp.strength) || !std::isfinite(stamp.rotation) ||
@@ -596,6 +599,7 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
             const json& terrainRoot = root.at("terrain");
             level.terrainAutoFoliage = terrainRoot.value("autoFoliage",
                 level.mapType != LevelMapType::Snowy);
+            level.terrainAutoGrassDensity = terrainRoot.value("autoGrassDensity", 1.0f);
             if (terrainRoot.contains("materials")) {
                 const auto& materials = terrainRoot.at("materials");
                 if (!materials.is_array() || materials.size() != 4)
@@ -905,6 +909,8 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             root["mapType"] = LevelMapTypeName(level.mapType);
         if (!level.terrainAutoFoliage || level.mapType != LevelMapType::Tropical)
             root["terrain"]["autoFoliage"] = level.terrainAutoFoliage;
+        if (level.terrainAutoGrassDensity != 1.0f)
+            root["terrain"]["autoGrassDensity"] = level.terrainAutoGrassDensity;
         json materials = json::array();
         bool customMaterials = false;
         for (const auto& layer : level.terrainTextureLayers) {

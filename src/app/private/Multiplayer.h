@@ -784,6 +784,15 @@ static void PublishHostVehicles() {
     patrol.y = vehicles.boatPosition.y;
     patrol.z = vehicles.boatPosition.z;
     patrol.yaw = vehicles.boatYaw;
+    XMFLOAT4 boatRotation;
+    XMStoreFloat4(&boatRotation, XMQuaternionRotationMatrix(
+        VehicleSystem::BoatOrientation(vehicles.boatPhysics,
+            vehicles.boatRoll, vehicles.boatYaw)));
+    patrol.qx = boatRotation.x; patrol.qy = boatRotation.y;
+    patrol.qz = boatRotation.z; patrol.qw = boatRotation.w;
+    patrol.vx = vehicles.boatPhysics.velocity.x;
+    patrol.vy = vehicles.boatPhysics.velocity.y;
+    patrol.vz = vehicles.boatPhysics.velocity.z;
     g_netSession.PublishVehicles(state, boat, patrol);
 }
 
@@ -982,6 +991,7 @@ static void PublishHostArmor() {
         out.qz = rotation.z;
         out.qw = rotation.w;
         out.turretYaw = g_humveeGameplay[index].turretYaw;
+        out.friendlyGunner = HumveeHasFriendlyGunner(index) ? 1 : 0;
         g_hostHumveeScratch.push_back(out);
     }
     g_hostPlaneScratch.clear();
@@ -1119,6 +1129,7 @@ static void ApplyNetworkArmor() {
         if (state.dead) continue;
         state.netTurretYaw = in.turretYaw;
         state.netTurretSeen = true;
+        state.netFriendlyGunner = in.friendlyGunner != 0;
         if (!in.hostDriven) continue;
         state.netPosition = { in.x, in.y, in.z };
         XMStoreFloat4(&state.netRotation, XMQuaternionNormalize(
@@ -1570,6 +1581,10 @@ static void PublishHostEnemies() {
             ? g_netSession.LocalId()
             : actor->netKiller;
         state.marine = actor->faction == Faction::Marine;
+        if (actor->humveeCrew.Mounted()) {
+            state.humveeCrewSeat = static_cast<uint8_t>(actor->humveeCrew.seat);
+            state.humveeCrewVehicle = static_cast<uint8_t>(actor->humveeCrew.vehicle);
+        }
         g_hostEnemyScratch.push_back(state);
     }
     g_netSession.PublishEnemies(g_hostEnemyScratch);
@@ -1691,6 +1706,10 @@ static void UpdateClientEnemies(float frameDelta) {
         body->aimYaw = remote.aimYaw;
         body->aimPitch = remote.aimPitch;
         body->health = remote.health;
+        body->humveeCrew.ApplyNetwork(remote.humveeCrewVehicle, remote.humveeCrewSeat);
+        body->turretGunner = body->humveeCrew.Gunner();
+        if (body->humveeCrew.Mounted())
+            body->mountedVehicleIndex = body->humveeCrew.vehicle;
         if (remote.dead) {
             // Kill locally so the ragdoll, the death audio and the payout all
             // run through the paths that already exist, rather than a second
@@ -1704,8 +1723,11 @@ static void UpdateClientEnemies(float frameDelta) {
                         remote.killer == g_netSession.LocalId());
             continue;
         }
-        body->UpdateNetworkedPose(frameDelta, remote.moving, false,
-                                  /*aiming=*/false, remote.crouching);
+        if (body->humveeCrew.Mounted())
+            PoseHumveeMarine(*body, frameDelta);
+        else
+            body->UpdateNetworkedPose(frameDelta, remote.moving, false,
+                                      /*aiming=*/false, remote.crouching);
     }
 
     // Drop bodies the host has stopped sending. An enemy that fell out of the
@@ -2281,8 +2303,11 @@ static void UpdateMultiplayerSession(float frameDelta,
         vehicle.x = boat.boatPosition.x;
         vehicle.y = boat.boatPosition.y;
         vehicle.z = boat.boatPosition.z;
-        vehicle.qy = std::sin(boat.boatYaw * 0.5f);
-        vehicle.qw = std::cos(boat.boatYaw * 0.5f);
+        XMFLOAT4 rotation;
+        XMStoreFloat4(&rotation, XMQuaternionRotationMatrix(
+            VehicleSystem::BoatOrientation(boat.boatPhysics, boat.boatRoll, boat.boatYaw)));
+        vehicle.qx = rotation.x; vehicle.qy = rotation.y;
+        vehicle.qz = rotation.z; vehicle.qw = rotation.w;
     }
     if (g_playerTankEntity != 0) {
         for (uint8_t i = 0; i < g_enemyTanks.size() && i < net::kMaxReplicatedTanks; ++i) {
@@ -2507,6 +2532,13 @@ static void UpdateMultiplayerBodies(float frameDelta) {
                 boat.drivingBoat || remote.health <= 0.0f || remote.downed)
                 continue;
             boat.boatCaptured = boat.boatRemoteDriven = true;
+            ReleaseBoatBody(boat.boatPhysics);
+            boat.boatPhysics.hasPose = true;
+            boat.boatPhysics.rotation = {vehicle.qx,vehicle.qy,vehicle.qz,vehicle.qw};
+            XMStoreFloat4(&boat.boatPhysics.rotation,
+                XMQuaternionNormalize(XMLoadFloat4(&boat.boatPhysics.rotation)));
+            boat.boatPhysics.velocity = {};
+            boat.boatRoll = 0;
             const BoatPlatformPose previous = CurrentBoatPlatformPose();
             boat.boatPosition = { vehicle.x, vehicle.y, vehicle.z };
             boat.boatYaw = std::atan2(

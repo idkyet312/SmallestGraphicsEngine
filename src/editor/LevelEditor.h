@@ -267,6 +267,7 @@ private:
     float terrainBrushStrength_ = 0.45f;
     float terrainBrushSpacing_ = 1.0f;
     float terrainFlattenHeight_ = 0.0f;
+    int terrainBakeResolution_ = 4096;
     std::vector<std::string> terrainStampNames_;
     bool terrainStampLibraryScanned_ = false;
     int terrainStampSelection_ = 0;

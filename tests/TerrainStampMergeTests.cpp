@@ -2,6 +2,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 
@@ -140,6 +141,35 @@ int main() {
             std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(testDirectory);
     std::filesystem::current_path(testDirectory);
+
+    CHECK(IsTerrainStampBakeResolution(2));
+    CHECK(IsTerrainStampBakeResolution(16384));
+    CHECK(!IsTerrainStampBakeResolution(1));
+    CHECK(!IsTerrainStampBakeResolution(16385));
+    CHECK(TerrainStampBufferTexels(16384) == kTerrainStampBakeOffset + size_t(16384) * 16384);
+    CHECK(TerrainStampBufferTexels(4097) % 2 == 0);
+    // Exceed the old 4K limit and preserve an arbitrary, non-power-of-two size.
+    // An opt-in run exercises the full 16K allocation and PNG encode/decode.
+    const uint32_t wholeSide = std::getenv("SGE_TEST_16K_TERRAIN_BAKE") ? 16384 : 4097;
+    TerrainSculptStamp whole;
+    const auto wholeResult = BakeTerrainSculptToStamp(
+        stamps, [](float, float) { return 2.0f; },
+        "Map/Map_baked.png", &stbi_zlib_compress, whole, wholeSide);
+    CHECK(wholeResult.ok);
+    CHECK(IsTerrainStampBakeFilename(whole.texture));
+    const Image wholeImage = ReadImage(whole.texture);
+    CHECK(wholeImage.side == int(wholeSide));
+    CHECK(wholeImage.gray.size() == size_t(wholeSide) * wholeSide);
+    CHECK(std::abs(ApplyImage(0, whole.x, whole.z, whole, wholeImage) - 2.0f) < 1e-4f);
+    CHECK(std::abs(wholeResult.metresPerTexel - 2 * whole.radius / wholeSide) < 1e-6f);
+    TerrainSculptStamp invalid;
+    invalid.texture = "unchanged";
+    size_t invalidSamples = 0;
+    const auto invalidResult = BakeTerrainSculptToStamp(
+        stamps, [&](float, float) { ++invalidSamples; return 0.0f; },
+        "Map/invalid_baked.png", &stbi_zlib_compress, invalid, 16385);
+    CHECK(!invalidResult.ok && invalidSamples == 0);
+    CHECK(invalid.texture == "unchanged");
 
     // Include flatten after additive edits: the baked surface must retain the
     // ordered result, rather than treating all stamps as additive relief.

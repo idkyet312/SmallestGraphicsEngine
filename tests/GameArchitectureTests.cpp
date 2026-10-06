@@ -9,6 +9,7 @@
 #include "RankSystem.h"
 #include "CombatSystem.h"
 #include "VehicleSystem.h"
+#include "HumveeCrew.h"
 #include "BoatWakeEmitter.h"
 #include "DeploymentPlanner.h"
 #include "LevelLoadingController.h"
@@ -580,6 +581,17 @@ int main() {
               insertion.insertionBoatPosition.z == parked.z);
         CHECK(insertion.insertionBoatVisible && !insertion.insertionBoatCarryingPlayer);
         CHECK(!insertion.PlayerCanDriveInsertionBoat({1000.0f, 0.0f, 1000.0f}));
+        insertion.insertionBoatPhysics.handle = 42;
+        insertion.insertionBoatPhysics.hasPose = true;
+        insertion.insertionBoatPhysics.rotation = {0,0,0,1};
+        const auto physicalPosition = insertion.insertionBoatPosition;
+        insertion.UpdateInsertionBoat(0.25f);
+        CHECK(insertion.insertionBoatPosition.x == physicalPosition.x &&
+              insertion.insertionBoatPosition.y == physicalPosition.y &&
+              insertion.insertionBoatPosition.z == physicalPosition.z);
+        insertion.insertionBoatPhysics.rotation = {0,0,0.7071068f,0.7071068f};
+        CHECK(!insertion.InsertionBoatSupportsPassenger(parked,1.8f));
+        insertion.insertionBoatPhysics = {};
         CHECK(insertion.TakeInsertionBoatHelm(parked));
         insertion.SetBoatInput(-1.0f, 0.0f, false);
         for (int i = 0; i < 120; ++i) insertion.UpdateInsertionBoat(1.0f / 60.0f);
@@ -858,21 +870,66 @@ int main() {
     CHECK(player.Magazine(0) == 5);
     CHECK(player.Reserve(0) == 0);
     PlayerState demolitionKit;
-    for (int charge = 0; charge < 3; ++charge)
+    CHECK(demolitionKit.Magazine(5) == 1);
+    CHECK(demolitionKit.Reserve(5) == 2);
+    CHECK(demolitionKit.ReloadTime(5) == 5.0f);
+    CHECK(!demolitionKit.BeginReload(5));
+    for (int charge = 0; charge < 3; ++charge) {
         CHECK(demolitionKit.ConsumeAmmo(5));
+        CHECK(!demolitionKit.ConsumeAmmo(5));
+        if (charge == 2) break;
+        CHECK(demolitionKit.BeginReload(5));
+        CHECK(demolitionKit.reloadingSlot == 5);
+        CHECK(demolitionKit.reloadTimer == 5.0f);
+        CHECK(!demolitionKit.BeginReload(5));
+        demolitionKit.UpdateReload(4.5f);
+        CHECK(demolitionKit.Reloading());
+        CHECK(!demolitionKit.ConsumeAmmo(5));
+        CHECK(demolitionKit.Magazine(5) == 0);
+        demolitionKit.UpdateReload(0.5f);
+        CHECK(!demolitionKit.Reloading());
+        CHECK(demolitionKit.Magazine(5) == 1);
+        CHECK(demolitionKit.Reserve(5) == 1 - charge);
+    }
     CHECK(!demolitionKit.ConsumeAmmo(5));
     CHECK(!demolitionKit.BeginReload(5));
     CHECK(demolitionKit.ConsumeGrenade());
     CHECK(demolitionKit.ConsumeGrenade());
     CHECK(!demolitionKit.ConsumeGrenade());
     demolitionKit.RestoreAmmo();
-    CHECK(demolitionKit.Magazine(5) == 3);
-    CHECK(demolitionKit.Reserve(5) == 0);
+    CHECK(demolitionKit.Magazine(5) == 1);
+    CHECK(demolitionKit.Reserve(5) == 2);
     CHECK(demolitionKit.grenades == 2);
     CHECK(demolitionKit.SetAmmo(5, 99, 99));
-    CHECK(demolitionKit.Magazine(5) == 3);
-    CHECK(demolitionKit.Reserve(5) == 0);
+    CHECK(demolitionKit.Magazine(5) == 1);
+    CHECK(demolitionKit.Reserve(5) == 2);
     CHECK(PlayerState::kWeaponSlots == 15);
+    HumveeCrewSeat crew[4];
+    uint8_t occupiedCrewSeats = 0;
+    for (int passenger = 0; passenger < HumveeCrewSeat::Capacity; ++passenger) {
+        CHECK(crew[passenger].TryBoard(2, occupiedCrewSeats));
+        CHECK(crew[passenger].vehicle == 2);
+        CHECK(crew[passenger].seat == passenger);
+        occupiedCrewSeats |= static_cast<uint8_t>(1u << crew[passenger].seat);
+    }
+    CHECK(crew[0].Gunner());
+    CHECK(!crew[1].Gunner());
+    CHECK(!crew[3].TryBoard(2, occupiedCrewSeats));
+    CHECK(!crew[0].TryBoard(3, 0));
+    crew[0].Clear();
+    occupiedCrewSeats &= ~1u;
+    CHECK(crew[3].TryBoard(2, occupiedCrewSeats));
+    CHECK(crew[3].Gunner());
+    HumveeCrewSeat occupiedTurret;
+    CHECK(occupiedTurret.TryBoard(4, 1u));
+    CHECK(occupiedTurret.seat == 1);
+    occupiedTurret.Clear();
+    occupiedTurret.ApplyNetwork(4, 2);
+    CHECK(occupiedTurret.Mounted() && occupiedTurret.vehicle == 4 && occupiedTurret.seat == 2);
+    occupiedTurret.ApplyNetwork(4, HumveeCrewSeat::NoSeat);
+    CHECK(!occupiedTurret.Mounted());
+    occupiedTurret.ApplyNetwork(HumveeCrewSeat::NoSeat, 0);
+    CHECK(!occupiedTurret.Mounted());
     CHECK(MissionLoadout::kWeaponCount == PlayerState::kWeaponSlots);
     const auto* designator = player.weapons.FindWeapon(14);
     CHECK(designator != nullptr);

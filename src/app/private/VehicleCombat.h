@@ -2,6 +2,8 @@
 
 // Private application implementation; included once by main.cpp in dependency order.
 
+static bool HumveeHasFriendlyGunner(size_t index);
+
 static void WreckHumvee(size_t index, const XMFLOAT3& position, bool fromPlayer) {
     if (index >= g_humveeGameplay.size() || g_humveeGameplay[index].dead) return;
     if (g_drivingHumvee && g_activeHumveeIndex == index)
@@ -17,8 +19,11 @@ static void WreckHumvee(size_t index, const XMFLOAT3& position, bool fromPlayer)
         // A gunner may load after the deploy screen opens. Kill any present
         // rider now; the spawn path also rejects the destroyed mount.
         for (auto& bandit : g_bandits)
-            if (bandit && bandit->turretGunner && !bandit->Dead() &&
-                bandit->mountedVehicleIndex == static_cast<int>(index))
+            if (bandit && !bandit->Dead() &&
+                ((bandit->turretGunner &&
+                  bandit->mountedVehicleIndex == static_cast<int>(index)) ||
+                 (bandit->humveeCrew.Mounted() &&
+                  bandit->humveeCrew.vehicle == static_cast<int>(index))))
                 bandit->ApplyExplosion(bandit->position, 6.0f, 1000000.0f,
                                        scene.grenadeEnemyPush, fromPlayer);
         PlayBanditDeathEvents();
@@ -135,6 +140,7 @@ static void UpdateHumveeTurretAimAt(size_t vehicleIndex,
 
 static void UpdateHumveeTurretAim(float dt) {
     if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) return;
+    if (HumveeHasFriendlyGunner(g_activeHumveeIndex)) return;
     UpdateHumveeTurretAimAt(
         g_activeHumveeIndex, HumveeScreenCenterAimPoint(), dt);
 }
@@ -142,6 +148,7 @@ static void UpdateHumveeTurretAim(float dt) {
 static void FireHumveeTurret() {
     if (!g_drivingHumvee || g_activeHumveeIndex >= g_humveeGameplay.size() ||
         !g_humveeTurretNode) return;
+    if (HumveeHasFriendlyGunner(g_activeHumveeIndex)) return;
     HumveeGameplayState& state = g_humveeGameplay[g_activeHumveeIndex];
     if (state.turretFireCooldown > 0.0f) return;
     state.aimPoint = HumveeScreenCenterAimPoint();
@@ -216,7 +223,8 @@ static void UpdateHumveeImpacts(float dt) {
             const bool playerDriving =
                 g_drivingHumvee && g_activeHumveeIndex == vehicleIndex;
             for (auto& bandit : g_bandits) {
-                if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
+                if (!bandit || bandit->Dead() || bandit->turretGunner ||
+                    bandit->humveeCrew.Mounted()) continue;
                 // An enemy-driven Humvee hunting the player does not plough
                 // through its own side on the way.
                 if (state.aiDriving && bandit->faction == Faction::Bandit)
@@ -272,7 +280,8 @@ static void UpdateHumveeImpacts(float dt) {
 // actor on that fallback walked straight through containers and barracks.
 // Resolving position here fixes it regardless of why the path was missing.
 static void ResolveBanditPrefabCollisions(SkinnedEnemy& bandit) {
-    if (bandit.Dead() || bandit.Held() || bandit.turretGunner) return;
+    if (bandit.Dead() || bandit.Held() || bandit.turretGunner ||
+        bandit.humveeCrew.Mounted()) return;
 
     constexpr float kActorRadius = 0.42f;
     constexpr float kActorHeight = 1.75f;
@@ -353,7 +362,8 @@ static void ResolveBanditPrefabCollisions(SkinnedEnemy& bandit) {
 }
 
 static bool ResolveBanditHumveeCollision(SkinnedEnemy& bandit) {
-    if (bandit.Dead() || bandit.Held() || bandit.turretGunner) return false;
+    if (bandit.Dead() || bandit.Held() || bandit.turretGunner ||
+        bandit.humveeCrew.Mounted()) return false;
     for (size_t vehicleIndex = 0;
          vehicleIndex < g_destruction.VehicleCount(); ++vehicleIndex) {
         XMFLOAT4X4 pose;
@@ -427,6 +437,7 @@ static void ResolveActorSeparation() {
     // network-controlled actor's position belongs to the machine that owns it.
     const auto movable = [](const SkinnedEnemy& actor) {
         return !actor.Dead() && !actor.Held() && !actor.turretGunner &&
+               !actor.humveeCrew.Mounted() &&
                !actor.Rappelling() && !actor.networkControlled;
     };
 

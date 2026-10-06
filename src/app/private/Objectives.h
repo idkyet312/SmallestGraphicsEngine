@@ -239,38 +239,6 @@ static uint32_t CountObjectivePlanes() {
     return count;
 }
 
-// Stands the AA gun up beside the first comm tower on the level: the emplacement
-// is there to defend the relay, so it belongs with it rather than at some
-// unrelated authored point. Levels without a tower get no gun.
-//
-// Offset far enough from the mast that the tower's collapse radius does not
-// swallow it, but inside the range where flying at the tower means flying at
-// the gun -- which is the whole tactical point of it being here.
-static void PlaceAATurretNearCommTower() {
-    for (const LevelEntity& entity : g_game.world.Level().entities) {
-        if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
-            entity.prefabId != kCommTowerPrefabId) continue;
-        constexpr float kOffset = 14.0f;
-        const float x = entity.transform.position[0] + kOffset;
-        const float z = entity.transform.position[2] + kOffset;
-        float groundY = entity.transform.position[1];
-        if (scene.useMeshTerrain && g_terrain.supported) {
-            auto params = CurrentTerrainParams();
-            params.heightScale = scene.terrainHeightScale;
-            groundY = (std::max)(0.0f,
-                TerrainRendererDX12::HeightAt(params, x, z));
-            // Seated across the whole footprint, not just the centre sample,
-            // so a slope does not leave the base plate hanging off one edge.
-            groundY = (std::max)(0.0f, AATurretSeatHeight(x, z, groundY));
-        }
-        g_game.vehicles.PlaceAATurret(XMFLOAT3(x, groundY, z));
-        SGE_LOG("LogGameplay", EngineLog::Level::Display,
-            "AA turret emplaced at " + std::to_string(x) + ", " +
-            std::to_string(groundY) + ", " + std::to_string(z));
-        return;
-    }
-}
-
 // Picks what the AA gun shoots at and feeds the mount. Aircraft first -- it is
 // an anti-air gun, and the inbound BlackHawk is the threat it exists to answer
 // -- then the player, but only while they are airborne. A player on foot is not

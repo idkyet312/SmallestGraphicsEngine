@@ -20,6 +20,7 @@
 #include "CookedAssetLoader.h"
 #include "FBXImporter.h"
 #include "GLBImporter.h"
+#include "FoliageColor.h"
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cfloat>
@@ -381,6 +382,16 @@ private:
         // Frond card: preserve the tuned foliage threshold and extras.
         leaf->foliageShading = true;
         leaf->alphaCutoff = 0.20f;
+        leaf->foliageAuthoredColor = leaf->baseColorFactor;
+        if (leaf->baseColorTexture) {
+            std::vector<unsigned char> pixels;
+            int width = 0, height = 0;
+            if (GLBImporter::LoadPixelsRGBA(
+                    Resolve("Content/Models/palmtree/Texture/leaf alpha texture.png"),
+                    pixels, width, height))
+                leaf->foliageTextureMean = FoliageTextureMean(
+                    pixels, leaf->alphaCutoff);
+        }
 
         for (MeshPrimitive& p : prims) {
             float minY = FLT_MAX;

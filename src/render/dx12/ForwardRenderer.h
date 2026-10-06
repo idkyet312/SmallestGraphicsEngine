@@ -2273,11 +2273,15 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         if (!grassRanges.empty() && gvbv.BufferLocation && ginst) {
             const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+            const bool matchGroundColor = g_grass.MatchGroundColor() &&
+                g_terrain.grassLayerAlbedoReady;
             shader.SetGrassMaterial(
-                g_grass.Albedo(), g_grass.Roughness(),
+                matchGroundColor
+                    ? g_grass.GroundMatchedAlbedo(g_terrain.grassLayerAlbedo)
+                    : g_grass.Albedo(), g_grass.Roughness(),
                 g_grass.AmbientScale(), g_grass.DirectLightScale(),
                 g_grass.TransmissionStrength(), g_grass.ColorVariation(),
-                g_grass.NormalFalloff());
+                g_grass.NormalFalloff(), matchGroundColor);
 
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
@@ -2843,17 +2847,17 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
 
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-            // The blades are untextured, so this colour goes into the lighting
-            // as-is -- i.e. it is already LINEAR. The ground beneath them samples
-            // Grass004's albedo and decodes it with pow(x, 2.2) first, so matching
-            // the two by eye in sRGB is what left the blades looking pale and
-            // yellow against the turf. Keep a small lift over the texture mean so
-            // thin blades retain green energy after sub-pixel MSAA coverage.
+            // The cached ground mean is linear, like the blade material. Using
+            // it avoids an sRGB mismatch without sampling a texture per pixel.
+            const bool matchGroundColor = g_grass.MatchGroundColor() &&
+                g_terrain.grassLayerAlbedoReady;
             shader.SetGrassMaterial(
-                g_grass.Albedo(), g_grass.Roughness(),
+                matchGroundColor
+                    ? g_grass.GroundMatchedAlbedo(g_terrain.grassLayerAlbedo)
+                    : g_grass.Albedo(), g_grass.Roughness(),
                 g_grass.AmbientScale(), g_grass.DirectLightScale(),
                 g_grass.TransmissionStrength(), g_grass.ColorVariation(),
-                g_grass.NormalFalloff());
+                g_grass.NormalFalloff(), matchGroundColor);
 
             // Wind parameters as root constants (b6), and the per-blade data as a
             // root SRV (t6). Both slots exist for the terrain mesh-shader path and

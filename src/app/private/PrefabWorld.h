@@ -460,9 +460,8 @@ static void RebuildPrefabRenderBatches(bool refreshAssets = true) {
             : prefab->castShadow;
 
         // A prefab carrying "aaTurret" becomes a live emplacement rather than
-        // scenery: it tracks aircraft and shoots, exactly like the one placed
-        // beside the comm tower. Both feed the same vector, so a level can have
-        // the scripted gun plus any the designer drops in.
+        // scenery: it tracks aircraft and shoots. Turrets are authored independently
+        // of comm towers, so their placement stays under the designer's control.
         //
         // Checked here, before the render batch below, because the turret render
         // path draws the model itself -- emitting the prefab batch as well would

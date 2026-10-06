@@ -490,8 +490,13 @@ static TerrainTextureLayers g_requestedTerrainTextures =
     TerrainTexturePreset(LevelMapType::Tropical);
 static bool g_terrainTexturesPending = false;
 static void RequestTerrainTextures(const LevelDefinition& level) {
-    g_requestedTerrainTextures = ResolveTerrainTextureLayers(
+    const auto requested = ResolveTerrainTextureLayers(
         level.mapType, level.terrainTextureLayers);
+    // Repeated editor syncs must not overwrite a manual matching/tint choice.
+    if (requested != g_requestedTerrainTextures)
+        g_grass.MatchGroundColor() = level.mapType == LevelMapType::GrassGround ||
+            level.terrainTextureLayers[0].custom;
+    g_requestedTerrainTextures = requested;
     g_terrainTexturesPending = g_requestedTerrainTextures != g_terrain.textureLayers;
 }
 
@@ -818,6 +823,8 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // painted custom level rather than letting it bleed across a level change.
     ApplyTerrainSplatMap(customLevel ? *customLevel : LevelDefinition{}, true);
     g_grass.ClearRuntimeExclusions();
+    ReleaseBoatBody(g_game.vehicles.boatPhysics);
+    ReleaseBoatBody(g_game.vehicles.insertionBoatPhysics);
     g_game.ResetLevelState();
     g_enemySystem.ResetLevelCounters();
     // ResetLevelState cleared the turret list; drop the posed clones with it so
@@ -924,9 +931,6 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         BeginDeploymentPlanning();
         g_game.vehicles.DisableBlackHawkInsertion();
         g_game.vehicles.DisableInsertionBoat();
-        // Stand the AA gun back up for the new run. ResetLevel cleared it, so a
-        // map whose towers were all felled last run gets a fresh emplacement.
-        PlaceAATurretNearCommTower();
     } else {
         // Shared with the empty level: no planning screen, so the transports
         // have to be stood down explicitly or a run armed by the previous level

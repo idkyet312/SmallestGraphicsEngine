@@ -274,9 +274,18 @@ static void RebuildScalableEnvironment() {
     {
         ProfilerDX12::CpuScope grassProfile(g_profiler, "Editor/GrassScatter");
         const bool autoFoliage = g_game.world.Level().terrainAutoFoliage;
+        grassCount = static_cast<int>(grassCount *
+            g_game.world.Level().terrainAutoGrassDensity);
         g_grass.Initialize(terrainSampler, grassSpan, autoFoliage ? grassCount : 0,
             0.0f, grassExclusions, grassPatches,
             !g_customLevelMode, meshBlocked);
+        // Initialize resets the field's exclusions. Reapply gameplay damage so
+        // a later environment rebuild cannot regrow cover over existing cuts.
+        for (const TerrainSculptStamp& stamp : g_game.world.TerrainSculpt()) {
+            if (!stamp.runtimeDestruction) continue;
+            g_grass.AddRuntimeExclusion(stamp.x, stamp.z, stamp.radius *
+                (stamp.operation == TerrainSculptOperation::Crater ? 1.18f : 1.0f));
+        }
     }
     ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;

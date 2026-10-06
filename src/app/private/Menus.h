@@ -2138,19 +2138,21 @@ static void RunUICaptureHook(UICaptureHook& hook, const char* variable) {
     }
 }
 
-// Change Plan opens this map with the last committed choices restored. Quick
-// Restart commits those choices as soon as the level is ready.
-static void RenderInsertionChoiceScreen(HWND hwnd) {
-    if (g_deploymentRestartPending != net::RestartPlanMode::None) {
+// Replay before simulation so the first visible frame is already in transport.
+static void ProcessDeploymentRestart(HWND hwnd) {
+    if (DeploymentPlanningVisible() &&
+        g_deploymentRestartPending != net::RestartPlanMode::None) {
         const net::RestartPlanMode mode = g_deploymentRestartPending;
         g_deploymentRestartPending = net::RestartPlanMode::None;
         RestoreLastDeployment();
         g_replayPlanActive = true;
-        if (mode == net::RestartPlanMode::Quick) {
+        if (mode == net::RestartPlanMode::Quick)
             CommitDeployment(hwnd, true);
-            return;
-        }
     }
+}
+
+// Change Plan opens this map with the last committed choices restored.
+static void RenderInsertionChoiceScreen(HWND hwnd) {
     // Free the pointer so the buttons can be clicked, the way the death screen
     // does. Recaptured below once the choice is made.
     if (!g_insertionChoiceCursorReleased) {

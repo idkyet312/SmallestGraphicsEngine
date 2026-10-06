@@ -63,6 +63,10 @@ struct SceneMaterial {
     // the dark-texel green lift). Hard-surface cutouts such as fence mesh must
     // not, or they pick up a green tint along every clipped edge.
     bool foliageShading = false;
+    // CPU colour grading metadata; texture means exclude clipped background.
+    DirectX::XMFLOAT3 foliageTextureMean = { 1.0f, 1.0f, 1.0f };
+    DirectX::XMFLOAT4 foliageAuthoredColor = { 1.0f, 1.0f, 1.0f, 1.0f };
+    bool foliageMatchGrassColor = false;
     // Dark leaf photos need some recovery, but palm crowns must retain their
     // texture contrast rather than borrowing the grass's bright shadow floor.
     float foliageShadowLift = 0.72f;

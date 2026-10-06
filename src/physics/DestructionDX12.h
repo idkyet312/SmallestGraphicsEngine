@@ -98,7 +98,7 @@ struct GroundVehicleSpec {
     float maxSteerAngle = 0.42f;
     float steeringTorque = 850.0f;
     // Wheel spin at full throttle, rad/s: top speed is this times the radius.
-    float maxWheelSpin = 20.0f;
+    float maxWheelSpin = 40.0f;
     float driveTorque = 520.0f;
     // Coasting drag with no throttle, so a released vehicle rolls to a stop.
     float idleTorque = 95.0f;
@@ -247,6 +247,14 @@ public:
                                bool brake);
     bool GetGroundVehiclePose(uint32_t handle, DestructionBodyPose& pose) const;
     void DestroyGroundVehicle(uint32_t handle);
+
+    uint32_t CreateBoatBody(const DirectX::XMFLOAT3& position,
+                            const DirectX::XMFLOAT4& rotation,
+                            const DirectX::XMFLOAT3& velocity);
+    void SetBoatBodyInput(uint32_t handle, float throttle, float steering,
+                           bool brake, float waterY, bool afloat = true);
+    bool GetBoatBodyPose(uint32_t handle, DestructionBodyPose& pose) const;
+    void DestroyBoatBody(uint32_t handle);
 
     // Static triangle-mesh colliders: the prefabs with "mesh" collision (the
     // airport, car park, helipad, buildings). Without them the physics world

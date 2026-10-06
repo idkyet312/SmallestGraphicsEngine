@@ -47,8 +47,8 @@ cbuffer ObjectBuffer : register(b3) {
     float normalTexW;        // normal-map dimensions, precomputed on the CPU
     float normalTexH;
     float specularScale;     // per-draw highlight control; viewmodels use less
-    float materialType;      // 0=ordinary, 1=pool water, 2=ocean
-    float materialTime;      // seconds; used by procedural water detail
+    float materialType;      // 0=ordinary, 1/2=water, 4=grass-matched foliage
+    float materialTime;      // water time; matched foliage texture luminance
     float useEmissiveMap;    // > 0.5: add emissiveMap * emissiveFactor
     // > 0: fade the first-person weapon by view distance, so the parts nearest
     // the eye go the most transparent. See ViewmodelSeeThroughAlpha below.
@@ -854,6 +854,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     // edge-colour bleed or the dark-texel green lift.
     const bool isAlphaBlended = alphaCut < -0.5;
     const bool isFoliage = alphaCut > 0.5 && alphaCut < 1.5;
+    const bool matchGrassColor = isFoliage && materialType == 4.0;
     float foliageCoverage = 1.0;
     float materialTextureAlpha = 1.0;
 
@@ -918,7 +919,16 @@ float4 main(PS_INPUT input) : SV_TARGET
             texColor.rgb = lerp(texColor.rgb, coveredColor, edgeBlend * 0.88);
         }
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
-        albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
+        const float3 textureAlbedo = pow(max(texColor.rgb, 0.0), 2.2);
+        albedo = textureAlbedo * objectColor;
+        if (matchGrassColor) {
+            // Preserve leaf veins and cutout coverage, but use the grass hue for
+            // both the textured surface and dark-texel recovery below. Inverse
+            // RGB compensation tints that recovery pink on the green fern scan.
+            const float detail = dot(textureAlbedo,
+                float3(0.2126, 0.7152, 0.0722)) / max(materialTime, 1e-4);
+            albedo = objectColor * detail;
+        }
         // Palm-leaf photos carry near-black shadowed leaflets; gamma decode crushes
         // them to zero, so backlit crown fronds read as black silhouettes. Lift the
         // darkest foliage texels toward a leafy green so they can catch light.
