@@ -611,6 +611,65 @@ public:
     }
 };
 
+// Per-caster culling against one virtual shadow page. Set only while page
+// draws are recorded: a page projection is the light rotation times an
+// orthographic box over exactly that page's square, so a caster outside the
+// square cannot write a texel of it. Every caster used to be recorded into all
+// resident pages. Cascades keep their own radius test, and spot casters are
+// perspective, which these affine tests do not handle.
+inline bool g_shadowPageCull = false;
+
+// Light-space x/y units per world metre. Square page, orthonormal rotation, so
+// x and y share it.
+inline float ShadowPageScale(const XMMATRIX& lightSpace) {
+    XMFLOAT4X4 m;
+    XMStoreFloat4x4(&m, lightSpace);
+    return std::sqrt(m._11 * m._11 + m._21 * m._21 + m._31 * m._31);
+}
+
+// A local box through an affine toPage (model * page matrix). |M| maps the box
+// half-extents to the exact light-space box around the transformed one; pad is
+// extra margin in page units. Only x/y: the page depth range spans the world.
+inline bool ShadowPageOverlapsBox(const XMMATRIX& toPage, const XMFLOAT3& boundsMin,
+                                  const XMFLOAT3& boundsMax, float pad = 0.0f) {
+    XMFLOAT4X4 m;
+    XMStoreFloat4x4(&m, toPage);
+    const float cx = (boundsMin.x + boundsMax.x) * 0.5f;
+    const float cy = (boundsMin.y + boundsMax.y) * 0.5f;
+    const float cz = (boundsMin.z + boundsMax.z) * 0.5f;
+    const float ex = (boundsMax.x - boundsMin.x) * 0.5f;
+    const float ey = (boundsMax.y - boundsMin.y) * 0.5f;
+    const float ez = (boundsMax.z - boundsMin.z) * 0.5f;
+    const float x = cx * m._11 + cy * m._21 + cz * m._31 + m._41;
+    const float y = cx * m._12 + cy * m._22 + cz * m._32 + m._42;
+    const float rx = ex * std::fabs(m._11) + ey * std::fabs(m._21) +
+                     ez * std::fabs(m._31) + pad;
+    const float ry = ex * std::fabs(m._12) + ey * std::fabs(m._22) +
+                     ez * std::fabs(m._32) + pad;
+    return std::fabs(x) <= 1.0f + rx && std::fabs(y) <= 1.0f + ry;
+}
+
+// A world-space sphere against the page square.
+inline bool ShadowPageOverlapsSphere(const XMMATRIX& lightSpace,
+                                     const XMFLOAT3& center, float radius) {
+    XMFLOAT3 p;
+    XMStoreFloat3(&p, XMVector3Transform(XMLoadFloat3(&center), lightSpace));
+    const float r = radius * ShadowPageScale(lightSpace);
+    return std::fabs(p.x) <= 1.0f + r && std::fabs(p.y) <= 1.0f + r;
+}
+
+// Page test for one rigid primitive. Primitives without CPU bounds always draw.
+inline bool ShadowPageKeepsPrimitive(const MeshPrimitive& prim,
+                                     const XMMATRIX& model,
+                                     const XMMATRIX& lightSpace,
+                                     uint32_t instances = 1) {
+    if (!g_shadowPageCull) return true;
+    const bool keep = !prim.boundsValid ||
+        ShadowPageOverlapsBox(model * lightSpace, prim.boundsMin, prim.boundsMax);
+    (keep ? g_vsmCastersDrawn : g_vsmCastersCulled) += instances;
+    return keep;
+}
+
 inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
                                 DepthOnlyShaderDX12& shader,
                                 const XMMATRIX& worldTransform,
@@ -624,6 +683,10 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
 
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
+            // A skinned primitive's bounds are its bind pose; the palette (a
+            // spinning rotor) can carry vertices outside them.
+            if (!(bonePalette && prim.skinBuffer) &&
+                !ShadowPageKeepsPrimitive(prim, model, lightSpace)) continue;
             if (!shader.UseMaterial(prim.material.get())) continue;
 
             // Pose the shadow from the same palette as the colour pass, so a
@@ -682,12 +745,26 @@ inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
     }
 
     if (node->mesh) {
-        static thread_local std::vector<XMMATRIX> models;
-        models.clear();
-        models.reserve(worlds.size());
+        static thread_local std::vector<XMMATRIX> allModels;
+        allModels.clear();
+        allModels.reserve(worlds.size());
         const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
-        for (const XMMATRIX& world : worlds) models.push_back(local * world);
+        for (const XMMATRIX& world : worlds) allModels.push_back(local * world);
+        static thread_local std::vector<XMMATRIX> pageModels;
         for (const auto& prim : node->mesh->primitives) {
+            // Page draws keep only the instances whose bounds reach the page.
+            const std::vector<XMMATRIX>* drawModels = &allModels;
+            if (g_shadowPageCull && prim.boundsValid) {
+                pageModels.clear();
+                for (const XMMATRIX& model : allModels)
+                    if (ShadowPageKeepsPrimitive(prim, model, lightSpace))
+                        pageModels.push_back(model);
+                if (pageModels.empty()) continue;
+                drawModels = &pageModels;
+            } else if (g_shadowPageCull) {
+                g_vsmCastersDrawn += static_cast<uint32_t>(allModels.size());
+            }
+            const std::vector<XMMATRIX>& models = *drawModels;
             if (!shader.UseMaterial(prim.material.get())) continue;
             shader.SetMatrices(XMMatrixIdentity(), lightSpace);
             if (!shader.SetInstances(models)) {
@@ -742,6 +819,14 @@ public:
     VirtualShadowMapDX12 virtualMaps;
     bool virtualDepthAttempted = false;
     bool drawingVirtualPages = false;
+
+    // SGE_VSM_NO_CASTER_CULL records every caster into every page again, for
+    // A/B against the per-page cull.
+    static bool VirtualCasterCullDisabled() {
+        static const bool disabled =
+            GetEnvironmentVariableA("SGE_VSM_NO_CASTER_CULL", nullptr, 0) > 0;
+        return disabled;
+    }
 
     static bool VirtualTerrainLive() {
         static const bool live =
@@ -1059,10 +1144,15 @@ public:
             const float depthRange =
                 (std::max)(scene.shadowFarPlane, distance + ortho) - 0.1f;
             const auto inLightBox = [&](const XMFLOAT3& c, float r) {
-                // The legacy radius approximation describes a whole cascade,
-                // not a cropped virtual page. Let raster clipping handle pages.
-                if (drawingVirtualPages) return true;
                 if (r <= 0.0f) return true;
+                // The legacy radius approximation describes a whole cascade,
+                // not a cropped virtual page; pages test their own square.
+                if (drawingVirtualPages) {
+                    const bool keep = !g_shadowPageCull ||
+                        ShadowPageOverlapsSphere(lightSpace, c, r);
+                    if (!keep) ++g_vsmCastersCulled;
+                    return keep;
+                }
                 XMFLOAT4 ndc;
                 XMStoreFloat4(&ndc, XMVector4Transform(
                     XMVectorSet(c.x, c.y, c.z, 1.0f), lightSpace));
@@ -1219,6 +1309,26 @@ public:
 
                 for (const MeshPrimitive& prim : slice->primitives) {
                     if (!prim.vbv.BufferLocation) continue;
+                    // Wind only rotates a slice about its local origin (crown
+                    // yaw, bend <= 0.34 rad), so the sphere there that holds
+                    // the bounds holds every swayed pose too.
+                    if (g_shadowPageCull && prim.boundsValid) {
+                        const float reachX = (std::max)(std::fabs(prim.boundsMin.x), std::fabs(prim.boundsMax.x));
+                        const float reachY = (std::max)(std::fabs(prim.boundsMin.y), std::fabs(prim.boundsMax.y));
+                        const float reachZ = (std::max)(std::fabs(prim.boundsMin.z), std::fabs(prim.boundsMax.z));
+                        const float scale = (std::max)({
+                            XMVectorGetX(XMVector3Length(model.r[0])),
+                            XMVectorGetX(XMVector3Length(model.r[1])),
+                            XMVectorGetX(XMVector3Length(model.r[2]))});
+                        XMFLOAT3 origin;
+                        XMStoreFloat3(&origin, model.r[3]);
+                        if (!ShadowPageOverlapsSphere(lightSpace, origin, scale *
+                                std::sqrt(reachX * reachX + reachY * reachY + reachZ * reachZ))) {
+                            ++g_vsmCastersCulled;
+                            continue;
+                        }
+                        ++g_vsmCastersDrawn;
+                    }
                     const bool alphaCutout = prim.material &&
                         prim.material->alphaCutout &&
                         prim.material->baseColorTexture;
@@ -1254,7 +1364,7 @@ public:
             g_grass.ShadowDensity() > 0.0f && drawShader.grassPipelineState) {
             g_grass.SetViewer(scene.camera.Position);
             static std::vector<GrassField::DrawRange> grassShadowRanges;
-            g_grass.GetVisible(grassShadowRanges);
+            g_grass.GetVisible(grassShadowRanges, &lightSpace, 4);
             const auto& grassVbv = g_grass.GetVBV();
             const auto& grassIbv = g_grass.GetIBV();
             const auto instances = g_grass.GetInstanceBufferAddress();
@@ -1316,10 +1426,38 @@ public:
         const auto drawActorShadow = [&](SkinnedEnemy* bandit) {
             if (!bandit || (!bandit->castsShadow && !bandit->Dead()) || !bandit->CanRender())
                 return;
-            const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
             const XMMATRIX model = bandit->MeshWorldMatrix();
+            // Bind-pose bounds don't hold an animated pose, but any pose of a
+            // living actor stays within the bind pose's reach of its root
+            // (prone included), so test that sphere plus a margin. Corpses always draw: a ragdoll is not tied to the root.
+            if (g_shadowPageCull && !bandit->Dead()) {
+                float reach = 0.0f;
+                bool bounded = true;
+                for (const auto& prim : bandit->model.node->mesh->primitives) {
+                    if (!prim.vbv.BufferLocation || !prim.skinBuffer) continue;
+                    if (!prim.boundsValid) { bounded = false; break; }
+                    const float x = (std::max)(std::fabs(prim.boundsMin.x), std::fabs(prim.boundsMax.x));
+                    const float y = (std::max)(std::fabs(prim.boundsMin.y), std::fabs(prim.boundsMax.y));
+                    const float z = (std::max)(std::fabs(prim.boundsMin.z), std::fabs(prim.boundsMax.z));
+                    reach = (std::max)(reach, std::sqrt(x * x + y * y + z * z));
+                }
+                if (bounded) {
+                    const float scale = (std::max)({
+                        XMVectorGetX(XMVector3Length(model.r[0])),
+                        XMVectorGetX(XMVector3Length(model.r[1])),
+                        XMVectorGetX(XMVector3Length(model.r[2]))});
+                    XMFLOAT3 origin;
+                    XMStoreFloat3(&origin, model.r[3]);
+                    if (!ShadowPageOverlapsSphere(lightSpace, origin, reach * scale + 0.5f)) {
+                        ++g_vsmCastersCulled;
+                        return;
+                    }
+                }
+            }
+            const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
             for (const auto& prim : bandit->model.node->mesh->primitives) {
                 if (!prim.vbv.BufferLocation || !prim.skinBuffer) continue;
+                if (g_shadowPageCull) ++g_vsmCastersDrawn;
                 drawShader.SetMatrices(model, lightSpace);
                 drawShader.SetSkinning(palette, prim.skinBuffer->GetGPUVirtualAddress());
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
@@ -1773,6 +1911,8 @@ public:
                 virtualDepthShader.SetPalmWindFrame(g_trees.GetWindFrame());
                 InvalidateVirtualPagesOnTerrainChange();
                 drawingVirtualPages = true;
+                g_shadowPageCull = !VirtualCasterCullDisabled();
+                g_vsmCastersDrawn = g_vsmCastersCulled = 0;
                 virtualMaps.Render(scene,
                     [&](const XMMATRIX& matrix, bool live) {
                         DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
@@ -1781,6 +1921,7 @@ public:
                         return virtualDepthShader.currentDrawCall < SHADOW_MAX_DRAWS - 1;
                     });
                 drawingVirtualPages = false;
+                g_shadowPageCull = false;
                 g_virtualShadowConstants = virtualMaps.constants;
                 g_vsmResident = virtualMaps.resident;
                 g_vsmRefreshed = virtualMaps.refreshed;

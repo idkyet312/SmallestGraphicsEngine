@@ -387,14 +387,64 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
                     GLBImporter::BuildMeshletData(wheels, device.Get()))
                     root->mesh->primitives.push_back(std::move(wheels));
             }
-            // Humvee source is flattened into three meshes. Extract the upper
-            // centre gun assembly from Body mesh into a pivoted child so runtime
-            // turret yaw does not rotate the hull, wheels, or rear antenna.
-            if (filepath.find("Humvee") != std::string::npos &&
-                std::string(src->mName.C_Str()) == "Mesh.005") {
-                constexpr float pivotX = 0.0f;
-                constexpr float pivotY = 622.0f;
-                constexpr float pivotZ = 82.0f;
+            // The Humvee turret: PreTransformVertices folds the FBX's Circle
+            // (turret ring), Cube.006 (gun on its pintle) and Cube.001 (ammo
+            // box) into the body mesh. Lift every welded part lying wholly in
+            // the roof turret volume into a child pivoted on the ring centre,
+            // so turret yaw swings ring, gun and box together around the
+            // gunner's hatch and leaves hull, wheels, spare and antennas still.
+            // Whole parts, not triangles: the body's roof reaches y 538.9, so
+            // a per-triangle height cut cannot separate it from the ring
+            // (534-558). Measured on humvee.fbx: 10 parts, 540 triangles.
+            if (filepath.find("Humvee") != std::string::npos) {
+                constexpr float pivotX = 0.0f;     // ring centre
+                constexpr float pivotY = 534.0f;   // ring base
+                constexpr float pivotZ = -73.6f;
+                const UINT vertexCount = static_cast<UINT>(p.vertices.size() / 12);
+                std::vector<UINT> owner(vertexCount);
+                for (UINT i = 0; i < vertexCount; ++i) owner[i] = i;
+                const auto findRoot = [&](UINT i) {
+                    while (owner[i] != i) i = owner[i] = owner[owner[i]];
+                    return i;
+                };
+                const auto unite = [&](UINT a, UINT b) {
+                    a = findRoot(a); b = findRoot(b);
+                    if (a != b) owner[b] = a;
+                };
+                // UV seams duplicate vertices; weld by position so a part stays whole.
+                std::unordered_map<std::string, UINT> positionOwner;
+                for (UINT i = 0; i < vertexCount; ++i) {
+                    const size_t offset = (size_t)i * 12;
+                    const std::string key = std::to_string((long long)std::llround(p.vertices[offset] * 1000.0f)) + ":" +
+                        std::to_string((long long)std::llround(p.vertices[offset + 1] * 1000.0f)) + ":" +
+                        std::to_string((long long)std::llround(p.vertices[offset + 2] * 1000.0f));
+                    const auto [it, inserted] = positionOwner.emplace(key, i);
+                    if (!inserted) unite(i, it->second);
+                }
+                for (size_t tri = 0; tri + 2 < p.indices.size(); tri += 3) {
+                    unite(p.indices[tri], p.indices[tri + 1]);
+                    unite(p.indices[tri], p.indices[tri + 2]);
+                }
+                std::unordered_map<UINT, std::pair<XMFLOAT3, XMFLOAT3>> partBounds;
+                for (size_t i = 0; i < p.indices.size(); ++i) {
+                    const UINT vertex = p.indices[i];
+                    const float* position = &p.vertices[(size_t)vertex * 12];
+                    auto [it, inserted] = partBounds.try_emplace(findRoot(vertex),
+                        XMFLOAT3(FLT_MAX, FLT_MAX, FLT_MAX),
+                        XMFLOAT3(-FLT_MAX, -FLT_MAX, -FLT_MAX));
+                    XMFLOAT3& lo = it->second.first;
+                    XMFLOAT3& hi = it->second.second;
+                    lo = { (std::min)(lo.x, position[0]), (std::min)(lo.y, position[1]),
+                           (std::min)(lo.z, position[2]) };
+                    hi = { (std::max)(hi.x, position[0]), (std::max)(hi.y, position[1]),
+                           (std::max)(hi.z, position[2]) };
+                }
+                const auto turretPart = [&](UINT vertex) {
+                    const auto& [lo, hi] = partBounds.at(findRoot(vertex));
+                    return lo.x >= -180.0f * uniformScale && hi.x <= 180.0f * uniformScale &&
+                           lo.y >= 530.0f * uniformScale &&
+                           lo.z >= -260.0f * uniformScale && hi.z <= 425.0f * uniformScale;
+                };
                 MeshPrimitive turret;
                 turret.material = p.material;
                 turret.materialIndex = p.materialIndex;
@@ -402,19 +452,7 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
                 std::vector<UINT> hullIndices;
                 hullIndices.reserve(p.indices.size());
                 for (size_t tri = 0; tri + 2 < p.indices.size(); tri += 3) {
-                    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
-                    for (int corner = 0; corner < 3; ++corner) {
-                        const size_t vertex = static_cast<size_t>(p.indices[tri + corner]) * 12;
-                        cx += p.vertices[vertex];
-                        cy += p.vertices[vertex + 1];
-                        cz += p.vertices[vertex + 2];
-                    }
-                    cx /= 3.0f; cy /= 3.0f; cz /= 3.0f;
-                    const bool turretTriangle =
-                        cy > 600.0f * uniformScale &&
-                        std::abs(cx) < 150.0f * uniformScale &&
-                        cz > -50.0f * uniformScale && cz < 460.0f * uniformScale;
-                    if (!turretTriangle) {
+                    if (!turretPart(p.indices[tri])) {
                         hullIndices.insert(hullIndices.end(),
                             p.indices.begin() + tri, p.indices.begin() + tri + 3);
                         continue;
@@ -434,16 +472,19 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
                         turret.indices.push_back(entry->second);
                     }
                 }
-                p.indices = std::move(hullIndices);
-                if (!turret.indices.empty() &&
-                    GLBImporter::BuildMeshletData(turret, device.Get())) {
-                    auto turretNode = std::make_shared<SceneNode>("HumveeTurret");
-                    turretNode->translation = {
-                        pivotX * uniformScale, pivotY * uniformScale,
-                        pivotZ * uniformScale };
-                    turretNode->mesh = std::make_shared<SceneMesh>();
-                    turretNode->mesh->primitives.push_back(std::move(turret));
-                    root->AddChild(turretNode);
+                if (!turret.indices.empty()) {
+                    std::cout << "Humvee turret split: " << turret.indices.size() / 3
+                              << " of " << p.indices.size() / 3 << " triangles\n";
+                    p.indices = std::move(hullIndices);
+                    if (GLBImporter::BuildMeshletData(turret, device.Get())) {
+                        auto turretNode = std::make_shared<SceneNode>("HumveeTurret");
+                        turretNode->translation = {
+                            pivotX * uniformScale, pivotY * uniformScale,
+                            pivotZ * uniformScale };
+                        turretNode->mesh = std::make_shared<SceneMesh>();
+                        turretNode->mesh->primitives.push_back(std::move(turret));
+                        root->AddChild(turretNode);
+                    }
                 }
             }
             if (GLBImporter::BuildMeshletData(p, device.Get(), buildMeshlets))

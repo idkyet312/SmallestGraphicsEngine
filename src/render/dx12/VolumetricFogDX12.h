@@ -5,10 +5,14 @@
 #include "DX12Core.h"
 #include "Scene.h"
 #include "WaterVolume.h"
+#include "ProfilerDX12.h"
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <fstream>
 #include <sstream>
+
+extern ProfilerDX12 g_profiler;
 
 class VolumetricFogDX12 {
 public:
@@ -49,6 +53,7 @@ public:
                              cloudPS.Get(), psMSAA.Get(), cloudPSMSAA.Get()) ||
             !CreateHeapAndVolume() || !CreateUploadBuffers())
             return false;
+        CreateSplitPipelines(source, flags);
         initialized = true;
         return true;
     }
@@ -80,20 +85,35 @@ public:
         ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
         commandList->SetDescriptorHeaps(1, heaps);
 
+        std::optional<ProfilerDX12::Scope> phase;
+        phase.emplace(g_profiler, "Fog/Volume", commandList);
         Transition(commandList, volume_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        commandList->SetPipelineState(scene.enableFlyableClouds
-            ? cloudComputePipeline_.Get() : computePipeline_.Get());
-        commandList->SetComputeRootSignature(rootSignature_.Get());
-        BindComputeRoots(commandList);
-        commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER uav = {};
         uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         uav.UAV.pResource = volume_.Get();
+        if (splitReady_) {
+            commandList->SetPipelineState(scene.enableFlyableClouds
+                ? cloudSplitPipeline_.Get() : splitPipeline_.Get());
+            commandList->SetComputeRootSignature(rootSignature_.Get());
+            BindComputeRoots(commandList);
+            commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, gridZ_);
+            commandList->ResourceBarrier(1, &uav);
+            commandList->SetPipelineState(integratePipeline_.Get());
+            commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, 1);
+        } else {
+            commandList->SetPipelineState(scene.enableFlyableClouds
+                ? cloudComputePipeline_.Get() : computePipeline_.Get());
+            commandList->SetComputeRootSignature(rootSignature_.Get());
+            BindComputeRoots(commandList);
+            commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, 1);
+        }
         commandList->ResourceBarrier(1, &uav);
         Transition(commandList, volume_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+        phase.reset();
+        phase.emplace(g_profiler, "Fog/Composite", commandList);
         if (!depthAlreadyReadable)
             Transition(commandList, depthResource,
                        D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -295,6 +315,46 @@ private:
         return SUCCEEDED(g_dx12.device->CreateRootSignature(0,
             serialized->GetBufferPointer(), serialized->GetBufferSize(),
             IID_PPV_ARGS(&rootSignature_)));
+    }
+
+    // Optional two-pass volume (see SGE_FOG_SPLIT in volumetric_fog.hlsl).
+    // Any failure leaves splitReady_ false and the single-pass path in use;
+    // SGE_FOG_SINGLE_PASS forces that path for A/B.
+    void CreateSplitPipelines(const std::string& source, UINT flags) {
+        splitReady_ = false;
+        if (GetEnvironmentVariableA("SGE_FOG_SINGLE_PASS", nullptr, 0) > 0)
+            return;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {
+            DXGI_FORMAT_R16G16B16A16_FLOAT };
+        if (FAILED(g_dx12.device->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+            return;
+        const D3D_SHADER_MACRO splitDefines[] = {
+            { "SGE_FOG_SPLIT", "1" }, { nullptr, nullptr } };
+        const D3D_SHADER_MACRO splitCloudDefines[] = {
+            { "SGE_FOG_SPLIT", "1" }, { "SGE_WORLD_CLOUDS", "1" },
+            { nullptr, nullptr } };
+        ComPtr<ID3DBlob> cs, cloudCS, integrate, errors;
+        if (!Compile(source, "CSMain", "cs_5_0", flags, cs, errors,
+                     splitDefines) ||
+            !Compile(source, "CSMain", "cs_5_0", flags, cloudCS, errors,
+                     splitCloudDefines) ||
+            !Compile(source, "CSIntegrate", "cs_5_0", flags, integrate,
+                     errors, splitDefines))
+            return;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {};
+        compute.pRootSignature = rootSignature_.Get();
+        compute.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &compute, IID_PPV_ARGS(&splitPipeline_)))) return;
+        compute.CS = { cloudCS->GetBufferPointer(), cloudCS->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &compute, IID_PPV_ARGS(&cloudSplitPipeline_)))) return;
+        compute.CS = { integrate->GetBufferPointer(), integrate->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &compute, IID_PPV_ARGS(&integratePipeline_)))) return;
+        splitReady_ = true;
     }
 
     bool CreatePipelines(ID3DBlob* cs, ID3DBlob* cloudCS, ID3DBlob* vs,
@@ -671,6 +731,10 @@ private:
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> computePipeline_;
     ComPtr<ID3D12PipelineState> cloudComputePipeline_;
+    ComPtr<ID3D12PipelineState> splitPipeline_;
+    ComPtr<ID3D12PipelineState> cloudSplitPipeline_;
+    ComPtr<ID3D12PipelineState> integratePipeline_;
+    bool splitReady_ = false;
     ComPtr<ID3D12PipelineState> graphicsPipeline_;
     ComPtr<ID3D12PipelineState> cloudGraphicsPipeline_;
     ComPtr<ID3D12PipelineState> graphicsPipelineHDR_;

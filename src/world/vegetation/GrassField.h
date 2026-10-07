@@ -49,6 +49,7 @@
 #include "StaticBufferDX12.h"
 #include "GrassDamageRanges.h"
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -235,8 +236,29 @@ public:
     // Intact patches use one instance range; damaged patches use cached surviving
     // runs. Visibility tests cells, never individual blades, each frame.
     struct DrawRange { UINT firstInstance, instanceCount; };
-    void GetVisible(std::vector<DrawRange>& out) const {
+    // viewProjection (optional) also drops cells outside that clip volume.
+    // Distance alone kept every cell behind the player, each still paying full
+    // vertex shading. Shadow callers pass their light matrix with planeCount 4
+    // (sides only): a caster nearer the light than the near plane can still
+    // shadow what is inside, and a VSM page would otherwise draw the whole
+    // field's sparse casters into each of its 16 pages.
+    void GetVisible(std::vector<DrawRange>& out,
+                    const DirectX::XMMATRIX* viewProjection = nullptr,
+                    UINT planeCount = 6) const {
+        using namespace DirectX;
         out.clear();
+        // Clip-space planes (D3D, row vectors): w+x, w-x, w+y, w-y, z, w-z.
+        XMVECTOR planes[6] = {};
+        if (viewProjection) {
+            const XMMATRIX m = XMMatrixTranspose(*viewProjection);
+            planes[0] = XMVectorAdd(m.r[3], m.r[0]);
+            planes[1] = XMVectorSubtract(m.r[3], m.r[0]);
+            planes[2] = XMVectorAdd(m.r[3], m.r[1]);
+            planes[3] = XMVectorSubtract(m.r[3], m.r[1]);
+            planes[4] = m.r[2];
+            planes[5] = XMVectorSubtract(m.r[3], m.r[2]);
+            for (XMVECTOR& plane : planes) plane = XMPlaneNormalize(plane);
+        }
         // A cell is drawn if any blade in it could be inside the draw radius, so
         // test the cell's centre against the radius plus the cell's corner reach.
         const float reach = m_drawDistance + kCellSize * 0.7072f;   // half-diagonal
@@ -245,6 +267,16 @@ public:
             const float dx = c.cx - m_eye.x;
             const float dz = c.cz - m_eye.z;
             if (dx * dx + dz * dz > reachSq) continue;
+            if (viewProjection) {
+                const XMVECTOR centre = XMVectorSet(
+                    c.cx, (c.minY + c.maxY) * 0.5f, c.cz, 1.0f);
+                bool outside = false;
+                for (UINT p = 0; p < (std::min)(planeCount, 6u); ++p) {
+                    if (XMVectorGetX(XMPlaneDotCoord(planes[p], centre)) <
+                        -c.boundRadius) { outside = true; break; }
+                }
+                if (outside) continue;
+            }
             // Density trims each cell's contiguous instance run. Blades are
             // stored tuft-contiguous, so a fractional cut drops whole tufts and
             // reads as natural thinning -- no buffer rebuild, safe to change
@@ -554,6 +586,9 @@ private:
     // field becomes a few dozen instanced draws and the far ones are just skipped.
     struct Cell {
         float  cx = 0.0f, cz = 0.0f;   // centre, world space
+        // Bounding sphere for the frustum test: Y span of roots..tips, and a
+        // radius padded by the tallest blade for lean and wind bend.
+        float  minY = 0.0f, maxY = 0.0f, boundRadius = 0.0f;
         UINT   firstBlade = 0;
         UINT   bladeCount = 0;
         GrassDamageRanges damage;
@@ -992,6 +1027,21 @@ private:
             cell.cz = -half + (iz + 0.5f) * kCellSize;
             cell.firstBlade = (UINT)starts[c];
             cell.bladeCount = (UINT)counts[c];
+            float minY = FLT_MAX, maxY = -FLT_MAX, tallest = 0.0f;
+            for (size_t i = starts[c]; i < starts[c] + counts[c]; ++i) {
+                const Blade& b = m_blades[i];
+                minY = (std::min)(minY, b.baseY);
+                maxY = (std::max)(maxY, b.baseY + b.height);
+                tallest = (std::max)(tallest, b.height);
+            }
+            // Bend and lean can push a tip up to its full height sideways (or
+            // down); 1.5x leaves room for the helicopter downwash too.
+            const float pad = tallest * 1.5f;
+            cell.minY = minY - pad;
+            cell.maxY = maxY + pad;
+            const float halfXZ = kCellSize * 0.5f + pad;
+            const float halfY = (cell.maxY - cell.minY) * 0.5f;
+            cell.boundRadius = std::sqrt(2.0f * halfXZ * halfXZ + halfY * halfY);
             m_cells.push_back(cell);
         }
     }

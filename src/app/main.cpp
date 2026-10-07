@@ -1615,6 +1615,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     XMConvertToDegrees(std::atan2(
                         dy, std::sqrt(dx * dx + dz * dz))));
             }
+            // SGE_CAPTURE_HUMVEE="distance,rise,bearing" does the same for
+            // Humvee 0, which drives off once its gunner has a target.
+            // Bearing is degrees about world +Y from +Z.
+            char captureHumvee[64] = {};
+            float humveeView[3] = {};
+            XMFLOAT4X4 humveePose;
+            XMFLOAT3 humveeAt;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HUMVEE", captureHumvee,
+                                        sizeof(captureHumvee)) > 0 &&
+                sscanf_s(captureHumvee, "%f,%f,%f", &humveeView[0],
+                         &humveeView[1], &humveeView[2]) == 3 &&
+                HumveeVisualPose(0, humveePose, &humveeAt)) {
+                const float bearing = XMConvertToRadians(humveeView[2]);
+                scene.camera.Position = {
+                    humveeAt.x + std::sin(bearing) * humveeView[0],
+                    humveeAt.y + humveeView[1],
+                    humveeAt.z + std::cos(bearing) * humveeView[0] };
+                const float dx = humveeAt.x - scene.camera.Position.x;
+                const float dy = humveeAt.y + 1.0f - scene.camera.Position.y;
+                const float dz = humveeAt.z - scene.camera.Position.z;
+                scene.camera.SetViewAngles(
+                    XMConvertToDegrees(std::atan2(dz, dx)),
+                    XMConvertToDegrees(std::atan2(
+                        dy, std::sqrt(dx * dx + dz * dz))));
+            }
             // A stray ESC during a long unattended run would park the capture
             // behind the pause screen.
             g_gamePaused = false;
@@ -2721,12 +2746,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             static_cast<size_t>(bandit->mountedVehicleIndex),
                             target, banditDeltaTime);
                     }
-                    bandit->UpdateMounted(
-                        banditDeltaTime, mount,
-                        playerControlsTurret &&
+                    XMFLOAT3 lookAt = playerControlsTurret &&
                         g_activeHumveeIndex < g_humveeGameplay.size()
                             ? g_humveeGameplay[g_activeHumveeIndex].aimPoint
-                            : target);
+                            : target;
+                    // He stands on the turret ring, so he faces where the
+                    // gun points while it traverses, not where it is going.
+                    size_t turretVehicle = 0;
+                    if (HumveeTurretGunner(*bandit, turretVehicle))
+                        lookAt = HumveeTurretSightPoint(turretVehicle, mount, lookAt);
+                    bandit->UpdateMounted(banditDeltaTime, mount, lookAt);
                 } else if (updateBandit && bandit->Rappelling()) {
                     // On the dropship rope: descend toward the terrain under the
                     // actor and skip the ground AI entirely until it lands.
@@ -2915,8 +2944,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bandit->mountedVehicleIndex >= 0 &&
                     g_activeHumveeIndex == static_cast<size_t>(
                         bandit->mountedVehicleIndex);
+                // A Humvee gunner fires once the traversing gun bears.
+                size_t turretVehicle = 0;
+                const bool turretGunner = HumveeTurretGunner(*bandit, turretVehicle);
                 const bool fired = !playerControlsMountedTurret &&
                     (!bandit->humveeCrew.Gunner() || haveTarget) &&
+                    (!turretGunner ||
+                     HumveeTurretAimError(turretVehicle, target) < 0.12f) &&
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection,
@@ -2960,15 +2994,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
-                    if (bandit->humveeCrew.Gunner() && g_humveeTurretNode) {
-                        const size_t vehicle = static_cast<size_t>(bandit->humveeCrew.vehicle);
-                        PrepareHumveeModelForRender(vehicle);
-                        const XMMATRIX turretWorld =
-                            XMLoadFloat4x4(&g_humveeTurretNode->globalTransform) *
-                            HumveeWorldMatrix(vehicle);
-                        XMStoreFloat3(&shotOrigin, XMVector3TransformCoord(
-                            XMVectorSet(0.0f, 72.0f, 338.0f, 1.0f), turretWorld));
-                        const XMVECTOR aim = XMLoadFloat3(&target) - XMLoadFloat3(&shotOrigin);
+                    if (turretGunner) {
+                        // Out of the barrel, at the point TryFireAt picked:
+                        // its spread and lead survive the origin move.
+                        const XMVECTOR body = XMLoadFloat3(&shotOrigin);
+                        const XMVECTOR aimed = body + XMLoadFloat3(&shotDirection) *
+                            XMVector3Length(XMLoadFloat3(&target) - body);
+                        shotOrigin = HumveeTurretMuzzleWorld(turretVehicle);
+                        const XMVECTOR aim = aimed - XMLoadFloat3(&shotOrigin);
                         if (XMVectorGetX(XMVector3LengthSq(aim)) > 0.001f)
                             XMStoreFloat3(&shotDirection, XMVector3Normalize(aim));
                     }
@@ -5901,8 +5934,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     }
                     ConfigureHumveeBounds();
                     BuildHumveeProjectileCollision();
+                    // Merge the hull only: a merged turret would cast its
+                    // shadow at the import angle forever. The depth root
+                    // shares the live turret node instead, posed by
+                    // PrepareHumveeModelForRender with the colour model.
+                    auto& parts = g_humveeModel->children;
+                    parts.erase(std::remove(parts.begin(), parts.end(),
+                                            g_humveeTurretNode), parts.end());
                     g_humveeShadowModel = GLBImporter::MergeSceneForDepth(
                         g_humveeModel, g_dx12.device);
+                    if (g_humveeTurretNode) {
+                        parts.push_back(g_humveeTurretNode);
+                        if (g_humveeShadowModel)
+                            g_humveeShadowModel->children.push_back(
+                                g_humveeTurretNode);
+                    }
                     std::cout << "Humvee FBX ready at center\n";
                 } else {
                     std::cerr << "Humvee FBX failed to load\n";
@@ -6981,7 +7027,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             {
                 ProfilerDX12::Scope drawProfile(
                     g_profiler, "Grass/Draw", g_dx12.commandList.Get());
-                grassMSAA.Begin(g_dx12.commandList.Get());
+                // Seed with the depth the composite tests against, so early-Z
+                // drops hidden blades. Only when that is the bound extension
+                // depth, which is what puts it in DEPTH_WRITE here.
+                ID3D12Resource* grassSeedDepth =
+                    visBuffer.ActiveDepthBuffer() == g_dx12.depthStencilBuffer.Get()
+                        ? g_dx12.depthStencilBuffer.Get() : nullptr;
+                grassMSAA.Begin(g_dx12.commandList.Get(), grassSeedDepth);
                 RenderGrassForward(scene, mainShader, scene.GetViewMatrix(),
                     extensionProj, fogLightSpace, fogShadowResource,
                     mainShader.GetHDRMSAAGrassPipelineState());
@@ -7769,6 +7821,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 dump << "--- VRAM: " << (vram.usageBytes >> 20) << " / "
                      << (vram.budgetBytes >> 20) << " MB budget ("
                      << (vram.dedicatedBytes >> 20) << " MB dedicated) ---\n";
+                dump << "grass instances (last frame): "
+                     << g_grassDrawnInstances << '\n';
+                dump << "vsm casters (last frame): drawn "
+                     << g_vsmCastersDrawn << " culled "
+                     << g_vsmCastersCulled << " pages resident "
+                     << g_vsmResident << " refreshed " << g_vsmRefreshed << '\n';
                 dump << "screen: " << static_cast<int>(g_game.session.Screen())
                      << " backbuffer: " << g_dx12.screenWidth << "x"
                      << g_dx12.screenHeight << "\n";

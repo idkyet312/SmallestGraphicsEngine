@@ -34,7 +34,10 @@ public:
         return CreateTargets(width, height);
     }
 
-    void Begin(ID3D12GraphicsCommandList* commandList) {
+    // sceneDepth must be the depth the composite later compares against, in
+    // DEPTH_WRITE (the forward-extension state); null keeps the plain clear.
+    void Begin(ID3D12GraphicsCommandList* commandList,
+               ID3D12Resource* sceneDepth = nullptr) {
         if (!initialized) return;
         if (readable_) {
             D3D12_RESOURCE_BARRIER barriers[3] = {};
@@ -62,11 +65,14 @@ public:
             dsvHeap_->GetCPUDescriptorHandleForHeapStart();
         commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
         commandList->ClearRenderTargetView(motionRtv, clear, 0, nullptr);
-        commandList->ClearDepthStencilView(
-            dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        commandList->OMSetRenderTargets(2, &rtv, TRUE, &dsv);
         commandList->RSSetViewports(1, &g_dx12.viewport);
         commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        if (sceneDepth && !DepthSeedDisabled() && EnsureDepthSeed())
+            SeedDepth(commandList, sceneDepth, dsv);
+        else
+            commandList->ClearDepthStencilView(
+                dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        commandList->OMSetRenderTargets(2, &rtv, TRUE, &dsv);
     }
 
     void Composite(ID3D12GraphicsCommandList* commandList,
@@ -191,6 +197,115 @@ public:
     }
 
 private:
+    static constexpr UINT SeedDescriptor = 9;
+
+    // SGE_GRASS_NO_DEPTH_SEED restores the cleared grass depth for A/B.
+    static bool DepthSeedDisabled() {
+        static const bool disabled =
+            GetEnvironmentVariableA("SGE_GRASS_NO_DEPTH_SEED", nullptr, 0) > 0;
+        return disabled;
+    }
+
+    // See grass_msaa_depth_seed.hlsl.
+    bool EnsureDepthSeed() {
+        if (seedPipeline_) return true;
+        if (seedTried_) return false;
+        seedTried_ = true;
+        std::ifstream file("shaders/grass_msaa_depth_seed.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream stream;
+        stream << file.rdbuf();
+        const std::string source = stream.str();
+        const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> vs, ps, errors;
+        if (FAILED(ShaderCacheDX12::CompileCached(source.data(), source.size(),
+                "grass_msaa_depth_seed.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "VSMain", "vs_5_0",
+                flags, 0, &vs, &errors)) ||
+            FAILED(ShaderCacheDX12::CompileCached(source.data(), source.size(),
+                "grass_msaa_depth_seed.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "PSMain", "ps_5_0",
+                flags, 0, &ps, &errors))) {
+            if (errors) std::cerr << "Grass MSAA depth seed: "
+                                  << (char*)errors->GetBufferPointer() << '\n';
+            return false;
+        }
+        D3D12_DESCRIPTOR_RANGE range = {};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER param = {};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param.DescriptorTable.NumDescriptorRanges = 1;
+        param.DescriptorTable.pDescriptorRanges = &range;
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC root = {};
+        root.NumParameters = 1;
+        root.pParameters = &param;
+        ComPtr<ID3DBlob> signature;
+        if (FAILED(D3D12SerializeRootSignature(
+                &root, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)) ||
+            FAILED(g_dx12.device->CreateRootSignature(
+                0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                IID_PPV_ARGS(&seedRootSignature_)))) return false;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = seedRootSignature_.Get();
+        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.DepthStencilState.DepthEnable = TRUE;
+        pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        pso.SampleMask = UINT_MAX;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 0;
+        pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pso.SampleDesc.Count = MSAADX12::SampleCount;
+        return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+            &pso, IID_PPV_ARGS(&seedPipeline_)));
+    }
+
+    // Leaves a different graphics root signature and descriptor heap bound;
+    // the caller rebinds its own before drawing.
+    void SeedDepth(ID3D12GraphicsCommandList* commandList,
+                   ID3D12Resource* sceneDepth,
+                   D3D12_CPU_DESCRIPTOR_HANDLE dsv) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = sceneDepth;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_READ |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &barrier);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+            descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(SeedDescriptor) * g_dx12.cbvSrvUavDescriptorSize;
+        gpu.ptr += static_cast<UINT64>(SeedDescriptor) * g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        srv.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(sceneDepth, &srv, cpu);
+
+        ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
+        commandList->SetDescriptorHeaps(1, heaps);
+        commandList->SetGraphicsRootSignature(seedRootSignature_.Get());
+        commandList->SetPipelineState(seedPipeline_.Get());
+        commandList->SetGraphicsRootDescriptorTable(0, gpu);
+        commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commandList->DrawInstanced(3, 1, 0, 0);
+
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        commandList->ResourceBarrier(1, &barrier);
+    }
+
     bool CreateDescriptorHeaps() {
         D3D12_DESCRIPTOR_HEAP_DESC rtv = {};
         rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -204,7 +319,8 @@ private:
                 &dsv, IID_PPV_ARGS(&dsvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = 9;
+        // 9 for the composite, then the depth seed's scene-depth SRV.
+        descriptors.NumDescriptors = 10;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         return SUCCEEDED(g_dx12.device->CreateDescriptorHeap(
             &descriptors, IID_PPV_ARGS(&descriptorHeap_)));
@@ -425,6 +541,9 @@ private:
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> pipelineState_;
+    ComPtr<ID3D12RootSignature> seedRootSignature_;
+    ComPtr<ID3D12PipelineState> seedPipeline_;
+    bool seedTried_ = false;
 };
 
 #endif

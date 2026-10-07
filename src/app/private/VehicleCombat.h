@@ -138,6 +138,58 @@ static void UpdateHumveeTurretAimAt(size_t vehicleIndex,
     PrepareHumveeModelForRender(vehicleIndex);
 }
 
+// Barrel tip in the Humvee FBX's model space (imported at scale 1), measured
+// off the split turret mesh. The turret node sits at its ring-centre pivot.
+static constexpr XMFLOAT3 kHumveeMuzzleModel{ 0.0f, 702.0f, 425.0f };
+
+static XMMATRIX HumveeTurretWorld(size_t vehicleIndex) {
+    PrepareHumveeModelForRender(vehicleIndex);
+    return XMLoadFloat4x4(&g_humveeTurretNode->globalTransform) *
+           HumveeWorldMatrix(vehicleIndex);
+}
+
+static XMFLOAT3 HumveeTurretMuzzleWorld(size_t vehicleIndex) {
+    XMFLOAT3 muzzle;
+    XMStoreFloat3(&muzzle, XMVector3TransformCoord(
+        XMLoadFloat3(&kHumveeMuzzleModel) -
+            XMLoadFloat3(&g_humveeTurretNode->translation),
+        HumveeTurretWorld(vehicleIndex)));
+    return muzzle;
+}
+
+// The turret heading, as a point level with `target` at its range: what a
+// gunner riding the ring is looking at. He turns with the gun, not ahead of it.
+static XMFLOAT3 HumveeTurretSightPoint(size_t vehicleIndex,
+                                       const XMFLOAT3& from,
+                                       const XMFLOAT3& target) {
+    XMFLOAT3 heading;
+    XMStoreFloat3(&heading, XMVector3TransformNormal(
+        XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f), HumveeTurretWorld(vehicleIndex)));
+    const float flat = std::sqrt(heading.x * heading.x + heading.z * heading.z);
+    const float dx = target.x - from.x, dz = target.z - from.z;
+    const float range = std::sqrt(dx * dx + dz * dz);
+    if (flat < 1e-4f || range < 0.1f) return target;
+    return { from.x + heading.x / flat * range, target.y,
+             from.z + heading.z / flat * range };
+}
+
+// Plan-view angle between the gun and the line to `target`, radians.
+static float HumveeTurretAimError(size_t vehicleIndex, const XMFLOAT3& target) {
+    const XMFLOAT3 muzzle = HumveeTurretMuzzleWorld(vehicleIndex);
+    const XMFLOAT3 sight = HumveeTurretSightPoint(vehicleIndex, muzzle, target);
+    const float gun = std::atan2(sight.x - muzzle.x, sight.z - muzzle.z);
+    const float want = std::atan2(target.x - muzzle.x, target.z - muzzle.z);
+    return std::abs(std::atan2(std::sin(want - gun), std::cos(want - gun)));
+}
+
+static bool HumveeTurretGunner(const SkinnedEnemy& actor, size_t& vehicleIndex) {
+    if (!actor.turretGunner || actor.mountedVehicleIndex < 0 ||
+        static_cast<size_t>(actor.mountedVehicleIndex) >= g_humveeGameplay.size() ||
+        !g_humveeModel || !g_humveeTurretNode) return false;
+    vehicleIndex = static_cast<size_t>(actor.mountedVehicleIndex);
+    return true;
+}
+
 static void UpdateHumveeTurretAim(float dt) {
     if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) return;
     if (HumveeHasFriendlyGunner(g_activeHumveeIndex)) return;
@@ -152,13 +204,7 @@ static void FireHumveeTurret() {
     HumveeGameplayState& state = g_humveeGameplay[g_activeHumveeIndex];
     if (state.turretFireCooldown > 0.0f) return;
     state.aimPoint = HumveeScreenCenterAimPoint();
-    PrepareHumveeModelForRender(g_activeHumveeIndex);
-    const XMMATRIX turretWorld =
-        XMLoadFloat4x4(&g_humveeTurretNode->globalTransform) *
-        HumveeWorldMatrix(g_activeHumveeIndex);
-    XMFLOAT3 muzzle;
-    XMStoreFloat3(&muzzle, XMVector3TransformCoord(
-        XMVectorSet(0.0f, 72.0f, 338.0f, 1.0f), turretWorld));
+    const XMFLOAT3 muzzle = HumveeTurretMuzzleWorld(g_activeHumveeIndex);
     XMVECTOR direction = XMLoadFloat3(&state.aimPoint) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 0.01f) return;
     XMFLOAT3 shotDirection;

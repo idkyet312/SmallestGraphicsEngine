@@ -471,11 +471,22 @@ float3 AtmosphereAmbient(float3 ray, float aboveBase)
     return daylightAmbient;
 }
 
+// SGE_FOG_SPLIT: one thread per froxel (id.z = slice) writes that slice's
+// in-scattering and optical depth; CSIntegrate then accumulates each column.
+// Every slice's terms are independent of the slices before it -- only the
+// running sum is serial -- so this is the same integral. The single-pass form
+// ran one thread per column (9216 at high res) marching 96 slices serially,
+// which left most of the GPU idle. Optical depth, not transmittance, is stored
+// because fp16 cannot resolve a per-slice transmittance just under 1.0.
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= volumeDims.x || id.y >= volumeDims.y)
         return;
+#ifdef SGE_FOG_SPLIT
+    if (id.z >= volumeDims.z)
+        return;
+#endif
 
     float2 uv = (float2(id.xy) + 0.5) / float2(volumeDims.xy);
     float3 ray = WorldRay(uv);
@@ -509,9 +520,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // useful once something averages it.
     float sliceJitter = InterleavedGradientNoise(float2(id.xy));
 
+#ifdef SGE_FOG_SPLIT
+    {
+        const uint z = id.z;
+#else
     [loop]
     for (uint z = 0; z < volumeDims.z; ++z)
     {
+#endif
         float nearDepth = SliceDepth((float)z);
         float farDepth = SliceDepth((float)z + 1.0);
         float centerDepth = lerp(nearDepth, farDepth, sliceJitter);
@@ -720,11 +736,37 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         }
 
         float3 segmentScattering = lighting * (1.0 - segmentTransmittance);
+#ifdef SGE_FOG_SPLIT
+        fogVolumeOut[uint3(id.xy, z)] = float4(segmentScattering,
+            -log(max(segmentTransmittance, 1e-30)));
+#else
         accumulated += transmittance * segmentScattering;
         transmittance *= segmentTransmittance;
         fogVolumeOut[uint3(id.xy, z)] = float4(accumulated, transmittance);
+#endif
     }
 }
+
+#ifdef SGE_FOG_SPLIT
+// Front-to-back accumulation of CSMain's per-slice terms, in place. Same
+// recurrence as the single-pass loop; needs typed UAV loads of RGBA16F.
+[numthreads(8, 8, 1)]
+void CSIntegrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= volumeDims.x || id.y >= volumeDims.y)
+        return;
+    float3 accumulated = 0.0;
+    float transmittance = 1.0;
+    [loop]
+    for (uint z = 0; z < volumeDims.z; ++z)
+    {
+        const float4 slice = fogVolumeOut[uint3(id.xy, z)];
+        accumulated += transmittance * slice.rgb;
+        transmittance *= exp(-slice.a);
+        fogVolumeOut[uint3(id.xy, z)] = float4(accumulated, transmittance);
+    }
+}
+#endif
 
 struct VSOutput
 {

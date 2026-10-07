@@ -301,6 +301,7 @@ extern std::shared_ptr<SceneNode> g_boatModel;
 extern std::shared_ptr<SceneNode> g_insertionBoatModel;
 extern std::shared_ptr<SceneNode> g_insertionBoatShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
+extern std::shared_ptr<SceneNode> g_humveeTurretNode;
 extern std::shared_ptr<SceneNode> g_boatShadowModel;
 extern std::shared_ptr<SceneNode> g_blackHawkModel;
 extern std::shared_ptr<SceneNode> g_blackHawkShadowModel;
@@ -2226,6 +2227,8 @@ inline bool SphereVisible(const XMFLOAT4 planes[6], const XMFLOAT3& c, float r) 
 // Draw only the wind-driven grass. Used by the visibility-buffer path to put
 // foliage in an independent multisampled layer without multisampling the full
 // visibility buffer.
+// Blades submitted by the last RenderGrassForward call (profile dump stat).
+inline UINT g_grassDrawnInstances = 0;
 inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
                                const XMMATRIX& view, const XMMATRIX& proj,
                                const XMMATRIX& lightSpace,
@@ -2265,7 +2268,14 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         (!DeploymentPlanningActive() || planningGrass)) {
         g_grass.SetViewer(scene.camera.Position);
         static std::vector<GrassField::DrawRange> grassRanges;
-        g_grass.GetVisible(grassRanges);
+        const XMMATRIX grassViewProjection = view * proj;
+        static const bool noFrustum =
+            GetEnvironmentVariableA("SGE_GRASS_NO_FRUSTUM", nullptr, 0) > 0;
+        g_grass.GetVisible(grassRanges,
+                           noFrustum ? nullptr : &grassViewProjection);
+        g_grassDrawnInstances = 0;
+        for (const GrassField::DrawRange& r : grassRanges)
+            g_grassDrawnInstances += r.instanceCount;
 
         const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
         const D3D12_GPU_VIRTUAL_ADDRESS ginst =
@@ -2839,7 +2849,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_grass.SetViewer(scene.camera.Position);
 
         static std::vector<GrassField::DrawRange> grassRanges;
-        g_grass.GetVisible(grassRanges);
+        const XMMATRIX grassViewProjection = view * proj;
+        g_grass.GetVisible(grassRanges, &grassViewProjection);
 
         const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
         const D3D12_GPU_VIRTUAL_ADDRESS ginst = g_grass.GetInstanceBufferAddress();
@@ -2921,10 +2932,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (!HumveeAlive(index)) continue;
             PrepareHumveeModelForRender(index);
             const XMMATRIX world = HumveeWorldMatrix(index);
+            // Batches flush after the loop, reading the turret node as the
+            // last Humvee left it; each turret has its own yaw.
             if (visibilityExtensionsOnly)
                 DrawSceneNode(g_humveeModel, shader, world,
                     view, proj, lightSpace, true);
-            else if (!staticBatches.Submit(g_humveeModel, world))
+            else if (g_humveeTurretNode ||
+                     !staticBatches.Submit(g_humveeModel, world))
                 DrawSceneNode(g_humveeModel, shader, world,
                     view, proj, lightSpace);
         }
@@ -2933,7 +2947,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (visibilityExtensionsOnly)
                 DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
                     view, proj, lightSpace, true);
-            else if (!staticBatches.Submit(g_humveeModel, SecondaryHumveeWorldMatrix()))
+            else if (g_humveeTurretNode ||
+                     !staticBatches.Submit(g_humveeModel, SecondaryHumveeWorldMatrix()))
                 DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
                     view, proj, lightSpace);
         }

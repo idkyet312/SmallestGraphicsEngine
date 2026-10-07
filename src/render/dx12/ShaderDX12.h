@@ -5,6 +5,9 @@
 #include "VirtualShadowPages.h"
 inline VirtualShadows::Constants g_virtualShadowConstants{};
 inline uint32_t g_vsmResident = 0, g_vsmRefreshed = 0, g_vsmReused = 0;
+// Caster primitives (instances counted individually) recorded into / skipped
+// from virtual pages last frame, summed over every page.
+inline uint32_t g_vsmCastersDrawn = 0, g_vsmCastersCulled = 0;
 inline bool g_vsmUnavailable = false;
 // Per-slot page state for the debug overlay: 0 unused, 1 reused (cached),
 // 2 refreshed (redrawn this frame). A plain uint8_t rather than the
