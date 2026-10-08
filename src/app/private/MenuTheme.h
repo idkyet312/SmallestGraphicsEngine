@@ -735,6 +735,12 @@ static void VideoTab() {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
+    if (ToggleRow("Experimental Lumen ReSTIR GI",
+                  "Reuses bounce samples across frames and neighbouring pixels, so interiors lit through openings are much less noisy at the same ray count. Full-resolution Lumen only; best with the radiance cache on.",
+                  &g_settings.lumenReSTIR)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
     ImGui::EndDisabled();
     const SliderResult reflectionCutoff = SliderRow(
         "Reflection Roughness Cutoff",

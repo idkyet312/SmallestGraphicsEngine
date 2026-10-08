@@ -233,6 +233,8 @@ public:
     // Root UAV u16 (Lumen radiance cache) on the enhanced resolve root
     // signatures, after the CBV, the table and the t90 root SRV.
     static constexpr UINT kEnhancedRadianceCacheRootParameter = 3;
+    // Root UAVs u17/u18 (Lumen ReSTIR reservoirs), right after the cache.
+    static constexpr UINT kEnhancedReSTIRRootParameter = 4;
     // Heap index of the spot shadow atlas (t92). Sits one past the terrain
     // splatmap, which was the previous last slot.
     static constexpr UINT kSpotShadowAtlasSlot = 91;
@@ -579,6 +581,16 @@ public:
     // Mode is this frame's b5 value: 0 off, 1 on, 2 clear then on.
     bool giRadianceCacheRequested = false;
     UINT giRadianceCacheMode = 0;
+    // ReSTIR GI for the Lumen bounce (settings LumenReSTIR). Mode is this
+    // frame's b5 value: 0 off, 1 with last frame's reservoirs, 2 without.
+    bool lumenReSTIRRequested = false;
+    UINT lumenReSTIRMode = 0;
+    bool restirHistoryValid = false;
+    // Two frames of per-pixel reservoirs (gi_restir.hlsli): 16 + 8 bytes.
+    ComPtr<ID3D12Resource> restirSampleBuffer;
+    ComPtr<ID3D12Resource> restirWeightBuffer;
+    UINT restirWidth = 0, restirHeight = 0;
+    bool restirAllocationFailed = false;
 private:
     RadianceCascadesDX12 radianceCascades;
     GIRadianceCacheDX12 giRadianceCache;
@@ -1296,6 +1308,7 @@ public:
         temporalHistoryValid = false;
         surfaceHistoryValid = false;
         svgfHistoryValid = false;
+        restirHistoryValid = false;
     }
 
     ID3D12Resource* StableSurfaceResource(UINT index) const {
@@ -1308,9 +1321,12 @@ public:
         if (validationMode || debugViewMode != 0 ||
             BentNormalGTAODiagnosticActive())
             return false;
+        // ReSTIR validates reused reservoirs against last frame's surface
+        // identity exactly as SVGF does, and runs under RR where SVGF does not.
         return (surfaceIDTemporalEnabled && temporalEffectsEnabled) ||
                historyDebugView ||
-               (enhancedResolve && svgfTemporalEnabled);
+               (enhancedResolve && svgfTemporalEnabled) ||
+               (enhancedResolve && lumenGIActive && lumenReSTIRRequested);
     }
 
     UINT StableSurfaceModeSignature(bool visibilityPath,
@@ -3471,6 +3487,15 @@ public:
             giRadianceCacheMode =
                 giRadianceCache.ClearThisFrame() && !ScopeSurfaceBound() ? 2u
                                                                         : 1u;
+        // ReSTIR: main view, full-resolution Lumen only (cascades and the
+        // half-resolution share replace the per-pixel ray it resamples).
+        lumenReSTIRMode = 0;
+        if (useEnhanced && lumenGIActive && lumenReSTIRRequested &&
+            !radianceCascadesGIRequested && !lumenGIHalfResolutionActive &&
+            !ScopeSurfaceBound() && EnsureReSTIRBuffers(width, height))
+            lumenReSTIRMode = restirHistoryValid ? 1u : 2u;
+        else if (!ScopeSurfaceBound())
+            restirHistoryValid = false;  // a gap in the reservoir chain
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
         }
@@ -3626,6 +3651,8 @@ public:
         }
         if (!ScopeSurfaceBound())
             radianceCascadesGIActive = useRadianceCascades;
+        // This frame writes every pixel's reservoir, so next frame may read.
+        if (lumenReSTIRMode != 0u) restirHistoryValid = true;
 
         if (!useBindless) {
             g_dx12.device->CopyDescriptorsSimple(
@@ -3662,12 +3689,10 @@ public:
                 : (useEnhanced
                     ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
                     : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
-        // u16 Lumen radiance cache; every enhanced root signature declares it.
-        // Unallocated until first enabled, and never read while mode is 0.
-        if (useEnhanced && giRadianceCache.Address() != 0)
-            cmdList->SetComputeRootUnorderedAccessView(
-                kEnhancedRadianceCacheRootParameter,
-                giRadianceCache.Address());
+        // u16 Lumen radiance cache and u17/u18 ReSTIR reservoirs; every
+        // enhanced root signature declares them. Unallocated until first
+        // enabled, and never read while their modes are 0.
+        if (useEnhanced) BindEnhancedRootUAVs(cmdList);
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
@@ -3751,7 +3776,9 @@ public:
                     : radianceCascades.Heap(frameSlot,
                                             RadianceCascadesDX12::ResolvePass),
                 constants, cascadeTables[RadianceCascadesDX12::ResolvePass],
-                giRadianceCache.Address());
+                giRadianceCache.Address(),
+                restirSampleBuffer ? restirSampleBuffer->GetGPUVirtualAddress() : 0,
+                restirWeightBuffer ? restirWeightBuffer->GetGPUVirtualAddress() : 0);
             selectedPSO = radianceCascades.ResolvePSO(
                 useBindless, useTerrainResolve, false);
             terrainOnlyPSO = radianceCascades.ResolvePSO(useBindless, true, true);
@@ -3844,10 +3871,7 @@ public:
                     : (useEnhanced
                         ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
                         : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
-            if (useEnhanced && giRadianceCache.Address() != 0)
-                cmdList->SetComputeRootUnorderedAccessView(
-                    kEnhancedRadianceCacheRootParameter,
-                    giRadianceCache.Address());
+            if (useEnhanced) BindEnhancedRootUAVs(cmdList);
 
             selectedPSO = tiledGenericPSO;
         }
@@ -4988,6 +5012,11 @@ public:
         svgfHistoryMoments[1].Reset();
         svgfStableSurfaceCurrent.Reset();
         svgfStableSurfaceHistory.Reset();
+        restirSampleBuffer.Reset();
+        restirWeightBuffer.Reset();
+        restirWidth = restirHeight = 0;
+        restirAllocationFailed = false;
+        restirHistoryValid = false;
         stableSurfaceWriteIndex = 0;
         stableSurfaceIdentityActive = false;
         stableSurfaceIdentityActiveThisFrame = false;
@@ -6241,7 +6270,9 @@ private:
             float detailMipGradScale;
             UINT  lumenHitShadeMode;
             UINT  giRadianceCache;
-            UINT  giRadianceCachePadding[3];
+            UINT  lumenReSTIR;
+            UINT  lumenReSTIRDebug;
+            UINT  lumenReSTIRSpatialTaps;
         } constants;
         static_assert(sizeof(EnhancedConstants) == 128,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
@@ -6300,7 +6331,21 @@ private:
         }();
         constants.lumenHitShadeMode = kLumenHitShadeMode;
         constants.giRadianceCache = giRadianceCacheMode;
-        for (UINT& pad : constants.giRadianceCachePadding) pad = 0u;
+        constants.lumenReSTIR = lumenReSTIRMode;
+        static const UINT kReSTIRDebug = [] {
+            char text[8] = {};
+            return GetEnvironmentVariableA("SGE_RESTIR_DEBUG", text,
+                                           sizeof(text)) > 0
+                ? static_cast<UINT>(atoi(text)) : 0u;
+        }();
+        constants.lumenReSTIRDebug = kReSTIRDebug;
+        static const UINT kReSTIRTaps = [] {
+            char text[8] = {};
+            return GetEnvironmentVariableA("SGE_RESTIR_TAPS", text,
+                                           sizeof(text)) > 0
+                ? static_cast<UINT>(std::clamp(atoi(text), 0, 8)) : 1u;
+        }();
+        constants.lumenReSTIRSpatialTaps = kReSTIRTaps;
         // DLSS mip bias (DLSS Programming Guide 3.5): while DLSS / RR is the
         // temporal resolve, textures are sampled at display detail with
         // bias = log2(render / display) - 1 (-1 DLAA, -2 at 50%).
@@ -6438,6 +6483,61 @@ private:
 
     // Source of one tier's base permutation. The tier builders and the boot
     // compile queue both take it from here, so they hash to the same blobs.
+    void BindEnhancedRootUAVs(ID3D12GraphicsCommandList* cmd) {
+        if (giRadianceCache.Address() != 0)
+            cmd->SetComputeRootUnorderedAccessView(
+                kEnhancedRadianceCacheRootParameter, giRadianceCache.Address());
+        if (restirSampleBuffer && restirWeightBuffer) {
+            cmd->SetComputeRootUnorderedAccessView(
+                kEnhancedReSTIRRootParameter,
+                restirSampleBuffer->GetGPUVirtualAddress());
+            cmd->SetComputeRootUnorderedAccessView(
+                kEnhancedReSTIRRootParameter + 1,
+                restirWeightBuffer->GetGPUVirtualAddress());
+        }
+    }
+
+    // Lazily sized to the render resolution; Resize() releases them after its
+    // GPU wait, so they are only ever created here, never replaced in flight.
+    bool EnsureReSTIRBuffers(UINT w, UINT h) {
+        if (restirSampleBuffer)
+            return restirWidth == w && restirHeight == h;
+        if (restirAllocationFailed || w == 0 || h == 0) return false;
+        const UINT64 pixels = static_cast<UINT64>(w) * h * 2ull;
+        auto create = [&](ComPtr<ID3D12Resource>& out, UINT64 bytes,
+                          const wchar_t* label) {
+            D3D12_HEAP_PROPERTIES heap = {};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc = {};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = bytes;
+            desc.Height = 1;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                    D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                    IID_PPV_ARGS(&out))))
+                return false;
+            out->SetName(label);
+            return true;
+        };
+        if (!create(restirSampleBuffer, pixels * 16ull, L"Lumen ReSTIR samples") ||
+            !create(restirWeightBuffer, pixels * 8ull, L"Lumen ReSTIR weights")) {
+            restirSampleBuffer.Reset();
+            restirWeightBuffer.Reset();
+            restirAllocationFailed = true;
+            return false;
+        }
+        restirWidth = w;
+        restirHeight = h;
+        restirHistoryValid = false;
+        return true;
+    }
+
     std::string ResolveTierSource(int tier) const {
         if (tier == ResolveTierFXC) return resolveSourceVSM;
         if (tier == ResolveTierBindless)
@@ -6833,7 +6933,7 @@ private:
         if (!bindless)
             radianceCascades.Configure(ranges, _countof(ranges), samplers);
 
-        D3D12_ROOT_PARAMETER params[4] = {};
+        D3D12_ROOT_PARAMETER params[6] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[0].Descriptor.RegisterSpace = 0;
@@ -6855,10 +6955,19 @@ private:
             16;
         params[kEnhancedRadianceCacheRootParameter].ShaderVisibility =
             D3D12_SHADER_VISIBILITY_ALL;
+        // u17/u18 ReSTIR reservoirs, root UAVs for the same reason.
+        for (UINT i = 0; i < 2; ++i) {
+            params[kEnhancedReSTIRRootParameter + i].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[kEnhancedReSTIRRootParameter + i].Descriptor.ShaderRegister =
+                17 + i;
+            params[kEnhancedReSTIRRootParameter + i].ShaderVisibility =
+                D3D12_SHADER_VISIBILITY_ALL;
+        }
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        // The CBV, the descriptor table, the t90 tile-list root SRV and the
-        // u16 radiance-cache root UAV.
+        // The CBV, the descriptor table, the t90 tile-list root SRV, the u16
+        // radiance-cache root UAV and the u17/u18 ReSTIR root UAVs.
         rootSigDesc.NumParameters = _countof(params);
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 3;  // s0 wrap, s1 shadow cmp, s2 clamp (terrain splat)
@@ -7820,6 +7929,14 @@ public:
     }
     const char* LumenRadianceCacheStatus() const {
         return giRadianceCache.Status();
+    }
+
+    void SetLumenReSTIR(bool on) {
+        if (on != lumenReSTIRRequested) {
+            svgfHistoryValid = false;
+            restirHistoryValid = false;
+        }
+        lumenReSTIRRequested = on;
     }
 
     bool EnhancedVisualsReady() const { return enhancedPipelineReady; }

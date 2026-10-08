@@ -371,7 +371,17 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // 0 = off, 1 = on, 2 = on and clear every entry this frame (level load,
     // toggle). Appended; C++ mirror EnhancedConstants.
     uint  giRadianceCache;
-    uint3 giRadianceCachePadding;
+    // ReSTIR GI for the Lumen bounce (gi_restir.hlsli): 0 = off, 1 = on with
+    // last frame's reservoirs, 2 = on without history (first frame, resize,
+    // toggle). Main view at full resolution only.
+    uint  lumenReSTIR;
+    // SGE_RESTIR_DEBUG: 1 = GI shows merged M / 20 (red) and the share of
+    // spatial taps accepted (green) instead of irradiance.
+    uint  lumenReSTIRDebug;
+    // Spatial neighbours merged per pixel (SGE_RESTIR_TAPS, default 1).
+    // Measured on Base (1080p, raw lit noise 4.21 without ReSTIR): 0 taps
+    // 2.78 at +0.45 ms, 1 tap 2.03 at +0.62, 3 taps 1.89 at +0.78.
+    uint  lumenReSTIRSpatialTaps;
 };
 #if SGE_RADIANCE_CASCADES
 cbuffer RadianceCascadeConstants : register(b6) {
@@ -1402,7 +1412,11 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 // sample to the accumulator rather than averaging here.
 #include "gi_radiance_cache.hlsli"
 
-float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
+#include "gi_restir.hlsli"
+
+// The Lumen bounce ray as a sample: where it landed and the radiance leaving
+// that point. ReSTIR keeps the sample; the plain path only needs radiance.
+GISample TraceLumenGISample(float3 worldPos, float3 normal, uint2 pixel) {
     uint pixelSeed = MatVarHashUint(pixel.x * 2654435761u ^
                                     pixel.y * 2246822519u);
     uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
@@ -1441,8 +1455,15 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
     // where the probe grid misses and this path is doing the work.
     while (query.Proceed()) {}
 
+    GISample result;
+    result.position = rayDir;
+    result.distance = 0.0;
+    result.sky = true;
     float3 incoming = SampleReflectionProbe(rayDir, 1.0);
     if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        result.distance = query.CommittedRayT();
+        result.position = ray.Origin + rayDir * result.distance;
+        result.sky = false;
         // Real hit shading where the geometry is bound, so a bounce off a
         // coloured surface carries that colour. This is the difference between
         // GI that only darkens and GI that bleeds colour.
@@ -1486,7 +1507,139 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
         }
         incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
     }
-    return SanitizeRaySample(incoming) * giIntensity;
+    result.radiance = SanitizeRaySample(incoming);
+    return result;
+}
+
+float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
+    return TraceLumenGISample(worldPos, normal, pixel).radiance * giIntensity;
+}
+
+// Radiance of a reused sample now: sky is re-read from the environment, hits
+// from the radiance cache when one is running (bucketed by the direction this
+// shading point sees them from, as a fresh ray would be).
+float3 RestirRefreshRadiance(GISample s, float3 worldPos) {
+    if (s.sky) return SanitizeRaySample(SampleReflectionProbe(s.position, 1.0));
+    if (giRadianceCache != 0u) {
+        float3 cached;
+        float3 facing = normalize(worldPos - s.position);
+        if (GICacheLookup(GICacheMakeKey(s.position, facing,
+                                         GICacheLod(s.position)), cached))
+            return SanitizeRaySample(cached);
+    }
+    return s.radiance;
+}
+
+float RestirRandom(inout uint state) {
+    state = GICachePcg(state);
+    return (float)(state >> 8u) * (1.0 / 16777216.0);
+}
+
+// One Lumen bounce through ReSTIR GI (gi_restir.hlsli). Returns the irradiance
+// estimate in the same units as RayTracedProbeMissGI.
+float3 LumenReSTIRGI(float3 worldPos, float3 normal, uint2 pixel,
+                     uint2 surfaceID, bool commit) {
+    GISample fresh = TraceLumenGISample(worldPos, normal, pixel);
+    uint rng = GICachePcg(pixel.x * 1973u + pixel.y * 9277u +
+                          enhancedFrameIndex * 26699u);
+
+    float debugAttempts = 0.0, debugAccepted = 0.0;
+    float debugRejectNamespace = 0.0, debugRejectEmpty = 0.0,
+          debugRejectGeometry = 0.0;
+    GIReservoir r;
+    r.s = fresh;
+    r.wSum = 0.0;
+    r.W = 0.0;
+    r.M = 1u;
+    // Cosine-sampled candidate: target / pdf = luminance(L).
+    RestirUpdate(r, fresh, RestirLuma(fresh.radiance), RestirRandom(rng));
+
+    const uint parity = enhancedFrameIndex & 1u;
+    if (lumenReSTIR == 1u) {
+        float2 currentUV = (float2(pixel) + 0.5) /
+                           float2(screenWidth, screenHeight);
+        float2 previousUV = currentUV - outputMotion[pixel];
+        if (all(previousUV >= 0.0) && all(previousUV < 1.0)) {
+            int2 previousPixel = clamp(
+                int2(previousUV * float2(screenWidth, screenHeight)),
+                int2(0, 0), int2(screenWidth - 1, screenHeight - 1));
+            float angle = RestirRandom(rng) * 6.2831853;
+            debugAttempts = 1.0;
+            [loop]
+            const uint spatialTaps = min(lumenReSTIRSpatialTaps, 8u);
+            for (uint tap = 0u; tap <= spatialTaps; ++tap) {
+                int2 source = previousPixel;
+                if (tap > 0u) {
+                    // Golden-angle spiral, rotated per pixel and frame.
+                    float a = angle + (float)tap * 2.39996323;
+                    float radius = RESTIR_SPATIAL_RADIUS *
+                        sqrt(((float)tap - 0.5) / (float)spatialTaps);
+                    source = clamp(previousPixel +
+                        int2(round(float2(cos(a), sin(a)) * radius)),
+                        int2(0, 0), int2(screenWidth - 1, screenHeight - 1));
+                }
+                // Same object (persistent namespace) as this pixel: samples
+                // from another object were taken in a different neighbourhood.
+                if (svgfStableSurfaceHistory.Load(int3(source, 0)).x !=
+                    surfaceID.x) {
+                    debugRejectNamespace += 1.0;
+                    continue;
+                }
+                GIReservoir n = RestirLoad(RestirIndex(uint2(source),
+                                                       parity ^ 1u));
+                if (n.M == 0u) {
+                    debugRejectEmpty += 1.0;
+                    continue;
+                }
+                debugRejectGeometry += 1.0;
+                n.M = min(n.M, RESTIR_MAX_M);
+                // Only the temporal tap re-reads the cache. A spatial tap's
+                // radiance was refreshed last frame as its own pixel's
+                // temporal tap, so it is at most one frame old, and the four
+                // probe-chain walks per pixel cost more than the reuse.
+                if (tap == 0u)
+                    n.s.radiance = RestirRefreshRadiance(n.s, worldPos);
+                float jacobian = 1.0;
+                if (!n.s.sky) {
+                    float distanceSq;
+                    RestirDirection(n.s, worldPos, distanceSq);
+                    // A sample at the shading point itself is the surface the
+                    // neighbour stood on, not something this pixel can see.
+                    if (distanceSq < 0.01) continue;
+                    jacobian = n.s.distance * n.s.distance / distanceSq;
+                    if (jacobian > RESTIR_MAX_JACOBIAN ||
+                        jacobian < 1.0 / RESTIR_MAX_JACOBIAN)
+                        continue;
+                }
+                float target = RestirTargetPdf(n.s, worldPos, normal);
+                if (target <= 0.0) continue;
+                RestirUpdate(r, n.s, target * n.W * (float)n.M * jacobian,
+                             RestirRandom(rng));
+                r.M += n.M;
+                debugAccepted += 1.0;
+                debugRejectGeometry -= 1.0;
+            }
+        }
+    }
+
+    float selectedTarget = RestirTargetPdf(r.s, worldPos, normal);
+    r.W = selectedTarget > 0.0 ? r.wSum / ((float)r.M * selectedTarget) : 0.0;
+    // Distance from THIS pixel, so a later reuse reconnects from here.
+    if (!r.s.sky) r.s.distance = length(r.s.position - worldPos);
+    float3 estimate = r.s.radiance * selectedTarget /
+                      max(RestirLuma(r.s.radiance), 1e-6) * r.W;
+    if (commit) {
+        r.M = min(r.M, RESTIR_MAX_M);
+        RestirStore(RestirIndex(pixel, parity), r);
+    }
+    if (lumenReSTIRDebug == 2u)
+        return float3(debugRejectNamespace, debugRejectEmpty,
+                      debugRejectGeometry) / (float)(min(lumenReSTIRSpatialTaps, 8u) + 1u);
+    if (lumenReSTIRDebug == 1u)
+        return float3(min((float)r.M, 80.0) / 80.0,
+                      debugAccepted / (float)(min(lumenReSTIRSpatialTaps, 8u) + 1u),
+                      debugAttempts);
+    return SanitizeRaySample(estimate) * giIntensity;
 }
 
 // Share irradiance before albedo/AO, so primary material boundaries remain sharp.
@@ -1497,7 +1650,9 @@ float3 SampleRadianceCascades(float3 position, float3 normal, uint2 pixel,
                               out bool resolved);
 #endif
 float3 SampleLumenGI(float3 worldPos, float3 normal, uint2 pixel,
-                     uint surfaceNamespace, out bool tracedRay) {
+                     uint2 stableSurfaceID, bool commitHistory,
+                     out bool tracedRay) {
+    const uint surfaceNamespace = stableSurfaceID.x;
     tracedRay = true;
 #if SGE_RADIANCE_CASCADES
     if (rcEnabled != 0u) {
@@ -1557,6 +1712,9 @@ float3 SampleLumenGI(float3 worldPos, float3 normal, uint2 pixel,
         return compatible ? sharedIrradiance : sample;
     }
 #endif
+    if (lumenReSTIR != 0u)
+        return LumenReSTIRGI(worldPos, normal, pixel, stableSurfaceID,
+                             commitHistory);
     return RayTracedProbeMissGI(worldPos, normal, pixel);
 }
 
@@ -2803,7 +2961,8 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
             float3 traced;
             if (lumenGI)
                 traced = SampleLumenGI(surface.fragPos, ambientNormal, pixel,
-                                       stableSurfaceID.x, giRayExecuted);
+                                       stableSurfaceID, commitTemporalHistory,
+                                       giRayExecuted);
             else
                 traced = RayTracedProbeMissGI(
                     surface.fragPos, ambientNormal, pixel);

@@ -1692,6 +1692,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 visBuffer.svgfTemporalEnabled = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOATROUS", nullptr, 0) > 0)
                 visBuffer.svgfAtrousEnabled = false;
+            {
+                char iters[8] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_ATROUS_ITERS", iters,
+                                            sizeof(iters)) > 0)
+                    visBuffer.svgfAtrousIterations =
+                        static_cast<UINT>((std::max)(1, atoi(iters)));
+            }
             if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
                 visBuffer.temporalEffectsEnabled = true;
             if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
@@ -1798,6 +1805,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " rc=" << visBuffer.radianceCascadesGIActive
                                 << " rcStatus=" << visBuffer.RadianceCascadesStatus()
                                 << " giCache=" << visBuffer.giRadianceCacheMode
+                                << " restir=" << visBuffer.lumenReSTIRMode
                                 << " giCacheMs=" << g_profiler.GpuScopeMs("Lumen Radiance Cache")
                                 << " captureFrame=" << poseCaptureFrames
                                 << " useDDGI=" << scene.useDDGI
@@ -5505,6 +5513,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.SetLumenGI(lumenRequested && visBuffer.enhancedVisualsActive);
             visBuffer.SetRadianceCascadesGI(g_settings.radianceCascadesGI);
             visBuffer.SetLumenRadianceCache(g_settings.lumenRadianceCache);
+            visBuffer.SetLumenReSTIR(g_settings.lumenReSTIR);
             const bool halfGI = visBuffer.lumenGIActive &&
                 g_settings.lumenGIHalfResolution &&
                 visBuffer.lumenGIHalfResolutionSupported;

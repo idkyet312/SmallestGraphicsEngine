@@ -137,7 +137,9 @@ public:
     void BindResolve(ID3D12GraphicsCommandList* cmd, bool bindless,
                      ID3D12DescriptorHeap* heap, UINT64 frameConstants,
                      D3D12_GPU_DESCRIPTOR_HANDLE table,
-                     D3D12_GPU_VIRTUAL_ADDRESS radianceCache) {
+                     D3D12_GPU_VIRTUAL_ADDRESS radianceCache,
+                     D3D12_GPU_VIRTUAL_ADDRESS restirSamples,
+                     D3D12_GPU_VIRTUAL_ADDRESS restirWeights) {
         cmd->SetDescriptorHeaps(1, &heap);
         cmd->SetComputeRootSignature(Root(bindless));
         cmd->SetComputeRootConstantBufferView(0, frameConstants);
@@ -147,6 +149,11 @@ public:
         // Edge pixels fall back to Lumen rays, which read the radiance cache.
         if (radianceCache != 0)
             cmd->SetComputeRootUnorderedAccessView(4, radianceCache);
+        // ReSTIR is off under cascades, but the shared source declares it.
+        if (restirSamples != 0 && restirWeights != 0) {
+            cmd->SetComputeRootUnorderedAccessView(5, restirSamples);
+            cmd->SetComputeRootUnorderedAccessView(6, restirWeights);
+        }
     }
 
     void Dispatch(ID3D12GraphicsCommandList* cmd, UINT slot, UINT64 frameConstants,
@@ -250,7 +257,7 @@ private:
         extra.BaseShaderRegister = 11;
         extra.OffsetInDescriptorsFromTableStart = BaseDescriptorCount + 7;
         ranges.push_back(extra);
-        D3D12_ROOT_PARAMETER params[5] = {};
+        D3D12_ROOT_PARAMETER params[7] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -264,8 +271,13 @@ private:
         // u16 Lumen radiance cache, as on the enhanced resolve signature.
         params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         params[4].Descriptor.ShaderRegister = 16;
+        // u17/u18 Lumen ReSTIR reservoirs, likewise.
+        params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[5].Descriptor.ShaderRegister = 17;
+        params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[6].Descriptor.ShaderRegister = 18;
         D3D12_ROOT_SIGNATURE_DESC root = {};
-        root.NumParameters = 5;
+        root.NumParameters = 7;
         root.pParameters = params;
         root.NumStaticSamplers = 3;
         root.pStaticSamplers = staticSamplers;

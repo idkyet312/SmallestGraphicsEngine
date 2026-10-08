@@ -115,6 +115,9 @@ struct GameSettings {
     // World-space radiance cache at Lumen ray hits: cached multi-bounce and
     // local-light bounce instead of shading every hit live.
     bool lumenRadianceCache = false;
+    // ReSTIR GI: per-pixel reservoirs reuse last frame's bounce samples and
+    // their neighbours', for a far less noisy bounce at one ray per pixel.
+    bool lumenReSTIR = false;
     // Ultra: Ray Reconstruction upscales from the DLSS screen percentage
     // instead of running at native resolution. Measured at 1080p, 50%:
     // RR 9.5 -> 2.9 ms, GPU frame 23.2 -> 10.5 ms.
@@ -200,6 +203,7 @@ struct GameSettings {
     static constexpr bool  kDefaultRadianceCascadesGI = false;
     static constexpr bool  kDefaultLumenGIHalfResolution = false;
     static constexpr bool  kDefaultLumenRadianceCache = false;
+    static constexpr bool  kDefaultLumenReSTIR = false;
     static constexpr bool  kDefaultRayReconstructionUpscale = true;
     static constexpr bool  kDefaultRRForwardGuides = true;
     static constexpr bool  kDefaultDLSSForwardMotion = true;
@@ -272,6 +276,7 @@ struct GameSettings {
         radianceCascadesGI = kDefaultRadianceCascadesGI;
         lumenGIHalfResolution = kDefaultLumenGIHalfResolution;
         lumenRadianceCache = kDefaultLumenRadianceCache;
+        lumenReSTIR = kDefaultLumenReSTIR;
         rayReconstructionUpscale = kDefaultRayReconstructionUpscale;
         rrForwardGuides = kDefaultRRForwardGuides;
         dlssForwardMotion = kDefaultDLSSForwardMotion;
@@ -394,6 +399,10 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.lumenRadianceCache =
                 value == "1" || value == "true" || value == "yes";
         }
+        else if (key == "LumenReSTIR") {
+            out.lumenReSTIR =
+                value == "1" || value == "true" || value == "yes";
+        }
         else if (key == "RadianceCascadesGI") {
             out.radianceCascadesGI =
                 value == "1" || value == "true" || value == "yes";
@@ -490,6 +499,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << (settings.lumenGIHalfResolution ? 1 : 0) << "\n"
          << "LumenRadianceCache="
          << (settings.lumenRadianceCache ? 1 : 0) << "\n"
+         << "LumenReSTIR="
+         << (settings.lumenReSTIR ? 1 : 0) << "\n"
          << "RayReconstructionUpscale="
          << (settings.rayReconstructionUpscale ? 1 : 0) << "\n"
          << "RRForwardGuides="
