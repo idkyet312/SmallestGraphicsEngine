@@ -742,6 +742,12 @@ static void VideoTab() {
         SaveGameSettings(g_settings);
     }
     ImGui::EndDisabled();
+    if (ToggleRow("Faster Ray Tracing Denoise",
+                  "Uses 3 spatial filter passes instead of 5 for ray-traced GI and reflections when Ray Reconstruction is off. About 1.7 ms faster; very slightly grainier in dark areas.",
+                  &g_settings.fastGIDenoise)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
     const SliderResult reflectionCutoff = SliderRow(
         "Reflection Roughness Cutoff",
         "Surfaces rougher than this skip ray-traced reflections and use the "

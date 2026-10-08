@@ -638,6 +638,17 @@ public:
     UINT svgfAtrousIterations = 5;
     UINT svgfAtrousDiagnosticMode = 0;
     static constexpr UINT kSVGFAtrousMaxIterations = 5;
+    // Player opt-in (settings FastGIDenoise): caps the passes the editor's
+    // svgfAtrousIterations asks for. Measured on Base in motion, 3 passes:
+    // GPU frame 14.37 -> 12.71 ms, image within run-to-run noise of 5 passes.
+    static constexpr UINT kSVGFFastAtrousIterations = 3;
+    bool svgfFastAtrous = false;
+    UINT SVGFAtrousIterationCount() const {
+        const UINT requested = std::clamp(svgfAtrousIterations, 1u,
+                                          kSVGFAtrousMaxIterations);
+        return svgfFastAtrous ? (std::min)(requested, kSVGFFastAtrousIterations)
+                              : requested;
+    }
     ComPtr<ID3D12Resource> svgfReflectionSrc;      // specular IBL from resolve
     ComPtr<ID3D12Resource> svgfAtrousScratch[2];   // ping-pong for à-trous
     ComPtr<ID3D12RootSignature> svgfAtrousRootSig;
@@ -4008,8 +4019,7 @@ public:
         // applied to the specular IBL signal, then composited back into the
         // lit output. Only runs when the enhanced resolve ran with both
         // temporal and spatial SVGF enabled.
-        const UINT atrousIterationCount = std::clamp(
-            svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
+        const UINT atrousIterationCount = SVGFAtrousIterationCount();
         ID3D12DescriptorHeap* atrousDescHeap =
             svgfAtrousDescHeaps[frameSlot].Get();
         ID3D12DescriptorHeap* compositeDescHeap =
@@ -6308,8 +6318,7 @@ private:
         constants.svgfMaxAccum = svgfMaxAccumFrames;
         constants.svgfAtrousEnable = (svgfAtrousEnabled &&
             !rayReconstructionActive && !ScopeSurfaceBound()) ? 1u : 0u;
-        constants.svgfAtrousIters = std::clamp(
-            svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
+        constants.svgfAtrousIters = SVGFAtrousIterationCount();
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
         constants.probeMissGIStrength = enhancedProbeMissGIStrength;
         constants.hitGeometryCount = hitGeometryCount;

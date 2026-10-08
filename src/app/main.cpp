@@ -5514,6 +5514,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.SetRadianceCascadesGI(g_settings.radianceCascadesGI);
             visBuffer.SetLumenRadianceCache(g_settings.lumenRadianceCache);
             visBuffer.SetLumenReSTIR(g_settings.lumenReSTIR);
+            visBuffer.svgfFastAtrous = g_settings.fastGIDenoise;
             const bool halfGI = visBuffer.lumenGIActive &&
                 g_settings.lumenGIHalfResolution &&
                 visBuffer.lumenGIHalfResolutionSupported;
