@@ -108,6 +108,8 @@ struct GameSettings {
     int rayTracingQuality = 0;
     // Lumen global illumination: ray-traced diffuse bounce lighting.
     bool lumenGI = false;
+    // Separate diffuse GI backend; never add two estimates of the same bounce.
+    bool radianceCascadesGI = false;
     // Opt-in sample sharing; full-resolution GI remains the parity reference.
     bool lumenGIHalfResolution = false;
     // Ultra: Ray Reconstruction upscales from the DLSS screen percentage
@@ -192,6 +194,7 @@ struct GameSettings {
     static constexpr bool  kDefaultDLSS = false;
     static constexpr int   kDefaultRayTracingQuality = kRayTracingOff;
     static constexpr bool  kDefaultLumenGI = false;
+    static constexpr bool  kDefaultRadianceCascadesGI = false;
     static constexpr bool  kDefaultLumenGIHalfResolution = false;
     static constexpr bool  kDefaultRayReconstructionUpscale = true;
     static constexpr bool  kDefaultRRForwardGuides = true;
@@ -203,6 +206,7 @@ struct GameSettings {
     static constexpr bool  kDefaultInvertMouseY = false;
 
     void Clamp() {
+        if (radianceCascadesGI) lumenGI = false;
         mouseSensitivity = (std::max)(kMinSensitivity,
                            (std::min)(kMaxSensitivity, mouseSensitivity));
         seeThroughWeaponStrength =
@@ -261,6 +265,7 @@ struct GameSettings {
         dlssEnabled = kDefaultDLSS;
         rayTracingQuality = kDefaultRayTracingQuality;
         lumenGI = kDefaultLumenGI;
+        radianceCascadesGI = kDefaultRadianceCascadesGI;
         lumenGIHalfResolution = kDefaultLumenGIHalfResolution;
         rayReconstructionUpscale = kDefaultRayReconstructionUpscale;
         rrForwardGuides = kDefaultRRForwardGuides;
@@ -380,6 +385,10 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.lumenGIHalfResolution =
                 value == "1" || value == "true" || value == "yes";
         }
+        else if (key == "RadianceCascadesGI") {
+            out.radianceCascadesGI =
+                value == "1" || value == "true" || value == "yes";
+        }
         else if (key == "RayReconstructionUpscale") {
             out.rayReconstructionUpscale =
                 value == "1" || value == "true" || value == "yes";
@@ -466,6 +475,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << settings.rayTracingQuality << "\n"
          << "LumenGI="
          << (settings.lumenGI ? 1 : 0) << "\n"
+         << "RadianceCascadesGI="
+         << (settings.radianceCascadesGI ? 1 : 0) << "\n"
          << "LumenGIHalfResolution="
          << (settings.lumenGIHalfResolution ? 1 : 0) << "\n"
          << "RayReconstructionUpscale="

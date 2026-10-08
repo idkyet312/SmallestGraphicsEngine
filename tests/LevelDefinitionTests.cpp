@@ -24,6 +24,22 @@ int main() {
         CHECK(flat.entities.front().type == LevelEntityType::PlayerSpawn);
         CHECK(flat.terrainSculpt.empty());
     }
+    // The player-flyable gunship round-trips through its saved name and passes
+    // validation (it sits past Prefab, which the range check used to end on).
+    {
+        LevelEntityType parsed = LevelEntityType::PlayerSpawn;
+        CHECK(ParseLevelEntityType("parked_helicopter", parsed));
+        CHECK(parsed == LevelEntityType::ParkedHelicopter);
+        CHECK(std::string(LevelEntityTypeName(LevelEntityType::ParkedHelicopter)) ==
+              "parked_helicopter");
+        LevelDefinition parked = MakeFlatLevelTemplate();
+        LevelEntity gunship;
+        gunship.id = 9001;
+        gunship.type = LevelEntityType::ParkedHelicopter;
+        gunship.name = "Player Gunship";
+        parked.entities.push_back(gunship);
+        CHECK(ValidateLevel(parked).ok);
+    }
     // Procedural levels must stay procedural: terrainFlat defaults off, so a
     // level saved before the flag existed still loads as its island.
     CHECK(!MakeLevelOneTemplate().terrainFlat);
@@ -86,6 +102,7 @@ int main() {
     level.dxrDDGI.hysteresis = 0.9f;
     level.insertionMode = LevelInsertionMode::PlayerChoice;
     level.deploymentRadius = 137.5f;
+    level.deploymentTerrainSpacing = 4;
     level.defaultInsertionPoint = kDeploymentZoneCount;
     level.patrolBoatEnabled = false;
 
@@ -239,6 +256,7 @@ int main() {
     CHECK(loaded.level.insertionMode == LevelInsertionMode::PlayerChoice);
     CHECK(loaded.level.defaultInsertionPoint == kDeploymentZoneCount);
     CHECK(loaded.level.deploymentRadius == 137.5f);
+    CHECK(loaded.level.deploymentTerrainSpacing == 4);
     CHECK(!loaded.level.patrolBoatEnabled);
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     CHECK(ParseLevelInsertionMode("boat", insertion));
@@ -336,6 +354,15 @@ int main() {
     LevelDefinition invalidDeployment = level;
     invalidDeployment.deploymentRadius = kMaxDeploymentRadius + 1.0f;
     CHECK(!ValidateLevel(invalidDeployment).ok);
+    LevelDefinition invalidSpacing = level;
+    invalidSpacing.deploymentTerrainSpacing = 3;
+    CHECK(!ValidateLevel(invalidSpacing).ok);
+    LevelDefinition largestIsland = level;
+    largestIsland.terrainIslandScaleX = kMaxTerrainIslandScale;
+    largestIsland.terrainIslandScaleZ = kMaxTerrainIslandScale;
+    CHECK(ValidateLevel(largestIsland).ok);
+    largestIsland.terrainIslandScaleZ = kMaxTerrainIslandScale + 0.1f;
+    CHECK(!ValidateLevel(largestIsland).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";
@@ -358,6 +385,7 @@ int main() {
     // Files saved before insertion modes existed all arrived by helicopter.
     CHECK(legacyLoaded.level.insertionMode == LevelInsertionMode::Helicopter);
     CHECK(legacyLoaded.level.deploymentRadius == kDefaultDeploymentRadius);
+    CHECK(legacyLoaded.level.deploymentTerrainSpacing == 0);
     CHECK(legacyLoaded.level.defaultInsertionPoint == 0);
     CHECK(legacyLoaded.level.patrolBoatEnabled);
 

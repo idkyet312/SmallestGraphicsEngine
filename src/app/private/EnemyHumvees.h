@@ -413,3 +413,107 @@ static void SyncEnemyHumveePoses(float dt) {
                                      state.drawRotation);
     }
 }
+
+// Diesel loop per running Humvee, pitched and swelled by load the way the
+// boats are. "Running" is crewed -- this player, a remote driver, an AI or
+// Marine gunner -- or visibly moving, which also covers a client's view of
+// Humvees the host drives. Only the kHumveeEngineVoices nearest are voiced.
+static void UpdateHumveeEngineAudio(float deltaTime) {
+    struct EngineMotion {
+        XMFLOAT3 previous{};
+        float load = 0.0f;
+        bool valid = false;
+    };
+    static std::vector<EngineMotion> motions;
+    static size_t slotOwner[kHumveeEngineVoices] = {
+        kNoHumvee, kNoHumvee, kNoHumvee, kNoHumvee };
+    // ~18.7 m/s: kEnemyHumveeMaxThrottle is documented as ~14 m/s.
+    constexpr float kFullSpeed = 14.0f / kEnemyHumveeMaxThrottle;
+    constexpr float kMaxDistance = 120.0f;
+
+    const bool audible = IsGameplayScreen() && !g_game.loading.Active() &&
+        !IsEditorEditing() &&
+        (scene.player.godMode || scene.player.health > 0.0f);
+    motions.resize(g_humveeGameplay.size());
+
+    struct Running { size_t index; XMFLOAT3 position; float distanceSq; };
+    std::vector<Running> running;
+    const float dt = (std::clamp)(deltaTime, 0.0f, 0.25f);
+    for (size_t index = 0; audible && index < g_humveeGameplay.size(); ++index) {
+        const HumveeGameplayState& state = g_humveeGameplay[index];
+        EngineMotion& motion = motions[index];
+        XMFLOAT4X4 pose;
+        XMFLOAT3 position;
+        if (state.dead ||
+            !g_destruction.GetVehicleTransform(index, pose, &position)) {
+            motion = {};
+            continue;
+        }
+        const bool playerDriving =
+            g_drivingHumvee && g_activeHumveeIndex == index;
+        float targetLoad = 0.0f;
+        if (motion.valid && deltaTime > 0.0001f) {
+            const float dx = position.x - motion.previous.x;
+            const float dz = position.z - motion.previous.z;
+            targetLoad = (std::min)(1.0f,
+                std::sqrt(dx * dx + dz * dz) / (deltaTime * kFullSpeed));
+        }
+        if (playerDriving)
+            targetLoad = (std::max)(targetLoad,
+                                    std::abs(state.playerThrottle) * 0.5f);
+        else if (state.aiDriving)
+            targetLoad = (std::max)(targetLoad, std::abs(state.aiThrottle) * 0.5f);
+        // Eased so physics settling and snapshot corrections do not become
+        // pitch jumps.
+        motion.load += (targetLoad - motion.load) * (1.0f - std::exp(-4.0f * dt));
+        motion.previous = position;
+        motion.valid = true;
+
+        const bool crewed = playerDriving || state.remoteDriven ||
+            HumveeHasLiveGunner(index) || HumveeHasFriendlyGunner(index);
+        if (!crewed && motion.load < 0.05f) continue;
+        const float dx = position.x - scene.camera.Position.x;
+        const float dy = position.y - scene.camera.Position.y;
+        const float dz = position.z - scene.camera.Position.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq > kMaxDistance * kMaxDistance) continue;
+        running.push_back({ index, position, distanceSq });
+    }
+    std::sort(running.begin(), running.end(),
+        [](const Running& a, const Running& b) { return a.distanceSq < b.distanceSq; });
+    if (running.size() > kHumveeEngineVoices) running.resize(kHumveeEngineVoices);
+
+    // Keep a Humvee on the slot it already had, so its loop is not restarted
+    // when another one crosses into or out of the nearest set.
+    bool claimed[kHumveeEngineVoices] = {};
+    std::vector<bool> placed(running.size(), false);
+    for (size_t slot = 0; slot < kHumveeEngineVoices; ++slot)
+        for (size_t i = 0; i < running.size(); ++i)
+            if (!placed[i] && slotOwner[slot] == running[i].index) {
+                claimed[slot] = placed[i] = true;
+                break;
+            }
+    for (size_t slot = 0; slot < kHumveeEngineVoices; ++slot) {
+        if (claimed[slot]) continue;
+        slotOwner[slot] = kNoHumvee;
+        for (size_t i = 0; i < running.size(); ++i)
+            if (!placed[i]) {
+                slotOwner[slot] = running[i].index;
+                claimed[slot] = placed[i] = true;
+                break;
+            }
+    }
+    for (size_t slot = 0; slot < kHumveeEngineVoices; ++slot) {
+        GunAudio& sound = g_humveeEngineAudio[slot];
+        const auto owner = std::find_if(running.begin(), running.end(),
+            [&](const Running& r) { return r.index == slotOwner[slot]; });
+        if (owner == running.end()) {
+            sound.StopLoop();
+            continue;
+        }
+        const float load = motions[owner->index].load;
+        sound.SetLoopAt(true, owner->position.x, owner->position.y,
+            owner->position.z, 0.30f + load * 0.35f, 0.80f + load * 0.55f,
+            kMaxDistance);
+    }
+}

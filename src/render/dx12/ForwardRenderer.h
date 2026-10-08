@@ -294,6 +294,7 @@ inline void QueueWaterTransparentDrawDX12(
         : g_beforeWaterTransparentDraws).push_back(std::move(draw));
 }
 extern std::shared_ptr<SceneNode> g_c4Model;
+extern std::shared_ptr<SceneNode> g_weaponCrateModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
@@ -309,6 +310,8 @@ extern std::shared_ptr<SceneNode> g_helicopterModel;
 // Reinforcement dropship's own airframe: shares geometry with the above, owns
 // its rotor node transforms so both aircraft can spin their blades separately.
 extern std::shared_ptr<SceneNode> g_secondaryHelicopterModel;
+// Player-flyable gunship: another clone of the same airframe.
+extern std::shared_ptr<SceneNode> g_parkedGunshipModel;
 struct DandelionInstance {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 center;
@@ -521,6 +524,8 @@ inline void RemoveVehicleHeadlights(Scene& scene, int added) {
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 bool SecondaryHelicopterVisible();
+DirectX::XMMATRIX ParkedGunshipWorldMatrix();
+bool ParkedGunshipVisible();
 // Destroyed, as opposed to not drawn: a downed gunship keeps being rendered
 // through its fall and as a wreck afterwards, so the *Visible tests stay true.
 bool PrimaryHelicopterDestroyed();
@@ -3115,6 +3120,17 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                           view, proj, lightSpace, visibilityExtensionsOnly);
         g_useMeshShader = meshShadersWereEnabled;
     }
+    // The player's gunship, under the same skinning and raster-path rules as
+    // the patrol above but not its showHelicopter gate: a level can park one
+    // without placing an enemy gunship at all.
+    if (ParkedGunshipVisible()) {
+        shader.SetSkinningEnabled(false);
+        const bool meshShadersWereEnabled = g_useMeshShader;
+        g_useMeshShader = false;
+        DrawSceneNode(g_parkedGunshipModel, shader, ParkedGunshipWorldMatrix(),
+                      view, proj, lightSpace, visibilityExtensionsOnly);
+        g_useMeshShader = meshShadersWereEnabled;
+    }
 
     // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
     // stores barrel.position at collision center 0.75 m above ground.
@@ -3157,12 +3173,23 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (!g_emptyLevelMode) {
         for (const WeaponPickup& pickup : scene.weaponPickups) {
             if (!pickup.active || pickup.collected) continue;
+            // Supply crate: the model is centred on its bounds at load, so
+            // the body's pose is the whole transform.
+            if (pickup.crate && g_weaponCrateModel) {
+                const XMMATRIX crateTransform =
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&pickup.rotation)) *
+                    XMMatrixTranslation(pickup.position.x, pickup.position.y,
+                                        pickup.position.z);
+                DrawSceneNode(g_weaponCrateModel, shader, crateTransform,
+                              view, proj, lightSpace, visibilityExtensionsOnly);
+                continue;
+            }
             const std::shared_ptr<SceneMesh>& pickupMesh =
-                pickup.weapon.legacyWeaponId == 2 ?
-                    GunModel::RPGMesh() : GunModel::Mesh();
+                GunModel::WeaponMesh(pickup.weapon.legacyWeaponId);
             if (!pickupMesh) continue;
 
-            const float bob = std::sin(pickup.bobPhase * 1.9f) * 0.09f;
+            const float bob = pickup.dropHeight +
+                std::sin(pickup.bobPhase * 1.9f) * 0.09f;
             const float spin = pickup.bobPhase * 0.85f;
             // GunModel::Orient normalises every weapon to barrel-along-+Z with
             // the origin at the REAR of the mesh, not its centre -- the body
@@ -3173,9 +3200,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // The launcher lies flat and level: no X rotation. An earlier version
             // pitched it 90 degrees, which mapped the barrel to -Y and buried the
             // whole body under the terrain.
-            constexpr float kPickupMeshLength = 1.48f;   // RPG Orient() target
+            // Orient() target: 1.48 for the RPG, the shared 1.25 barrel for
+            // every other weapon.
+            const float kPickupMeshLength =
+                pickup.weapon.legacyWeaponId == 2 ? 1.48f : 1.25f;
+            // The viewmodel's per-weapon size correction, so a pistol is not
+            // drawn rifle-length (Orient fits every barrel to one length).
+            const XMFLOAT3 fit =
+                GunModel::WeaponFitScale(pickup.weapon.legacyWeaponId);
             const XMMATRIX pickupTransform =
-                XMMatrixTranslation(0.0f, 0.0f, -kPickupMeshLength * 0.5f) *
+                XMMatrixScaling(fit.x, fit.y, fit.z) *
+                XMMatrixTranslation(0.0f, 0.0f,
+                                    -kPickupMeshLength * fit.z * 0.5f) *
                 XMMatrixRotationY(spin) *
                 XMMatrixTranslation(pickup.position.x,
                                     pickup.position.y + bob,

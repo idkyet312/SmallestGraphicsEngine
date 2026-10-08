@@ -266,6 +266,7 @@ const char* LevelEntityTypeName(LevelEntityType type) {
     case LevelEntityType::Dandelion: return "dandelion";
     case LevelEntityType::Rock: return "rock";
     case LevelEntityType::Prefab: return "prefab";
+    case LevelEntityType::ParkedHelicopter: return "parked_helicopter";
     }
     return "unknown";
 }
@@ -276,7 +277,7 @@ bool ParseLevelEntityType(const std::string& text, LevelEntityType& type) {
         return true;
     }
     for (int i = static_cast<int>(LevelEntityType::PlayerSpawn);
-         i <= static_cast<int>(LevelEntityType::Prefab); ++i) {
+         i <= static_cast<int>(LevelEntityType::Last); ++i) {
         const auto candidate = static_cast<LevelEntityType>(i);
         if (text == LevelEntityTypeName(candidate)) {
             type = candidate;
@@ -396,7 +397,14 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(level.deploymentRadius) ||
         level.deploymentRadius < kMinDeploymentRadius ||
         level.deploymentRadius > kMaxDeploymentRadius)
-        result.errors.push_back("deployment radius must be between 5 and 600");
+        result.errors.push_back("deployment radius must be between 5 and 1200");
+    if (level.deploymentTerrainSpacing != 0 &&
+        level.deploymentTerrainSpacing != 1 &&
+        level.deploymentTerrainSpacing != 2 &&
+        level.deploymentTerrainSpacing != 4 &&
+        level.deploymentTerrainSpacing != 8)
+        result.errors.push_back(
+            "deployment terrain spacing must be 0 (auto), 1, 2, 4 or 8");
     if (level.defaultInsertionPoint < 0 ||
         level.defaultInsertionPoint > kDeploymentZoneCount)
         result.errors.push_back("default insertion point must be between 0 and " +
@@ -425,9 +433,11 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         level.terrainTilesZ < 4 || level.terrainTilesZ > 48)
         result.errors.push_back("terrain tile extent must be between 4 and 48");
     if (!std::isfinite(level.terrainIslandScaleX) ||
-        level.terrainIslandScaleX < 0.5f || level.terrainIslandScaleX > 12.0f ||
+        level.terrainIslandScaleX < 0.5f ||
+        level.terrainIslandScaleX > kMaxTerrainIslandScale ||
         !std::isfinite(level.terrainIslandScaleZ) ||
-        level.terrainIslandScaleZ < 0.5f || level.terrainIslandScaleZ > 12.0f)
+        level.terrainIslandScaleZ < 0.5f ||
+        level.terrainIslandScaleZ > kMaxTerrainIslandScale)
         result.errors.push_back("terrain island scale must be between 0.5 and 12");
     if (level.terrainOriginTileX < -256 || level.terrainOriginTileX > 256 ||
         level.terrainOriginTileZ < -256 || level.terrainOriginTileZ > 256)
@@ -478,7 +488,7 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         if (static_cast<int>(entity.type) <
             static_cast<int>(LevelEntityType::PlayerSpawn) ||
             static_cast<int>(entity.type) >
-                static_cast<int>(LevelEntityType::Prefab))
+                static_cast<int>(LevelEntityType::Last))
             result.errors.push_back("entity " + std::to_string(entity.id) +
                                     " has an unknown type");
         if (!entity.id || !ids.insert(entity.id).second)
@@ -576,6 +586,7 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         // Old levels used the historical 34 m ring and did not save this key.
         level.deploymentRadius = root.value(
             "deploymentRadius", kDefaultDeploymentRadius);
+        level.deploymentTerrainSpacing = root.value("deploymentTerrainSpacing", 0);
         if (root.contains("defaultInsertionPoint")) {
             const json& point = root.at("defaultInsertionPoint");
             if (!point.is_number_integer() || point < 0 ||
@@ -871,6 +882,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"deploymentRadius", level.deploymentRadius},
+            {"deploymentTerrainSpacing", level.deploymentTerrainSpacing},
             {"defaultInsertionPoint", level.defaultInsertionPoint},
             {"patrolBoatEnabled", level.patrolBoatEnabled},
             {"virtualShadowMaps", level.virtualShadowMaps},

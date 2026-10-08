@@ -371,6 +371,120 @@ static void UpdateOngoingBombardment(float deltaTime, bool active) {
     // distant one rather than dropping to nothing.
     g_rpgFireAudio.PlayAt(impact.x, impact.y, impact.z, 0.9f, 0.62f, 220.0f);
 }
+
+// Supply drop ordered from the deployment map: one extra weapon, parachuted
+// onto a point the player clicks, lying there as an ordinary WeaponPickup.
+// Taking it is the same exchange as the RPG beside the Humvee -- the loadout
+// stays two wide, so it trades for the weapon in hand.
+//
+// Planned on the board, charged on DEPLOY like the marine squad, and spawned
+// as the run starts. Weapon -1 means none ordered.
+static int g_supplyDropWeapon = -1;
+static bool g_supplyDropPlaced = false;
+static XMFLOAT3 g_supplyDropTarget{};
+// While armed, a map click places the drop instead of picking a landing zone.
+static bool g_supplyDropArmed = false;
+// Altitude the crate is released at above its landing point, and how fast it
+// comes down. ~10 s under canopy: long enough to watch it in from the LZ.
+static constexpr float kSupplyDropAltitude = 60.0f;
+static constexpr float kSupplyDropDescentRate = 6.0f;
+
+static void ClearSupplyDropPlan() {
+    g_supplyDropWeapon = -1;
+    g_supplyDropPlaced = false;
+    g_supplyDropTarget = {};
+    g_supplyDropArmed = false;
+}
+
+static bool SupplyDropPlanned() {
+    return g_supplyDropPlaced && g_supplyDropWeapon >= 0 &&
+           g_supplyDropWeapon < MissionLoadout::kWeaponCount;
+}
+
+// Delivered price: the weapon's own rental. The drop is the armory sending
+// the gun out rather than handing it over at the counter.
+static int SupplyDropPrice(int weapon) {
+    return ArmoryCatalog::WeaponPrice(weapon);
+}
+
+// Linear drag giving the crate kSupplyDropDescentRate as terminal speed under
+// canopy (Box3D's steady state is ~g / damping), and the drag it keeps once
+// the canopy is cut on touchdown.
+static constexpr float kSupplyCrateCanopyDamping = 9.81f / kSupplyDropDescentRate;
+static constexpr float kSupplyCrateLandedDamping = 0.10f;
+// A loaded long crate, ~40 kg whatever its bounds measure.
+static constexpr float kSupplyCrateMass = 40.0f;
+
+// Gives a crate pickup its rigid body at its current pose: falling at canopy
+// speed while it has not landed, at rest after. Leaves physicsHandle 0 when
+// the physics world is not up, for UpdateWeaponPickups to retry.
+static void CreateSupplyCrateBody(WeaponPickup& pickup) {
+    if (!pickup.crate || pickup.physicsHandle != 0 || !g_weaponCrateModel) return;
+    const XMFLOAT3 half = g_weaponCrateHalfExtents;
+    const float volume = 8.0f * half.x * half.y * half.z;
+    if (!(volume > 1e-6f)) return;
+    const XMFLOAT3 velocity = pickup.crateLanded
+        ? XMFLOAT3{ 0.0f, 0.0f, 0.0f }
+        : XMFLOAT3{ 0.0f, -kSupplyDropDescentRate, 0.0f };
+    // A slow swing under the canopy, so it does not come down dead level.
+    const XMFLOAT3 spin = pickup.crateLanded
+        ? XMFLOAT3{ 0.0f, 0.0f, 0.0f }
+        : XMFLOAT3{ 0.12f, 0.25f, -0.08f };
+    pickup.physicsHandle = g_destruction.CreateDroppedItemBody(
+        pickup.position, pickup.rotation, half, velocity, spin,
+        kSupplyCrateMass / volume);
+    if (pickup.physicsHandle != 0)
+        g_destruction.SetPropBodyLinearDamping(pickup.physicsHandle,
+            pickup.crateLanded ? kSupplyCrateLandedDamping
+                               : kSupplyCrateCanopyDamping);
+}
+
+// Puts the planned drop into the world, falling. Called once the run has
+// committed; any earlier drop still lying from a previous commit on the same
+// load is replaced rather than stacked.
+static void SpawnSupplyDrop() {
+    auto& pickups = scene.weaponPickups;
+    pickups.erase(std::remove_if(pickups.begin(), pickups.end(),
+                      [](const WeaponPickup& pickup) {
+                          if (!pickup.supplyDrop && !pickup.crate) return false;
+                          g_destruction.DestroyPropBody(pickup.physicsHandle);
+                          return true;
+                      }),
+                  pickups.end());
+    if (!SupplyDropPlanned()) return;
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    // Re-sampled rather than trusting the clicked point: a strike called from
+    // the same board may have cratered it since.
+    const float groundY = (std::max)(0.0f, TerrainRendererDX12::HeightAt(
+        params, g_supplyDropTarget.x, g_supplyDropTarget.z));
+    WeaponPickup drop;
+    // Knee height, the same rest pose as the Humvee's RPG.
+    drop.position = { g_supplyDropTarget.x, groundY + 0.85f,
+                      g_supplyDropTarget.z };
+    drop.yawRadians = ((float)std::rand() / (float)RAND_MAX) * XM_2PI;
+    drop.weapon = scene.player.weapons.CreateInstance(g_supplyDropWeapon);
+    drop.dropHeight = kSupplyDropAltitude;
+    drop.supplyDrop = true;
+    drop.active = true;
+    if (g_weaponCrateModel) {
+        // The body carries the altitude instead; created here if the physics
+        // world is up, otherwise by the first UpdateWeaponPickups after it is.
+        drop.crate = true;
+        drop.position.y = groundY + kSupplyDropAltitude;
+        drop.dropHeight = 0.0f;
+        drop.radius = 2.6f;   // reach the 1.7 m crate from either end
+        XMStoreFloat4(&drop.rotation,
+                      XMQuaternionRotationRollPitchYaw(0.0f, drop.yawRadians, 0.0f));
+        CreateSupplyCrateBody(drop);
+    }
+    scene.weaponPickups.push_back(drop);
+    char line[128];
+    std::snprintf(line, sizeof(line), "Supply drop inbound: %s at (%.1f, %.1f, %.1f)",
+                  GunModel::WeaponName(g_supplyDropWeapon),
+                  drop.position.x, drop.position.y, drop.position.z);
+    SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+}
 // Mouse-wheel zoom on the deployment overview, as a multiplier on the orbit
 // rig BuildCameraFrame composes. Applied to radius and height together so the
 // framing scales instead of skewing: pulling in low over the island would
@@ -490,6 +604,7 @@ static void CancelDeploymentPlanning() {
     // a previous attempt must not survive into the next one.
     g_marineDropPending = false;
     ClearWartornBarrage();
+    ClearSupplyDropPlan();
     g_deploymentZoom = 1.0f;
     g_deploymentOrbitDragging = false;
     g_deploymentOrbitOffset = 0.0f;
@@ -988,6 +1103,9 @@ static void BeginDeploymentPlanning() {
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;
+    // Ordered per deployment like the rest of the kit. A replay restores it
+    // from the last commit after this.
+    ClearSupplyDropPlan();
     // The squad is hired the same way and cannot be inherited either, or a
     // restart would deploy marines the player was never charged for. Cleared
     // before the rentals so a squad asked for at the base counter, which
@@ -1090,6 +1208,7 @@ static void UpdateMenuMusic() {
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
     if (!DeploymentPlanningVisible()) {
         scene.cameraFarOverride = 0.0f;
+        scene.volumetricFogDistanceOverride = 0.0f;
         // Leaving the overview -- deployed, cancelled or dropped into the
         // editor -- takes the rest of the salvo with it. The barrage is fired
         // from the orbit camera, so rounds still pending once that camera is
@@ -1099,6 +1218,7 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
     }
     if (g_game.loading.Active()) {
         scene.cameraFarOverride = 0.0f;
+        scene.volumetricFogDistanceOverride = 0.0f;
         return;
     }
     // Ahead of the camera update on purpose: a round leaves from the camera as
@@ -1186,6 +1306,15 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
         std::sin(angle) * horizontalRadius,
         lookAtHeight + std::sin(elevation) * orbitDistance,
         std::cos(angle) * horizontalRadius };
+    // Stretch the froxel volume to the far side of the insertion ring. The
+    // composite fades over the last 20% of its range, so the ring edge sits
+    // inside the solid part. The stock 34 m ring stays under the authored
+    // 800 m and is unaffected; 12xv1's 497 m ring needs ~2.3 km at zoom 1.
+    const float ringFarHorizontal = horizontalRadius + deploymentRadius * 1.1f;
+    const float ringFarDistance = std::sqrt(
+        ringFarHorizontal * ringFarHorizontal +
+        scene.camera.Position.y * scene.camera.Position.y);
+    scene.volumetricFogDistanceOverride = ringFarDistance / 0.8f;
     const XMFLOAT3 toCenter{
         -scene.camera.Position.x,
         lookAtHeight - scene.camera.Position.y,

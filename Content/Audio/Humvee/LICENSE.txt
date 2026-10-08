@@ -1,0 +1,16 @@
+humvee_engine_loop.wav
+
+Title: Military Vehicle Humming.flac
+Creator: Iwan "qubodup" Gabovitch
+Source: https://freesound.org/people/qubodup/sounds/182793/
+Downloaded audio: https://cdn.freesound.org/previews/182/182793_71257-hq.mp3
+License: Creative Commons 0 (CC0 1.0 Universal)
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Extracted by the uploader from a US Government agency video, thus public
+domain. The uploader asks for a link to the source page when used.
+
+Downloaded October 7, 2026 from Freesound's publicly available HQ MP3 preview.
+Adapted for the game: decoded to 48 kHz mono PCM16 WAV, took 12 s from 4 s in,
+removed DC offset, crossfaded the loop boundary over 250 ms (equal power) and
+normalized the peak to 0.8.

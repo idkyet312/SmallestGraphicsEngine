@@ -133,10 +133,11 @@ public:
         data.intensity = intensity;
         data.fallSpeed = kFallSpeed;
         data.windVelocity = windVelocity;
+        // 24 matches kMaxTerrainIslandScale (LevelDefinition.h).
         data.worldExtentX = kBaseWorldExtent * (std::max)(
-            0.5f, (std::min)(scene.terrainIslandScaleX, 12.0f));
+            0.5f, (std::min)(scene.terrainIslandScaleX, 24.0f));
         data.worldExtentZ = kBaseWorldExtent * (std::max)(
-            0.5f, (std::min)(scene.terrainIslandScaleZ, 12.0f));
+            0.5f, (std::min)(scene.terrainIslandScaleZ, 24.0f));
         data.dropLength = kDropLength;
         data.dropRadius = kDropRadius;
         data.worldBottom = kWorldBottom;

@@ -205,6 +205,30 @@ int main() {
         CHECK(defaults.lumenGI == GameSettings::kDefaultLumenGI);
     }
 
+    // Legacy files retain Lumen, and selecting cascades never stacks diffuse GI.
+    {
+        WriteSettingsFile("LumenGI=1\n");
+        GameSettings legacy;
+        CHECK(LoadGameSettings(legacy));
+        CHECK(legacy.lumenGI && !legacy.radianceCascadesGI);
+
+        WriteSettingsFile("LumenGI=1\nRadianceCascadesGI=1\n");
+        GameSettings cascades;
+        CHECK(LoadGameSettings(cascades));
+        CHECK(cascades.radianceCascadesGI && !cascades.lumenGI);
+        CHECK(SaveGameSettings(cascades));
+        GameSettings restored;
+        CHECK(LoadGameSettings(restored));
+        CHECK(restored.radianceCascadesGI && !restored.lumenGI);
+        restored.ResetToDefaults();
+        CHECK(!restored.radianceCascadesGI && !restored.lumenGI);
+
+        WriteSettingsFile("RadianceCascadesGI=banana\n");
+        GameSettings invalid;
+        CHECK(LoadGameSettings(invalid));
+        CHECK(!invalid.radianceCascadesGI);
+    }
+
     // Older settings keep the full-resolution reference; the opt-in survives
     // restarts independently of the main Lumen toggle; reset restores it.
     {

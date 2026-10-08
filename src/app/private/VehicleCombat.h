@@ -647,6 +647,20 @@ static bool ToggleTankDriving(bool anyDistance = false) {
 // steers with +1 toward a heading on the side cross(forward, want) < 0 names.
 // A walks the camera along +cross(front, up), so the hull's left is
 // cross(forward, up) = (-fz, 0, fx), whose solve gives -1: left is negative.
+// Player tank feel. Camera pitch in degrees (negative looks down onto the
+// hull); rates are 1/s for the exponential smoothing.
+constexpr float kTankCameraMinPitch = -40.0f;
+constexpr float kTankCameraMaxPitch = 8.0f;
+constexpr float kTankCameraFollowRate = 6.0f;
+constexpr float kTankCameraTrackRate = 9.0f;
+constexpr float kTankCameraBounceRate = 3.5f;
+constexpr float kTankTurretAimSmoothRate = 6.0f;
+// Traverse acceleration as a multiple of max rate: 1.4 reaches full speed
+// in ~0.7 s.
+constexpr float kTankTurretAccelPerRate = 1.4f;
+constexpr float kTankGunMinElevationDeg = -8.0f;
+constexpr float kTankGunMaxElevationDeg = 15.0f;
+
 static void DrivePlayerTank(float throttle, float turn, bool brake) {
     EnemyTankState* tank = PlayerTank();
     if (!tank || tank->dead) return;
@@ -676,9 +690,15 @@ static void FirePlayerTankShell() {
     if (barrelFlat < 1e-4f) return;
     const float ax = aim.x - muzzle.x, az = aim.z - muzzle.z;
     const float range = (std::max)(1.0f, std::sqrt(ax * ax + az * az));
+    // The breech only elevates so far: a crosshair on the sky gets the gun's
+    // maximum elevation, not a round fired straight up.
+    const float elevation = (std::clamp)(
+        std::atan2(aim.y - muzzle.y, range),
+        XMConvertToRadians(kTankGunMinElevationDeg),
+        XMConvertToRadians(kTankGunMaxElevationDeg));
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(XMVectorSet(
-        barrel.x / barrelFlat * range, aim.y - muzzle.y,
+        barrel.x / barrelFlat * range, std::tan(elevation) * range,
         barrel.z / barrelFlat * range, 0.0f)));
     const XMFLOAT3 start = EnemyTankShellStart(*tank, muzzle, shotDirection);
     SpawnEnemyTankShell(muzzle, start, shotDirection, kPlayerTankShellSpeed,
@@ -781,16 +801,50 @@ static void UpdatePlayerTank(float dt) {
     // looking over the turret roof.
     XMFLOAT3 roof = tank->boxCenterLocal;
     roof.y = tank->boxCenterLocal.y * 2.0f + 0.6f;
-    const XMVECTOR target =
-        XMVector3TransformCoord(XMLoadFloat3(&roof), hullWorld);
-    const float distance = tank->spec.chassisHalfExtents.x * 2.0f + 4.5f;
+    XMFLOAT3 roofWorld;
+    XMStoreFloat3(&roofWorld,
+        XMVector3TransformCoord(XMLoadFloat3(&roof), hullWorld));
+    const float clampedDt = (std::max)(0.0f, dt);
+    // The look-at point trails the hull through a low-pass, heavier on the
+    // vertical: suspension bounce and track judder stay on the tank instead
+    // of shaking the whole view. Snaps on boarding (or any teleport).
+    static XMFLOAT3 smoothTarget{};
+    static uint64_t smoothedTank = 0;
+    {
+        float jx = roofWorld.x - smoothTarget.x;
+        float jy = roofWorld.y - smoothTarget.y;
+        float jz = roofWorld.z - smoothTarget.z;
+        if (smoothedTank != g_playerTankEntity ||
+            jx * jx + jy * jy + jz * jz > 15.0f * 15.0f) {
+            smoothedTank = g_playerTankEntity;
+            smoothTarget = roofWorld;
+            jx = jy = jz = 0.0f;
+        }
+        const float horizontal =
+            1.0f - std::exp(-kTankCameraTrackRate * clampedDt);
+        const float vertical =
+            1.0f - std::exp(-kTankCameraBounceRate * clampedDt);
+        smoothTarget.x += jx * horizontal;
+        smoothTarget.y += jy * vertical;
+        smoothTarget.z += jz * horizontal;
+    }
+    const XMVECTOR target = XMLoadFloat3(&smoothTarget);
+    // The orbit comes from the mouse's yaw/pitch, not from last frame's look
+    // direction: reading Front back fed every hull movement into the next
+    // frame's orbit, so the view wandered and twitched with the tank. Pitch
+    // is limited so the view -- and with it the gun -- cannot swing up into
+    // the sky or down under the hull.
+    scene.camera.SetViewAngles(scene.camera.Yaw,
+        (std::clamp)(scene.camera.Pitch, kTankCameraMinPitch,
+                     kTankCameraMaxPitch));
     const XMVECTOR orbitView =
         XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+    const float distance = tank->spec.chassisHalfExtents.x * 2.0f + 4.5f;
     XMFLOAT3 desired;
     XMStoreFloat3(&desired, target - orbitView * distance);
     desired.y = (std::max)(desired.y,
         GroundHeightAt(desired.x, desired.z) + 0.6f);
-    const float follow = 1.0f - std::exp(-8.0f * (std::max)(0.0f, dt));
+    const float follow = 1.0f - std::exp(-kTankCameraFollowRate * clampedDt);
     const XMVECTOR cameraPosition = XMVectorLerp(
         XMLoadFloat3(&scene.camera.Position), XMLoadFloat3(&desired), follow);
     XMStoreFloat3(&scene.camera.Position, cameraPosition);
@@ -810,13 +864,24 @@ static void UpdatePlayerTank(float dt) {
         XMVectorSet(aim.x - pivot.x, 0.0f, aim.z - pivot.z, 0.0f),
         XMMatrixTranspose(orientation));
     if (XMVectorGetX(XMVector3LengthSq(local)) > 0.01f) {
-        const float desiredYaw =
+        const float aimYaw =
             std::atan2(-XMVectorGetZ(local), XMVectorGetX(local));
-        const float error = std::atan2(
-            std::sin(desiredYaw - tank->turretYaw),
-            std::cos(desiredYaw - tank->turretYaw));
-        const float step =
-            (std::max)(1.2f, tank->turretRate * 2.0f) * (std::max)(0.0f, dt);
-        tank->turretYaw += (std::max)(-step, (std::min)(step, error));
+        // The crosshair ray flicks between near and far hits as it sweeps
+        // over cover, so the bearing is low-passed before the mount chases it.
+        static float desiredYaw = 0.0f;
+        static uint64_t aimedTank = 0;
+        if (aimedTank != g_playerTankEntity) {
+            aimedTank = g_playerTankEntity;
+            desiredYaw = aimYaw;
+        }
+        desiredYaw += std::atan2(std::sin(aimYaw - desiredYaw),
+                                 std::cos(aimYaw - desiredYaw)) *
+            (1.0f - std::exp(-kTankTurretAimSmoothRate * clampedDt));
+        // Eased in and braked onto the crosshair, so the turret glides rather
+        // than snapping between full traverse and a dead stop.
+        const float maxRate = (std::max)(1.2f, tank->turretRate * 2.0f);
+        SGE::StepTurretTraverse(tank->turretYaw, tank->turretYawRate,
+                                desiredYaw, maxRate,
+                                maxRate * kTankTurretAccelPerRate, dt);
     }
 }

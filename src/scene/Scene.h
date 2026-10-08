@@ -338,6 +338,22 @@ struct WeaponPickup {
     float verticalRange = 3.0f; // vertical tolerance, so a pickup is not
                                 // collectable from a rooftop directly above it
     float bobPhase = 0.0f;      // drives the idle hover/spin so it reads as loot
+    // Metres still to fall before it lands at `position`. A supply drop starts
+    // high and descends; it cannot be taken while airborne.
+    float dropHeight = 0.0f;
+    // Ordered from the deploy map. Marked on the HUD until first taken.
+    bool supplyDrop = false;
+    // Delivered in a weapon crate: a Box3D prop body (a box fitted to the
+    // crate model) that parachutes in under heavy drag and lands for real.
+    // `position`/`rotation` are the body's centre and are read back each
+    // frame; dropHeight stays 0 because the body carries the altitude. The
+    // crate stays after the swap, holding the player's cast-off weapon.
+    // physicsHandle 0 with crate set means the body is still to be made (the
+    // physics world was not up yet) -- it is retried each update.
+    bool crate = false;
+    bool crateLanded = false;
+    XMFLOAT4 rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t physicsHandle = 0;
     bool active = false;
     bool collected = false;
 };
@@ -465,6 +481,10 @@ struct Scene {
     // Temporary projection extension for views such as deployment planning.
     // Zero preserves the authored gameplay far plane and its depth precision.
     float  cameraFarOverride = 0.0f;
+    // Same idea for the froxel volume (fog + world clouds). The deployment
+    // camera sits well past the authored fog distance on wide maps, so the
+    // clouds stopped mid-island. Transient: never written back to weather.
+    float  volumetricFogDistanceOverride = 0.0f;
     // Sub-pixel projection offset used by visibility-buffer TAA. Zero for
     // forward, raytracing, menus, and validation captures.
     XMFLOAT2 temporalJitterPixels = { 0.0f, 0.0f };
@@ -2948,6 +2968,9 @@ struct Scene {
     }
     float EffectiveCameraFarPlane() const {
         return (std::max)(cameraFar, cameraFarOverride);
+    }
+    float EffectiveVolumetricFogDistance() const {
+        return (std::max)(volumetricFogDistance, volumetricFogDistanceOverride);
     }
     XMMATRIX GetViewMatrix() const {
         if (sniperScopeCameraPass) return sniperScopeView;

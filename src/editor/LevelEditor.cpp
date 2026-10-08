@@ -74,7 +74,8 @@ const LevelEntityType kBuiltInSpawnTypes[] = {
     LevelEntityType::EnemySpawn, LevelEntityType::AllySpawn,
     LevelEntityType::Humvee, LevelEntityType::Helicopter,
     LevelEntityType::PlayerSpawn, LevelEntityType::GrassPatch,
-    LevelEntityType::Dandelion, LevelEntityType::Rock };
+    LevelEntityType::Dandelion, LevelEntityType::Rock,
+    LevelEntityType::ParkedHelicopter };
 
 // The complete set of collision shapes the runtime understands. Shared by the
 // prefab authoring panel and the per-entity override row so the two can never
@@ -146,7 +147,8 @@ float PickRadius(LevelEntityType type) {
     switch (type) {
     case LevelEntityType::WoodHouse:
     case LevelEntityType::MetalHouse: return 5.0f;
-    case LevelEntityType::Helicopter: return 5.0f;
+    case LevelEntityType::Helicopter:
+    case LevelEntityType::ParkedHelicopter: return 5.0f;
     case LevelEntityType::Humvee: return 2.6f;
     case LevelEntityType::Palm: return 1.3f;
     case LevelEntityType::GrassPatch: return 2.0f;
@@ -186,6 +188,7 @@ ImU32 TypeColor(LevelEntityType type, bool selected) {
     case LevelEntityType::Dandelion: return IM_COL32(35, 170, 75, 220);
     case LevelEntityType::Rock: return IM_COL32(145, 145, 135, 230);
     case LevelEntityType::Prefab: return IM_COL32(90, 185, 255, 230);
+    case LevelEntityType::ParkedHelicopter: return IM_COL32(120, 200, 255, 230);
     }
     return IM_COL32_WHITE;
 }
@@ -2908,6 +2911,27 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                               "deployment/drop-off point.");
     }
     {
+        // Spacing values in combo order; index 0 is Auto.
+        static constexpr int kSpacings[] = { 0, 1, 2, 4, 8 };
+        const char* details[] = {
+            "Auto", "Full (1 m)", "High (2 m)", "Medium (4 m)", "Low (8 m)" };
+        int detail = 0;
+        for (int index = 0; index < IM_ARRAYSIZE(kSpacings); ++index)
+            if (kSpacings[index] == level_.deploymentTerrainSpacing)
+                detail = index;
+        const LevelDefinition detailBefore = level_;
+        const bool detailChanged = ImGui::Combo(
+            "Planning map detail", &detail, details, IM_ARRAYSIZE(details));
+        if (detailChanged) level_.deploymentTerrainSpacing = kSpacings[detail];
+        TrackItemEdit(detailBefore, detailChanged);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Terrain vertex spacing on the deployment planning map.\n"
+                "The map draws the whole island at once, so a large island\n"
+                "at 1 m costs several ms. Auto picks the finest spacing\n"
+                "that keeps the map within a fixed tile budget.");
+    }
+    {
         char preview[48] = {};
         if (level_.defaultInsertionPoint == 0)
             std::snprintf(preview, sizeof(preview), "None (player chooses)");
@@ -3440,13 +3464,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island width (X)",
-            &level_.terrainIslandScaleX, 0.5f, 12.0f, "%.2f x");
+            &level_.terrainIslandScaleX, 0.5f, kMaxTerrainIslandScale, "%.2f x");
         TrackItemEdit(before, changed);
     }
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island depth (Z)",
-            &level_.terrainIslandScaleZ, 0.5f, 12.0f, "%.2f x");
+            &level_.terrainIslandScaleZ, 0.5f, kMaxTerrainIslandScale, "%.2f x");
         TrackItemEdit(before, changed);
     }
     // Link toggle: drag either slider with this on to scale both together.

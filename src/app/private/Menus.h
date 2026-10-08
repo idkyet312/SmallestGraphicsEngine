@@ -806,6 +806,9 @@ struct LastDeployment {
     std::unordered_set<std::string> ownedAttachments;
     XMFLOAT3 target{};
     int marines = 0;
+    // Supply drop as committed (and paid for); -1 when none was ordered.
+    int supplyWeapon = -1;
+    XMFLOAT3 supplyTarget{};
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     InsertionAirframe airframe = InsertionAirframe::NewBlackHawk;
     bool leftSeat = false;
@@ -1183,6 +1186,8 @@ static void SaveLastDeployment() {
     last.ownedAttachments = g_ownedAttachments;
     last.target = g_deploymentTarget;
     last.marines = g_deploymentMarineCount;
+    last.supplyWeapon = SupplyDropPlanned() ? g_supplyDropWeapon : -1;
+    last.supplyTarget = g_supplyDropTarget;
     last.insertion = g_playerInsertionChoice;
     last.airframe = g_insertionAirframe;
     last.leftSeat = g_playerRidesLeftSeat;
@@ -1202,6 +1207,12 @@ static void RestoreLastDeployment() {
     g_ownedGear = last.ownedGear;
     g_ownedAttachments = last.ownedAttachments;
     g_deploymentMarineCount = last.marines;
+    ClearSupplyDropPlan();
+    if (last.supplyWeapon >= 0) {
+        g_supplyDropWeapon = last.supplyWeapon;
+        g_supplyDropTarget = last.supplyTarget;
+        g_supplyDropPlaced = true;
+    }
     g_playerInsertionChoice = last.insertion;
     ApplyInsertionAirframe(last.airframe);
     g_playerRidesLeftSeat = last.leftSeat;
@@ -1256,6 +1267,29 @@ static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
             else g_deploymentMarineCount = 0;
         }
     }
+    // Supply drop, after the squad so the marines keep first call on the
+    // wallet the slider already clamped them to. A drop of a weapon already
+    // carried could never be taken (the swap refuses duplicates), so it is
+    // cancelled rather than charged.
+    g_supplyDropArmed = false;
+    if (SupplyDropPlanned()) {
+        const bool prepaid = replayPaidPlan &&
+            g_lastDeployment.supplyWeapon == g_supplyDropWeapon;
+        if (loadout.ContainsWeapon(g_supplyDropWeapon) ||
+            !GunModel::WeaponLoaded(g_supplyDropWeapon)) {
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Supply drop cancelled: weapon carried or unavailable");
+            ClearSupplyDropPlan();
+        } else if (!prepaid) {
+            if (ArmoryPurchase(SupplyDropPrice(g_supplyDropWeapon))) {
+                SaveCareer();
+            } else {
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Supply drop cancelled: cannot afford");
+                ClearSupplyDropPlan();
+            }
+        }
+    }
     for (size_t slot = 0; slot < loadout.weapons.size(); ++slot) {
         if (GunModel::WeaponLoaded(loadout.weapons[slot])) continue;
         for (int candidate = 0; candidate <= GunModel::kMaxWeapon;
@@ -1291,6 +1325,7 @@ static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
     g_game.session.ResetTimer(true);
     g_game.mission.SetCommTowerCount(CountStandingCommTowers());
     ArmObjectivePlanes();
+    SpawnSupplyDrop();
     visBuffer.InvalidateTemporalHistory();
     g_game.commands.Request(GameCommand::ResetDDGIHistory);
     SetCapture(hwnd);
@@ -2527,38 +2562,89 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // the projectile system already uses -- picking against the real height
     // field rather than a flat plane, so a strike called on a hillside lands on
     // the slope instead of punching through it.
-    bool missileClickConsumed = false;
-    if (g_missileStrikeArmed && selectClick) {
+    const auto pickTerrainUnderMouse = [&](XMFLOAT3& impact) {
         XMVECTOR determinant;
         const XMMATRIX inverseViewProjection =
             XMMatrixInverse(&determinant, viewProjection);
-        if (!XMVector4Equal(determinant, XMVectorZero())) {
-            const float ndcX = (mouse.x / display.x) * 2.0f - 1.0f;
-            const float ndcY = 1.0f - (mouse.y / display.y) * 2.0f;
-            const XMVECTOR nearClip = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
-            const XMVECTOR farClip = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
-            XMVECTOR nearWorld =
-                XMVector4Transform(nearClip, inverseViewProjection);
-            XMVECTOR farWorld =
-                XMVector4Transform(farClip, inverseViewProjection);
-            const float nearW = XMVectorGetW(nearWorld);
-            const float farW = XMVectorGetW(farWorld);
-            if (std::abs(nearW) > 1e-6f && std::abs(farW) > 1e-6f) {
-                nearWorld = XMVectorScale(nearWorld, 1.0f / nearW);
-                farWorld = XMVectorScale(farWorld, 1.0f / farW);
-                XMFLOAT3 rayStart, rayEnd;
-                XMStoreFloat3(&rayStart, nearWorld);
-                XMStoreFloat3(&rayEnd, farWorld);
-                XMFLOAT3 impact;
-                if (HitTerrainSegment(rayStart, rayEnd, 0.0f, impact)) {
-                    // Fired from the camera itself, so the round leaves from
-                    // the viewpoint the player is looking through and flies out
-                    // to where they clicked.
-                    LaunchMissileStrike(scene.camera.Position, impact);
-                    g_missileStrikeArmed = false;
-                    missileClickConsumed = true;
-                }
-            }
+        if (XMVector4Equal(determinant, XMVectorZero())) return false;
+        const float ndcX = (mouse.x / display.x) * 2.0f - 1.0f;
+        const float ndcY = 1.0f - (mouse.y / display.y) * 2.0f;
+        const XMVECTOR nearClip = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+        const XMVECTOR farClip = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+        XMVECTOR nearWorld = XMVector4Transform(nearClip, inverseViewProjection);
+        XMVECTOR farWorld = XMVector4Transform(farClip, inverseViewProjection);
+        const float nearW = XMVectorGetW(nearWorld);
+        const float farW = XMVectorGetW(farWorld);
+        if (std::abs(nearW) <= 1e-6f || std::abs(farW) <= 1e-6f) return false;
+        nearWorld = XMVectorScale(nearWorld, 1.0f / nearW);
+        farWorld = XMVectorScale(farWorld, 1.0f / farW);
+        XMFLOAT3 rayStart, rayEnd;
+        XMStoreFloat3(&rayStart, nearWorld);
+        XMStoreFloat3(&rayEnd, farWorld);
+        return HitTerrainSegment(rayStart, rayEnd, 0.0f, impact);
+    };
+    bool missileClickConsumed = false;
+    if (g_missileStrikeArmed && selectClick) {
+        XMFLOAT3 impact;
+        if (pickTerrainUnderMouse(impact)) {
+            // Fired from the camera itself, so the round leaves from the
+            // viewpoint the player is looking through and flies out to where
+            // they clicked.
+            LaunchMissileStrike(scene.camera.Position, impact);
+            g_missileStrikeArmed = false;
+            missileClickConsumed = true;
+        }
+    }
+    // Supply drop placement shares the same pick. Missile wins if both are
+    // armed, since it was the one the dev tools put up last. A click in the
+    // sea is refused rather than sinking the crate: the ocean surface is
+    // y = 0, and the 0.55 m floor is the one the barrage uses for dry land.
+    if (g_supplyDropArmed && selectClick && !missileClickConsumed) {
+        XMFLOAT3 impact;
+        if (pickTerrainUnderMouse(impact) && impact.y >= 0.55f) {
+            g_supplyDropTarget = impact;
+            g_supplyDropPlaced = true;
+            g_supplyDropArmed = false;
+            g_menuSelectionChanged = true;
+        }
+        missileClickConsumed = true;
+    }
+    if (g_supplyDropArmed && !ImGui::GetIO().WantCaptureMouse) {
+        const char* hint = "CLICK DRY LAND TO PLACE SUPPLY DROP";
+        foreground->AddText(ImVec2(mouse.x + 18.0f, mouse.y + 14.0f),
+                            IM_COL32(255, 205, 80, 240), hint);
+    }
+    // The planned drop: an amber box with a parachute arc, distinct from the
+    // round LZ markers and the hostile diamonds.
+    if (SupplyDropPlanned()) {
+        XMFLOAT3 marker = g_supplyDropTarget;
+        marker.y += 1.3f;
+        ImVec2 at;
+        if (projectToScreen(marker, at)) {
+            const ImU32 amber = IM_COL32(255, 196, 64, 245);
+            foreground->AddRectFilled(ImVec2(at.x - 8.0f, at.y - 6.0f),
+                                      ImVec2(at.x + 8.0f, at.y + 8.0f),
+                                      IM_COL32(20, 14, 4, 220));
+            foreground->AddRect(ImVec2(at.x - 8.0f, at.y - 6.0f),
+                                ImVec2(at.x + 8.0f, at.y + 8.0f), amber, 0.0f, 0,
+                                2.0f);
+            foreground->PathArcTo(ImVec2(at.x, at.y - 12.0f), 11.0f,
+                                  XM_PI, XM_2PI, 12);
+            foreground->PathStroke(amber, 0, 2.0f);
+            foreground->AddLine(ImVec2(at.x - 11.0f, at.y - 12.0f),
+                                ImVec2(at.x - 6.0f, at.y - 6.0f), amber, 1.2f);
+            foreground->AddLine(ImVec2(at.x + 11.0f, at.y - 12.0f),
+                                ImVec2(at.x + 6.0f, at.y - 6.0f), amber, 1.2f);
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "SUPPLY: %s",
+                          GunModel::WeaponName(g_supplyDropWeapon));
+            const ImVec2 tagSize = ImGui::CalcTextSize(tag);
+            const ImVec2 tagPos(at.x + 18.0f, at.y - tagSize.y * 0.5f);
+            foreground->AddRectFilled(
+                ImVec2(tagPos.x - 6.0f, tagPos.y - 3.0f),
+                ImVec2(tagPos.x + tagSize.x + 6.0f, tagPos.y + tagSize.y + 3.0f),
+                IM_COL32(8, 14, 16, 220));
+            foreground->AddText(tagPos, amber, tag);
         }
     }
 
@@ -4054,6 +4140,91 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
     }
 
+    // Supply drop: a third weapon parachuted onto a point on this map, to be
+    // swapped for one in hand once on the ground. Opens by itself once a
+    // drop is ordered so the plan is visible without hunting for it.
+    if (deploySection("SUPPLY DROP", SupplyDropPlanned())) {
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::TextDisabled("WEAPON");
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::SetNextItemWidth(340.0f);
+    {
+        char preview[64];
+        if (g_supplyDropWeapon >= 0) {
+            char price[32];
+            MoneySystem::Format(price, sizeof(price),
+                                SupplyDropPrice(g_supplyDropWeapon));
+            std::snprintf(preview, sizeof(preview), "%s  (%s)",
+                          GunModel::WeaponName(g_supplyDropWeapon), price);
+        } else {
+            std::snprintf(preview, sizeof(preview), "None");
+        }
+        if (ImGui::BeginCombo("##SupplyDropWeapon", preview)) {
+            if (ImGui::Selectable("None", g_supplyDropWeapon < 0))
+                ClearSupplyDropPlan();
+            for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
+                // The charge is always carried; dropping one adds nothing.
+                if (weapon == GunModel::kRemoteChargeWeapon ||
+                    !GunModel::WeaponLoaded(weapon)) continue;
+                char row[64], price[32];
+                MoneySystem::Format(price, sizeof(price), SupplyDropPrice(weapon));
+                std::snprintf(row, sizeof(row), "%s  (%s)",
+                              GunModel::WeaponName(weapon), price);
+                if (ImGui::Selectable(row, g_supplyDropWeapon == weapon))
+                    g_supplyDropWeapon = weapon;
+            }
+            ImGui::EndCombo();
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "A weapon parachuted onto a point you pick on the map.\n"
+            "Walk up and press E to swap it for the weapon in hand.\n"
+            "Charged when you deploy.");
+    if (g_supplyDropWeapon >= 0) {
+        ImGui::SetCursorPosX(45.0f);
+        if (g_supplyDropArmed) {
+            ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(150, 105, 25, 255));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(185, 130, 35, 255));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(205, 145, 40, 255));
+            if (ImGui::Button("CANCEL PLACEMENT", ImVec2(340.0f, 30.0f)))
+                g_supplyDropArmed = false;
+            ImGui::PopStyleColor(3);
+            ImGui::SetCursorPosX(45.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.77f, 0.3f, 1.0f),
+                               "Click dry land on the map");
+        } else {
+            if (ImGui::Button(g_supplyDropPlaced ? "MOVE DROP POINT"
+                                                 : "PLACE DROP ON MAP",
+                              ImVec2(340.0f, 30.0f))) {
+                g_supplyDropArmed = true;
+                g_missileStrikeArmed = false;
+            }
+        }
+        // Warnings rather than disabled controls: the loadout and the wallet
+        // can both change after the drop is planned, and DEPLOY re-checks.
+        const int dropPrice = SupplyDropPrice(g_supplyDropWeapon);
+        const bool prepaid = g_replayPlanActive &&
+            g_lastDeployment.supplyWeapon == g_supplyDropWeapon;
+        ImGui::SetCursorPosX(45.0f);
+        if (loadout.ContainsWeapon(g_supplyDropWeapon)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                               "Already in your loadout, will not drop");
+        } else if (!g_supplyDropPlaced) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                               "No drop point placed");
+        } else if (!prepaid && g_game.money.Balance() < dropPrice) {
+            ImGui::TextColored(ImVec4(0.75f, 0.32f, 0.28f, 1.0f),
+                               "Cannot afford the drop");
+        } else if (!prepaid && dropPrice > 0) {
+            char cost[32];
+            MoneySystem::Format(cost, sizeof(cost), dropPrice);
+            ImGui::TextColored(UITheme::kWarning, "%s on deploy", cost);
+        }
+    }
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    }
+
     // One roll for time, weather, fog density and the enemy layout. The
     // controls it drives stay editable afterwards -- a roll is a starting
     // point, not a lock. Below the squad: it is the least-used control here.
@@ -4154,8 +4325,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
                            "Click the map to set the impact point");
     } else {
-        if (ImGui::Button("LAUNCH MISSILE", ImVec2(340.0f, 32.0f)))
+        if (ImGui::Button("LAUNCH MISSILE", ImVec2(340.0f, 32.0f))) {
             g_missileStrikeArmed = true;
+            g_supplyDropArmed = false;
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "Call in an impact-fused round. Arms targeting; the next\n"
@@ -4326,6 +4499,23 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                     g_selectedDeploymentZone = zone;
             }
             if (g_selectedDeploymentZone < 0) g_selectedDeploymentZone = 0;
+            // SGE_AUTO_SUPPLY_DROP=<weapon id> orders that weapon dropped
+            // 10 m inland of the chosen zone, as a map click would.
+            char dropText[16] = {};
+            if (GetEnvironmentVariableA("SGE_AUTO_SUPPLY_DROP", dropText,
+                                        sizeof(dropText)) > 0) {
+                XMFLOAT3 point = g_deploymentZones[
+                    static_cast<size_t>(g_selectedDeploymentZone)];
+                const float length =
+                    std::sqrt(point.x * point.x + point.z * point.z);
+                if (length > 10.0f) {
+                    point.x -= point.x / length * 10.0f;
+                    point.z -= point.z / length * 10.0f;
+                }
+                g_supplyDropWeapon = std::atoi(dropText);
+                g_supplyDropTarget = point;
+                g_supplyDropPlaced = true;
+            }
             autoDeployed = true;
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 std::string("Auto-deploy (") + autoRole + ")");

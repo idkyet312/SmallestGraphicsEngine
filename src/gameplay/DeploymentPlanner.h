@@ -8,7 +8,10 @@
 #include <vector>
 
 struct DeploymentPlanner {
-    static constexpr uint32_t MaxTerrainClipmapRings = 8;
+    // Gameplay ring half-span is 10 m * 2^(R-1) (G = 20, 1 m base): 8 rings
+    // reach 1280 m, enough for a 12x island (1096 m); 9 reach 2560 m for the
+    // 24x maximum (2152 m). Too few rings drops the seabed past the last one.
+    static constexpr uint32_t MaxTerrainClipmapRings = 9;
     static constexpr float DeploymentTerrainTileSize = 8.0f;
 
     struct CameraFrame {
@@ -82,21 +85,47 @@ struct DeploymentPlanner {
     }
 
     // Deployment uses a uniform grid instead of clipmap rings. Eight mesh
-    // shader quads per 8 m tile gives one-metre vertex spacing everywhere,
+    // shader quads per tile, so vertex spacing is tileSize / 8 everywhere,
     // including the outer shore and maximum insertion-radius apron.
-    static uint32_t DeploymentTerrainGridSide(float requiredRadius) {
+    static uint32_t DeploymentTerrainGridSide(
+        float requiredRadius, float tileSize = DeploymentTerrainTileSize) {
         const float safeRadius = (std::max)(0.0f, requiredRadius);
         uint32_t side = static_cast<uint32_t>(std::ceil(
-            safeRadius * 2.0f / DeploymentTerrainTileSize));
+            safeRadius * 2.0f / tileSize));
         // A centred grid needs an even side count to put the origin on a tile
         // boundary and provide identical positive/negative coverage.
         if ((side & 1u) != 0u) ++side;
         return (std::max)(2u, side);
     }
 
-    static float DeploymentTerrainHalfSpan(uint32_t gridSide) {
-        return static_cast<float>(gridSide) *
-            DeploymentTerrainTileSize * 0.5f;
+    static float DeploymentTerrainHalfSpan(
+        uint32_t gridSide, float tileSize = DeploymentTerrainTileSize) {
+        return static_cast<float>(gridSide) * tileSize * 0.5f;
+    }
+
+    // Auto detail keeps the overview grid at or under this many tiles a side.
+    // Measured on the planning screen (VB Terrain): BigIslandv34, 96 tiles at
+    // 1 m, 1.8 ms. The 12x island (12xv1): 274 tiles at 1 m 10.05 ms, 138 at
+    // 2 m 4.54 ms, 70 at 4 m 1.95 ms. 4 m visibly aliases the fine relief on
+    // the shallow shelf (blotchy, wider dark band); 2 m matches 1 m closely.
+    // The budget admits 2 m there and leaves the smaller islands at 1 m.
+    static constexpr uint32_t DeploymentTerrainAutoMaxSide = 160;
+
+    // Overview tile size for an authored vertex spacing in metres (1, 2, 4 or
+    // 8). Anything else is Auto: the finest spacing whose grid fits the budget.
+    static float DeploymentTerrainTileSizeFor(float requiredRadius,
+                                              int spacingMetres) {
+        if (spacingMetres == 1 || spacingMetres == 2 || spacingMetres == 4 ||
+            spacingMetres == 8)
+            return DeploymentTerrainTileSize * static_cast<float>(spacingMetres);
+        for (int spacing = 1; spacing < 8; spacing *= 2) {
+            const float tileSize =
+                DeploymentTerrainTileSize * static_cast<float>(spacing);
+            if (DeploymentTerrainGridSide(requiredRadius, tileSize) <=
+                DeploymentTerrainAutoMaxSide)
+                return tileSize;
+        }
+        return DeploymentTerrainTileSize * 8.0f;
     }
 
     static float HeadingTowardIslandCenter(

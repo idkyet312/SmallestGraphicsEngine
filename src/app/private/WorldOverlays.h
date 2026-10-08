@@ -49,6 +49,52 @@ static void DrawEscapeBoatMarker(CXMMATRIX view, CXMMATRIX projection) {
                   green, label);
 }
 
+// Supply drop ordered from the deploy map, marked until it is first taken so
+// the player can find a crate that landed out of sight. Follows the crate down
+// while it is still under canopy.
+static void DrawSupplyDropMarker(CXMMATRIX view, CXMMATRIX projection) {
+    if (g_game.session.Screen() != GameScreen::Level1) return;
+    if (g_emptyLevelMode || !g_game.session.TimerRunning()) return;
+    for (const WeaponPickup& pickup : scene.weaponPickups) {
+        if (!pickup.supplyDrop || !pickup.active || pickup.collected) continue;
+        const XMFLOAT3 anchor{ pickup.position.x,
+                               pickup.position.y + pickup.dropHeight + 1.2f,
+                               pickup.position.z };
+        const XMVECTOR clip = XMVector3Transform(
+            XMLoadFloat3(&anchor), view * projection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) continue;   // behind the camera
+
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        const ImVec2 screen{
+            (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+            (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+        const float dx = scene.camera.Position.x - pickup.position.x;
+        const float dz = scene.camera.Position.z - pickup.position.z;
+        const float distance = std::sqrt(dx * dx + dz * dz);
+
+        ImDrawList* draw = ImGui::GetForegroundDrawList();
+        const ImU32 amber = IM_COL32(255, 196, 64, 235);
+        draw->AddRect(ImVec2(screen.x - 7.0f, screen.y - 6.0f),
+                      ImVec2(screen.x + 7.0f, screen.y + 7.0f), amber, 0.0f, 0,
+                      2.0f);
+        draw->PathArcTo(ImVec2(screen.x, screen.y - 11.0f), 10.0f,
+                        XM_PI, XM_2PI, 12);
+        draw->PathStroke(amber, 0, 2.0f);
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s  %.0f m",
+                      GunModel::WeaponName(pickup.weapon.legacyWeaponId),
+                      distance);
+        const ImVec2 size = ImGui::CalcTextSize(label);
+        draw->AddRectFilled(
+            ImVec2(screen.x - size.x * 0.5f - 4.0f, screen.y + 11.0f),
+            ImVec2(screen.x + size.x * 0.5f + 4.0f, screen.y + 15.0f + size.y),
+            IM_COL32(20, 14, 4, 170), 3.0f);
+        draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y + 13.0f),
+                      amber, label);
+    }
+}
+
 // Impact marker for an inbound bombardment round. This is the counterplay, not
 // a flourish: the round is aimed at a random point with no regard for where the
 // player is standing, so without something on the ground saying where it lands

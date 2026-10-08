@@ -69,6 +69,10 @@ struct EnemyTankState {
     XMFLOAT4 safeRotation{ 0.0f, 0.0f, 0.0f, 1.0f };
     // Hull-relative traverse, radians; 0 looks down the hull's +X.
     float turretYaw = 0.0f;
+    // Current traverse speed, rad/s; see SGE::StepTurretTraverse.
+    float turretYawRate = 0.0f;
+    // Heavy-gun hits not yet applied; see DamageEnemyTankFromHeavyGun.
+    float chipDamage = 0.0f;
     float health = 1500.0f;
     float maxHealth = 1500.0f;
     bool dead = false;
@@ -150,7 +154,8 @@ static EnemyTankState* PlayerTank() {
 // Driving owns movement input, water state and the weapon visibility.
 static bool PlayerInVehicle() {
     return g_drivingHumvee || g_playerTankEntity != 0 ||
-           g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat;
+           g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat ||
+           g_pilotedHelicopter != PilotedHelicopter::None;
 }
 
 static void ReleaseEnemyTanks() {
@@ -528,6 +533,41 @@ static void RouteEnemyTankDamage(EnemyTankState& tank, float damage,
                                    /*kind=*/4);
 }
 
+// Heavy machine guns -- a Humvee's turret, a gunship's cannon -- chip armour
+// rather than piercing it: each round takes this fraction of the tank's
+// maximum health, so a hull soaks ~170 of them (about 20 s of sustained turret
+// fire). Rifle rounds still do nothing.
+static constexpr float kHeavyGunTankDamageFraction = 0.006f;
+// Chip damage is banked and applied in chunks this size, so a long burst is
+// a handful of damage events (smoke puff, log line, network report) rather
+// than one per round.
+static constexpr float kHeavyGunTankDamageChunk = 0.05f;
+
+// A heavy-gun round that struck prefab collider `entityId`. Friendly rounds
+// wear down enemy tanks; hostile ones only the tank the player has taken, so
+// enemy gunners do not grind down their own armour. Returns true when the
+// collider was a live tank.
+static bool DamageEnemyTankFromHeavyGun(uint64_t entityId, const XMFLOAT3& hit,
+                                        bool hostile, bool fromPlayer) {
+    if (entityId == 0) return false;
+    for (EnemyTankState& tank : g_enemyTanks) {
+        if (tank.entityId != entityId || tank.dead) continue;
+        const bool playerTank = tank.entityId == g_playerTankEntity;
+        if (hostile != playerTank) return true;
+        tank.chipDamage += tank.maxHealth * kHeavyGunTankDamageFraction;
+        const bool lethal = tank.health - tank.chipDamage <= 0.0f;
+        if (tank.chipDamage < tank.maxHealth * kHeavyGunTankDamageChunk &&
+            !lethal)
+            return true;
+        const float damage = tank.chipDamage;
+        tank.chipDamage = 0.0f;
+        RouteEnemyTankDamage(tank, damage, hit, fromPlayer,
+                             /*hostAuthored=*/false);
+        return true;
+    }
+    return false;
+}
+
 // Host-side: a client's reported hit, drained from the world-impact queue.
 static void ApplyReportedEnemyTankDamage(uint64_t entityId, float damage,
                                          const XMFLOAT3& hit,
@@ -880,11 +920,11 @@ static void UpdateEnemyTanks(float dt) {
                 XMVectorSet(dx, 0.0f, dz, 0.0f), XMMatrixTranspose(orientation));
             desiredYaw = std::atan2(-XMVectorGetZ(local), XMVectorGetX(local));
         }
-        float yawError = std::atan2(std::sin(desiredYaw - tank.turretYaw),
-                                    std::cos(desiredYaw - tank.turretYaw));
-        const float step = tank.turretRate * dt;
-        tank.turretYaw += (std::max)(-step, (std::min)(step, yawError));
-        yawError -= (std::max)(-step, (std::min)(step, yawError));
+        // Spins up, cruises at turretRate and brakes onto the bearing, like
+        // a heavy mount -- not a constant-rate clamp that starts and stops dead.
+        const float yawError = SGE::StepTurretTraverse(
+            tank.turretYaw, tank.turretYawRate, desiredYaw,
+            tank.turretRate, tank.turretRate * 2.5f, dt);
 
         // ---- Gun --------------------------------------------------------
         tank.reload = (std::max)(0.0f, tank.reload - dt);

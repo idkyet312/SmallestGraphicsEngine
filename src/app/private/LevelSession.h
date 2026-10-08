@@ -13,11 +13,18 @@ static void UpdateHelicopterHoverAudio() {
     // until it climbs out of sight, so it feeds the same loop.
     const VehicleSystem& vehicles = g_game.vehicles;
     // A downed wreck has no rotor left to turn, so it drops out of the loop.
+    // A player-flown bird left parked on the ground has its engine off.
     const bool blackHawkActive = vehicles.blackHawkVisible &&
         vehicles.blackHawkPhase != VehicleSystem::BlackHawkPhase::Gone &&
-        !vehicles.BlackHawkIsDown();
+        !vehicles.BlackHawkIsDown() &&
+        !(vehicles.blackHawkPhase == VehicleSystem::BlackHawkPhase::PlayerFlown &&
+          !vehicles.blackHawkPiloted && vehicles.blackHawkLanded);
+    // The player's gunship turns its blades only while someone is flying it,
+    // and keeps the loop through the spin-down.
+    const bool gunshipActive = ParkedGunshipVisible() &&
+        g_parkedGunshipRotorSpeedScale > 0.05f;
     const bool active = IsGameplayScreen() && alive &&
-        (primaryActive || secondaryActive || blackHawkActive);
+        (primaryActive || secondaryActive || blackHawkActive || gunshipActive);
     auto distanceToCamera = [](const XMFLOAT3& position) {
         const float dx = position.x - scene.camera.Position.x;
         const float dy = position.y - scene.camera.Position.y;
@@ -36,6 +43,9 @@ static void UpdateHelicopterHoverAudio() {
             : (std::max)(4.0f, distanceToCamera(vehicles.blackHawkPosition));
         distance = (std::min)(distance, blackHawkDistance);
     }
+    if (gunshipActive)
+        distance = (std::min)(distance, (std::max)(4.0f,
+            distanceToCamera(g_parkedGunshipFlight.position)));
     const float volume = 0.72f * (std::max)(0.0f, 1.0f - distance / 95.0f);
     g_helicopterHoverAudio.SetLoop(active, volume, 0.96f);
 
@@ -315,6 +325,8 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
                                             transform.position[1],
                                             transform.position[2] }});
     }
+    for (const WeaponPickup& pickup : scene.weaponPickups)
+        g_destruction.DestroyPropBody(pickup.physicsHandle);
     scene.weaponPickups.clear();
     // Recorded per level load, so a level without a Humvee entity does not
     // inherit the previous level's vehicle (or the struct default at origin).
@@ -370,6 +382,28 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
         g_helicopterYaw = XMConvertToRadians(helicopter.rotation[1]);
         scene.showHelicopter = true;
     } else { scene.showHelicopter = false; g_helicopterLevelScale = 1.0f; }
+    // A level (re)load stands the player down from any gunship they were
+    // flying; editor transform edits (movePlayer false) leave a flight alone.
+    if (movePlayer && g_pilotedHelicopter == PilotedHelicopter::Gunship) {
+        g_pilotedHelicopter = PilotedHelicopter::None;
+        scene.gun.visible = g_pilotSavedGunVisible;
+        scene.camera.FPSMode = g_pilotSavedFPSMode;
+    }
+    if (movePlayer || g_pilotedHelicopter != PilotedHelicopter::Gunship) {
+        g_parkedGunshipPresent = !plan.parkedHelicopterSpawns.empty();
+        if (g_parkedGunshipPresent) {
+            const Transform& parked = plan.parkedHelicopterSpawns.front();
+            g_parkedGunshipSpawn = { parked.position[0], parked.position[1],
+                                     parked.position[2] };
+            g_parkedGunshipSpawnYaw = XMConvertToRadians(parked.rotation[1]);
+            // Seated on the ground on the first frame the terrain is final;
+            // the sculpt stamps land later in this load (see the pickup above).
+            g_parkedGunshipNeedsPark = true;
+            g_parkedGunshipDead = false;
+            g_parkedGunshipHealth = kParkedGunshipMaxHealth;
+            g_parkedGunshipRotorSpeedScale = 0.0f;
+        }
+    }
     if (movePlayer && plan.playerSpawn) {
             const Transform& player = *plan.playerSpawn;
             scene.camera = Camera({ player.position[0],
@@ -709,6 +743,11 @@ static void EnsureSceneRenderAssets() {
 static void ReleaseAmmoPickupBodies() {
     for (const AmmoPickup& pickup : scene.ammoPickups)
         g_destruction.DestroyPropBody(pickup.physicsHandle);
+    // Supply crates are prop bodies too.
+    for (WeaponPickup& pickup : scene.weaponPickups) {
+        g_destruction.DestroyPropBody(pickup.physicsHandle);
+        pickup.physicsHandle = 0;
+    }
 }
 
 // SGE_DEBUG_TELEPORT="x,y,z,yawDeg,pitchDeg": debug start for unattended

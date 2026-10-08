@@ -263,6 +263,28 @@ static void ConfigureHelicopterBounds() {
         (minimum.y + maximum.y) * 0.5f,
         (minimum.z + maximum.z) * 0.5f };
     g_helicopterModelScale = kHelicopterLength / horizontalLength;
+    g_game.vehicles.helicopterModelBottomOffset =
+        (g_helicopterModelCenter.y - minimum.y) * g_helicopterModelScale;
+}
+
+// The player-flyable gunship. Same airframe and normalisation as the enemy
+// patrol; the pose comes from its flight model.
+XMMATRIX ParkedGunshipWorldMatrix() {
+    const HelicopterFlight& flight = g_parkedGunshipFlight;
+    return XMMatrixTranslation(-g_helicopterModelCenter.x,
+                               -g_helicopterModelCenter.y,
+                               -g_helicopterModelCenter.z) *
+           XMMatrixScaling(g_helicopterModelScale, g_helicopterModelScale,
+                           g_helicopterModelScale) *
+           XMMatrixRotationRollPitchYaw(flight.pitch, flight.yaw + XM_PI,
+                                        flight.roll) *
+           XMMatrixTranslation(flight.position.x, flight.position.y,
+                               flight.position.z);
+}
+
+bool ParkedGunshipVisible() {
+    return g_parkedGunshipPresent && g_parkedGunshipModel && g_helicopterModel &&
+           !g_emptyLevelMode;
 }
 
 XMMATRIX BlackHawkWorldMatrix() {

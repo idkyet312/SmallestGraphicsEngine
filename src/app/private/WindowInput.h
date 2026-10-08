@@ -170,6 +170,7 @@ static void ProcessInput(HWND) {
             g_destruction.SetVehicleInput(g_activeHumveeIndex, 0.0f, 0.0f, true);
         if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat)
             g_game.vehicles.SetBoatInput(0.0f, 0.0f, true);
+        if (PilotingHelicopter()) ProcessPilotInput(/*inputBlocked=*/true);
         return;
     }
 
@@ -189,6 +190,10 @@ static void ProcessInput(HWND) {
         return;
     }
 
+    if (PilotingHelicopter()) {
+        ProcessPilotInput(/*inputBlocked=*/false);
+        return;
+    }
     if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat) {
         const float throttle =
             ((FocusedKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
@@ -251,6 +256,7 @@ static void ProcessInput(HWND) {
         };
         smoothThrottle = approach(smoothThrottle, throttleKey, 2.5f, 4.0f);
         smoothTurn = approach(smoothTurn, turnKey, 3.0f, 5.0f);
+        state.playerThrottle = smoothThrottle;
         // The Humvee's steering axle is behind its rendered nose, reversing
         // the wheel input needed for A/D relative to the tank.
         g_destruction.SetVehicleInput(
@@ -615,7 +621,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // aim or swap weapons mid-sentence.
         if (ChatPromptOpen()) return 0;
         if (!ImGui::GetIO().WantCaptureMouse) {
-            if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat) {
+            if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat ||
+                PilotingHelicopter()) {
                 return 0;
             } else if (g_playerTankEntity != 0) {
                 FirePlayerTankShell();
@@ -763,7 +770,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == 'C')    { cameraLocked = true; ReleaseCapture(); ShowCursor(TRUE); }
         else if (!g_emptyLevelMode && wParam == 'F' &&
-                 !(lParam & 0x40000000)) { GrabOrThrowObject(); }
+                 !(lParam & 0x40000000)) {
+            // Riding in the BlackHawk, F moves up front and takes the stick.
+            if (!TakeBlackHawkStickFromCabin()) GrabOrThrowObject();
+        }
         else if (wParam == 'V' && !(lParam & 0x40000000)) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
@@ -844,12 +854,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (g_travelScreenOpen) CloseTravelScreen(hwnd);
             else if (g_game.vehicles.drivingBoat || g_game.vehicles.drivingInsertionBoat)
                 ExitPlayerBoat();
-            else if (!g_game.vehicles.BailOutOfBlackHawk() &&
+            else if (PilotingHelicopter()) ExitPilotedHelicopter();
+            else if (!TakeBlackHawkStickFromCabin() &&
+                !g_game.vehicles.BailOutOfBlackHawk() &&
                 !(g_game.vehicles.insertionBoatCarryingPlayer && ToggleBoatDriving(true)) &&
                 !g_game.vehicles.BailOutOfInsertionBoat() &&
                 !CollectNearbyWeaponPickup() &&
                 !OpenNearbyArmoryShop() &&
                 !OpenNearbyTravelScreen() &&
+                !TryBoardHelicopter() &&
                 !ToggleTankDriving() && !ToggleBoatDriving())
                 ToggleHumveeDriving();
         }

@@ -706,11 +706,21 @@ static void VideoTab() {
     if (ToggleRow("Lumen Global Illumination",
                   "Ray-traced bounce lighting with colour bleeding and multi-bounce via the probe cache, similar to Unreal's Lumen. Requires a DXR GPU.",
                   &g_settings.lumenGI)) {
+        // The two GI modes are exclusive; the latest choice wins.
+        if (g_settings.lumenGI) g_settings.radianceCascadesGI = false;
         g_settings.Clamp();
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
-    ImGui::BeginDisabled(!g_settings.lumenGI || !LumenHalfResolutionSupported());
+    if (ToggleRow("Experimental Radiance Cascades GI",
+                  "Replaces Lumen's per-pixel bounce rays with shared ray-traced radiance cascades. Surface edges the probes cannot cover still trace Lumen rays. First use compiles shaders in the background.",
+                  &g_settings.radianceCascadesGI)) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::BeginDisabled(!(g_settings.lumenGI || g_settings.radianceCascadesGI) ||
+                         !LumenHalfResolutionSupported());
     if (ToggleRow("Experimental Half Resolution Lumen GI",
                   "Reduces bounce samples while keeping surface edges separate. May be noisier in motion; performance depends on the scene.",
                   &g_settings.lumenGIHalfResolution)) {

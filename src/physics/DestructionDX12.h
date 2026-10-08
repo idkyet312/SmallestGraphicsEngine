@@ -416,6 +416,9 @@ public:
     // pose instead of being re-read and re-uploaded every frame.
     bool IsPropBodyAwake(uint32_t handle) const;
     void DestroyPropBody(uint32_t handle);
+    // Drag on a prop body. Terminal fall speed is g / damping, so a supply
+    // crate under canopy is a prop with heavy damping that drops it on landing.
+    bool SetPropBodyLinearDamping(uint32_t handle, float damping);
     uint32_t CreateGrenadeBody(
         const DirectX::XMFLOAT3& worldPosition,
         const DirectX::XMFLOAT3& linearVelocity,

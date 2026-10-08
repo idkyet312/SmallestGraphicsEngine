@@ -540,7 +540,7 @@ private:
             effectiveLightColor.z, scene.volumetricFogAnisotropy
         };
         constants.fogParams = { scene.volumetricFogHeightFalloff,
-            scene.volumetricFogBaseHeight, scene.volumetricFogDistance,
+            scene.volumetricFogBaseHeight, scene.EffectiveVolumetricFogDistance(),
             shadowResource ? 1.0f : 0.0f };
         constants.ambientFogColor = {
             scene.volumetricFogTint.x,

@@ -838,6 +838,62 @@ int main() {
     CHECK(cutRun.blackHawkRopeReleaseRequested);
     CHECK(!cutRun.blackHawkRopeCut);
 
+    // Taking the stick mid-approach: the passenger becomes the pilot, the
+    // squad stays aboard, and the flight model owns the pose from then on.
+    VehicleSystem piloted;
+    piloted.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, false);
+    piloted.UpdateBlackHawk(0.5f);
+    CHECK(piloted.TakeBlackHawkControls());
+    CHECK(!piloted.TakeBlackHawkControls());   // already flown
+    CHECK(piloted.blackHawkPhase == VehicleSystem::BlackHawkPhase::PlayerFlown);
+    CHECK(!piloted.blackHawkCarryingPlayer);
+    CHECK(piloted.blackHawkSquadAboard);
+    const float pilotStartY = piloted.blackHawkPosition.y;
+    piloted.blackHawkFlightGroundY = 0.0f;
+    piloted.blackHawkPilotInput.lift = 1.0f;
+    for (int stepIndex = 0; stepIndex < 60; ++stepIndex)
+        piloted.UpdateBlackHawk(1.0f / 60.0f);
+    CHECK(piloted.blackHawkPosition.y > pilotStartY + 2.0f);
+    CHECK(piloted.BlackHawkIsFlying());
+    // Forward stick noses the airframe DOWN. It draws nose-on-+Z, where a
+    // positive X rotation tips +Z toward -Y, so the drawn pitch is positive.
+    piloted.blackHawkPilotInput = {};
+    piloted.blackHawkPilotInput.forward = 1.0f;
+    for (int stepIndex = 0; stepIndex < 60; ++stepIndex)
+        piloted.UpdateBlackHawk(1.0f / 60.0f);
+    CHECK(piloted.blackHawkPitch > 0.1f);
+    {
+        const DirectX::XMVECTOR nose = DirectX::XMVector3TransformNormal(
+            DirectX::XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f),
+            DirectX::XMMatrixRotationRollPitchYaw(piloted.blackHawkPitch,
+                piloted.blackHawkYaw, piloted.blackHawkRoll));
+        CHECK(DirectX::XMVectorGetY(nose) < -0.1f);
+    }
+    piloted.blackHawkPilotInput = {};
+    // Climbing out leaves it to settle empty, still in the player's hands.
+    piloted.ReleaseBlackHawkControls();
+    for (int stepIndex = 0; stepIndex < 60 * 30; ++stepIndex)
+        piloted.UpdateBlackHawk(1.0f / 60.0f);
+    CHECK(piloted.blackHawkLanded);
+    CHECK(std::abs(piloted.blackHawkPosition.y) < 0.001f);
+    CHECK(piloted.blackHawkPhase == VehicleSystem::BlackHawkPhase::PlayerFlown);
+    CHECK(piloted.TakeBlackHawkControls());    // parked: flyable again
+    // Shot down at the stick: the pilot is thrown clear rather than strapped in.
+    piloted.BeginBlackHawkCrash();
+    CHECK(!piloted.blackHawkPiloted);
+    CHECK(piloted.blackHawkBailedOut);
+    CHECK(!piloted.blackHawkCarryingPlayer);
+    CHECK(!piloted.TakeBlackHawkControls());
+    // The rope is the one place the stick is out of reach.
+    VehicleSystem roped;
+    roped.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, true);
+    for (int stepIndex = 0; stepIndex < 1000 &&
+         roped.blackHawkPhase == VehicleSystem::BlackHawkPhase::Inbound;
+         ++stepIndex)
+        roped.UpdateBlackHawk(0.05f);
+    CHECK(roped.BlackHawkIsRappelling());
+    CHECK(!roped.TakeBlackHawkControls());
+
     vehicleDamage = vehicles.DamageInsertionBlackHawkFromEnemyFire(
         VehicleSystem::BlackHawkMaxHealth * 0.40f);
     CHECK(vehicleDamage.applied);
@@ -1123,6 +1179,26 @@ int main() {
     CHECK(std::abs(
         DeploymentPlanner::DeploymentTerrainTileSize / 8.0f - 1.0f) <
         0.001f);
+    // The gameplay clipmap (G = 20, 1 m base) must reach a 24x island's
+    // seabed edge, or the shelf past the last ring is simply not drawn.
+    {
+        const float need = 88.0f * 24.0f + 40.0f;
+        const uint32_t rings = DeploymentPlanner::TerrainRingCount(
+            need, 20u, 1.0f, DeploymentPlanner::MaxTerrainClipmapRings);
+        CHECK(DeploymentPlanner::TerrainClipmapHalfSpan(20u, 1.0f, rings) >= need);
+    }
+    // Planning-map detail: authored spacing wins; Auto keeps small islands at
+    // 1 m and coarsens large ones until the grid fits the tile budget.
+    CHECK(DeploymentPlanner::DeploymentTerrainTileSizeFor(1096.0f, 2) == 16.0f);
+    CHECK(DeploymentPlanner::DeploymentTerrainTileSizeFor(383.0f, 0) == 8.0f);
+    const float autoLargeTile =
+        DeploymentPlanner::DeploymentTerrainTileSizeFor(1096.0f, 0);
+    CHECK(autoLargeTile == 16.0f);
+    CHECK(DeploymentPlanner::DeploymentTerrainGridSide(1096.0f, autoLargeTile) <=
+          DeploymentPlanner::DeploymentTerrainAutoMaxSide);
+    CHECK(DeploymentPlanner::DeploymentTerrainHalfSpan(
+              DeploymentPlanner::DeploymentTerrainGridSide(1096.0f, autoLargeTile),
+              autoLargeTile) >= 1096.0f);
 
     DeferredReleaseQueue<int> releases;
     releases.Retire(4, 10);

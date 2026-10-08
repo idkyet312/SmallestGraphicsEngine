@@ -418,6 +418,9 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
                                            : g_helicopterModel,
                 SecondaryHelicopterWorldMatrix(), items);
     }
+    if (ParkedGunshipVisible())
+        AppendOpaqueSceneNodeDrawItems(g_parkedGunshipModel,
+            ParkedGunshipWorldMatrix(), items);
 
     if (!g_emptyLevelMode && g_explosiveBarrelModel) {
         for (size_t b = 0; b < scene.explosiveBarrels.size(); ++b) {

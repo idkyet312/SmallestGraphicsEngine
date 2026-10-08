@@ -21,6 +21,7 @@ struct RuntimeLevelPlan {
     std::optional<Transform> playerSpawn;
     std::vector<Transform> humveeSpawns;
     std::optional<Transform> helicopterSpawn;
+    std::vector<Transform> parkedHelicopterSpawns;
     std::vector<Transform> explosiveBarrels;
 };
 
@@ -55,6 +56,9 @@ public:
                 break;
             case LevelEntityType::ExplosiveBarrel:
                 plan.explosiveBarrels.push_back(entity.transform);
+                break;
+            case LevelEntityType::ParkedHelicopter:
+                plan.parkedHelicopterSpawns.push_back(entity.transform);
                 break;
             default:
                 break;

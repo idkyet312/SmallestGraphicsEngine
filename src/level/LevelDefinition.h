@@ -23,7 +23,12 @@ enum class LevelEntityType {
     GrassPatch,
     Dandelion,
     Rock,
-    Prefab
+    Prefab,
+    // An unmanned gunship parked for the player to fly, separate from the
+    // enemy patrol (Helicopter). The runtime flies the first enabled one.
+    ParkedHelicopter,
+    // Highest valid value, for range checks. Keep it on the last entry.
+    Last = ParkedHelicopter
 };
 
 struct Transform {
@@ -209,7 +214,12 @@ enum class LevelInsertionMode : uint32_t {
 
 inline constexpr float kDefaultDeploymentRadius = 34.0f;
 inline constexpr float kMinDeploymentRadius = 5.0f;
-inline constexpr float kMaxDeploymentRadius = 600.0f;
+// Sized for the largest island: a 24x island's land reaches 43 * 24 = 1032 m,
+// so the insertion ring has to be able to sit offshore of that.
+inline constexpr float kMaxDeploymentRadius = 1200.0f;
+// Coastline stretch per axis. 24x puts the seabed edge (88 m * scale + 40 m
+// margin) at 2152 m, which DeploymentPlanner::MaxTerrainClipmapRings covers.
+inline constexpr float kMaxTerrainIslandScale = 24.0f;
 inline constexpr int kDeploymentZoneCount = 20;
 
 struct LevelDefinition {
@@ -225,6 +235,11 @@ struct LevelDefinition {
     // World-space radius of the selectable insertion/drop-off ring. It is not
     // multiplied by island scale: an authored 120 m radius stays exactly 120 m.
     float deploymentRadius = kDefaultDeploymentRadius;
+    // Terrain vertex spacing on the deployment planning map, in metres: 1, 2,
+    // 4 or 8, or 0 for Auto (finest spacing that keeps the overview grid within
+    // DeploymentPlanner's tile budget). The overview draws the whole island at
+    // once, so a 12x island at 1 m measured 10 ms of terrain raster alone.
+    int deploymentTerrainSpacing = 0;
     // Screen numbering is 1-based; zero preserves the legacy player choice.
     int defaultInsertionPoint = 0;
     // The autonomous armed patrol boat is level scenery/gameplay, separate from

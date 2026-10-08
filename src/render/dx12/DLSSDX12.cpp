@@ -480,12 +480,20 @@ bool Evaluate(const DLSSFrameInputs& in) {
         options.colorBuffersHDR = sl::Boolean::eTrue;
         options.normalRoughnessMode =
             sl::DLSSDNormalRoughnessMode::ePacked;
-        // Capture A/B only: SGE_RR_PRESET=<sl::DLSSDPreset value>.
+        // Capture A/B only: SGE_RR_PRESET=<sl::DLSSDPreset value>. Every
+        // mode's slot: upscaling RR runs as Quality/Balanced, not DLAA.
         char rrPresetText[8] = {};
         if (GetEnvironmentVariableA("SGE_RR_PRESET", rrPresetText,
-                                    sizeof(rrPresetText)) > 0)
-            options.dlaaPreset =
+                                    sizeof(rrPresetText)) > 0) {
+            const auto preset =
                 static_cast<sl::DLSSDPreset>(atoi(rrPresetText));
+            options.dlaaPreset = preset;
+            options.qualityPreset = preset;
+            options.balancedPreset = preset;
+            options.performancePreset = preset;
+            options.ultraPerformancePreset = preset;
+            options.ultraQualityPreset = preset;
+        }
         options.worldToCameraView = ToSL(in.view);
         const XMMATRIX viewMatrix = XMLoadFloat4x4(&in.view);
         options.cameraViewToWorld = ToSL(

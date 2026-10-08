@@ -365,6 +365,14 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     float enhancedDetailMipGradScale;
     uint  enhancedHalfResolutionPadding;
 };
+#if SGE_RADIANCE_CASCADES
+cbuffer RadianceCascadeConstants : register(b6) {
+    uint rcLevel;
+    uint rcProbeSpacing;
+    uint rcLevelCount;
+    uint rcEnabled;
+};
+#endif
 // Every motion write goes through this so the three sites (surfaces, sky,
 // terrain) cannot disagree about the jitter convention.
 #define RR_UNJITTER(motion) ((motion) - rrMotionJitterUV)
@@ -1429,9 +1437,23 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
 // Share irradiance before albedo/AO, so primary material boundaries remain sharp.
 // Matching active lanes by pixel block avoids assuming a vendor's wave layout,
 // and handles sky holes, split terrain dispatches, and edge-AA sub-samples.
+#if SGE_RADIANCE_CASCADES
+float3 SampleRadianceCascades(float3 position, float3 normal, uint2 pixel,
+                              out bool resolved);
+#endif
 float3 SampleLumenGI(float3 worldPos, float3 normal, uint2 pixel,
                      uint surfaceNamespace, out bool tracedRay) {
     tracedRay = true;
+#if SGE_RADIANCE_CASCADES
+    if (rcEnabled != 0u) {
+        bool resolved;
+        float3 irradiance = SampleRadianceCascades(worldPos, normal, pixel, resolved);
+        if (resolved) {
+            tracedRay = false;
+            return irradiance;
+        }
+    }
+#endif
 #if SGE_LUMEN_HALF_RES_SUPPORTED
     [branch] if (enhancedLumenHalfResolution != 0u) {
         uint block = (pixel.y >> 1u) * (((uint)screenWidth + 1u) >> 1u) +
@@ -2246,6 +2268,10 @@ float3 DecodeTerrainVBNormal(uint packed) {
 }
 #endif // SGE_TERRAIN_VISIBILITY
 
+#if SGE_RADIANCE_CASCADES
+#include "radiance_cascades.hlsli"
+#endif
+
 // ---- Point Light Calculation (matching forward shader) ----
 
 float3 calculatePointLight(int index, float3 fragPos, float3 normal,
@@ -2739,6 +2765,14 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
                 ? traced * giStrength
                 : traced;
             giTraced = true;
+#if SGE_RADIANCE_CASCADES
+            // Cascade irradiance is deterministic and already shared. Only
+            // edge fallback rays belong in the stochastic denoiser signal.
+            if (rcEnabled != 0u && !giRayExecuted) {
+                tracedGIIrradiance = 0.0;
+                giTraced = false;
+            }
+#endif
             // Denoise the irradiance, not the final contribution. The
             // accumulator should see the raw ray estimate before albedo and AO
             // scale it: those are per-pixel constants, so filtering after they
@@ -3303,6 +3337,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
             if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
             return;
         }
+#if SGE_ENHANCED_VISUALS
+        // Normal views (see the mesh path): terrain's height-derived normal
+        // stands in for both the face and vertex normal.
+        if (debugViewMode >= 10u && debugViewMode <= 13u) {
+            float3 debugNormal = debugViewMode == 12u
+                ? terrainPBR.normal : terrainGeoNormal;
+            outputColor[pixel] = float4(debugViewMode == 13u
+                ? float3(0.0, 1.0, 0.0) : debugNormal * 0.5 + 0.5, 1.0);
+            outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+            if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+            return;
+        }
+#endif
 
         Surface terrainSurface = (Surface)0;
         terrainSurface.fragPos = terrainWorldPos;
@@ -3607,6 +3654,35 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
         outputColor[pixel] = float4(debugColor, 1.0);
         return;
     }
+
+#if SGE_ENHANCED_VISUALS
+    // SM6 tiers only, so the default FXC resolve stays byte-identical.
+    // Debug views 10-13, world space as n * 0.5 + 0.5:
+    //   10 geometric face normal (winding order decides its sign)
+    //   11 interpolated vertex normal -- what the GI probes place rays on
+    //   12 final shading normal: normal map and double-sided flip applied
+    //   13 vertex vs face agreement: green aligned, yellow > 25 degrees,
+    //      red > 60 degrees, blue pointing opposite (flipped winding/normals)
+    if (debugViewMode >= 10u && debugViewMode <= 13u) {
+        float3 faceCross = cross(wp1 - wp0, wp2 - wp0);
+        float3 faceNormal = dot(faceCross, faceCross) > 1e-20
+            ? normalize(faceCross) : 0.0;
+        float3 vertexNormal = normalize(mul(
+            normalize(bary.x * n0 + bary.y * n1 + bary.z * n2),
+            (float3x3)dc.modelMatrix));
+        float3 debugColor = (debugViewMode == 10u ? faceNormal
+            : debugViewMode == 11u ? vertexNormal : surface.normal) * 0.5 + 0.5;
+        if (debugViewMode == 13u) {
+            float agreement = dot(faceNormal, vertexNormal);
+            debugColor = agreement < 0.0 ? float3(0.1, 0.3, 1.0)
+                : agreement < 0.5 ? float3(1.0, 0.1, 0.1)
+                : agreement < 0.9 ? float3(1.0, 0.85, 0.1)
+                : float3(0.1, 0.8, 0.2);
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        return;
+    }
+#endif
 
 #if SGE_ENHANCED_VISUALS
     // Debug view 4: why a pixel did or did not get a ray-traced reflection.

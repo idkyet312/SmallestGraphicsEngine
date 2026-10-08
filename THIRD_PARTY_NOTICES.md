@@ -718,6 +718,7 @@ THE SOFTWARE.
 | bullet_flesh_hit.wav | Eldritch Grim | https://opengameart.org/content/impactsgunsfx | CC0 1.0 Universal |
 | helicopter_hover_loop.mp3 | Iwan "qubodup" Gabovitch | https://freesound.org/people/qubodup/sounds/187681/ | CC0 1.0 Universal |
 | Boat/boat_engine_loop.wav (adapted: mono PCM, DC removal, loop crossfade, peak normalization) | LG | https://freesound.org/people/LG/sounds/91533/ | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| Humvee/humvee_engine_loop.wav (adapted: mono PCM, 12 s excerpt, DC removal, loop crossfade, peak normalization) | Iwan "qubodup" Gabovitch | https://freesound.org/people/qubodup/sounds/182793/ | CC0 1.0 Universal |
 | bandit_spotted_01.wav, bandit_spotted_02.wav, bandit_attack.wav, bandit_death.wav, bandit_hit_voice.wav | xathien | https://opengameart.org/content/steampunk-fantasy-voices | CC0 1.0 Universal |
 | flesh_hit.ogg | Iwan "qubodup" Gabovitch | https://opengameart.org/content/impact | CC0 1.0 Universal |
 | breathing_tired.ogg | OwlishMedia | https://opengameart.org/content/cc0-sound-effects | CC0 1.0 Universal |

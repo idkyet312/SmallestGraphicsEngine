@@ -2916,10 +2916,21 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
                     "Edge mask", "RT reflection rays", "SVGF denoiser",
                     "SVGF a-trous output", "Terrain layer weights",
-                    "Lumen GI irradiance", "Lumen GI contribution"
+                    "Lumen GI irradiance", "Lumen GI contribution",
+                    "Geometric (face) normals", "Vertex normals",
+                    "Shading normals", "Vertex vs face normal agreement"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
+                if (vb.debugViewMode >= 10) {
+                    if (!vb.EnhancedVisualsReady())
+                        ImGui::TextDisabled("  Needs the SM6.5 resolve");
+                    else if (vb.debugViewMode == 13)
+                        ImGui::TextDisabled(
+                            "  green=aligned  yellow>25deg  red>60deg  blue=opposite");
+                    else
+                        ImGui::TextDisabled("  World space, n*0.5+0.5: +X red  +Y green  +Z blue");
+                }
                 if (vb.debugViewMode == 7) {
                     ImGui::TextDisabled(
                         "  green=grass  orange=dirt  blue=sand  white=rock");

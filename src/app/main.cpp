@@ -100,6 +100,7 @@
 #include "EnemySystem.h"
 #include "VehicleSystem.h"
 #include "VehicleBlast.h"
+#include "TurretTraverse.h"
 #include "AATurretCharge.h"
 #include "RopeSwing.h"
 #include "DeploymentPlanner.h"
@@ -153,6 +154,7 @@ using namespace DirectX;
 #include "private/BoatWaterEffects.h"
 #include "private/PlayerInteraction.h"
 #include "private/VehicleCombat.h"
+#include "private/PlayerHelicopters.h"
 #include "private/EnemyHumvees.h"
 #include "private/Multiplayer.h"
 #include "private/MultiplayerInsertion.h"
@@ -460,6 +462,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                        AudioBus::Ambience);
     g_insertionBoatEngineAudio.Initialize("Content/Audio/Boat/boat_engine_loop.wav",
                                           AudioBus::Ambience);
+    for (GunAudio& engine : g_humveeEngineAudio)
+        engine.Initialize("Content/Audio/Humvee/humvee_engine_loop.wav",
+                          AudioBus::Ambience);
     g_blackHawkAlarmAudio.Initialize(
         "Content/Audio/freesound_community-siren-alert-96052.mp3");
     // Grass footsteps. Add a Grass03.wav and bump kFootstepVariantCount to
@@ -545,7 +550,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     visBuffer.SetBindlessHeap(&bindlessHeap);
     visBuffer.SetPredictedResolveTier(
         g_settings.rayTracingQuality == GameSettings::kRayTracingUltra ||
-            g_settings.lumenGI || scene.enhancedVisuals,
+            g_settings.lumenGI || g_settings.radianceCascadesGI ||
+            scene.enhancedVisuals,
         scene.bindlessMaterials && bindlessHeapReady);
     visBuffer.QueueBootResolveCompiles();
 
@@ -1470,7 +1476,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // falling through. Uses last frame's body transforms -- fine for
         // standing, and avoids a one-frame lag that would drop the player.
         if (!ridingBlackHawk && !deploymentPlanning &&
-            !g_game.vehicles.drivingBoat && !g_game.vehicles.drivingInsertionBoat) {
+            !g_game.vehicles.drivingBoat && !g_game.vehicles.drivingInsertionBoat &&
+            !PilotingHelicopter()) {
             if (scene.useDestruction && g_destruction.IsInitialized()) {
                 g_destruction.ResolvePlayerCollision(scene.camera.Position,
                     scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight,
@@ -1788,6 +1795,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " lumenSetting=" << g_settings.lumenGI
                                 << " lumen=" << visBuffer.lumenGIActive
                                 << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
+                                << " rc=" << visBuffer.radianceCascadesGIActive
+                                << " rcStatus=" << visBuffer.RadianceCascadesStatus()
                                 << " captureFrame=" << poseCaptureFrames
                                 << " useDDGI=" << scene.useDDGI
                                 << " giIntensity=" << scene.giIntensity
@@ -2062,6 +2071,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         vehicles.blackHawkPosition.z);
                 }
                 vehicles.blackHawkCrashGroundY = crashGround;
+                // A player-flown bird settles on the sea surface rather than
+                // the seabed under it.
+                vehicles.blackHawkFlightGroundY = HelicopterFloorAt(
+                    vehicles.blackHawkPosition.x, vehicles.blackHawkPosition.z);
             }
             g_game.vehicles.UpdateBlackHawk(
                 armedInsertionThisFrame ? 0.0f : deltaTime);
@@ -2118,6 +2131,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             SpinBlackHawkRotor();
             RidePlayerInBlackHawk(deltaTime);
             UpdateBlackHawkCrashEffects(deltaTime);
+            // After the BlackHawk has flown this frame's input, so the chase
+            // camera follows the pose that is about to be drawn.
+            UpdatePlayerHelicopters(deltaTime);
 
             // Insertion boat, armed and stepped the same way so a load-sized
             // delta cannot advance a run that only just started.
@@ -4408,6 +4424,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     stopProjectileAt(insertionVehicleHit);
                     continue;
                 }
+                if (projectile.hostile &&
+                    HitPilotedGunshipSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, insertionVehicleHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(insertionVehicleHit, normal);
+                    PlayMetalHitAudio(insertionVehicleHit, 1.0f);
+                    DamagePilotedGunship(2.4f * projectile.damageMultiplier);
+                    stopProjectileAt(insertionVehicleHit);
+                    continue;
+                }
                 XMFLOAT3 helicopterHit;
                 if (!projectile.hostile && HitHelicopterSegment(
                         projectile.previousPosition, projectile.position,
@@ -4601,6 +4630,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         XMFLOAT3 ignoredTowerBase{};
                         if (!FindCommTower(prefabEntityId, ignoredTowerBase))
                             scene.IgniteMaterial(prefabEntityId, hit, 1.65f);
+                    }
+                    // Turret and door-gun rounds wear tank armour down slowly.
+                    if (projectile.sourceHumvee >= 0 || projectile.aircraftGun) {
+                        const bool fromPlayer = !projectile.hostile &&
+                            (projectile.playerOwned ||
+                             (g_drivingHumvee && projectile.sourceHumvee ==
+                                 static_cast<int>(g_activeHumveeIndex)));
+                        DamageEnemyTankFromHeavyGun(prefabEntityId, hit,
+                            projectile.hostile, fromPlayer);
                     }
                     if (!projectile.harpoon ||
                         projectile.harpoonPiercedCount == 0)
@@ -5054,6 +5092,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // ?? begin frame ??
         UpdateRemoteInsertionVisuals(deltaTime);
         UpdateBoatEngineAudio(deltaTime);
+        UpdateHumveeEngineAudio(deltaTime);
 
         // Timed on its own: BeginFrame blocks on the frame fence, so folding it
         // into the setup scope below would report a GPU stall as CPU work. Read
@@ -5423,7 +5462,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const bool rrRequested = DLSS::GetSettings().enabled &&
                 DLSS::GetSettings().rayReconstruction &&
                 DLSS::RayReconstructionAvailable();
-            const bool lumenRequested = g_settings.lumenGI;
+            // Cascades replace the Lumen estimate, so they run on its path.
+            const bool lumenRequested =
+                g_settings.lumenGI || g_settings.radianceCascadesGI;
             const bool wantEnhanced = (scene.enhancedVisuals || rrRequested || lumenRequested) &&
                 usingVisibility &&
                 !visBuffer.validationMode && ddgiStatus.dxrSupported &&
@@ -5460,6 +5501,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enhancedRTReflections || rrRequested || lumenRequested);
             // Apply Lumen GI when it is requested and enhanced visuals are active.
             visBuffer.SetLumenGI(lumenRequested && visBuffer.enhancedVisualsActive);
+            visBuffer.SetRadianceCascadesGI(g_settings.radianceCascadesGI);
             const bool halfGI = visBuffer.lumenGIActive &&
                 g_settings.lumenGIHalfResolution &&
                 visBuffer.lumenGIHalfResolutionSupported;
@@ -5909,6 +5951,90 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     std::cerr << "C4 GLB failed; using procedural fallback"
                               << std::endl;
 
+                // Supply-drop crate. Whatever unit the importer lands it in,
+                // it is fitted to kCrateLength along its long axis and its
+                // bounds centre moved onto the origin, so the render transform
+                // is the rigid body's pose with nothing in between.
+                if (!g_weaponCrateModel) {
+                    const std::filesystem::path crateSource =
+                        "Content/Models/WeaponCrate/Weapon_Crate.fbx";
+                    std::string crateCookError;
+                    g_weaponCrateModel = CookedAssetLoader::LoadForSource(
+                        crateSource, g_dx12.device, g_dx12.commandList,
+                        &crateCookError);
+                    if (!g_weaponCrateModel)
+                        g_weaponCrateModel = FBXImporter::Load(
+                            crateSource.string(), g_dx12.device,
+                            g_dx12.commandList, 1.0f, false, true);
+                    const auto crateBounds = [](const std::shared_ptr<SceneNode>& root,
+                                                XMFLOAT3& mn, XMFLOAT3& mx) {
+                        mn = { FLT_MAX, FLT_MAX, FLT_MAX };
+                        mx = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                        XMFLOAT4X4 identity;
+                        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+                        root->UpdateGlobalTransform(identity);
+                        const auto walk = [&](const auto& self, const SceneNode* node) -> void {
+                            if (node->mesh) {
+                                const XMMATRIX world = XMLoadFloat4x4(&node->globalTransform);
+                                for (const MeshPrimitive& prim : node->mesh->primitives) {
+                                    if (!prim.boundsValid) continue;
+                                    for (int c = 0; c < 8; ++c) {
+                                        const XMFLOAT3 corner{
+                                            (c & 1) ? prim.boundsMax.x : prim.boundsMin.x,
+                                            (c & 2) ? prim.boundsMax.y : prim.boundsMin.y,
+                                            (c & 4) ? prim.boundsMax.z : prim.boundsMin.z };
+                                        XMFLOAT3 p;
+                                        XMStoreFloat3(&p, XMVector3TransformCoord(
+                                            XMLoadFloat3(&corner), world));
+                                        mn = { (std::min)(mn.x, p.x), (std::min)(mn.y, p.y),
+                                               (std::min)(mn.z, p.z) };
+                                        mx = { (std::max)(mx.x, p.x), (std::max)(mx.y, p.y),
+                                               (std::max)(mx.z, p.z) };
+                                    }
+                                }
+                            }
+                            for (const auto& child : node->children) self(self, child.get());
+                        };
+                        walk(walk, root.get());
+                        return mn.x <= mx.x;
+                    };
+                    XMFLOAT3 mn, mx;
+                    if (g_weaponCrateModel && crateBounds(g_weaponCrateModel, mn, mx)) {
+                        // Authored 171 x 36 x 58 cm (measured from the OBJ
+                        // export beside the FBX); kept at that real size.
+                        constexpr float kCrateLength = 1.71f;
+                        const float longest = (std::max)(
+                            { mx.x - mn.x, mx.y - mn.y, mx.z - mn.z });
+                        const float k = longest > 1e-4f ? kCrateLength / longest : 1.0f;
+                        SceneNode& root = *g_weaponCrateModel;
+                        root.scale = { root.scale.x * k, root.scale.y * k, root.scale.z * k };
+                        root.translation = { root.translation.x * k,
+                                             root.translation.y * k,
+                                             root.translation.z * k };
+                        crateBounds(g_weaponCrateModel, mn, mx);
+                        root.translation.x -= (mn.x + mx.x) * 0.5f;
+                        root.translation.y -= (mn.y + mx.y) * 0.5f;
+                        root.translation.z -= (mn.z + mx.z) * 0.5f;
+                        crateBounds(g_weaponCrateModel, mn, mx);
+                        g_weaponCrateHalfExtents = {
+                            (mx.x - mn.x) * 0.5f, (mx.y - mn.y) * 0.5f,
+                            (mx.z - mn.z) * 0.5f };
+                        std::cout << "Weapon crate ready: scale " << k
+                                  << ", half extents " << g_weaponCrateHalfExtents.x
+                                  << " x " << g_weaponCrateHalfExtents.y
+                                  << " x " << g_weaponCrateHalfExtents.z
+                                  << ", centre (" << (mn.x + mx.x) * 0.5f << ", "
+                                  << (mn.y + mx.y) * 0.5f << ", "
+                                  << (mn.z + mx.z) * 0.5f << ")"
+                                  << (crateCookError.empty() ? "" : " [uncooked]")
+                                  << std::endl;
+                    } else {
+                        g_weaponCrateModel.reset();
+                        std::cerr << "Weapon crate FBX failed; supply drop "
+                                     "falls back to the floating weapon" << std::endl;
+                    }
+                }
+
                 AdvanceLevelLoading(LevelLoadStage::Humvee,
                     "Humvee model, bounds and shadow mesh",
                     "Content/Models/Humvee/humvee.fbx",
@@ -5986,6 +6112,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             g_secondaryHelicopterMainRotorNode = child;
                         else if (child->name == "TailRotor")
                             g_secondaryHelicopterTailRotorNode = child;
+                    }
+                }
+                // Third clone: the gunship a level parks for the player.
+                g_parkedGunshipModel = CloneSceneNodeShallow(g_helicopterModel);
+                if (g_parkedGunshipModel) {
+                    for (const auto& child : g_parkedGunshipModel->children) {
+                        if (!child) continue;
+                        if (child->name == "MainRotor")
+                            g_parkedGunshipMainRotorNode = child;
+                        else if (child->name == "TailRotor")
+                            g_parkedGunshipTailRotorNode = child;
                     }
                 }
                 ConfigureHelicopterBounds();
@@ -6470,6 +6607,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 collectNode(g_insertionBoatModel);
                 collectNode(g_blackHawkModel);
                 collectNode(g_explosiveBarrelModel);
+                collectNode(g_weaponCrateModel);
                 collectNode(g_dandelionModel);
                 for (const auto& entry : g_prefabModelCache)
                     collectNode(entry.second.model);
@@ -8001,6 +8139,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (g_levelEditor.IsPlaying()) {
                 RenderPlayerHUD(scene);
                 DrawBoatDrivingPrompt();
+                DrawHelicopterPilotPrompt();
                 DrawArmoryShopPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 RenderArmoryShopPanel(hwnd);
@@ -8016,6 +8155,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene.player.godMode)
                     RenderPlayerHUD(scene);
                 DrawBoatDrivingPrompt();
+                DrawHelicopterPilotPrompt();
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawMarineFriendlyMarkers(
@@ -8023,6 +8163,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawIncomingStrikeMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawImpactDecalDebug(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawSupplyDropMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawWeaponPickupPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
@@ -8849,6 +8991,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_helicopterHoverAudio.Shutdown();
     g_patrolBoatEngineAudio.Shutdown();
     g_insertionBoatEngineAudio.Shutdown();
+    for (GunAudio& engine : g_humveeEngineAudio) engine.Shutdown();
     g_blackHawkAlarmAudio.Shutdown();
     g_fireLoopAudio.Shutdown();
     g_fireIgnitionAudio.Shutdown();

@@ -1273,11 +1273,20 @@ public:
                                                : g_helicopterModel,
                     drawShader, SecondaryHelicopterWorldMatrix(), lightSpace);
         }
+        if (drawDynamic && ParkedGunshipVisible())
+            DrawSceneNodeShadow(g_parkedGunshipModel, drawShader,
+                ParkedGunshipWorldMatrix(), lightSpace);
 
-        if (drawStatic) for (const PrefabRenderBatch& batch : prefabRenderBatches) {
-            if (batch.model && batch.castShadow && !batch.transforms.empty())
-                DrawSceneNodeShadowInstances(batch.model, drawShader,
-                    batch.transforms, lightSpace);
+        // A batch whose transforms are being rewritten (enemy tank hulls,
+        // rigid-body props) draws with the live casters; baked into the static
+        // pages it would invalidate every page on every frame it moves.
+        for (size_t index = 0; index < prefabRenderBatches.size(); ++index) {
+            const PrefabRenderBatch& batch = prefabRenderBatches[index];
+            if (!batch.model || !batch.castShadow || batch.transforms.empty())
+                continue;
+            if (BatchMoving(index) ? !drawDynamic : !drawStatic) continue;
+            DrawSceneNodeShadowInstances(batch.model, drawShader,
+                batch.transforms, lightSpace);
         }
 
         // Palm shadows use the same GPU wind as the visible mesh. Leaf cards run
@@ -1411,7 +1420,23 @@ public:
                 g_explosiveBarrelShadowModel
                     ? g_explosiveBarrelShadowModel : g_explosiveBarrelModel,
                 drawShader, barrelTransforms, lightSpace);
-        } else if (drawDynamic && !g_emptyLevelMode) for (
+        }
+        // Supply crates: the canopy shadow sweeping in is how a drop that
+        // lands behind the player is noticed.
+        if (drawDynamic && !g_emptyLevelMode && g_weaponCrateModel) {
+            std::vector<XMMATRIX> crateTransforms;
+            for (const WeaponPickup& pickup : scene.weaponPickups) {
+                if (!pickup.crate || !pickup.active || pickup.collected) continue;
+                crateTransforms.push_back(
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&pickup.rotation)) *
+                    XMMatrixTranslation(pickup.position.x, pickup.position.y,
+                                        pickup.position.z));
+            }
+            if (!crateTransforms.empty())
+                DrawSceneNodeShadowInstances(g_weaponCrateModel, drawShader,
+                                             crateTransforms, lightSpace);
+        }
+        if (!g_explosiveBarrelModel && drawDynamic && !g_emptyLevelMode) for (
             const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (barrel.active) {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
@@ -1626,6 +1651,7 @@ public:
         g_vsmResident = g_vsmRefreshed = g_vsmReused = 0;
         g_vsmSlotStates.fill(0);
         g_vsmSlotKeys.fill(VirtualShadows::Invalid);
+        UpdateBatchMotion(prefabRenderBatches);
 
         // Decide this before any cascade work: when virtual shadows are on they
         // replace the cascades outright rather than refining them, so the
@@ -1997,6 +2023,59 @@ private:
         for (const auto& child : node->children) AppendSpotNode(child);
     }
 
+    // Per prefab batch: is it being moved? Measured on level3v4's planning
+    // screen: one enemy tank's hull pose, rewritten each frame by its physics
+    // body, made the static inputs differ every frame, so all three VSM pages
+    // re-rendered the whole terrain every frame (Shadow/Terrain 16.3 ms).
+    //
+    // Detected from the transforms rather than flagged by each writer (tanks,
+    // rigid-body props, the objective aircraft, editor drags), so a new mover
+    // cannot reintroduce the per-frame invalidation by forgetting a flag. A
+    // batch that holds still for kBatchSettleFrames returns to the static
+    // pages; each move between the two sets costs one invalidation.
+    struct BatchMotion {
+        const SceneNode* model = nullptr;
+        size_t count = 0;
+        uint64_t hash = 0;
+        uint32_t stillFrames = 0;
+        bool moving = false;
+    };
+    static constexpr uint32_t kBatchSettleFrames = 120;
+    std::vector<BatchMotion> batchMotion;
+
+    bool BatchMoving(size_t index) const {
+        return index < batchMotion.size() && batchMotion[index].moving;
+    }
+
+    void UpdateBatchMotion(const std::vector<PrefabRenderBatch>& batches) {
+        batchMotion.resize(batches.size());
+        for (size_t index = 0; index < batches.size(); ++index) {
+            const PrefabRenderBatch& batch = batches[index];
+            uint64_t hash = 14695981039346656037ull;
+            const auto* bytes = reinterpret_cast<const unsigned char*>(
+                batch.transforms.data());
+            const size_t size = batch.transforms.size() * sizeof(XMMATRIX);
+            for (size_t i = 0; i < size; ++i)
+                hash = (hash ^ bytes[i]) * 1099511628211ull;
+            BatchMotion& motion = batchMotion[index];
+            // A rebuilt or resized batch is a new placement, not motion.
+            if (motion.model != batch.model.get() ||
+                motion.count != batch.transforms.size()) {
+                motion = { batch.model.get(), batch.transforms.size(), hash,
+                           kBatchSettleFrames, false };
+                continue;
+            }
+            if (hash != motion.hash) {
+                motion.hash = hash;
+                motion.stillFrames = 0;
+                motion.moving = true;
+            } else if (motion.moving &&
+                       ++motion.stillFrames >= kBatchSettleFrames) {
+                motion.moving = false;
+            }
+        }
+    }
+
     void UpdateSpotStaticInputs(const Scene& scene, const GeometryBuffers& geo,
         const std::vector<PrefabRenderBatch>& batches,
         const std::shared_ptr<SceneNode>& crateModel) {
@@ -2011,9 +2090,12 @@ private:
             AppendSpotInput(geo.cubeVBV.BufferLocation);
         }
         AppendSpotInput(batches.size());
-        for (const auto& batch : batches) {
+        for (size_t index = 0; index < batches.size(); ++index) {
+            const auto& batch = batches[index];
+            const bool moving = BatchMoving(index);
             AppendSpotInput(batch.castShadow);
-            if (!batch.castShadow) continue;
+            AppendSpotInput(moving);
+            if (!batch.castShadow || moving) continue;
             AppendSpotNode(batch.model);
             AppendSpotInput(batch.transforms.size());
             for (const auto& world : batch.transforms) {

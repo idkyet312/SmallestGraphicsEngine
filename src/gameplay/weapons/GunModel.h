@@ -273,6 +273,31 @@ public:
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
     }
+    // PlayerMesh for an arbitrary weapon id rather than the selected one, for
+    // weapons drawn in the world (pickups). Same fallbacks, and null for the
+    // designator, which has no imported mesh.
+    static std::shared_ptr<SceneMesh>& WeaponMesh(int weapon) {
+        static std::shared_ptr<SceneMesh> noImportedMesh;
+        switch (weapon) {
+        case 1: if (ShotgunLoaded()) return ShotgunMesh(); break;
+        case 2: if (RPGLoaded()) return RPGMesh(); break;
+        case 3: case kRetiredSuppressedR700:
+            if (R700Loaded()) return R700Mesh(); break;
+        case 6: if (ShotgunLoaded()) return ShotgunMesh(); break;
+        case 7:
+            if (HarpoonGunLoaded()) return HarpoonGunMesh();
+            if (ShotgunLoaded()) return ShotgunMesh();
+            break;
+        case 9: if (M4Loaded()) return M4Mesh(); break;
+        case 10: if (AK74Loaded()) return AK74Mesh(); break;
+        case 11: if (M9Loaded()) return M9Mesh(); break;
+        case 12: if (KrissLoaded()) return KrissMesh(); break;
+        case 13: if (GarandLoaded()) return GarandMesh(); break;
+        case kTargetDesignatorWeapon: return noImportedMesh;
+        default: break;
+        }
+        return Mesh();
+    }
     // Per-weapon placement in gun-local space. Each imported mesh has a
     // different distance from its rear bound to its support-hand grip, so one
     // shared offset cannot keep every weapon inside the same animated hands.

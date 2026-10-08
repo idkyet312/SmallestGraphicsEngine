@@ -10,6 +10,7 @@
 #include "VisibilityGeometryPool.h"
 #include "DLSSDX12.h"
 #include "BootTimer.h"
+#include "RadianceCascadesDX12.h"
 #include <DirectXPackedVector.h>
 #include <stb_image.h>
 #include <algorithm>
@@ -568,6 +569,11 @@ public:
     // Full-resolution Lumen traces each pixel; probes are its radiance cache
     // at hits. The opt-in shares irradiance on continuous surfaces.
     bool lumenGIActive = false;
+    bool radianceCascadesGIRequested = false;
+    bool radianceCascadesGIActive = false;
+private:
+    RadianceCascadesDX12 radianceCascades;
+public:
     bool lumenGIHalfResolutionActive = false;
     bool lumenGIHalfResolutionSupported = false;
     // Player-facing reflection roughness cutoff (settings menu). Used instead
@@ -3560,6 +3566,41 @@ public:
             }
         }
 
+        // Radiance cascades replace the Lumen estimate on the main view only:
+        // their atlases and tables belong to the frame slot, and the scope
+        // resolves earlier in the same frame.
+        bool useRadianceCascades = false;
+        std::array<D3D12_GPU_DESCRIPTOR_HANDLE,
+                   RadianceCascadesDX12::PassCount> cascadeTables{};
+        if (radianceCascadesGIRequested && lumenGIActive && useEnhanced &&
+            !ScopeSurfaceBound()) {
+            useRadianceCascades = radianceCascades.Ensure(
+                ResolveTierSource(useBindless ? ResolveTierBindlessEnhanced
+                                              : ResolveTierEnhanced),
+                useBindless, width, height);
+            if (useRadianceCascades) {
+                // After every per-frame rewrite of the enhanced heap above.
+                radianceCascades.PrepareDescriptors(frameSlot, enhancedDescHeap);
+                for (UINT pass = 0; pass < RadianceCascadesDX12::PassCount &&
+                                    useRadianceCascades; ++pass) {
+                    ID3D12DescriptorHeap* heap =
+                        radianceCascades.Heap(frameSlot, pass);
+                    if (!useBindless) {
+                        cascadeTables[pass] =
+                            heap->GetGPUDescriptorHandleForHeapStart();
+                        continue;
+                    }
+                    const UINT base = AllocateBindlessResolveTable(
+                        heap, RadianceCascadesDX12::DescriptorCount);
+                    useRadianceCascades = base != BINDLESS_INVALID_INDEX;
+                    if (useRadianceCascades)
+                        cascadeTables[pass] = bindlessHeap->GpuHandleAt(base);
+                }
+            }
+        }
+        if (!ScopeSurfaceBound())
+            radianceCascadesGIActive = useRadianceCascades;
+
         if (!useBindless) {
             g_dx12.device->CopyDescriptorsSimple(
                 useEnhanced ? kEnhancedResolveDescriptorCount : kResolveDescriptorCount,
@@ -3615,6 +3656,8 @@ public:
         ID3D12PipelineState* tiledTerrainPSO =
             TerrainOnlyResolveTiledPSOForTier(useBindless, useEnhanced);
         const bool useTileClassification =
+            // The cascade tier builds no tile-classified permutations.
+            !useRadianceCascades &&
             !ScopeSurfaceBound() && useTerrainResolve && tileClassifyReady && tiledGenericPSO &&
             tiledTerrainPSO && tileClassifyPSO && tileClassifyResetPSO &&
             genericTileListBuffer && terrainTileListBuffer &&
@@ -3636,6 +3679,27 @@ public:
         // Setup ends here: everything after this point is dispatch work that
         // has a scope of its own.
         setupScope.reset();
+
+        // The traces read the same depth, visibility IDs and TLAS as the
+        // resolve, so they run here, after its input transitions. The resolve
+        // then binds the cascade root signature to read the guides.
+        if (useRadianceCascades) {
+            const UINT64 constants =
+                frameConstantBuffer.GetGPUAddress(ViewFrameIndex());
+            ID3D12DescriptorHeap* sharedHeap =
+                useBindless ? bindlessHeap->Heap() : nullptr;
+            radianceCascades.Dispatch(cmdList, frameSlot, constants,
+                                      useBindless, sharedHeap, cascadeTables);
+            radianceCascades.BindResolve(cmdList, useBindless,
+                useBindless ? sharedHeap
+                    : radianceCascades.Heap(frameSlot,
+                                            RadianceCascadesDX12::ResolvePass),
+                constants, cascadeTables[RadianceCascadesDX12::ResolvePass]);
+            selectedPSO = radianceCascades.ResolvePSO(
+                useBindless, useTerrainResolve, false);
+            terrainOnlyPSO = radianceCascades.ResolvePSO(useBindless, true, true);
+            cmdList->SetPipelineState(selectedPSO);
+        }
 
         if (useTileClassification) {
             ProfilerDX12::Scope classifyScope(
@@ -4843,6 +4907,7 @@ public:
 
         visBufferRT.Reset();
         surfaceHistoryValid = false;
+        radianceCascades.ResetResources();
         outputTexture.Reset();
         dlssUpscaledTexture.Reset();
         presentTexture.Reset();
@@ -4953,7 +5018,31 @@ private:
         const UINT base = bindlessResolveTableBases[frameSlot % FRAME_COUNT];
         if (base == BINDLESS_INVALID_INDEX) return base;
         bindlessHeap->CopyTransientTable(base, sources.data(), descriptorCount);
+        WriteBindlessMaterialRecords(base);
+        return base;
+    }
 
+    // Same table in a fresh transient range: the cascade passes need one per
+    // pass, alive together, on top of the reserved resolve table.
+    UINT AllocateBindlessResolveTable(ID3D12DescriptorHeap* sourceHeap,
+                                      UINT descriptorCount) {
+        if (!bindlessHeap || !bindlessHeap->Initialized() || !sourceHeap ||
+            descriptorCount <= 7)
+            return BINDLESS_INVALID_INDEX;
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> sources(descriptorCount);
+        D3D12_CPU_DESCRIPTOR_HANDLE source =
+            sourceHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < descriptorCount; ++i) {
+            sources[i] = source;
+            source.ptr += g_dx12.cbvSrvUavDescriptorSize;
+        }
+        const UINT base = bindlessHeap->AllocateTransientTable(
+            sources.data(), descriptorCount);
+        if (base != BINDLESS_INVALID_INDEX) WriteBindlessMaterialRecords(base);
+        return base;
+    }
+
+    void WriteBindlessMaterialRecords(UINT base) {
         // Slot 7 is t7. Point it at this frame's bindless material-record slice;
         // all other entries mirror the already-refreshed legacy/enhanced table.
         D3D12_SHADER_RESOURCE_VIEW_DESC materials = {};
@@ -4967,7 +5056,6 @@ private:
         g_dx12.device->CreateShaderResourceView(
             bindlessMaterialDataBuffer.Get(), &materials,
             bindlessHeap->CpuHandleAt(base + 7));
-        return base;
     }
 
     // Writes the three terrain layer-array SRVs at `slot`, `slot+1`, `slot+2`.
@@ -6665,6 +6753,12 @@ private:
             ranges[20 + i].RegisterSpace = 0;
             ranges[20 + i].OffsetInDescriptorsFromTableStart = 105 + i;
         }
+        // Radiance cascades extend this exact table past its last slot.
+        static_assert(RadianceCascadesDX12::BaseDescriptorCount ==
+                      kEnhancedResolveDescriptorCount,
+                      "cascade tables must start where the enhanced table ends");
+        if (!bindless)
+            radianceCascades.Configure(ranges, _countof(ranges), samplers);
 
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -7619,6 +7713,16 @@ public:
     void SetLumenGI(bool on) {
         if (on != lumenGIActive) svgfHistoryValid = false;
         lumenGIActive = on;
+    }
+
+    // Replaces the Lumen estimate, so it only takes effect while Lumen is
+    // active. Until its pipelines finish compiling, the frame stays on Lumen.
+    void SetRadianceCascadesGI(bool on) {
+        if (on != radianceCascadesGIRequested) svgfHistoryValid = false;
+        radianceCascadesGIRequested = on;
+    }
+    const char* RadianceCascadesStatus() const {
+        return radianceCascades.Status();
     }
 
     bool EnhancedVisualsReady() const { return enhancedPipelineReady; }

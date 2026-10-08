@@ -66,9 +66,9 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         //   count R; tileSize = base (innermost) tile size.
         params.terrainStyle = 2u;   // clipmap mode
         params.islandScaleX = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleX, 12.0f));
+            (std::min)(scene.terrainIslandScaleX, kMaxTerrainIslandScale));
         params.islandScaleZ = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleZ, 12.0f));
+            (std::min)(scene.terrainIslandScaleZ, kMaxTerrainIslandScale));
         // 1 m base tiles at the mesh shader's 8 quads per side = 0.125 m per
         // vertex in ring 0. Authored heightmap stamps carry detail far finer
         // than the terrain could represent at 0.5 m, so stamped ridges still
@@ -151,17 +151,20 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
                   DeploymentPlanner::BuildCameraFrame(
                       islandRadius, deploymentRadius).terrainViewRadius);
 
-        // A deployment overview is not a clipmap. Every tile is eight metres
-        // wide and the mesh shader emits its complete 8x8 surface grid, giving
-        // one-metre terrain vertices from the island centre through the entire
+        // A deployment overview is not a clipmap. Every tile is the same size
+        // and the mesh shader emits its complete 8x8 surface grid, giving one
+        // uniform vertex spacing from the island centre through the entire
         // requested apron. This is a distinct topology from gameplay and does
-        // not inherit exponentially larger outer-ring tiles.
+        // not inherit exponentially larger outer-ring tiles. The spacing is
+        // the level's planning-map detail (Auto by default).
         params.terrainStyle &= ~TerrainRendererDX12::kStyleClipmap;
         params.terrainStyle |=
             TerrainRendererDX12::kStyleDeploymentOverview;
-        params.tileSize = DeploymentPlanner::DeploymentTerrainTileSize;
+        params.tileSize = DeploymentPlanner::DeploymentTerrainTileSizeFor(
+            requiredRadius, g_customLevelMode
+                ? g_game.world.Level().deploymentTerrainSpacing : 0);
         params.tilesX = DeploymentPlanner::DeploymentTerrainGridSide(
-            requiredRadius);
+            requiredRadius, params.tileSize);
         params.tilesZ = params.tilesX;
         params.originTileX = 0;
         params.originTileZ = 0;
@@ -533,7 +536,14 @@ static size_t LiveMarineCount() {
 // on the craft's collision volume and feed its existing failure health.
 static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
     const VehicleSystem& vehicles = g_game.vehicles;
-    if (vehicles.blackHawkVisible && vehicles.blackHawkCarryingPlayer) {
+    // A player at the controls is as aboard as a passenger: the chase camera
+    // floats well behind the airframe, so aiming at it would miss the craft.
+    if (g_pilotedHelicopter == PilotedHelicopter::Gunship) {
+        target = g_parkedGunshipFlight.position;
+        return true;
+    }
+    if (vehicles.blackHawkVisible &&
+        (vehicles.blackHawkCarryingPlayer || vehicles.blackHawkPiloted)) {
         target = vehicles.blackHawkPosition;
         target.y += 2.2f;
         return true;

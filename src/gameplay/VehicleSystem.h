@@ -6,6 +6,8 @@
 #include <cmath>
 #include <vector>
 
+#include "HelicopterFlight.h"
+
 // The rappel rope is a box3d simulation, referenced here by forward-declared
 // pointer on purpose. This header is included by GameArchitectureTests, which
 // links neither box3d nor the renderer; a by-value member would drag the physics
@@ -257,6 +259,9 @@ struct VehicleSystem {
     float humveeModelScale = 1.0f;
     DirectX::XMFLOAT3 helicopterModelCenter{};
     float helicopterModelScale = 1.0f;
+    // Metres from the draw origin (the mesh centre) down to its lowest point,
+    // at modelScale: how high the origin sits when the airframe is parked.
+    float helicopterModelBottomOffset = 0.0f;
 
     float helicopterLevelScale = 1.0f;
     float helicopterMainRotorAngle = 0.0f;
@@ -1205,9 +1210,12 @@ public:
     // BlackHawk: flies the player in at level start. The normal run lands; the
     // fast run holds above the spawn while the player rappels down. Enemy fire
     // can send either route through the same crash sequence.
+    // PlayerFlown: the player took the stick, so blackHawkFlight owns the pose
+    // from then on -- piloted, or settling empty once they climb out. Appended
+    // last so the logged phase numbers of the scripted run stay as they were.
     enum class BlackHawkPhase {
         Inbound, Descending, Rappelling, Unloading, Departing, Crashing, Down,
-        Gone };
+        Gone, PlayerFlown };
 
     static constexpr float BlackHawkStartHeight = 90.0f;
     static constexpr float BlackHawkDescentSpeed = 6.5f;
@@ -1411,6 +1419,73 @@ public:
         return true;
     }
 
+    // ---- Player at the stick ------------------------------------------------
+    // Once taken, blackHawkFlight owns the pose (phase PlayerFlown) for the rest
+    // of the run: flown while blackHawkPiloted, settling to the ground empty
+    // after the player climbs out, and flyable again from there.
+    HelicopterFlight blackHawkFlight;
+    HelicopterFlightInput blackHawkPilotInput;
+    bool blackHawkPiloted = false;
+    // Ground (or sea surface) under the airframe, set by the caller each frame
+    // before UpdateBlackHawk -- this header knows neither terrain nor water.
+    float blackHawkFlightGroundY = 0.0f;
+    // The squad had not been set down when the player took over, so they get
+    // out wherever the player lands instead (the caller reads and clears it).
+    bool blackHawkSquadAboard = false;
+
+    static HelicopterFlightTuning BlackHawkFlightTuning() {
+        HelicopterFlightTuning tuning;
+        tuning.maxSpeed = 46.0f;
+        tuning.maxStrafeSpeed = 14.0f;
+        tuning.maxClimbRate = 8.0f;
+        tuning.yawRate = 1.1f;
+        // blackHawkPosition is the bottom of the skids (see BlackHawkWorldMatrix).
+        tuning.restHeight = 0.0f;
+        return tuning;
+    }
+
+    // Scripted phases a pilot can take over from. Not on the rope (the player is
+    // outside the airframe), not once it is going down or gone.
+    bool CanTakeBlackHawkControls() const {
+        if (!blackHawkVisible || blackHawkPiloted) return false;
+        switch (blackHawkPhase) {
+        case BlackHawkPhase::Inbound:
+        case BlackHawkPhase::Descending:
+        case BlackHawkPhase::Unloading:
+        case BlackHawkPhase::Departing:
+        case BlackHawkPhase::PlayerFlown:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool TakeBlackHawkControls() {
+        if (!CanTakeBlackHawkControls()) return false;
+        if (blackHawkPhase != BlackHawkPhase::PlayerFlown) {
+            // Before the drop the marines are still in the back.
+            blackHawkSquadAboard =
+                blackHawkPhase == BlackHawkPhase::Inbound ||
+                blackHawkPhase == BlackHawkPhase::Descending;
+            blackHawkFlight.Adopt(blackHawkPosition, blackHawkVelocity,
+                                  blackHawkYaw, -blackHawkPitch, -blackHawkRoll,
+                                  /*onGround=*/false);
+            blackHawkPhase = BlackHawkPhase::PlayerFlown;
+        }
+        blackHawkPiloted = true;
+        blackHawkCarryingPlayer = false;
+        blackHawkDepartureHold = false;
+        blackHawkLanded = blackHawkFlight.grounded;
+        blackHawkPilotInput = {};
+        return true;
+    }
+
+    // The airframe stays in PlayerFlown and settles unpowered where it is.
+    void ReleaseBlackHawkControls() {
+        blackHawkPiloted = false;
+        blackHawkPilotInput = {};
+    }
+
     bool BlackHawkIsRappelling() const {
         return blackHawkPhase == BlackHawkPhase::Rappelling &&
                blackHawkCarryingPlayer;
@@ -1468,6 +1543,9 @@ public:
         blackHawkRopeReleaseRequested = true;
         blackHawkRopeCut = false;
         blackHawkRopeCutProgress = 0.0f;
+        blackHawkPiloted = false;
+        blackHawkPilotInput = {};
+        blackHawkSquadAboard = false;
         // Back the bird up along its heading so it flies in toward the spawn.
         blackHawkPosition = {
             dropOff.x - std::sin(approachHeading) * BlackHawkApproachDistance,
@@ -1509,6 +1587,9 @@ public:
         blackHawkRopeReleaseRequested = true;
         blackHawkRopeCut = false;
         blackHawkRopeCutProgress = 0.0f;
+        blackHawkPiloted = false;
+        blackHawkPilotInput = {};
+        blackHawkSquadAboard = false;
         // Sitting on the pad, not backed off down an approach: the climb starts
         // from where the aircraft actually is.
         blackHawkPosition = { pad.x, groundY, pad.z };
@@ -1522,10 +1603,14 @@ public:
         const DirectX::XMFLOAT3 poseAtEntry = blackHawkPosition;
         const bool idling = blackHawkPhase == BlackHawkPhase::Unloading;
         // The rotor winds down once the engine quits instead of holding revs.
+        // A parked, empty PlayerFlown airframe has its engine off.
+        const bool playerFlown = blackHawkPhase == BlackHawkPhase::PlayerFlown;
         const float rotorRate =
             blackHawkPhase == BlackHawkPhase::Down ? 0.0f :
             blackHawkPhase == BlackHawkPhase::Crashing ? 18.0f :
-            (idling ? 22.0f : 34.0f);
+            (playerFlown && !blackHawkPiloted)
+                ? (blackHawkLanded ? 0.0f : 18.0f) :
+            (idling || (playerFlown && blackHawkLanded) ? 22.0f : 34.0f);
         blackHawkRotorSpin += dt * rotorRate;
         blackHawkDroppedPlayer = false;
         blackHawkJustCrashed = false;
@@ -1702,6 +1787,18 @@ public:
             break;
         case BlackHawkPhase::Gone:
             break;
+        case BlackHawkPhase::PlayerFlown: {
+            blackHawkFlight.Step(blackHawkPilotInput, BlackHawkFlightTuning(),
+                                 dt, blackHawkFlightGroundY, blackHawkPiloted);
+            blackHawkPosition = blackHawkFlight.position;
+            blackHawkYaw = blackHawkFlight.yaw;
+            // The airframe draws nose-on-+Z (no half turn, unlike the gunship), so
+            // the flight model's nose-down -pitch and right-down +roll flip here.
+            blackHawkPitch = -blackHawkFlight.pitch;
+            blackHawkRoll = -blackHawkFlight.roll;
+            blackHawkLanded = blackHawkFlight.grounded;
+            break;
+        }
         }
 
         // Cabin size while anyone could be inside it; exterior size once it is
@@ -1720,7 +1817,10 @@ public:
                 (distance - BlackHawkShrinkStartDistance) /
                 (BlackHawkShrinkEndDistance - BlackHawkShrinkStartDistance)));
             blackHawkShrinkProgress = (std::max)(blackHawkShrinkProgress, target);
-        } else if (blackHawkPhase == BlackHawkPhase::Crashing) {
+        } else if (blackHawkPhase == BlackHawkPhase::Crashing ||
+                   blackHawkPhase == BlackHawkPhase::PlayerFlown) {
+            // Flown from the chase camera, nobody walks the cabin, so it eases
+            // to exterior size like a crash does.
             blackHawkShrinkProgress = (std::min)(1.0f,
                 blackHawkShrinkProgress + dt / BlackHawkCrashShrinkTime);
         }
@@ -1760,6 +1860,9 @@ public:
         blackHawkRopeReleaseRequested = true;
         blackHawkRopeCut = false;
         blackHawkRopeCutProgress = 0.0f;
+        blackHawkPiloted = false;
+        blackHawkPilotInput = {};
+        blackHawkSquadAboard = false;
     }
 
     // Kills the engine and starts the spiral, carrying whatever momentum the
@@ -1772,6 +1875,13 @@ public:
         if (blackHawkPhase == BlackHawkPhase::Rappelling &&
             blackHawkCarryingPlayer) {
             blackHawkCarryingPlayer = false;
+            blackHawkBailedOut = true;
+        }
+        // A shot-down pilot goes out the door and falls clear of the spiral;
+        // the caller sees blackHawkPiloted drop and hands the controls back.
+        if (blackHawkPiloted) {
+            blackHawkPiloted = false;
+            blackHawkPilotInput = {};
             blackHawkBailedOut = true;
         }
         // The rope goes down with the aircraft either way: a wreck spiralling

@@ -130,6 +130,11 @@ static void AwardCombatEvent(MoneyEvent event, int count = 1) {
 // Authored C4 brick, replacing the procedural boxes the charge used to be
 // drawn as. Shared by the viewmodel, the thrown charge and the placed one.
 std::shared_ptr<SceneNode>  g_c4Model;
+// Supply-drop weapon crate. Normalised at load so its bounds centre sits at
+// the model origin -- the rigid body's frame -- and its half extents are the
+// box hull the body is given.
+std::shared_ptr<SceneNode>  g_weaponCrateModel;
+XMFLOAT3 g_weaponCrateHalfExtents = { 0.85f, 0.18f, 0.29f };
 std::shared_ptr<SceneNode>  g_explosiveBarrelModel;
 std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
@@ -469,6 +474,33 @@ std::shared_ptr<SceneNode>  g_secondaryHelicopterTailRotorNode;
 static float                g_secondaryHelicopterRotorSpeedScale = 1.0f;
 static float                g_secondaryHelicopterMainRotorAngle = 0.0f;
 static float                g_secondaryHelicopterTailRotorAngle = 0.0f;
+// A third, unmanned gunship parked where the level places a parked_helicopter
+// entity, for the player to fly. Same shallow-clone arrangement as above.
+std::shared_ptr<SceneNode>  g_parkedGunshipModel;
+std::shared_ptr<SceneNode>  g_parkedGunshipMainRotorNode;
+std::shared_ptr<SceneNode>  g_parkedGunshipTailRotorNode;
+static bool                 g_parkedGunshipPresent = false;
+static bool                 g_parkedGunshipDead = false;
+static HelicopterFlight     g_parkedGunshipFlight;
+static XMFLOAT3             g_parkedGunshipSpawn{};
+static float                g_parkedGunshipSpawnYaw = 0.0f;
+static bool                 g_parkedGunshipNeedsPark = false;
+constexpr float             kParkedGunshipMaxHealth = 700.0f;
+static float                g_parkedGunshipHealth = kParkedGunshipMaxHealth;
+static float                g_parkedGunshipRotorSpeedScale = 0.0f;
+static float                g_parkedGunshipMainRotorAngle = 0.0f;
+static float                g_parkedGunshipTailRotorAngle = 0.0f;
+static float                g_parkedGunshipFireCooldown = 0.0f;
+static float                g_parkedGunshipRocketCooldown = 0.0f;
+// Which aircraft the player is at the controls of. The BlackHawk's own state
+// lives in VehicleSystem (blackHawkPiloted); this says which one the camera,
+// input and HUD follow.
+enum class PilotedHelicopter : uint8_t { None, Gunship, BlackHawk };
+static PilotedHelicopter    g_pilotedHelicopter = PilotedHelicopter::None;
+static bool                 g_pilotSavedGunVisible = true;
+static bool                 g_pilotSavedFPSMode = true;
+// Gunship controls, read in ProcessInput and flown in the frame update.
+static HelicopterFlightInput g_pilotInput;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
 static XMFLOAT3&            g_humveeModelCenter = g_game.vehicles.humveeModelCenter;
 static float&               g_humveeModelMinY = g_game.vehicles.humveeModelMinY;
@@ -922,6 +954,11 @@ GunAudio                    g_banditHitVoiceAudio;
 GunAudio                    g_helicopterHoverAudio;
 GunAudio                    g_patrolBoatEngineAudio;
 GunAudio                    g_insertionBoatEngineAudio;
+// Positional diesel loops, handed to the nearest running Humvees each frame.
+// Each slot keeps its own voice, so a level with more Humvees than slots only
+// voices the ones closest to the listener.
+constexpr size_t            kHumveeEngineVoices = 4;
+GunAudio                    g_humveeEngineAudio[kHumveeEngineVoices];
 // Cockpit alarm on the insertion BlackHawk, looped while it is critically
 // damaged so the player hears the failure before they see the ground.
 GunAudio                    g_blackHawkAlarmAudio;
@@ -1130,6 +1167,9 @@ struct HumveeGameplayState {
     float aiThrottle = 0.0f;
     float aiSteering = 0.0f;
     float aiTargetDistance = 0.0f;
+    // This machine's player at the wheel: the smoothed W/S throttle, so the
+    // engine note rises on the pedal before the chassis has picked up speed.
+    float playerThrottle = 0.0f;
     // Client-side: the host's latest pose, eased toward each frame.
     bool netPosed = false;
     XMFLOAT3 netPosition{};

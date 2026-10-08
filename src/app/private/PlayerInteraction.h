@@ -7,6 +7,50 @@ static void UpdateWeaponPickups(float dt) {
     for (WeaponPickup& pickup : scene.weaponPickups) {
         if (!pickup.active || pickup.collected) continue;
         pickup.bobPhase += dt;
+        if (pickup.crate) {
+            CreateSupplyCrateBody(pickup);
+            if (pickup.physicsHandle == 0) continue;
+            DestructionBodyPose pose;
+            if (!g_destruction.GetPropBodyPose(pickup.physicsHandle, pose)) {
+                // The world was rebuilt under it: remake it where it was.
+                pickup.physicsHandle = 0;
+                continue;
+            }
+            pickup.position = pose.position;
+            pickup.rotation = pose.rotation;
+            // Touchdown is the first time the canopy-speed fall is stopped.
+            // The canopy is cut there, so from then on it tips, slides and
+            // takes blasts as an ordinary loose box.
+            const XMFLOAT3& v = pose.linearVelocity;
+            if (!pickup.crateLanded &&
+                v.x * v.x + v.y * v.y + v.z * v.z <
+                    0.25f * kSupplyDropDescentRate * kSupplyDropDescentRate) {
+                pickup.crateLanded = true;
+                g_destruction.SetPropBodyLinearDamping(
+                    pickup.physicsHandle, kSupplyCrateLandedDamping);
+                char line[128];
+                std::snprintf(line, sizeof(line),
+                    "Supply crate landed: %s at (%.2f, %.2f, %.2f)",
+                    GunModel::WeaponName(pickup.weapon.legacyWeaponId),
+                    pickup.position.x, pickup.position.y, pickup.position.z);
+                SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+            }
+            continue;
+        }
+        // Parachute descent: a steady rate rather than gravity, so the crate
+        // can be watched in from the landing zone.
+        if (pickup.dropHeight > 0.0f) {
+            pickup.dropHeight = (std::max)(
+                0.0f, pickup.dropHeight - kSupplyDropDescentRate * dt);
+            if (pickup.dropHeight == 0.0f) {
+                char line[128];
+                std::snprintf(line, sizeof(line),
+                    "Supply drop landed: %s at (%.1f, %.1f, %.1f)",
+                    GunModel::WeaponName(pickup.weapon.legacyWeaponId),
+                    pickup.position.x, pickup.position.y, pickup.position.z);
+                SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+            }
+        }
     }
 }
 
@@ -120,6 +164,8 @@ static WeaponPickup* NearbyWeaponPickup() {
     float bestDistanceSq = FLT_MAX;
     for (WeaponPickup& pickup : scene.weaponPickups) {
         if (!pickup.active || pickup.collected) continue;
+        if (pickup.dropHeight > 0.0f) continue;   // still coming down
+        if (pickup.crate && !pickup.crateLanded) continue;
         // The launcher model has to be loaded before the weapon can be selected:
         // GunModel::PlayerMesh() would otherwise fall through to the AK and the
         // player would hold the wrong gun while firing rockets.
@@ -187,6 +233,12 @@ static bool CollectNearbyWeaponPickup() {
     // rather than pushing a new one keeps the count stable across a run.
     pickup->weapon = droppedSnapshot;
     pickup->bobPhase = 0.0f;
+    // The drop's HUD marker pointed at the ordered weapon; what is left here
+    // now is the player's own cast-off.
+    pickup->supplyDrop = false;
+    // The charge rides along outside the two slots (see LoadoutAllows), so
+    // an empty slot swapped out leaves nothing worth putting on the ground.
+    if (dropped == GunModel::kRemoteChargeWeapon) pickup->active = false;
     g_reloadAudio.Play(0.9f, 0.85f);
     return true;
 }

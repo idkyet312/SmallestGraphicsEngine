@@ -6066,6 +6066,19 @@ void DestructionDX12::DestroyPropBody(uint32_t handle) {
     m->propBodies.erase(it);
 }
 
+bool DestructionDX12::SetPropBodyLinearDamping(uint32_t handle, float damping) {
+    if (!m || handle == 0 || !(damping >= 0.0f) || !std::isfinite(damping))
+        return false;
+    const auto it = std::find_if(
+        m->propBodies.begin(), m->propBodies.end(),
+        [handle](const Impl::PropRuntime& prop) {
+            return prop.handle == handle;
+        });
+    if (it == m->propBodies.end() || B3_IS_NULL(it->body)) return false;
+    b3Body_SetLinearDamping(it->body, damping);
+    return true;
+}
+
 uint32_t DestructionDX12::CreateGrenadeBody(
     const XMFLOAT3& worldPosition, const XMFLOAT3& linearVelocity,
     bool capsuleShape, float gravityScale) {
