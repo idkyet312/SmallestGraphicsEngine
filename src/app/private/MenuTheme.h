@@ -728,6 +728,14 @@ static void VideoTab() {
         SaveGameSettings(g_settings);
     }
     ImGui::EndDisabled();
+    ImGui::BeginDisabled(!(g_settings.lumenGI || g_settings.radianceCascadesGI));
+    if (ToggleRow("Experimental Lumen Radiance Cache",
+                  "Caches bounce lighting in world space so most rays reuse it instead of shading their hit, and adds multi-bounce and local-light bounce. First use compiles a shader in the background.",
+                  &g_settings.lumenRadianceCache)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
     const SliderResult reflectionCutoff = SliderRow(
         "Reflection Roughness Cutoff",
         "Surfaces rougher than this skip ray-traced reflections and use the "

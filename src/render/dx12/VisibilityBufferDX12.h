@@ -11,6 +11,7 @@
 #include "DLSSDX12.h"
 #include "BootTimer.h"
 #include "RadianceCascadesDX12.h"
+#include "GIRadianceCacheDX12.h"
 #include <DirectXPackedVector.h>
 #include <stb_image.h>
 #include <algorithm>
@@ -229,6 +230,9 @@ public:
     // descriptor makes bindless sample an uninitialized heap entry.
     static constexpr UINT kResolveDescriptorCount = 92;
     static constexpr UINT kEnhancedResolveDescriptorCount = 108;
+    // Root UAV u16 (Lumen radiance cache) on the enhanced resolve root
+    // signatures, after the CBV, the table and the t90 root SRV.
+    static constexpr UINT kEnhancedRadianceCacheRootParameter = 3;
     // Heap index of the spot shadow atlas (t92). Sits one past the terrain
     // splatmap, which was the previous last slot.
     static constexpr UINT kSpotShadowAtlasSlot = 91;
@@ -571,8 +575,15 @@ public:
     bool lumenGIActive = false;
     bool radianceCascadesGIRequested = false;
     bool radianceCascadesGIActive = false;
+    // World radiance cache for Lumen hits (settings LumenRadianceCache).
+    // Mode is this frame's b5 value: 0 off, 1 on, 2 clear then on.
+    bool giRadianceCacheRequested = false;
+    UINT giRadianceCacheMode = 0;
 private:
     RadianceCascadesDX12 radianceCascades;
+    GIRadianceCacheDX12 giRadianceCache;
+    ResolveEntryPipelineDX12 rayQueryWarmup{ L"RayQueryWarmupMain",
+                                             "Ray query warm-up" };
 public:
     bool lumenGIHalfResolutionActive = false;
     bool lumenGIHalfResolutionSupported = false;
@@ -3445,6 +3456,21 @@ public:
         // still perfectly good.
         const bool savedSVGFHistoryValid = svgfHistoryValid;
         if (ScopeSurfaceBound()) svgfHistoryValid = false;
+        // The cache is used only once its refresh pass exists: that pass is
+        // what clears and evicts, so a table without it would never let go of
+        // a stale entry. The clear runs on the main view, before its resolve.
+        giRadianceCacheMode = 0;
+        if (useEnhanced && lumenGIActive && giRadianceCacheRequested &&
+            giRadianceCache.EnsureBuffer() &&
+            giRadianceCache.EnsurePipeline(
+                ResolveTierSource(useBindless ? ResolveTierBindlessEnhanced
+                                              : ResolveTierEnhanced),
+                useBindless,
+                useBindless ? bindlessEnhancedResolveRootSig.Get()
+                            : enhancedResolveRootSig.Get()))
+            giRadianceCacheMode =
+                giRadianceCache.ClearThisFrame() && !ScopeSurfaceBound() ? 2u
+                                                                        : 1u;
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
         }
@@ -3636,6 +3662,12 @@ public:
                 : (useEnhanced
                     ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
                     : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
+        // u16 Lumen radiance cache; every enhanced root signature declares it.
+        // Unallocated until first enabled, and never read while mode is 0.
+        if (useEnhanced && giRadianceCache.Address() != 0)
+            cmdList->SetComputeRootUnorderedAccessView(
+                kEnhancedRadianceCacheRootParameter,
+                giRadianceCache.Address());
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
@@ -3680,6 +3712,30 @@ public:
         // has a scope of its own.
         setupScope.reset();
 
+        // Relight (or clear) the radiance cache before this frame's lookups.
+        // Uses the resolve's own root signature and bindings; main view only.
+        if (giRadianceCacheMode != 0u && !ScopeSurfaceBound()) {
+            giRadianceCache.Refresh(cmdList, useBindless);
+            cmdList->SetPipelineState(selectedPSO);
+        }
+        // One-thread ray-query dispatch ahead of the resolve. Measured on Base
+        // (4060, 1080p): when the generic resolve was the first ray-query
+        // pipeline dispatched in the command list it took 3.02 ms; after any
+        // earlier ray-query dispatch -- even one whose threads exit at once --
+        // 1.87 ms, and the GPU frame dropped 1.4 ms. An empty pipeline with no
+        // ray-query code did not help. SGE_NO_RQ_WARMUP=1 skips it for A/B.
+        static const bool kNoRayQueryWarmup =
+            GetEnvironmentVariableA("SGE_NO_RQ_WARMUP", nullptr, 0) > 0;
+        if (useEnhanced && !kNoRayQueryWarmup &&
+            rayQueryWarmup.Ensure(
+                ResolveTierSource(useBindless ? ResolveTierBindlessEnhanced
+                                              : ResolveTierEnhanced),
+                useBindless, selectedRoot)) {
+            cmdList->SetPipelineState(rayQueryWarmup.PSO(useBindless));
+            cmdList->Dispatch(1, 1, 1);
+            cmdList->SetPipelineState(selectedPSO);
+        }
+
         // The traces read the same depth, visibility IDs and TLAS as the
         // resolve, so they run here, after its input transitions. The resolve
         // then binds the cascade root signature to read the guides.
@@ -3694,7 +3750,8 @@ public:
                 useBindless ? sharedHeap
                     : radianceCascades.Heap(frameSlot,
                                             RadianceCascadesDX12::ResolvePass),
-                constants, cascadeTables[RadianceCascadesDX12::ResolvePass]);
+                constants, cascadeTables[RadianceCascadesDX12::ResolvePass],
+                giRadianceCache.Address());
             selectedPSO = radianceCascades.ResolvePSO(
                 useBindless, useTerrainResolve, false);
             terrainOnlyPSO = radianceCascades.ResolvePSO(useBindless, true, true);
@@ -3787,6 +3844,10 @@ public:
                     : (useEnhanced
                         ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
                         : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
+            if (useEnhanced && giRadianceCache.Address() != 0)
+                cmdList->SetComputeRootUnorderedAccessView(
+                    kEnhancedRadianceCacheRootParameter,
+                    giRadianceCache.Address());
 
             selectedPSO = tiledGenericPSO;
         }
@@ -6178,9 +6239,11 @@ private:
             UINT  lumenGIHalfResolution;
             float mipGradScale;
             float detailMipGradScale;
-            UINT  halfResolutionPadding[1];
+            UINT  lumenHitShadeMode;
+            UINT  giRadianceCache;
+            UINT  giRadianceCachePadding[3];
         } constants;
-        static_assert(sizeof(EnhancedConstants) == 112,
+        static_assert(sizeof(EnhancedConstants) == 128,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
@@ -6227,7 +6290,17 @@ private:
         constants.lumenGI = lumenGIActive ? 1u : 0u;
         constants.lumenGIHalfResolution =
             (lumenGIHalfResolutionActive && !ScopeSurfaceBound()) ? 1u : 0u;
-        for (UINT& pad : constants.halfResolutionPadding) pad = 0u;
+        // Stage-0 Lumen cost split (A/B only): SGE_LUMEN_HIT_SHADE=1 drops the
+        // GI hit's sun shadow ray, =2 drops GI hit shading entirely.
+        static const UINT kLumenHitShadeMode = [] {
+            char text[8] = {};
+            return GetEnvironmentVariableA("SGE_LUMEN_HIT_SHADE", text,
+                                           sizeof(text)) > 0
+                ? static_cast<UINT>(std::clamp(atoi(text), 0, 2)) : 0u;
+        }();
+        constants.lumenHitShadeMode = kLumenHitShadeMode;
+        constants.giRadianceCache = giRadianceCacheMode;
+        for (UINT& pad : constants.giRadianceCachePadding) pad = 0u;
         // DLSS mip bias (DLSS Programming Guide 3.5): while DLSS / RR is the
         // temporal resolve, textures are sampled at display detail with
         // bias = log2(render / display) - 1 (-1 DLAA, -2 at 50%).
@@ -6760,7 +6833,7 @@ private:
         if (!bindless)
             radianceCascades.Configure(ranges, _countof(ranges), samplers);
 
-        D3D12_ROOT_PARAMETER params[3] = {};
+        D3D12_ROOT_PARAMETER params[4] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[0].Descriptor.RegisterSpace = 0;
@@ -6774,11 +6847,19 @@ private:
         params[2].Descriptor.ShaderRegister = 90;
         params[2].Descriptor.RegisterSpace = 0;
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // u16 Lumen radiance cache. A root UAV, so the descriptor table, its
+        // heap counts and the bindless transient copy are all unchanged.
+        params[kEnhancedRadianceCacheRootParameter].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[kEnhancedRadianceCacheRootParameter].Descriptor.ShaderRegister =
+            16;
+        params[kEnhancedRadianceCacheRootParameter].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        // Three: the shared resolveParams array carries the t90 tile-list root
-        // SRV alongside the CBV and the descriptor table.
-        rootSigDesc.NumParameters = 3;
+        // The CBV, the descriptor table, the t90 tile-list root SRV and the
+        // u16 radiance-cache root UAV.
+        rootSigDesc.NumParameters = _countof(params);
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 3;  // s0 wrap, s1 shadow cmp, s2 clamp (terrain splat)
         rootSigDesc.pStaticSamplers = samplers;
@@ -7698,6 +7779,9 @@ public:
         const bool wantActive = active && tlasAddress != 0;
         if (rtReflectionsChanged || wantActive != enhancedVisualsActive)
             svgfHistoryValid = false;
+        // A reallocated TLAS means the scene was rebuilt (level change or a
+        // large streaming step): cached surfaces may no longer exist.
+        if (tlasAddress != enhancedTLASAddress) giRadianceCache.RequestClear();
         enhancedTLASAddress = tlasAddress;
         const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
         // The current frame slot is idle by the time its allocator is reused,
@@ -7723,6 +7807,19 @@ public:
     }
     const char* RadianceCascadesStatus() const {
         return radianceCascades.Status();
+    }
+
+    // Starts empty whenever it is switched on: entries from an earlier session
+    // could describe geometry and lighting that no longer exist.
+    void SetLumenRadianceCache(bool on) {
+        if (on != giRadianceCacheRequested) {
+            svgfHistoryValid = false;
+            if (on) giRadianceCache.RequestClear();
+        }
+        giRadianceCacheRequested = on;
+    }
+    const char* LumenRadianceCacheStatus() const {
+        return giRadianceCache.Status();
     }
 
     bool EnhancedVisualsReady() const { return enhancedPipelineReady; }

@@ -1797,6 +1797,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
                                 << " rc=" << visBuffer.radianceCascadesGIActive
                                 << " rcStatus=" << visBuffer.RadianceCascadesStatus()
+                                << " giCache=" << visBuffer.giRadianceCacheMode
+                                << " giCacheMs=" << g_profiler.GpuScopeMs("Lumen Radiance Cache")
                                 << " captureFrame=" << poseCaptureFrames
                                 << " useDDGI=" << scene.useDDGI
                                 << " giIntensity=" << scene.giIntensity
@@ -5502,6 +5504,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // Apply Lumen GI when it is requested and enhanced visuals are active.
             visBuffer.SetLumenGI(lumenRequested && visBuffer.enhancedVisualsActive);
             visBuffer.SetRadianceCascadesGI(g_settings.radianceCascadesGI);
+            visBuffer.SetLumenRadianceCache(g_settings.lumenRadianceCache);
             const bool halfGI = visBuffer.lumenGIActive &&
                 g_settings.lumenGIHalfResolution &&
                 visBuffer.lumenGIHalfResolutionSupported;

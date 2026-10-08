@@ -136,13 +136,17 @@ public:
     // guide SRVs, and b6 with the trace-only fields zeroed.
     void BindResolve(ID3D12GraphicsCommandList* cmd, bool bindless,
                      ID3D12DescriptorHeap* heap, UINT64 frameConstants,
-                     D3D12_GPU_DESCRIPTOR_HANDLE table) {
+                     D3D12_GPU_DESCRIPTOR_HANDLE table,
+                     D3D12_GPU_VIRTUAL_ADDRESS radianceCache) {
         cmd->SetDescriptorHeaps(1, &heap);
         cmd->SetComputeRootSignature(Root(bindless));
         cmd->SetComputeRootConstantBufferView(0, frameConstants);
         cmd->SetComputeRootDescriptorTable(1, table);
         UINT constants[] = { 0u, ProbeSpacing, LevelCount, 1u };
         cmd->SetComputeRoot32BitConstants(3, 4, constants, 0);
+        // Edge pixels fall back to Lumen rays, which read the radiance cache.
+        if (radianceCache != 0)
+            cmd->SetComputeRootUnorderedAccessView(4, radianceCache);
     }
 
     void Dispatch(ID3D12GraphicsCommandList* cmd, UINT slot, UINT64 frameConstants,
@@ -246,7 +250,7 @@ private:
         extra.BaseShaderRegister = 11;
         extra.OffsetInDescriptorsFromTableStart = BaseDescriptorCount + 7;
         ranges.push_back(extra);
-        D3D12_ROOT_PARAMETER params[4] = {};
+        D3D12_ROOT_PARAMETER params[5] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -257,8 +261,11 @@ private:
         params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[3].Constants.ShaderRegister = 6;
         params[3].Constants.Num32BitValues = 4;
+        // u16 Lumen radiance cache, as on the enhanced resolve signature.
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[4].Descriptor.ShaderRegister = 16;
         D3D12_ROOT_SIGNATURE_DESC root = {};
-        root.NumParameters = 4;
+        root.NumParameters = 5;
         root.pParameters = params;
         root.NumStaticSamplers = 3;
         root.pStaticSamplers = staticSamplers;

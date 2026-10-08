@@ -363,7 +363,15 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // a negative bias on normals aliases the lighting, which RR then smears
     // into a crawling pattern under camera motion.
     float enhancedDetailMipGradScale;
-    uint  enhancedHalfResolutionPadding;
+    // Stage-0 measurement switch for the Lumen bounce (SGE_LUMEN_HIT_SHADE):
+    // 0 = normal, 1 = GI hits skip the sun shadow ray, 2 = GI hits skip
+    // ShadeRayHit entirely. Claimed from the padding slot; size unchanged.
+    uint  lumenHitShadeMode;
+    // World-space radiance cache for Lumen hits (gi_radiance_cache.hlsli):
+    // 0 = off, 1 = on, 2 = on and clear every entry this frame (level load,
+    // toggle). Appended; C++ mirror EnhancedConstants.
+    uint  giRadianceCache;
+    uint3 giRadianceCachePadding;
 };
 #if SGE_RADIANCE_CASCADES
 cbuffer RadianceCascadeConstants : register(b6) {
@@ -1048,16 +1056,69 @@ float3 RayHitAmbient(float3 hitPos, float3 n) {
 // Takes already-read hit data rather than a RayQuery, so the same shading serves
 // both radiance flag sets -- see the RayHit declaration for why that indirection
 // exists. Shadow queries are visibility-only and never reach here.
-float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
-    resolved = false;
-    if (enhancedHitGeometryCount == 0) return float3(0.0, 0.0, 0.0);
+// Set only around the Lumen GI call so lumenHitShadeMode 1 cannot change the
+// reflection or radiance-cascade paths that share ShadeRayHit.
+static bool gLumenGIHitShading = false;
+
+// Light arriving at a ray-hit surface: ambient (sky, or probes in Lumen mode)
+// plus the direct sun, shadowed by a second ray. Split from ShadeRayHit so the
+// GI radiance cache can relight a stored surface without re-reading its
+// triangle.
+float3 RayHitSunLight(float3 hitPos, float3 worldNormal) {
+    float3 incoming = 0.0;
+
+    // Direct sun at the hit, shadowed by a second ray. Without this test every
+    // bounce surface is lit as though unoccluded, which reads as light leaking
+    // through walls -- most visible in exactly the interior spaces where the
+    // probe grid misses and this path is doing the work.
+    if (lightType == 0 && !(gLumenGIHitShading && lumenHitShadeMode == 1u)) {
+        // Same convention the primary lighting uses: for a directional light
+        // lightPos IS the direction toward the sun, not a position. Negating it
+        // here lit every bounce surface from the wrong side, leaving the sky
+        // term to dominate and washing indirect light blue.
+        float3 sunDir = normalize(lightPos);
+        float sunNdotL = saturate(dot(worldNormal, sunDir));
+        if (sunNdotL > 0.0) {
+            RayDesc shadowRay;
+            shadowRay.Origin = hitPos + worldNormal * 0.02;
+            shadowRay.Direction = sunDir;
+            shadowRay.TMin = 0.0;
+            shadowRay.TMax = enhancedShadowRayLength;
+            RayQuery<SGE_RAY_FLAGS_SHADOW> shadowQuery;
+            shadowQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
+                                       shadowRay);
+            shadowQuery.Proceed();
+            if (shadowQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                incoming += lightColor * sunNdotL;
+        }
+    }
+    return incoming;
+}
+
+float3 RayHitIncoming(float3 hitPos, float3 worldNormal) {
+    return RayHitAmbient(hitPos, worldNormal) +
+           RayHitSunLight(hitPos, worldNormal);
+}
+
+// The surface a ray hit: position, facing normal, albedo and emissive. False
+// when the hit cannot be addressed (no hit-geometry table, or an unbound
+// geometry without a fallback colour); the caller keeps its approximation.
+// Unbound geometry with a snapshot colour (terrain) reports -rayDir as its
+// normal, the exact answer for the cosine-weighted bounce it mostly serves.
+bool ShadeRayHitSurface(RayHit hit, float3 rayDir, out float3 hitPos,
+                        out float3 worldNormal, out float3 albedo,
+                        out float3 hitEmissive) {
+    hitPos = hit.rayOrigin + rayDir * hit.rayT;
+    worldNormal = -rayDir;
+    albedo = 0.0;
+    hitEmissive = 0.0;
+    if (enhancedHitGeometryCount == 0) return false;
 
     // Same addressing the DispatchRays shader table uses: the instance's
     // contribution selects its mesh's first record, the geometry index offsets
     // within it.
     uint bindingIndex = hit.contribution + hit.geometryIndex;
-    if (bindingIndex >= enhancedHitGeometryCount)
-        return float3(0.0, 0.0, 0.0);
+    if (bindingIndex >= enhancedHitGeometryCount) return false;
 
     HitGeometry binding = hitGeometry[bindingIndex];
     if (binding.valid == 0) {
@@ -1069,35 +1130,15 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
         // largest surface in an outdoor scene and absorbs most of the downward
         // bounce rays. Without this those rays return dimmed sky and the ground
         // bounce reads grey instead of sand or grass.
-        if (binding.hasFallbackColor == 0) return float3(0.0, 0.0, 0.0);
+        if (binding.hasFallbackColor == 0) return false;
         // The surface normal is unavailable without vertex data. Facing the
         // normal back along the ray is exact for the cosine-weighted bounce
         // this mostly serves -- the ray was drawn about the SHADING point's
         // hemisphere, so the hit is being asked "how much light leaves you
         // toward me", and -rayDir is that direction. It is only approximate for
         // the sky term, which is the smaller part.
-        float3 fallbackNormal = -rayDir;
-        float3 fallbackPos = hit.rayOrigin + rayDir * hit.rayT;
-        float3 fallbackIncoming = RayHitAmbient(fallbackPos, fallbackNormal);
-        if (lightType == 0) {
-            float3 sunDir = normalize(lightPos);
-            float sunNdotL = saturate(dot(fallbackNormal, sunDir));
-            if (sunNdotL > 0.0) {
-                RayDesc fallbackShadow;
-                fallbackShadow.Origin = fallbackPos + fallbackNormal * 0.02;
-                fallbackShadow.Direction = sunDir;
-                fallbackShadow.TMin = 0.0;
-                fallbackShadow.TMax = enhancedShadowRayLength;
-                RayQuery<SGE_RAY_FLAGS_SHADOW> fallbackQuery;
-                fallbackQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
-                                             fallbackShadow);
-                fallbackQuery.Proceed();
-                if (fallbackQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-                    fallbackIncoming += lightColor * sunNdotL;
-            }
-        }
-        resolved = true;
-        return fallbackIncoming * binding.fallbackColor;
+        albedo = binding.fallbackColor;
+        return true;
     }
 
     // The BLAS and the visibility buffer consume the same index array in the
@@ -1138,7 +1179,7 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
     // below. Non-uniform scale would skew this; it would show as slightly
     // wrong bounce falloff, not as a structural error.
     float3x4 objectToWorld = hit.objectToWorld;
-    float3 worldNormal = normalize(float3(
+    float3 facingNormal = normalize(float3(
         dot(objectToWorld[0].xyz, objectNormal),
         dot(objectToWorld[1].xyz, objectNormal),
         dot(objectToWorld[2].xyz, objectNormal)));
@@ -1146,7 +1187,7 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
     // double-sided geometry, where the stored normal points away from the ray
     // and would otherwise light the surface from behind -- the same failure the
     // old faked normal had, just less often.
-    if (dot(worldNormal, rayDir) > 0.0) worldNormal = -worldNormal;
+    if (dot(facingNormal, rayDir) > 0.0) facingNormal = -facingNormal;
 
     // Select the record whose texture indices match the active heap model.
     // Both IDs are scene-stable, so toggling bindless never requires a TLAS
@@ -1156,8 +1197,8 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
 #else
     uint hitMaterialID = binding.materialID;
 #endif
-    float3 albedo = float3(0.72, 0.70, 0.66);
-    float3 hitEmissive = 0.0;
+    worldNormal = facingNormal;
+    albedo = float3(0.72, 0.70, 0.66);
     if (hitMaterialID != 0) {
         MaterialData hitMaterial = materials[hitMaterialID];
         albedo = hitMaterial.baseColorFactor.rgb;
@@ -1203,42 +1244,18 @@ float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
         }
     }
 
-    float3 hitPos = hit.rayOrigin + rayDir * hit.rayT;
+    return true;
+}
 
-    // Ambient light at the hit: sky plus probes in Lumen mode.
-    float3 incoming = RayHitAmbient(hitPos, worldNormal);
-
-    // Direct sun at the hit, shadowed by a second ray. Without this test every
-    // bounce surface is lit as though unoccluded, which reads as light leaking
-    // through walls -- most visible in exactly the interior spaces where the
-    // probe grid misses and this path is doing the work.
-    if (lightType == 0) {
-        // Same convention the primary lighting uses: for a directional light
-        // lightPos IS the direction toward the sun, not a position. Negating it
-        // here lit every bounce surface from the wrong side, leaving the sky
-        // term to dominate and washing indirect light blue.
-        float3 sunDir = normalize(lightPos);
-        float sunNdotL = saturate(dot(worldNormal, sunDir));
-        if (sunNdotL > 0.0) {
-            RayDesc shadowRay;
-            shadowRay.Origin = hitPos + worldNormal * 0.02;
-            shadowRay.Direction = sunDir;
-            shadowRay.TMin = 0.0;
-            shadowRay.TMax = enhancedShadowRayLength;
-            RayQuery<SGE_RAY_FLAGS_SHADOW> shadowQuery;
-            shadowQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
-                                       shadowRay);
-            shadowQuery.Proceed();
-            if (shadowQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-                incoming += lightColor * sunNdotL;
-        }
-    }
-
-    resolved = true;
+float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
+    float3 hitPos, worldNormal, albedo, hitEmissive;
+    resolved = ShadeRayHitSurface(hit, rayDir, hitPos, worldNormal, albedo,
+                                  hitEmissive);
+    if (!resolved) return float3(0.0, 0.0, 0.0);
     // Lambertian reflectance. The albedo is what makes this carry colour, and
     // it is the whole point of the table. Emissive surfaces light the scene in
     // Lumen mode.
-    return incoming * albedo + hitEmissive;
+    return RayHitIncoming(hitPos, worldNormal) * albedo + hitEmissive;
 }
 
 // One stochastic GGX-importance-sampled reflection ray against the static
@@ -1383,6 +1400,8 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 // choice the reflection path makes, and for the same reason: the variance is
 // what the SVGF temporal pass is there to resolve. The caller feeds this raw
 // sample to the accumulator rather than averaging here.
+#include "gi_radiance_cache.hlsli"
+
 float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
     uint pixelSeed = MatVarHashUint(pixel.x * 2654435761u ^
                                     pixel.y * 2246822519u);
@@ -1428,7 +1447,43 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
         // coloured surface carries that colour. This is the difference between
         // GI that only darkens and GI that bleeds colour.
         bool resolved = false;
-        float3 shaded = ShadeRayHit(ReadGIHit(query), rayDir, resolved);
+        float3 shaded = 0.0;
+        [branch] if (lumenHitShadeMode != 2u) {
+            // Cache first: a hit in a cell another ray already shaded costs one
+            // lookup instead of a material fetch and a shadow ray. Only cache
+            // misses shade live, and the lane that claimed the cell stores it.
+            uint cacheState = GI_CACHE_FULL;
+            uint cacheSlot = 0u;
+            GICacheKey cacheKey = (GICacheKey)0;
+            [branch] if (giRadianceCache != 0u) {
+                float3 hitPos = ray.Origin + rayDir * query.CommittedRayT();
+                uint lod = GICacheLod(hitPos);
+                float3 lookup = GICacheJitter(hitPos, lod,
+                    pixelSeed ^ (enhancedFrameIndex * 0x9e3779b9u));
+                cacheKey = GICacheMakeKey(lookup, -rayDir, lod);
+                cacheState = GICacheFind(cacheKey, cacheSlot, shaded);
+                resolved = cacheState == GI_CACHE_HIT;
+            }
+            [branch] if (cacheState != GI_CACHE_HIT) {
+                float3 hitPos, hitNormal, albedo, emissive;
+                gLumenGIHitShading = true;
+                resolved = ShadeRayHitSurface(ReadGIHit(query), rayDir, hitPos,
+                                              hitNormal, albedo, emissive);
+                if (resolved)
+                    shaded = RayHitIncoming(hitPos, hitNormal) * albedo +
+                             emissive;
+                gLumenGIHitShading = false;
+                if (cacheState == GI_CACHE_CLAIMED) {
+                    // An unaddressable hit has no surface to relight, so the
+                    // cell is released rather than holding the sky fallback.
+                    if (resolved)
+                        GICacheStore(cacheSlot, cacheKey.checksum, shaded,
+                                     hitPos, hitNormal, albedo, emissive);
+                    else
+                        giCacheEntries[cacheSlot * GI_CACHE_STRIDE].x = 0u;
+                }
+            }
+        }
         incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
     }
     return SanitizeRaySample(incoming) * giIntensity;
@@ -3836,3 +3891,121 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
     outputColor[pixel] = float4(result, 1.0);
 #endif
 }
+
+#if SGE_ENHANCED_VISUALS
+// Relights a slice of the Lumen radiance cache (gi_radiance_cache.hlsli) each
+// frame, before the resolve reads it. The stored surface is lit by the sun
+// (shadow ray), the local lights, and one cosine bounce ray whose hit reads
+// the cache itself. That bounce replaces the sky/DDGI ambient the resolve used
+// when it inserted the cell, so every level gets multiple bounces. The result
+// blends in with an EMA over GI_CACHE_MAX_SAMPLES; cells nobody has looked up
+// for GI_CACHE_EVICT_FRAMES are released.
+[numthreads(64, 1, 1)]
+void GICacheRefreshMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
+    if (giRadianceCache == 2u) {
+        // Clear: one thread per entry over the whole table.
+        if (dispatchThreadID.x < GI_CACHE_CAPACITY) {
+            uint base = dispatchThreadID.x * GI_CACHE_STRIDE;
+            giCacheEntries[base] = 0u;
+            giCacheEntries[base + 1u] = 0u;
+            giCacheEntries[base + 2u] = 0u;
+        }
+        return;
+    }
+    if (giRadianceCache == 0u ||
+        dispatchThreadID.x >= GI_CACHE_REFRESH_PER_FRAME)
+        return;
+    uint index = (enhancedFrameIndex * GI_CACHE_REFRESH_PER_FRAME +
+                  dispatchThreadID.x) & (GI_CACHE_CAPACITY - 1u);
+    uint base = index * GI_CACHE_STRIDE;
+    uint4 head = giCacheEntries[base];
+    if (head.x == 0u) return;
+    if (enhancedFrameIndex - head.w > GI_CACHE_EVICT_FRAMES) {
+        giCacheEntries[base] = 0u;
+        giCacheEntries[base + 1u] = 0u;
+        giCacheEntries[base + 2u] = 0u;
+        return;
+    }
+    uint samples = GICacheSamples(head);
+    if (samples == 0u) return;
+
+    uint4 surface = giCacheEntries[base + 1u];
+    uint4 material = giCacheEntries[base + 2u];
+    float3 position = asfloat(surface.xyz);
+    float3 normal = GICacheOctDecode(GICacheUnpackSnorm2(surface.w));
+    float3 albedo = GICacheUnpackUnorm3(material.x);
+    float3 emissive = float3(f16tof32(material.y), f16tof32(material.y >> 16u),
+                             f16tof32(material.z));
+
+    // Direct light, as the resolve lights a hit, plus every local light. The
+    // view vector only feeds the specular term, which roughness 1 zeroes.
+    float3 incoming = RayHitSunLight(position, normal);
+    for (int light = 0; light < min(numPointLights, 64); ++light)
+        incoming += calculatePointLight(light, position, normal, normal, 1.0);
+
+    // One cosine-weighted bounce. Its radiance is an unbiased estimate of the
+    // ambient term in the same units (the resolve's own GI ray works the same
+    // way), so it stands in for RayHitAmbient here.
+    uint seed = GICachePcg(index ^ GICachePcg(enhancedFrameIndex));
+    float2 xi = float2(GICachePcg(seed), GICachePcg(seed ^ 0x5bd1e995u)) *
+                (1.0 / 4294967296.0);
+    float phi = 6.2831853071 * xi.x;
+    float cosTheta = sqrt(1.0 - xi.y);
+    float sinTheta = sqrt(xi.y);
+    float3 up = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                      : float3(1.0, 0.0, 0.0);
+    float3 tangentX = normalize(cross(up, normal));
+    float3 tangentY = cross(normal, tangentX);
+    float3 bounceDir = normalize(tangentX * (sinTheta * cos(phi)) +
+                                 tangentY * (sinTheta * sin(phi)) +
+                                 normal * cosTheta);
+    RayDesc ray;
+    ray.Origin = position + normal * 0.02;
+    ray.Direction = bounceDir;
+    ray.TMin = 0.0;
+    ray.TMax = enhancedReflectionRayLength;
+    RayQuery<SGE_RAY_FLAGS_GI> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    while (query.Proceed()) {}
+    float3 bounce = SampleReflectionProbe(bounceDir, 1.0);
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        float3 hitPos = ray.Origin + bounceDir * query.CommittedRayT();
+        uint lod = GICacheLod(hitPos);
+        float3 cached;
+        if (GICacheLookup(GICacheMakeKey(hitPos, -bounceDir, lod), cached)) {
+            bounce = cached;
+        } else {
+            bool resolved = false;
+            float3 shaded = ShadeRayHit(ReadGIHit(query), bounceDir, resolved);
+            bounce = resolved ? shaded : bounce * enhancedReflectionOcclusion;
+        }
+    }
+    incoming += SanitizeRaySample(bounce);
+
+    float3 radiance = incoming * albedo + emissive;
+    samples = min(samples + 1u, GI_CACHE_MAX_SAMPLES);
+    radiance = lerp(GICacheRadiance(head), radiance, 1.0 / (float)samples);
+    giCacheEntries[base] = GICachePackHead(head.x, radiance, samples, head.w);
+}
+#endif
+
+#if SGE_ENHANCED_VISUALS
+// Dispatched as one thread just before the generic resolve; see the C++ call
+// site for the measurement. Its pipeline must contain ray-query code -- an
+// empty one did not help -- so the trace sits behind a test that never passes
+// at runtime but that the compiler cannot fold away.
+[numthreads(1, 1, 1)]
+void RayQueryWarmupMain() {
+    if (enhancedFrameIndex != 0xffffffffu) return;
+    RayDesc ray;
+    ray.Origin = cameraPos;
+    ray.Direction = float3(0.0, 1.0, 0.0);
+    ray.TMin = 0.0;
+    ray.TMax = 1e-3;
+    RayQuery<SGE_RAY_FLAGS_SHADOW> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    query.Proceed();
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        outputRayMask[uint2(0, 0)] = 0u;
+}
+#endif
