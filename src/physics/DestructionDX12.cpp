@@ -18,6 +18,7 @@
 #include "BoatPhysics.h"
 #include "ProfilerDX12.h"
 #include <box3d/box3d.h>
+#include "CollisionMeshCache.h"
 
 #include <algorithm>
 #include <cstring>
@@ -33,6 +34,9 @@
 #include <list>
 #include <optional>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <malloc.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -3957,6 +3961,9 @@ struct DestructionDX12::StaticMeshRegistry {
         // different one is not mistaken for it.
         float probe[6] = {};
         b3MeshData* mesh = nullptr;
+        // Read from the bake rather than built by b3CreateMesh: the blob is
+        // ours (_aligned_malloc), so b3DestroyMesh must not free it.
+        bool baked = false;
         int users = 0;
     };
     struct Instance {
@@ -3970,8 +3977,94 @@ struct DestructionDX12::StaticMeshRegistry {
     std::vector<Instance> instances;
 
     ~StaticMeshRegistry() {
-        for (Shared& entry : shared)
-            if (entry.mesh) b3DestroyMesh(entry.mesh);
+        for (Shared& entry : shared) Free(entry);
+    }
+
+    static void Free(Shared& entry) {
+        if (!entry.mesh) return;
+        if (entry.baked) _aligned_free(entry.mesh);
+        else b3DestroyMesh(entry.mesh);
+        entry.mesh = nullptr;
+    }
+
+    // ---- Physics mesh bake --------------------------------------------------
+    // b3CreateMesh welds, identifies edges and builds a BVH: ~360 ms for the
+    // airfield's 310k triangles, every level start. Its result is one flat,
+    // offset-addressed blob (byteCount bytes, no pointers), so it is saved
+    // after the first build and read back afterwards. Files are named by a hash
+    // of the triangle soup, the weld settings and Box3D's mesh version, so a
+    // changed model or a Box3D upgrade simply misses and rebuilds.
+    struct BakeHeader {
+        uint32_t magic = 0x4D504753;  // "SGPM"
+        uint32_t byteCount = 0;
+        uint64_t inputHash = 0;
+        uint64_t meshVersion = B3_MESH_VERSION;
+    };
+
+    static uint64_t HashSoup(const StaticMeshColliderDesc& desc,
+                             const b3MeshDef& def) {
+        uint64_t hash = 1469598103934665603ull ^ B3_MESH_VERSION;
+        const auto mix = [&hash](const void* data, size_t bytes) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            for (size_t i = 0; i < bytes; ++i)
+                hash = (hash ^ p[i]) * 1099511628211ull;
+        };
+        mix(desc.triangles, desc.triangleCount * 9 * sizeof(float));
+        mix(&def.weldVertices, sizeof(def.weldVertices));
+        mix(&def.weldTolerance, sizeof(def.weldTolerance));
+        mix(&def.identifyEdges, sizeof(def.identifyEdges));
+        return hash;
+    }
+
+    static std::filesystem::path BakePath(uint64_t hash) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "%016llx.b3mesh",
+                      static_cast<unsigned long long>(hash));
+        return std::filesystem::path("Content") / "Cooked" / "PhysicsMesh" / name;
+    }
+
+    static b3MeshData* LoadBake(uint64_t hash) {
+        if (!CollisionCache::Enabled()) return nullptr;
+        std::ifstream stream(BakePath(hash), std::ios::binary);
+        if (!stream) return nullptr;
+        BakeHeader header;
+        stream.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (stream.gcount() != static_cast<std::streamsize>(sizeof(header)) ||
+            header.magic != BakeHeader{}.magic ||
+            header.meshVersion != B3_MESH_VERSION ||
+            header.inputHash != hash ||
+            header.byteCount < sizeof(b3MeshData)) return nullptr;
+        // Box3D allocates meshes 32-byte aligned; match it.
+        auto* mesh = static_cast<b3MeshData*>(_aligned_malloc(header.byteCount, 32));
+        if (!mesh) return nullptr;
+        stream.read(reinterpret_cast<char*>(mesh), header.byteCount);
+        if (stream.gcount() != static_cast<std::streamsize>(header.byteCount) ||
+            mesh->version != B3_MESH_VERSION ||
+            mesh->byteCount != static_cast<int>(header.byteCount)) {
+            _aligned_free(mesh);
+            return nullptr;
+        }
+        return mesh;
+    }
+
+    static void SaveBake(uint64_t hash, const b3MeshData* mesh) {
+        if (!CollisionCache::Enabled() || !mesh || mesh->byteCount <= 0) return;
+        const std::filesystem::path path = BakePath(hash);
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        std::filesystem::path temporary = path;
+        temporary += ".tmp";
+        {
+            std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+            if (!stream) return;
+            BakeHeader header;
+            header.byteCount = static_cast<uint32_t>(mesh->byteCount);
+            header.inputHash = hash;
+            stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            stream.write(reinterpret_cast<const char*>(mesh), mesh->byteCount);
+            if (!stream) return;
+        }
+        std::filesystem::rename(temporary, path, error);
     }
 
     static void Probe(const StaticMeshColliderDesc& desc, float out[6]) {
@@ -4011,13 +4104,20 @@ struct DestructionDX12::StaticMeshRegistry {
         def.weldVertices = true;
         def.weldTolerance = 0.001f;
         def.identifyEdges = true;
-        b3MeshData* mesh = b3CreateMesh(&def, nullptr, 0);
-        if (!mesh) return nullptr;
+        const uint64_t hash = HashSoup(desc, def);
+        b3MeshData* mesh = LoadBake(hash);
+        const bool baked = mesh != nullptr;
+        if (!mesh) {
+            mesh = b3CreateMesh(&def, nullptr, 0);
+            if (!mesh) return nullptr;
+            SaveBake(hash, mesh);
+        }
         Shared entry;
         entry.source = desc.source;
         entry.triangleCount = desc.triangleCount;
         std::memcpy(entry.probe, probe, sizeof(probe));
         entry.mesh = mesh;
+        entry.baked = baked;
         entry.users = 1;
         shared.push_back(entry);
         return mesh;
@@ -4031,7 +4131,7 @@ struct DestructionDX12::StaticMeshRegistry {
     void DropUnused() {
         for (size_t i = shared.size(); i-- > 0;) {
             if (shared[i].users > 0) continue;
-            if (shared[i].mesh) b3DestroyMesh(shared[i].mesh);
+            Free(shared[i]);
             shared.erase(shared.begin() + i);
         }
     }

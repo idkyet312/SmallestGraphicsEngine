@@ -711,3 +711,121 @@ static void DrawJitterDebug(VisibilityBufferDX12& vb) {
         }
     }
 }
+
+// SGE_AI_STUCK_TRACE=1: logs every on-foot actor that asked to move but did not.
+// Windows of 2 s; an actor is "stuck" when the AI commanded more than 1.5 m of
+// travel and it ended up less than a quarter of that from where it started.
+// Each line names the stage that ate the motion: the AI step itself (aiMove),
+// the prop pushout (prefabPush) or the vehicle pushout (vehiclePush), plus the
+// navmesh state, so a stall can be attributed rather than inferred.
+struct AiStuckWindow {
+    XMFLOAT3 start{};
+    float elapsed = 0.0f;
+    float commanded = 0.0f;
+    float aiMove = 0.0f;
+    float prefabPush = 0.0f;
+    float vehiclePush = 0.0f;
+    bool pathFailed = false;
+};
+
+static bool AiStuckTraceEnabled() {
+    static const bool enabled =
+        GetEnvironmentVariableA("SGE_AI_STUCK_TRACE", nullptr, 0) > 0;
+    return enabled;
+}
+
+static std::ofstream& AiStuckTraceLog() {
+    static std::ofstream log("ai_stuck.log", std::ios::trunc);
+    return log;
+}
+
+static void AiStuckTraceSample(SkinnedEnemy& actor, float dt,
+                               const XMFLOAT3& beforeUpdate,
+                               const XMFLOAT3& afterUpdate,
+                               const XMFLOAT3& afterPrefab,
+                               const XMFLOAT3& afterVehicle) {
+    static std::unordered_map<SkinnedEnemy*, AiStuckWindow> windows;
+    static uint64_t windowCount = 0, stuckCount = 0;
+    static float totalTime = 0.0f;
+    const auto flat = [](const XMFLOAT3& a, const XMFLOAT3& b) {
+        const float dx = b.x - a.x, dz = b.z - a.z;
+        return std::sqrt(dx * dx + dz * dz);
+    };
+    AiStuckWindow& w = windows[&actor];
+    if (w.elapsed <= 0.0f) w.start = beforeUpdate;
+    w.elapsed += dt;
+    w.commanded += actor.debugCommandedSpeed * dt;
+    w.aiMove += flat(beforeUpdate, afterUpdate);
+    w.prefabPush += flat(afterUpdate, afterPrefab);
+    w.vehiclePush += flat(afterPrefab, afterVehicle);
+    if (!actor.debugLastPathFound) w.pathFailed = true;
+    if (w.elapsed < 2.0f) return;
+
+    ++windowCount;
+    const float actual = flat(w.start, afterVehicle);
+    if (w.commanded > 1.5f && actual < w.commanded * 0.25f) {
+        ++stuckCount;
+        XMFLOAT3 nearest{};
+        const bool onMesh = g_navigation.NearestWalkable(afterVehicle, 0.3f, nearest);
+        const bool nearMesh = onMesh ||
+            g_navigation.NearestWalkable(afterVehicle, 2.0f, nearest);
+        const char* awareness =
+            actor.Awareness() == SkinnedEnemy::AwarenessState::Combat ? "Combat" :
+            actor.Awareness() == SkinnedEnemy::AwarenessState::Alert ? "Alert" :
+            "Patrol";
+        const XMFLOAT3 dest = actor.DebugNavigationDestination();
+        char line[512];
+        std::snprintf(line, sizeof(line),
+            "STUCK id=%p faction=%d %s pos=(%.2f,%.2f,%.2f) commanded=%.2f "
+            "actual=%.2f aiMove=%.2f prefabPush=%.2f vehiclePush=%.2f "
+            "pathFailed=%d path=%zu wp=%zu dest=(%.1f,%.1f) cover=%d onMesh=%d "
+            "nearMesh=%d nearest=(%.2f,%.2f)",
+            static_cast<void*>(&actor), static_cast<int>(actor.faction),
+            awareness, afterVehicle.x, afterVehicle.y, afterVehicle.z,
+            w.commanded, actual, w.aiMove, w.prefabPush, w.vehiclePush,
+            w.pathFailed ? 1 : 0, actor.DebugPathSize(),
+            actor.DebugPathWaypoint(), dest.x, dest.z,
+            actor.DebugHasCoverTarget() ? 1 : 0, onMesh ? 1 : 0,
+            nearMesh ? 1 : 0, nearest.x, nearest.z);
+        AiStuckTraceLog() << line << "\n";
+        // What pushes back: probe a step ahead along the facing.
+        const float feet = afterVehicle.y + actor.footOffset;
+        const XMFLOAT3 probe{ afterVehicle.x + std::sin(actor.yaw) * 0.2f, feet,
+                              afterVehicle.z + std::cos(actor.yaw) * 0.2f };
+        for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+            const CollisionMeshPushout pushout = CollisionMeshInstanceResolveCapsule(
+                instance, probe, 0.42f, 1.75f, kBanditMaxStepDown);
+            if (!pushout.touched) continue;
+            char detail[256];
+            std::snprintf(detail, sizeof(detail),
+                "    mesh entity=%llu push=(%.2f,%.2f,%.2f) floor=%d floorY=%.2f feet=%.2f\n",
+                static_cast<unsigned long long>(instance.entityId),
+                pushout.displacement.x, pushout.displacement.y,
+                pushout.displacement.z, pushout.hasFloor ? 1 : 0,
+                pushout.floorY, feet);
+            AiStuckTraceLog() << detail;
+        }
+        for (const PrefabCollider& collider : g_prefabColliders) {
+            if (g_meshCollisionEntities.count(collider.entityId)) continue;
+            const XMFLOAT3 local = PrefabColliderToLocal(collider, probe);
+            if (std::abs(local.x) >= collider.halfExtents.x + 0.42f ||
+                std::abs(local.z) >= collider.halfExtents.z + 0.42f) continue;
+            char detail[256];
+            std::snprintf(detail, sizeof(detail),
+                "    box entity=%llu prefab=%s center=(%.2f,%.2f,%.2f) half=(%.2f,%.2f,%.2f) feet=%.2f\n",
+                static_cast<unsigned long long>(collider.entityId),
+                collider.prefabId.c_str(), collider.center.x, collider.center.y,
+                collider.center.z, collider.halfExtents.x,
+                collider.halfExtents.y, collider.halfExtents.z, feet);
+            AiStuckTraceLog() << detail;
+        }
+    }
+    totalTime += w.elapsed;
+    if (windowCount % 50 == 0) {
+        AiStuckTraceLog() << "SUMMARY windows=" << windowCount
+                          << " stuck=" << stuckCount
+                          << " actorSeconds=" << totalTime << "\n";
+        AiStuckTraceLog().flush();
+    }
+    w = AiStuckWindow{};
+}

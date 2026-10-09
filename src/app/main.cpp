@@ -1233,8 +1233,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_editorFullReconcileRequested = false;
             SynchronizeEditorRuntime(false);
         }
+        // Not while a prefab rebuild is queued: the navmesh and grass read the
+        // prefab colliders, and on a travel start (assets already resident)
+        // both requests land together. Building first used the previous
+        // level's empty set, then the prefab rebuild re-latched this and the
+        // whole navmesh was built a second time -- 4.6 s wasted on the airfield,
+        // and each build overwrote the other's bake so it never hit.
         if (g_pendingEnvironmentRebuild && IsSceneScreen() &&
-            !g_game.loading.Active() && g_environmentInitialized) {
+            !g_game.loading.Active() && g_environmentInitialized &&
+            !g_prefabRebuildRequested) {
             WaitForGPU();
             RebuildScalableEnvironment();
             if (g_trees.IsInitialized()) ResetPalmTrees();
@@ -2349,6 +2356,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             UpdateMarineHumveeCrew();
+            // The trace needs a long fight, so the player must not die.
+            if (AiStuckTraceEnabled()) scene.player.godMode = true;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             static std::unordered_map<SkinnedEnemy*,
                 std::pair<XMFLOAT3, float>> lastVisibleTarget;
@@ -2863,22 +2872,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (ClientOwnedByHost()) continue;
                     bandit->Update(banditDeltaTime, target, groundY,
                                    targetIsActor);
+                    const XMFLOAT3 afterAiPosition = bandit->position;
                     // Keep an actor on the platform it started the frame on.
-                    // The navmesh is terrain-only, so steering happily walks a
-                    // bandit off a watchtower deck; without this it would path
-                    // straight over the edge and fall. Cancelling the move
+                    // A deck's navmesh region is cut off from the ground, but a
+                    // partial path or a knockback can still carry a bandit to
+                    // the edge; without this it would step over and fall. Cancelling the move
                     // leaves it at the ledge facing the player rather than
                     // teleporting it back to the middle.
                     if (onPrefabSurface && !bandit->Dead() && !bandit->Held()) {
                         float steppedSurfaceY = 0.0f;
-                        const bool stillSupported = PrefabSurfaceSupports(
+                        bool steppingOntoTerrain = false;
+                        bool stillSupported = PrefabSurfaceSupports(
                             bandit->position, prefabSurfaceY,
                             kBanditLedgeProbeDrop, steppedSurfaceY);
+                        // The terrain is ground too. Without it, stepping off a
+                        // flush slab (a car park) onto the grass beside it read
+                        // as walking off a cliff, and the actor was held on the
+                        // slab's edge forever.
+                        if (scene.useMeshTerrain && g_terrain.supported) {
+                            auto tp = CurrentTerrainParams();
+                            tp.heightScale = scene.terrainHeightScale;
+                            const float terrainY = TerrainRendererDX12::HeightAt(
+                                tp, bandit->position.x, bandit->position.z);
+                            if (!stillSupported || terrainY > steppedSurfaceY) {
+                                steppedSurfaceY = terrainY;
+                                stillSupported = true;
+                                steppingOntoTerrain = true;
+                            }
+                        }
                         // A drop larger than a step down is a ledge, not a
-                        // ramp or a stair tread.
+                        // ramp or a stair tread. Off a slab onto the ground an
+                        // actor may hop a little further: the navmesh joins
+                        // those edges with voxel slack, and refusing them left
+                        // actors pinned on a car-park lip. A deck is metres up
+                        // and still refused.
+                        const float maxDrop = steppingOntoTerrain
+                            ? kBanditMaxStepDown + 0.45f : kBanditMaxStepDown;
                         if (!stillSupported ||
-                            prefabSurfaceY - steppedSurfaceY >
-                                kBanditMaxStepDown) {
+                            prefabSurfaceY - steppedSurfaceY > maxDrop) {
                             bandit->position.x = preMovePosition.x;
                             bandit->position.z = preMovePosition.z;
                             bandit->position.y = prefabSurfaceY;
@@ -2887,7 +2918,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // After the ledge check, so standing on a prop is decided
                     // before the walls of that same prop push sideways.
                     ResolveBanditPrefabCollisions(*bandit);
+                    const XMFLOAT3 afterPrefabPosition = bandit->position;
                     ResolveBanditHumveeCollision(*bandit);
+                    if (AiStuckTraceEnabled() && !bandit->Dead() &&
+                        !bandit->Held())
+                        AiStuckTraceSample(*bandit, banditDeltaTime,
+                            preMovePosition, afterAiPosition,
+                            afterPrefabPosition, bandit->position);
                 }
                 XMFLOAT3 shotOrigin, shotDirection;
                 // Terrain LOS is deliberately expensive. Test only when a shot

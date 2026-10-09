@@ -1,6 +1,8 @@
 #pragma once
 
 #include <DirectXMath.h>
+#include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -24,9 +26,21 @@ public:
     NavigationSystem(const NavigationSystem&) = delete;
     NavigationSystem& operator=(const NavigationSystem&) = delete;
 
+    // `solidTriangles` is world-space prop geometry (9 floats per triangle)
+    // rasterized alongside the terrain: its walls block, its floors, decks and
+    // ramps become walkable. Winding is ignored -- scraped assets are
+    // inconsistent -- so a triangle is walkable when it is flat enough either
+    // way up.
+    //
+    // `bakePath`, when set, is a pre-built mesh on disk: it is loaded instead of
+    // building when its stored input hash matches this call's inputs, and is
+    // (re)written after a build otherwise. A level start then pays for the
+    // terrain sampling and the hash, not the ~5 s Recast build.
     bool BuildTerrain(const std::function<float(float, float)>& heightAt,
                       float minX, float maxX, float minZ, float maxZ,
-                      const std::vector<NavigationObstacle>& obstacles);
+                      const std::vector<NavigationObstacle>& obstacles,
+                      const std::vector<float>& solidTriangles = {},
+                      const std::filesystem::path& bakePath = {});
     bool FindPath(const DirectX::XMFLOAT3& start,
                   const DirectX::XMFLOAT3& destination,
                   std::vector<DirectX::XMFLOAT3>& points) const;
@@ -48,6 +62,10 @@ public:
                          const std::function<bool(const DirectX::XMFLOAT3&)>&
                              accept = {}) const;
     bool Ready() const { return navMesh_ != nullptr && query_ != nullptr; }
+    // Nearest walkable point within `horizontalReach` metres (XZ) of `point`.
+    // False when nothing walkable is that close.
+    bool NearestWalkable(const DirectX::XMFLOAT3& point, float horizontalReach,
+                         DirectX::XMFLOAT3& nearest) const;
     // The walkable surface as world-space triangles, three vertices per triangle,
     // for debug visualisation. This is the detail mesh rather than the coarse
     // polygons, so it follows the terrain the way the navmesh actually does.
@@ -61,6 +79,12 @@ public:
     void Reset();
 
 private:
+    // Bump when anything in the build changes that the input hash cannot see
+    // (Recast calls, filters, Detour params), so stale bakes are rebuilt.
+    static constexpr uint64_t kBakeVersion = 1;
+    bool LoadBaked(const std::filesystem::path& path, uint64_t inputHash);
+    static void SaveBaked(const std::filesystem::path& path, uint64_t inputHash,
+                          const unsigned char* data, int size);
     dtNavMesh* navMesh_ = nullptr;
     dtNavMeshQuery* query_ = nullptr;
 };

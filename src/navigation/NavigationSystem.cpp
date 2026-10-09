@@ -7,7 +7,9 @@
 #include <Recast.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <memory>
 
@@ -69,9 +71,18 @@ void NavigationSystem::DebugWalkableTriangles(
 bool NavigationSystem::BuildTerrain(
     const std::function<float(float, float)>& heightAt,
     float minX, float maxX, float minZ, float maxZ,
-    const std::vector<NavigationObstacle>& obstacles) {
+    const std::vector<NavigationObstacle>& obstacles,
+    const std::vector<float>& solidTriangles,
+    const std::filesystem::path& bakePath) {
     Reset();
     if (!heightAt || minX >= maxX || minZ >= maxZ) return false;
+    using NavClock = std::chrono::steady_clock;
+    const auto navT0 = NavClock::now();
+    std::vector<std::pair<const char*, double>> navStages;
+    const auto stage = [&](const char* name) {
+        navStages.emplace_back(name, std::chrono::duration<double, std::milli>(
+            NavClock::now() - navT0).count());
+    };
 
     constexpr float sampleSpacing = 0.65f;
     const int columns = static_cast<int>(std::ceil((maxX - minX) / sampleSpacing)) + 1;
@@ -101,6 +112,7 @@ bool NavigationSystem::BuildTerrain(
         }
     }
 
+    stage("terrain grid");
     rcConfig cfg{};
     cfg.cs = 0.30f;
     cfg.ch = 0.15f;
@@ -116,7 +128,38 @@ bool NavigationSystem::BuildTerrain(
     cfg.detailSampleDist = cfg.cs * 6.0f;
     cfg.detailSampleMaxError = cfg.ch;
     rcCalcBounds(vertices.data(), static_cast<int>(vertices.size() / 3), cfg.bmin, cfg.bmax);
+    // XZ stays the terrain's: prop geometry outside it is simply clipped. Y has
+    // to cover the props as well, or a watchtower deck above the highest
+    // terrain sample would fall outside the heightfield.
+    for (size_t i = 1; i < solidTriangles.size(); i += 3) {
+        cfg.bmin[1] = (std::min)(cfg.bmin[1], solidTriangles[i]);
+        cfg.bmax[1] = (std::max)(cfg.bmax[1], solidTriangles[i] + 2.0f);
+    }
     rcCalcGridSize(cfg.bmin, cfg.bmax, cfg.cs, &cfg.width, &cfg.height);
+
+    // Everything the build reads, so a baked mesh is reused only when it would
+    // come out identical. Hashing is ~20 ms against a ~5 s build.
+    const uint64_t inputHash = [&] {
+        uint64_t hash = 1469598103934665603ull ^ kBakeVersion;
+        const auto mix = [&hash](const void* data, size_t bytes) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            for (size_t i = 0; i < bytes; ++i)
+                hash = (hash ^ p[i]) * 1099511628211ull;
+        };
+        mix(&cfg, sizeof(cfg));
+        mix(vertices.data(), vertices.size() * sizeof(float));
+        mix(obstacles.data(), obstacles.size() * sizeof(NavigationObstacle));
+        mix(solidTriangles.data(), solidTriangles.size() * sizeof(float));
+        return hash;
+    }();
+    if (!bakePath.empty() && LoadBaked(bakePath, inputHash)) {
+        stage("baked load");
+        std::cout << "Navigation loaded baked " << bakePath.generic_string()
+                  << " (" << solidTriangles.size() / 9 << " prop triangles)\n";
+        for (const auto& s : navStages)
+            std::cout << "  nav stage " << s.first << " @ " << s.second << " ms\n";
+        return true;
+    }
 
     rcContext context(false);
     std::unique_ptr<rcHeightfield, decltype(&rcFreeHeightField)>
@@ -156,6 +199,35 @@ bool NavigationSystem::BuildTerrain(
     if (!rcRasterizeTriangles(&context, vertices.data(),
                               static_cast<int>(vertices.size() / 3), triangles.data(),
                               areas.data(), triangleCount, *solid, cfg.walkableClimb)) return false;
+    stage("terrain raster");
+
+    // Prop geometry. Before this, every prop was an axis-aligned hole, so an
+    // actor standing anywhere inside a prop's bounds (the airport's spans the
+    // whole apron) had no navmesh under it, FindPath failed, and it walked
+    // straight at its goal into a wall the pushout then undid -- forever.
+    // Measured on BigIslandv35: 32% of actor time spent like that.
+    const int solidCount = static_cast<int>(solidTriangles.size() / 9);
+    if (solidCount > 0) {
+        const float walkableNormalY =
+            std::cos(cfg.walkableSlopeAngle / 180.0f * 3.14159265f);
+        std::vector<unsigned char> solidAreas(static_cast<size_t>(solidCount),
+                                              RC_NULL_AREA);
+        for (int i = 0; i < solidCount; ++i) {
+            const float* v = solidTriangles.data() + i * 9;
+            const float e0[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] };
+            const float e1[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
+            const float nx = e0[1] * e1[2] - e0[2] * e1[1];
+            const float ny = e0[2] * e1[0] - e0[0] * e1[2];
+            const float nz = e0[0] * e1[1] - e0[1] * e1[0];
+            const float length = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (length > 1e-12f && std::abs(ny) / length >= walkableNormalY)
+                solidAreas[i] = RC_WALKABLE_AREA;
+        }
+        if (!rcRasterizeTriangles(&context, solidTriangles.data(),
+                                  solidAreas.data(), solidCount, *solid,
+                                  cfg.walkableClimb)) return false;
+    }
+    stage("raster");
     rcFilterLowHangingWalkableObstacles(&context, cfg.walkableClimb, *solid);
     rcFilterLedgeSpans(&context, cfg.walkableHeight, cfg.walkableClimb, *solid);
     rcFilterWalkableLowHeightSpans(&context, cfg.walkableHeight, *solid);
@@ -169,6 +241,7 @@ bool NavigationSystem::BuildTerrain(
         !rcBuildDistanceField(&context, *compact) ||
         !rcBuildRegions(&context, *compact, 0, cfg.minRegionArea, cfg.mergeRegionArea)) return false;
 
+    stage("regions");
     std::unique_ptr<rcContourSet, decltype(&rcFreeContourSet)>
         contours(rcAllocContourSet(), rcFreeContourSet);
     if (!contours || !rcBuildContours(&context, *compact, cfg.maxSimplificationError,
@@ -180,6 +253,7 @@ bool NavigationSystem::BuildTerrain(
         detail(rcAllocPolyMeshDetail(), rcFreePolyMeshDetail);
     if (!detail || !rcBuildPolyMeshDetail(&context, *mesh, *compact,
             cfg.detailSampleDist, cfg.detailSampleMaxError, *detail)) return false;
+    stage("polymesh+detail");
     for (int i = 0; i < mesh->npolys; ++i)
         if (mesh->areas[i] == RC_WALKABLE_AREA) mesh->flags[i] = 1;
 
@@ -208,6 +282,9 @@ bool NavigationSystem::BuildTerrain(
     unsigned char* navData = nullptr;
     int navDataSize = 0;
     if (!dtCreateNavMeshData(&params, &navData, &navDataSize)) return false;
+    stage("create blob");
+    if (!bakePath.empty()) SaveBaked(bakePath, inputHash, navData, navDataSize);
+    stage("save bake");
     navMesh_ = dtAllocNavMesh();
     if (!navMesh_ || dtStatusFailed(navMesh_->init(navData, navDataSize, DT_TILE_FREE_DATA))) {
         dtFree(navData);
@@ -215,16 +292,20 @@ bool NavigationSystem::BuildTerrain(
         return false;
     }
     query_ = dtAllocNavMeshQuery();
-    if (!query_ || dtStatusFailed(query_->init(navMesh_, 2048))) {
+    if (!query_ || dtStatusFailed(query_->init(navMesh_, 8192))) {
         Reset();
         return false;
     }
     std::cout << "Navigation ready: " << mesh->npolys << " polygons, "
+              << solidCount << " prop triangles, "
               << obstacles.size() << " blocked regions";
     if (ineffectiveObstacles > 0)
         std::cout << " (" << ineffectiveObstacles
                   << " cleared no ground; those props will not block pathing)";
     std::cout << "\n";
+    stage("detour");
+    for (const auto& s : navStages)
+        std::cout << "  nav stage " << s.first << " @ " << s.second << " ms\n";
     return true;
 }
 
@@ -280,6 +361,95 @@ bool NavigationSystem::FindRandomPoint(
     return false;
 }
 
+namespace {
+// File layout: header, then the raw Detour tile blob dtCreateNavMeshData made.
+struct NavBakeHeader {
+    uint32_t magic = 0x564E4753;  // "SGNV"
+    uint32_t dataSize = 0;
+    uint64_t version = 0;
+    uint64_t inputHash = 0;
+};
+}  // namespace
+
+bool NavigationSystem::LoadBaked(const std::filesystem::path& path,
+                                 uint64_t inputHash) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    NavBakeHeader header;
+    stream.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (stream.gcount() != static_cast<std::streamsize>(sizeof(header)) ||
+        header.magic != NavBakeHeader{}.magic || header.version != kBakeVersion ||
+        header.inputHash != inputHash || header.dataSize == 0) {
+        std::cout << "Navigation bake " << path.generic_string()
+                  << " is stale; rebuilding\n";
+        return false;
+    }
+    auto* data = static_cast<unsigned char*>(dtAlloc(header.dataSize, DT_ALLOC_PERM));
+    if (!data) return false;
+    stream.read(reinterpret_cast<char*>(data), header.dataSize);
+    if (stream.gcount() != static_cast<std::streamsize>(header.dataSize)) {
+        dtFree(data);
+        return false;
+    }
+    navMesh_ = dtAllocNavMesh();
+    if (!navMesh_ || dtStatusFailed(navMesh_->init(
+            data, static_cast<int>(header.dataSize), DT_TILE_FREE_DATA))) {
+        dtFree(data);
+        Reset();
+        return false;
+    }
+    query_ = dtAllocNavMeshQuery();
+    if (!query_ || dtStatusFailed(query_->init(navMesh_, 8192))) {
+        Reset();
+        return false;
+    }
+    return true;
+}
+
+void NavigationSystem::SaveBaked(const std::filesystem::path& path,
+                                 uint64_t inputHash, const unsigned char* data,
+                                 int size) {
+    if (!data || size <= 0) return;
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    // Temporary file then rename, so an interrupted write never leaves a file
+    // whose header passes and whose blob is cut short.
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) return;
+        NavBakeHeader header;
+        header.dataSize = static_cast<uint32_t>(size);
+        header.version = kBakeVersion;
+        header.inputHash = inputHash;
+        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        stream.write(reinterpret_cast<const char*>(data), size);
+        if (!stream) return;
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (!error)
+        std::cout << "Navigation baked to " << path.generic_string() << " ("
+                  << size / 1024 << " KB)\n";
+}
+
+bool NavigationSystem::NearestWalkable(const XMFLOAT3& point,
+                                       float horizontalReach,
+                                       XMFLOAT3& nearest) const {
+    if (!Ready()) return false;
+    dtQueryFilter filter;
+    filter.setIncludeFlags(1);
+    filter.setExcludeFlags(0);
+    const float extents[3] = { horizontalReach, 4.0f, horizontalReach };
+    const float at[3] = { point.x, point.y, point.z };
+    float found[3]{};
+    dtPolyRef ref = 0;
+    if (dtStatusFailed(query_->findNearestPoly(at, extents, &filter, &ref, found)) ||
+        !ref) return false;
+    nearest = { found[0], found[1], found[2] };
+    return true;
+}
+
 bool NavigationSystem::FindPath(const XMFLOAT3& start,
                                 const XMFLOAT3& destination,
                                 std::vector<XMFLOAT3>& points) const {
@@ -294,9 +464,16 @@ bool NavigationSystem::FindPath(const XMFLOAT3& start,
     float nearestFrom[3]{}, nearestTo[3]{};
     dtPolyRef fromRef = 0, toRef = 0;
     if (dtStatusFailed(query_->findNearestPoly(from, extents, &filter,
-            &fromRef, nearestFrom)) || !fromRef ||
-        dtStatusFailed(query_->findNearestPoly(to, extents, &filter,
-            &toRef, nearestTo)) || !toRef) return false;
+            &fromRef, nearestFrom)) || !fromRef) return false;
+    // A goal inside a prop (the player on a container, a cover point against a
+    // wall) is still worth approaching: snap it from further away before
+    // giving up on the path entirely.
+    if (dtStatusFailed(query_->findNearestPoly(to, extents, &filter,
+            &toRef, nearestTo)) || !toRef) {
+        const float wideExtents[3] = { 8.0f, 6.0f, 8.0f };
+        if (dtStatusFailed(query_->findNearestPoly(to, wideExtents, &filter,
+                &toRef, nearestTo)) || !toRef) return false;
+    }
 
     dtPolyRef corridor[256]{};
     int corridorCount = 0;

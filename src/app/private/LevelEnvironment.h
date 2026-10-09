@@ -5,6 +5,61 @@
 // Defined below; the navmesh extent needs it before that point.
 static float CurrentPhysicsTerrainExtent();
 
+// World-space collision triangles of every enabled prefab/rock, for the navmesh:
+// the per-triangle mesh where the prefab has one, its collider boxes otherwise.
+static void AppendPrefabNavigationGeometry(std::vector<float>& triangles) {
+    std::unordered_set<uint64_t> enabledProps;
+    for (const LevelEntity& entity : g_game.world.Level().entities)
+        if (entity.enabled && (entity.type == LevelEntityType::Prefab ||
+                               entity.type == LevelEntityType::Rock))
+            enabledProps.insert(entity.id);
+
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        if (!instance.mesh || !enabledProps.count(instance.entityId)) continue;
+        const XMMATRIX world = XMLoadFloat4x4(&instance.worldTransform);
+        const std::vector<float>& local = instance.mesh->triangles;
+        const size_t base = triangles.size();
+        triangles.resize(base + local.size());
+        for (size_t i = 0; i < local.size(); i += 3) {
+            XMFLOAT3 p;
+            XMStoreFloat3(&p, XMVector3TransformCoord(
+                XMVectorSet(local[i], local[i + 1], local[i + 2], 1.0f), world));
+            triangles[base + i] = p.x;
+            triangles[base + i + 1] = p.y;
+            triangles[base + i + 2] = p.z;
+        }
+    }
+
+    // Two triangles per face; the top face is what lets an actor stand on a
+    // container, the sides are the walls.
+    static constexpr int kBoxFaces[6][4] = {
+        {0, 1, 3, 2}, {4, 6, 7, 5}, {0, 4, 5, 1},
+        {2, 3, 7, 6}, {0, 2, 6, 4}, {1, 5, 7, 3} };
+    for (const PrefabCollider& collider : g_prefabColliders) {
+        if (!enabledProps.count(collider.entityId) ||
+            g_meshCollisionEntities.count(collider.entityId)) continue;
+        const float c = std::cos(collider.yawRadians);
+        const float s = std::sin(collider.yawRadians);
+        XMFLOAT3 corners[8];
+        for (int i = 0; i < 8; ++i) {
+            const float lx = (i & 4 ? 1.0f : -1.0f) * collider.halfExtents.x;
+            const float ly = (i & 2 ? 1.0f : -1.0f) * collider.halfExtents.y;
+            const float lz = (i & 1 ? 1.0f : -1.0f) * collider.halfExtents.z;
+            corners[i] = { collider.center.x + lx * c - lz * s,
+                           collider.center.y + ly,
+                           collider.center.z + lx * s + lz * c };
+        }
+        for (const auto& face : kBoxFaces) {
+            for (const int corner : { face[0], face[1], face[2],
+                                      face[0], face[2], face[3] }) {
+                triangles.push_back(corners[corner].x);
+                triangles.push_back(corners[corner].y);
+                triangles.push_back(corners[corner].z);
+            }
+        }
+    }
+}
+
 static void RebuildScalableEnvironment() {
     ProfilerDX12::CpuScope environmentProfile(g_profiler, "Editor/Environment");
     auto terrainParams = CurrentTerrainParams();
@@ -69,32 +124,27 @@ static void RebuildScalableEnvironment() {
                     static_cast<uint32_t>(entity.id) });
             } else if (entity.type == LevelEntityType::Prefab ||
                        entity.type == LevelEntityType::Rock) {
-                // Navigation obstacles are axis-aligned rectangles, so a
-                // mesh-collision prefab still contributes its bounds box here
-                // and this loop does not filter g_meshCollisionEntities.
-                // Consequence for the airport: enemies will not path inside it.
-                // Turning the triangle mesh into walkable navmesh needs
-                // rectangle decomposition, which is deferred follow-up work --
-                // this is the behaviour that already shipped, not a regression.
+                // Props go into the navmesh as their real collision geometry
+                // (AppendPrefabNavigationGeometry below), not as a bounds
+                // rectangle: the rectangle left everything inside the airport's
+                // apron, the barracks and the container stacks without navmesh,
+                // and actors standing there walked into walls forever.
                 //
-                // Grass no longer follows that box. The airport's bounds span
-                // the whole apron, so excluding by box stripped grass from
+                // Grass no longer follows the box either. The airport's bounds
+                // span the whole apron, so excluding by box stripped grass from
                 // every metre of open ground inside it; the triangle mesh is
                 // asked directly instead, below.
                 const bool meshCollision =
                     g_meshCollisionEntities.count(entity.id) > 0;
                 for (const PrefabCollider& collider : g_prefabColliders) {
                     if (collider.entityId != entity.id) continue;
+                    if (meshCollision) continue;
                     const float c = std::abs(std::cos(collider.yawRadians));
                     const float s = std::abs(std::sin(collider.yawRadians));
                     const float halfX = c * collider.halfExtents.x +
                                         s * collider.halfExtents.z;
                     const float halfZ = s * collider.halfExtents.x +
                                         c * collider.halfExtents.z;
-                    obstacles.push_back({ collider.center.x - halfX,
-                        collider.center.z - halfZ, collider.center.x + halfX,
-                        collider.center.z + halfZ });
-                    if (meshCollision) continue;
                     grassExclusions.push_back({ collider.center.x - halfX,
                         collider.center.z - halfZ, collider.center.x + halfX,
                         collider.center.z + halfZ });
@@ -166,8 +216,26 @@ static void RebuildScalableEnvironment() {
     }
     {
         ProfilerDX12::CpuScope navmeshProfile(g_profiler, "Editor/Navmesh");
-        if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
-                -extent, extent, obstacles))
+        const auto navigationBegin = std::chrono::steady_clock::now();
+        std::vector<float> propTriangles;
+        if (g_customLevelMode) AppendPrefabNavigationGeometry(propTriangles);
+        // A level file gets its navmesh baked to disk: the first start builds
+        // and writes it, every later start (and a shipped bake) loads it in
+        // milliseconds. Keyed on the build's exact inputs, so an edited level
+        // simply rebuilds. Unsaved editor maps have no file and always build.
+        std::filesystem::path bakePath;
+        if (g_customLevelMode && !g_activeLevelFile.empty())
+            bakePath = std::filesystem::path("Content") / "Cooked" / "Navmesh" /
+                (std::filesystem::path(g_activeLevelFile).stem().string() +
+                 ".sgenav");
+        const bool navigationBuilt = g_navigation.BuildTerrain(terrainSampler,
+            -extent, extent, -extent, extent, obstacles, propTriangles,
+            bakePath);
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Navmesh build " + std::to_string(std::chrono::duration<double,
+                std::milli>(std::chrono::steady_clock::now() -
+                            navigationBegin).count()) + " ms");
+        if (!navigationBuilt)
             std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
     }
 

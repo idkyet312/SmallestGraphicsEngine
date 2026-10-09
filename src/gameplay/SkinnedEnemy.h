@@ -324,6 +324,15 @@ public:
     bool DebugInCover() const { return inCover_; }
     bool DebugHasGunPose() const { return HasGunPose(); }
     int DebugBurstShots() const { return burstShotsRemaining; }
+    // SGE_AI_STUCK_TRACE: what the AI asked for this tick, so the app can
+    // compare it with where the actor actually ended up after collisions.
+    float debugCommandedSpeed = 0.0f;
+    bool debugLastPathFound = false;
+    size_t DebugPathSize() const { return navigationPath_.size(); }
+    size_t DebugPathWaypoint() const { return navigationWaypoint_; }
+    DirectX::XMFLOAT3 DebugNavigationDestination() const {
+        return navigationDestination_;
+    }
     enum class FireWaitReason : uint8_t {
         None, NoContact, Blocked, MovingToCover, Cooldown, Aiming,
         NoGunPose, Inactive
@@ -893,6 +902,23 @@ public:
             (std::max)(0.0f, playerGunshotMemoryTimer_ - dt);
         spotBroadcastCooldown_ =
             (std::max)(0.0f, spotBroadcastCooldown_ - dt);
+        // Blocked detection. The app resolves prop and vehicle pushout after
+        // Update returns, so the motion the AI asked for last tick is compared
+        // with where the actor actually is now. A wall that undoes every step
+        // reads as zero progress; after a short while the actor gives up on
+        // that goal instead of walking into the wall forever.
+        if (lastCommandedTravel_ > 0.005f) {
+            const float px = position.x - lastStepStart_.x;
+            const float pz = position.z - lastStepStart_.z;
+            const float progress = std::sqrt(px * px + pz * pz);
+            if (progress < lastCommandedTravel_ * 0.3f) blockedTime_ += dt;
+            else blockedTime_ = (std::max)(0.0f, blockedTime_ - dt);
+            if (blockedTime_ > 0.8f) GiveUpBlockedGoal();
+        } else {
+            blockedTime_ = (std::max)(0.0f, blockedTime_ - dt);
+        }
+        lastCommandedTravel_ = 0.0f;
+        lastStepStart_ = position;
         const DirectX::XMFLOAT3 locomotionStart = position;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
@@ -994,12 +1020,13 @@ public:
                     if (g_navigation.Ready() &&
                         (navigationRepathTimer_ <= 0.0f ||
                          navDx * navDx + navDz * navDz > 2.25f)) {
-                        if (g_navigation.FindPath(position, dest, navigationPath_)) {
+                        debugLastPathFound =
+                            g_navigation.FindPath(position, dest, navigationPath_);
+                        if (debugLastPathFound) {
                             navigationWaypoint_ = navigationPath_.size() > 1 ? 1 : 0;
                             navigationDestination_ = dest;
                         } else {
-                            navigationPath_.clear();
-                            navigationWaypoint_ = 0;
+                            PathBackOntoNavmesh();
                         }
                         navigationRepathTimer_ = 0.45f +
                             ((float)std::rand() / (float)RAND_MAX) * 0.18f;
@@ -1018,11 +1045,14 @@ public:
                         const float wd = std::sqrt(wx * wx + wz * wz);
                         if (wd > 0.001f) { moveX = wx / wd; moveZ = wz / wd; }
                     }
+                    if (PathEndedShortOf(dest)) moveSpeedThisTick = 0.0f;
                     const float travel = (std::min)(moveSpeedThisTick * dt, 0.45f);
                     position.x += moveX * travel;
                     position.z += moveZ * travel;
+                    lastCommandedTravel_ = travel;
                 }
             }
+            debugCommandedSpeed = moveSpeedThisTick;
             UpdateLocomotion(dt, locomotionStart, moveSpeedThisTick);
             ComputePose(dt);
             return;
@@ -1181,12 +1211,13 @@ public:
             const float navDz = requestedDestination.z - navigationDestination_.z;
             if (g_navigation.Ready() &&
                 (navigationRepathTimer_ <= 0.0f || navDx*navDx + navDz*navDz > 2.25f)) {
-                if (g_navigation.FindPath(position, requestedDestination, navigationPath_)) {
+                debugLastPathFound = g_navigation.FindPath(
+                    position, requestedDestination, navigationPath_);
+                if (debugLastPathFound) {
                     navigationWaypoint_ = navigationPath_.size() > 1 ? 1 : 0;
                     navigationDestination_ = requestedDestination;
                 } else {
-                    navigationPath_.clear();
-                    navigationWaypoint_ = 0;
+                    PathBackOntoNavmesh();
                 }
                 navigationRepathTimer_ = 0.45f +
                     ((float)std::rand() / (float)RAND_MAX) * 0.18f;
@@ -1206,12 +1237,16 @@ public:
                     moveZ = wz / waypointDistance;
                 }
             }
+            // Following a partial path to its end leaves the goal behind a wall
+            // or off a ledge; walking on from there is walking into it.
+            if (PathEndedShortOf(requestedDestination)) speed = 0.0f;
 
             // Asset loading can make one frame several seconds long. Never let
             // that frame overshoot through the player and spawn behind them.
             const float travel = (std::min)(speed * dt, 0.45f);
             position.x += moveX * travel;
             position.z += moveZ * travel;
+            lastCommandedTravel_ = travel;
             // Facing is turned onto the target where aimYaw is set, for every
             // actor rather than only a moving one; local velocity selects the
             // leg gait, so a strafing orbit still plays sideways steps.
@@ -1220,6 +1255,7 @@ public:
         const float referenceSpeed = running ? moveSpeed * 1.65f : moveSpeed;
         const float playbackRate = speed > 0.01f
             ? (std::max)(0.75f, (std::min)(1.15f, speed / referenceSpeed)) : 1.0f;
+        debugCommandedSpeed = speed;
         UpdateLocomotion(dt, locomotionStart, speed, playbackRate);
         ComputePose(dt);
     }
@@ -1534,6 +1570,52 @@ public:
         return false;
     }
 
+    // FindPath failed, which almost always means the actor itself is off the
+    // navmesh (knocked into a prop, spawned on a deck too small to keep). Walk
+    // to the nearest walkable point first; without this the fallback was a
+    // straight line at the goal, through whatever wall is in the way.
+    void PathBackOntoNavmesh() {
+        navigationPath_.clear();
+        navigationWaypoint_ = 0;
+        DirectX::XMFLOAT3 nearest{};
+        if (!g_navigation.NearestWalkable(position, 6.0f, nearest)) return;
+        const float dx = nearest.x - position.x, dz = nearest.z - position.z;
+        if (dx * dx + dz * dz < 0.3f * 0.3f) return;
+        navigationPath_.push_back(nearest);
+    }
+
+    // True once a path has been walked to its last point and that point is still
+    // well short of `goal` -- Detour returned a partial path because the goal is
+    // somewhere the navmesh cannot reach (the ground below a watchtower deck).
+    bool PathEndedShortOf(const DirectX::XMFLOAT3& goal) const {
+        if (navigationPath_.empty() ||
+            navigationWaypoint_ < navigationPath_.size()) return false;
+        const float dx = goal.x - navigationPath_.back().x;
+        const float dz = goal.z - navigationPath_.back().z;
+        return dx * dx + dz * dz > 1.5f * 1.5f;
+    }
+
+    // The current goal cannot be reached from here: the last 0.8 s of steps were
+    // undone by collision. Drop the goal so the next tick picks a different one,
+    // rather than leaning on the same wall until the round ends.
+    void GiveUpBlockedGoal() {
+        blockedTime_ = 0.0f;
+        navigationPath_.clear();
+        navigationWaypoint_ = 0;
+        navigationRepathTimer_ = 0.0f;
+        // Wandering: pick a fresh waypoint now. Authored route: skip the stop.
+        patrolWaypoint_ = position;
+        if (!patrolRoute_.empty())
+            patrolIndex_ = (patrolIndex_ + 1) % patrolRoute_.size();
+        // Orbiting into a wall: go round the other way.
+        orbitDirection = -orbitDirection;
+        // A cover point it cannot get to is not cover.
+        if (hasCoverTarget_ && !inCover_) {
+            hasCoverTarget_ = false;
+            coverTravelTime_ = 0.0f;
+        }
+    }
+
     // Returns true and writes `outTarget` when there's somewhere to walk this
     // tick; false means stand idle (mid-pause, or no route/navmesh yet).
     bool UpdatePatrolWaypoint(float dt, DirectX::XMFLOAT3& outTarget) {
@@ -1569,11 +1651,31 @@ public:
         const float dx = patrolWaypoint_.x - position.x;
         const float dz = patrolWaypoint_.z - position.z;
         if (dx * dx + dz * dz <= 0.6f * 0.6f) {
-            const float angle = ((float)std::rand() / RAND_MAX) * 6.2831853f;
-            const float radius = 3.0f + ((float)std::rand() / RAND_MAX) * 5.0f;
-            patrolWaypoint_ = { spawnPosition_.x + std::cos(angle) * radius,
-                                spawnPosition_.y,
-                                spawnPosition_.z + std::sin(angle) * radius };
+            // A random point around spawn can land inside a prop, or off the
+            // edge of the watchtower deck a sentry was placed on. Keep only a
+            // point the navmesh can actually walk to from here; a sentry with
+            // nowhere reachable holds its post instead of pacing into a rail.
+            patrolWaypoint_ = spawnPosition_;
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const float angle = ((float)std::rand() / RAND_MAX) * 6.2831853f;
+                const float radius = 3.0f + ((float)std::rand() / RAND_MAX) * 5.0f;
+                const DirectX::XMFLOAT3 candidate{
+                    spawnPosition_.x + std::cos(angle) * radius,
+                    spawnPosition_.y,
+                    spawnPosition_.z + std::sin(angle) * radius };
+                if (!g_navigation.Ready()) { patrolWaypoint_ = candidate; break; }
+                DirectX::XMFLOAT3 walkable{};
+                if (!g_navigation.NearestWalkable(candidate, 3.0f, walkable))
+                    continue;
+                std::vector<DirectX::XMFLOAT3> route;
+                if (!g_navigation.FindPath(position, walkable, route) ||
+                    route.empty()) continue;
+                const float ex = route.back().x - walkable.x;
+                const float ez = route.back().z - walkable.z;
+                if (ex * ex + ez * ez > 1.0f) continue;
+                patrolWaypoint_ = walkable;
+                break;
+            }
             patrolPauseTimer_ = 2.0f + ((float)std::rand() / RAND_MAX) * 3.0f;
             return false;
         }
@@ -2769,6 +2871,11 @@ private:
     size_t navigationWaypoint_ = 0;
     float navigationRepathTimer_ = 0.0f;
     DirectX::XMFLOAT3 navigationDestination_{};
+    // Blocked detection (see the top of Update): where last tick's step began,
+    // how far it asked to go, and how long steps have been coming to nothing.
+    DirectX::XMFLOAT3 lastStepStart_{};
+    float lastCommandedTravel_ = 0.0f;
+    float blockedTime_ = 0.0f;
     float laserCharge_ = 0.0f;
     DirectX::XMFLOAT3 laserTarget_{ 0.0f, 0.0f, 0.0f };
     bool preparingShot_ = false;

@@ -816,6 +816,11 @@ if(BUILD_TESTING)
     target_link_libraries(BoatPhysicsTests PRIVATE SGEProjectHeaders box3d)
     add_test(NAME BoatPhysicsTests COMMAND BoatPhysicsTests)
 
+    # The physics mesh bake relocates b3MeshData blobs; prove they survive it.
+    add_executable(PhysicsMeshBakeTests tests/PhysicsMeshBakeTests.cpp)
+    target_link_libraries(PhysicsMeshBakeTests PRIVATE box3d)
+    add_test(NAME PhysicsMeshBakeTests COMMAND PhysicsMeshBakeTests)
+
     # Pure struct/bitfield checks -- no device, no socket, no content root.
     add_executable(PlayerInputTests tests/PlayerInputTests.cpp)
     target_link_libraries(PlayerInputTests PRIVATE SGEProjectHeaders)
