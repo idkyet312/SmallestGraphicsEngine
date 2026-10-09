@@ -384,6 +384,17 @@ static XMMATRIX EnemyTankHullWorld(const EnemyTankState& tank) {
            XMMatrixTranslationFromVector(origin);
 }
 
+static bool PlayerTankGunTarget(XMFLOAT3& centre, XMFLOAT3& velocity,
+                                uint64_t& entity) {
+    const EnemyTankState* tank = PlayerTank();
+    if (!tank || tank->dead) return false;
+    XMStoreFloat3(&centre, XMVector3TransformCoord(
+        XMLoadFloat3(&tank->boxCenterLocal), EnemyTankHullWorld(*tank)));
+    velocity = tank->velocity;
+    entity = tank->entityId;
+    return true;
+}
+
 // Unscaled hull model space: the turret child's local space is authored there,
 // and the placement scale is applied once on top by the hull world.
 static XMMATRIX EnemyTankTurretWorld(const EnemyTankState& tank,
@@ -538,6 +549,10 @@ static void RouteEnemyTankDamage(EnemyTankState& tank, float damage,
 // maximum health, so a hull soaks ~170 of them (about 20 s of sustained turret
 // fire). Rifle rounds still do nothing.
 static constexpr float kHeavyGunTankDamageFraction = 0.006f;
+// An enemy gunship's door gun against the tank the player drives: every round
+// that lands costs this share of the hull, applied per hit rather than banked,
+// so each burst visibly takes a bite (~50 hits from full).
+static constexpr float kHostileAircraftTankDamageFraction = 0.02f;
 // Chip damage is banked and applied in chunks this size, so a long burst is
 // a handful of damage events (smoke puff, log line, network report) rather
 // than one per round.
@@ -548,12 +563,20 @@ static constexpr float kHeavyGunTankDamageChunk = 0.05f;
 // enemy gunners do not grind down their own armour. Returns true when the
 // collider was a live tank.
 static bool DamageEnemyTankFromHeavyGun(uint64_t entityId, const XMFLOAT3& hit,
-                                        bool hostile, bool fromPlayer) {
+                                        bool hostile, bool fromPlayer,
+                                        bool aircraft = false) {
     if (entityId == 0) return false;
     for (EnemyTankState& tank : g_enemyTanks) {
         if (tank.entityId != entityId || tank.dead) continue;
         const bool playerTank = tank.entityId == g_playerTankEntity;
         if (hostile != playerTank) return true;
+        if (hostile && aircraft) {
+            RouteEnemyTankDamage(tank,
+                tank.maxHealth * kHostileAircraftTankDamageFraction, hit,
+                fromPlayer, /*hostAuthored=*/false);
+            scene.camera.AddHitTrauma(0.06f);
+            return true;
+        }
         tank.chipDamage += tank.maxHealth * kHeavyGunTankDamageFraction;
         const bool lethal = tank.health - tank.chipDamage <= 0.0f;
         if (tank.chipDamage < tank.maxHealth * kHeavyGunTankDamageChunk &&
@@ -887,6 +910,25 @@ static void UpdateEnemyTanks(float dt) {
                 scene.SpawnSmokeBurst(center, 1.4f, 0.8f);
             }
             continue;
+        }
+        // Under 30% the hull trails smoke, thickening toward zero, so a tank
+        // about to go reads that way to whoever is driving or fighting it.
+        const float healthFraction =
+            tank.health / (std::max)(1.0f, tank.maxHealth);
+        if (healthFraction < kVehicleDamageSmokeFraction) {
+            tank.smokeCooldown -= dt;
+            if (tank.smokeCooldown <= 0.0f) {
+                const float severity =
+                    1.0f - healthFraction / kVehicleDamageSmokeFraction;
+                tank.smokeCooldown = 0.34f - 0.24f * severity;
+                XMFLOAT3 center;
+                XMStoreFloat3(&center, XMVector3TransformCoord(
+                    XMLoadFloat3(&tank.boxCenterLocal),
+                    EnemyTankHullWorld(tank)));
+                center.y += 1.0f;
+                scene.SpawnSmokeBurst(center, 0.5f + 0.7f * severity,
+                                      0.4f + 0.8f * severity);
+            }
         }
         // A client's own tank is theirs to drive; every other one is the host's.
         if (hostOwned && tank.entityId != g_playerTankEntity) continue;

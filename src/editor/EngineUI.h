@@ -38,6 +38,9 @@ extern bool g_playerSprinting;
 extern float g_staminaSeconds;
 extern bool g_staminaExhausted;
 extern const float kStaminaMaxSecondsUI;
+// Health of the vehicle the player is in, 0..1, or negative on foot. The sprint
+// row shows it instead of stamina while driving or flying.
+extern float g_hudVehicleHealthFraction;
 // Wireframe overlay for the prefab volumes the player collides against.
 extern bool g_showCollisionDebug;
 extern UINT g_forwardDrawCalls;
@@ -912,15 +915,23 @@ inline void RenderPlayerHUD(const Scene& scene) {
     // directly. It is kept visually distinct from the health bar above it by
     // being shorter and thinner rather than by being split -- two full-width
     // bars of the same weight would read as one control.
+    //
+    // In a vehicle the row becomes the vehicle's health: stamina means nothing
+    // at the wheel, and the hull is the health that matters there.
     {
         const float sprintY = barMax.y + 7.0f;
         const bool alive = scene.player.health > 0.0f;
-        const float staminaFraction = alive
+        const bool inVehicle = g_hudVehicleHealthFraction >= 0.0f;
+        const float vehicleFraction =
+            (std::min)(1.0f, (std::max)(0.0f, g_hudVehicleHealthFraction));
+        const float staminaFraction = inVehicle ? vehicleFraction
+            : alive
             ? (std::max)(0.0f, (std::min)(1.0f,
                   g_staminaSeconds / (std::max)(0.01f, kStaminaMaxSecondsUI)))
             : 0.0f;
-        const bool sprinting = g_playerSprinting && alive;
-        const bool spent = g_staminaExhausted && alive;
+        const bool sprinting = !inVehicle && g_playerSprinting && alive;
+        const bool spent = inVehicle ? vehicleFraction <= 0.30f
+                                     : g_staminaExhausted && alive;
         const ImU32 litTint = IM_COL32(126, 186, 214, 235);
         // Exhaustion is the one state worth colouring: the player has lost the
         // ability to sprint and the breathing they can hear needs a matching
@@ -928,21 +939,32 @@ inline void RenderPlayerHUD(const Scene& scene) {
         const ImU32 spentTint = IM_COL32(214, 108, 92, 235);
         const ImU32 readyTint = IM_COL32(255, 255, 255, 96);
         const ImU32 dimTint = IM_COL32(255, 255, 255, 38);
+        // A vehicle's health reads at full weight, like the player's bar.
         const ImU32 fillTint = spent ? spentTint
+                             : inVehicle ? IM_COL32(238, 242, 236, 235)
                              : (sprinting ? litTint : readyTint);
 
-        // Small runner: head, torso, and two legs mid-stride.
         const float glyphX = barMin.x + 2.0f;
         const ImU32 glyphTint = spent ? spentTint
+                              : inVehicle ? IM_COL32(238, 244, 246, 220)
                               : (sprinting ? litTint : IM_COL32(255, 255, 255, 70));
-        draw->AddCircleFilled(ImVec2(glyphX + 3.0f, sprintY + 1.0f), 2.0f,
-                              glyphTint, 8);
-        draw->AddLine(ImVec2(glyphX + 3.0f, sprintY + 3.5f),
-                      ImVec2(glyphX + 2.0f, sprintY + 8.0f), glyphTint, 1.6f);
-        draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
-                      ImVec2(glyphX + 6.0f, sprintY + 11.0f), glyphTint, 1.4f);
-        draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
-                      ImVec2(glyphX - 2.0f, sprintY + 11.0f), glyphTint, 1.4f);
+        if (inVehicle) {
+            // Small wrench: a ringed head on a diagonal handle -- repair state.
+            draw->AddCircle(ImVec2(glyphX + 5.0f, sprintY + 2.5f), 2.4f,
+                            glyphTint, 8, 1.6f);
+            draw->AddLine(ImVec2(glyphX + 3.6f, sprintY + 4.2f),
+                          ImVec2(glyphX - 1.0f, sprintY + 10.5f), glyphTint, 2.0f);
+        } else {
+            // Small runner: head, torso, and two legs mid-stride.
+            draw->AddCircleFilled(ImVec2(glyphX + 3.0f, sprintY + 1.0f), 2.0f,
+                                  glyphTint, 8);
+            draw->AddLine(ImVec2(glyphX + 3.0f, sprintY + 3.5f),
+                          ImVec2(glyphX + 2.0f, sprintY + 8.0f), glyphTint, 1.6f);
+            draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
+                          ImVec2(glyphX + 6.0f, sprintY + 11.0f), glyphTint, 1.4f);
+            draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
+                          ImVec2(glyphX - 2.0f, sprintY + 11.0f), glyphTint, 1.4f);
+        }
 
         // Same left edge and overall width the three segments spanned, so the
         // row keeps its place in the layout and nothing below it moves.

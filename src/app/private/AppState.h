@@ -1050,6 +1050,12 @@ bool                        g_staminaExhausted = false;
 // Mirrors kStaminaMaxSeconds for the HUD, which needs the denominator to draw
 // the meter as a fraction but cannot see a constant defined in this file.
 extern const float          kStaminaMaxSecondsUI = kStaminaMaxSeconds;
+// Health of the vehicle the player is in, 0..1, or negative on foot. Set each
+// frame before the HUD draws; the sprint row shows it in place of stamina.
+float                       g_hudVehicleHealthFraction = -1.0f;
+// Vehicles without a damage-smoke curve of their own (tanks, the patrol boat,
+// the player's gunship) start trailing smoke below this health fraction.
+static constexpr float      kVehicleDamageSmokeFraction = 0.30f;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
 // Lockout on the player's own hit sound, so a burst lands as one impact rather

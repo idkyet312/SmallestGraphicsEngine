@@ -2031,6 +2031,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             UpdateEnemyHelicopterDamageSmoke(deltaTime);
             const XMFLOAT3 previousPatrolBoatPosition = g_boatPosition;
             UpdateBoat(deltaTime);
+            UpdateVehicleDamageSmoke(deltaTime);
             UpdateBoatWaterEffects(g_patrolWakeEmitter, previousPatrolBoatPosition,
                 g_boatPosition, deltaTime,
                 g_levelPatrolBoatEnabled && g_boatModel && !g_boatDead && !g_boatSunk &&
@@ -4648,7 +4649,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                              (g_drivingHumvee && projectile.sourceHumvee ==
                                  static_cast<int>(g_activeHumveeIndex)));
                         DamageEnemyTankFromHeavyGun(prefabEntityId, hit,
-                            projectile.hostile, fromPlayer);
+                            projectile.hostile, fromPlayer,
+                            projectile.aircraftGun);
                     }
                     if (!projectile.harpoon ||
                         projectile.harpoonPiercedCount == 0)
@@ -8073,6 +8075,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             UITextureFromFile("Content/Textures/UI/hurt_blood.png");
         g_lowHealthBloodOverlay =
             UITextureFromFile("Content/Textures/UI/low_health_blood.png");
+        // The vehicle the player is in, for the HUD's sprint row. The Humvee
+        // has no hull health (it dies to a missile outright), so it reads full.
+        g_hudVehicleHealthFraction = -1.0f;
+        if (const EnemyTankState* tank = PlayerTank()) {
+            g_hudVehicleHealthFraction =
+                tank->health / (std::max)(1.0f, tank->maxHealth);
+        } else if (g_pilotedHelicopter == PilotedHelicopter::Gunship) {
+            g_hudVehicleHealthFraction =
+                g_parkedGunshipHealth / kParkedGunshipMaxHealth;
+        } else if (g_pilotedHelicopter == PilotedHelicopter::BlackHawk) {
+            g_hudVehicleHealthFraction =
+                g_game.vehicles.BlackHawkHealthFraction();
+        } else if (g_game.vehicles.drivingBoat) {
+            g_hudVehicleHealthFraction = g_boatHealth / kBoatMaxHealth;
+        } else if (g_game.vehicles.drivingInsertionBoat) {
+            g_hudVehicleHealthFraction =
+                g_game.vehicles.InsertionBoatHealthFraction();
+        } else if (g_drivingHumvee) {
+            g_hudVehicleHealthFraction = 1.0f;
+        }
         if (g_pendingLoadingAction || g_game.loading.Active() ||
             (g_insertionChoicePending && !g_deploymentPlanningVisible)) {
             RenderLoadingScreen();

@@ -462,7 +462,12 @@ static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
 // the same line-of-sight test the infantry use: a door gun that shoots marines
 // through a hangar roof is not a fight, it is a turret with x-ray vision.
 static bool HelicopterHasLineOfSightTo(const XMFLOAT3& muzzle,
-                                       const XMFLOAT3& target);
+                                       const XMFLOAT3& target,
+                                       uint64_t targetEntity = 0);
+// Defined in EnemyTanks.h, included after this header: the hull centre,
+// velocity and entity of the tank the player drives; false on foot.
+static bool PlayerTankGunTarget(XMFLOAT3& centre, XMFLOAT3& velocity,
+                                uint64_t& entity);
 
 // Who a gunship's door gun is shooting at. The airframe used to know only the
 // player, so a squad of marines could stand in the open under a hovering
@@ -482,7 +487,8 @@ struct HelicopterGunTarget {
 static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
     HelicopterGunTarget best;
     float bestDistSq = FLT_MAX;
-    auto consider = [&](const XMFLOAT3& p, bool isPlayer) {
+    auto consider = [&](const XMFLOAT3& p, bool isPlayer,
+                        const XMFLOAT3& velocity, uint64_t entity) {
         const float dx = p.x - muzzle.x;
         const float dy = p.y - muzzle.y;
         const float dz = p.z - muzzle.z;
@@ -493,23 +499,33 @@ static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
             distSq > kHelicopterEngagementRange * kHelicopterEngagementRange)
             return;
         if (distSq >= bestDistSq) return;
-        if (!HelicopterHasLineOfSightTo(muzzle, p)) return;
+        if (!HelicopterHasLineOfSightTo(muzzle, p, entity)) return;
         bestDistSq = distSq;
         best.position = p;
         // Only the player's velocity is tracked, so only the player's shots get
         // led. A marine is led by nothing rather than by the player's motion,
         // which would throw the burst toward wherever the player was running.
         best.aim = isPlayer
-            ? LeadTargetPoint(muzzle, p, g_playerVelocity, scene.projectileSpeed)
+            ? LeadTargetPoint(muzzle, p, velocity, scene.projectileSpeed)
             : p;
         best.isPlayer = isPlayer;
         best.valid = true;
     };
     // Not while planning: the gun is already held off then, and turning to
     // face the parked body would still give the undeployed player away.
+    //
+    // In a tank the target is the hull, not the camera: the chase camera
+    // floats metres behind and above it, and every round aimed there missed
+    // (measured: 126 s in sight, the hull never touched).
     if (scene.player.health > 0.0f && !scene.player.downed &&
-        !g_insertionChoicePending)
-        consider(scene.camera.Position, true);
+        !g_insertionChoicePending) {
+        XMFLOAT3 hull{}, hullVelocity{};
+        uint64_t hullEntity = 0;
+        if (PlayerTankGunTarget(hull, hullVelocity, hullEntity))
+            consider(hull, true, hullVelocity, hullEntity);
+        else
+            consider(scene.camera.Position, true, g_playerVelocity, 0);
+    }
     for (const auto& actor : g_bandits) {
         if (!actor || actor->Dead() || HiddenFromEnemies(*actor)) continue;
         if (actor->faction != Faction::Marine) continue;
@@ -517,7 +533,7 @@ static HelicopterGunTarget PickHelicopterGunTarget(const XMFLOAT3& muzzle) {
         // aimed at ground level dives into the terrain over any real distance.
         consider({ actor->position.x,
                    actor->position.y + actor->footOffset + 1.35f,
-                   actor->position.z }, false);
+                   actor->position.z }, false, XMFLOAT3{}, 0);
     }
     return best;
 }

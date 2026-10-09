@@ -347,14 +347,19 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
 // deliberately not tested -- the gun looks down through a canopy from above,
 // where the trunk sphere the infantry test uses is not what is in the way.
 static bool HelicopterHasLineOfSightTo(const XMFLOAT3& muzzle,
-                                       const XMFLOAT3& target) {
+                                       const XMFLOAT3& target,
+                                       uint64_t targetEntity) {
     constexpr float rayRadius = 0.04f;
     XMFLOAT3 hit;
     if (scene.useDestruction && g_destruction.IsInitialized() &&
         g_destruction.HitTestSegmentForVision(muzzle, target, rayRadius, hit))
         return false;
-    if (HitPrefabColliderSegment(muzzle, target, rayRadius, hit, nullptr,
-                                 nullptr, /*fencePanelsTransparent=*/true))
+    // A target inside a collider (the player's tank hull) is sighted when the
+    // first thing the ray meets is that collider.
+    uint64_t blocker = 0;
+    if (HitPrefabColliderSegment(muzzle, target, rayRadius, hit, &blocker,
+                                 nullptr, /*fencePanelsTransparent=*/true) &&
+        (targetEntity == 0 || blocker != targetEntity))
         return false;
     // The one that matters most for an airframe: a target behind a ridge or
     // inside a bowl is not shootable from a hover, however open the sky is.

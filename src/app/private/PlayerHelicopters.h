@@ -342,6 +342,34 @@ static void DamagePilotedGunship(float damage) {
     }
 }
 
+// Damage smoke for the vehicles with no curve of their own: the patrol boat and
+// the player's gunship trail smoke under kVehicleDamageSmokeFraction,
+// thickening toward zero. (Tanks smoke from UpdateEnemyTanks; the enemy
+// gunships, BlackHawk and insertion boat already have theirs.)
+static void UpdateVehicleDamageSmoke(float dt) {
+    const auto trail = [dt](float fraction, float& timer,
+                            const XMFLOAT3& position) {
+        if (fraction >= kVehicleDamageSmokeFraction) { timer = 0.0f; return; }
+        timer -= dt;
+        if (timer > 0.0f) return;
+        const float severity = 1.0f - (std::max)(0.0f, fraction) /
+                                          kVehicleDamageSmokeFraction;
+        timer = 0.34f - 0.24f * severity;
+        scene.SpawnSmokeBurst(position, 0.5f + 0.7f * severity,
+                              0.4f + 0.8f * severity);
+    };
+    static float boatTimer = 0.0f;
+    if (g_levelPatrolBoatEnabled && g_boatModel && !g_boatDead && !g_boatSunk)
+        trail(g_boatHealth / kBoatMaxHealth, boatTimer,
+              { g_boatPosition.x, g_boatPosition.y + 1.5f, g_boatPosition.z });
+    static float gunshipTimer = 0.0f;
+    if (ParkedGunshipVisible() && !g_parkedGunshipDead) {
+        const XMFLOAT3& p = g_parkedGunshipFlight.position;
+        trail(g_parkedGunshipHealth / kParkedGunshipMaxHealth, gunshipTimer,
+              { p.x, p.y + 1.1f * kHelicopterSizeScale, p.z });
+    }
+}
+
 static void PilotChaseCamera(const XMFLOAT3& origin, float yaw, float& lastYaw,
                              float distance, float lift) {
     // Turn the view with the airframe, so holding a heading keeps the camera
