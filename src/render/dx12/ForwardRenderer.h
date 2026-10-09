@@ -1370,7 +1370,7 @@ inline bool PrepareR700ScopeFrame(Scene& scene) {
     g_r700ScopeFrame.weapon = PlayerWeaponTransform(scene, view);
     const XMMATRIX weaponView = g_r700ScopeFrame.weapon * view;
     const XMVECTOR lensView = XMVector3TransformCoord(XMLoadFloat3(&lens), weaponView);
-    if (XMVectorGetZ(lensView) <= scene.cameraNear) return false;
+    if (XMVectorGetZ(lensView) <= scene.EffectiveCameraNearPlane()) return false;
     g_r700ScopeFrame.lensTangent = SniperScopeOptics::ProjectTangent(lensView);
     g_r700ScopeFrame.aimTangent = SniperScopeOptics::ProjectTangent(
         XMVector3TransformNormal(XMLoadFloat3(&scene.camera.GetAimFront()), view));
@@ -2418,7 +2418,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Clustered light cull
     scene.clusteredRenderer.setScreenSize(
         scene.RenderWidth(), scene.RenderHeight());
-    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
+    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.EffectiveCameraNearPlane(),
                                       scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
 

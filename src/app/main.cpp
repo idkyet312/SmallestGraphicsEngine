@@ -1691,6 +1691,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DLSS::GetSettings().rayReconstruction = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
                 scene.enableVolumetricFog = false;
+            // World cloud volumes and the sky's cloud layer both off, so an
+            // overview from above the cloud base sees the ground.
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOCLOUDS", nullptr, 0) > 0) {
+                scene.enableFlyableClouds = false;
+                scene.atmosphereCloudCoverage = 0.0f;
+            }
             if (GetEnvironmentVariableA("SGE_CAPTURE_HQ_LENS", nullptr, 0) > 0)
                 visBuffer.highQualityLensEnabled = true;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOAO", nullptr, 0) > 0)
@@ -6949,7 +6955,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     XMStoreFloat4x4(&inputs.view, scene.GetViewMatrix());
                     XMStoreFloat4x4(&inputs.projection,
                                     scene.GetUnjitteredProjectionMatrix());
-                    inputs.nearPlane = scene.cameraNear;
+                    inputs.nearPlane = scene.EffectiveCameraNearPlane();
                     inputs.farPlane = scene.EffectiveCameraFarPlane();
                     inputs.verticalFovRadians =
                         XMConvertToRadians(scene.EffectiveCameraFOV());
@@ -7666,7 +7672,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 XMStoreFloat4x4(&dlssInputs.view, scene.GetViewMatrix());
                 XMStoreFloat4x4(&dlssInputs.projection,
                                 scene.GetUnjitteredProjectionMatrix());
-                dlssInputs.nearPlane = scene.cameraNear;
+                dlssInputs.nearPlane = scene.EffectiveCameraNearPlane();
                 dlssInputs.farPlane = scene.EffectiveCameraFarPlane();
                 dlssInputs.verticalFovRadians =
                     XMConvertToRadians(scene.EffectiveCameraFOV());
@@ -7866,7 +7872,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 nightVision.Apply(g_dx12.commandList.Get(), noiseTime,
                                   g_nightVisionBlend, g_nightVisionGain,
                                   g_nightVisionOverload,
-                                  scene.cameraNear,
+                                  scene.EffectiveCameraNearPlane(),
                                   scene.EffectiveCameraFarPlane());
             }
         }

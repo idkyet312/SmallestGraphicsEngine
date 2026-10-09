@@ -634,7 +634,7 @@ private:
         XMStoreFloat4x4(&constants.viewProjection, XMMatrixTranspose(vp));
         constants.cameraNearFar = {
             scene.camera.VisualPosition().x, scene.camera.VisualPosition().y,
-            scene.camera.VisualPosition().z, scene.cameraNear };
+            scene.camera.VisualPosition().z, scene.EffectiveCameraNearPlane() };
         XMVECTOR light = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
         XMFLOAT3 lightDirection;
         XMStoreFloat3(&lightDirection, light);

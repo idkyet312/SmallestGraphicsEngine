@@ -1208,6 +1208,7 @@ static void UpdateMenuMusic() {
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
     if (!DeploymentPlanningVisible()) {
         scene.cameraFarOverride = 0.0f;
+        scene.cameraNearOverride = 0.0f;
         scene.volumetricFogDistanceOverride = 0.0f;
         // Leaving the overview -- deployed, cancelled or dropped into the
         // editor -- takes the rest of the salvo with it. The barrage is fired
@@ -1218,6 +1219,7 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
     }
     if (g_game.loading.Active()) {
         scene.cameraFarOverride = 0.0f;
+        scene.cameraNearOverride = 0.0f;
         scene.volumetricFogDistanceOverride = 0.0f;
         return;
     }
@@ -1306,6 +1308,15 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
         std::sin(angle) * horizontalRadius,
         lookAtHeight + std::sin(elevation) * orbitDistance,
         std::cos(angle) * horizontalRadius };
+    // Pull the near plane out with the orbit: 2% of the distance to the look
+    // point, and never past a quarter of the height above the sea, which is
+    // the closest thing the frustum can see even at the 1-degree elevation.
+    // SGE_NO_NEAR_SCALE keeps the 0.1 m gameplay near for an A/B.
+    static const bool nearScaleDisabled =
+        GetEnvironmentVariableA("SGE_NO_NEAR_SCALE", nullptr, 0) > 0;
+    scene.cameraNearOverride = nearScaleDisabled ? 0.0f : (std::max)(
+        scene.cameraNear, (std::min)(orbitDistance * 0.02f,
+                                     scene.camera.Position.y * 0.25f));
     // Stretch the froxel volume to the far side of the insertion ring. The
     // composite fades over the last 20% of its range, so the ring edge sits
     // inside the solid part. The stock 34 m ring stays under the authored

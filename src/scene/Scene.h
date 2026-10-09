@@ -481,6 +481,11 @@ struct Scene {
     // Temporary projection extension for views such as deployment planning.
     // Zero preserves the authored gameplay far plane and its depth precision.
     float  cameraFarOverride = 0.0f;
+    // Raised near plane for the same views. Depth is standard-Z D32, so the
+    // step at distance z is roughly z^2 * 6e-8 / near: 2 m at 1.8 km with the
+    // 0.1 m gameplay near, which the planning water read as noise that the
+    // DLSS jitter re-rolled every frame. Zero keeps cameraNear.
+    float  cameraNearOverride = 0.0f;
     // Same idea for the froxel volume (fog + world clouds). The deployment
     // camera sits well past the authored fog distance on wide maps, so the
     // clouds stopped mid-island. Transient: never written back to weather.
@@ -2966,6 +2971,9 @@ struct Scene {
         // turning a second time.
         return 1.0f - 0.30f * adsBlend;
     }
+    float EffectiveCameraNearPlane() const {
+        return cameraNearOverride > 0.0f ? cameraNearOverride : cameraNear;
+    }
     float EffectiveCameraFarPlane() const {
         return (std::max)(cameraFar, cameraFarOverride);
     }
@@ -3005,7 +3013,7 @@ struct Scene {
         return XMMatrixPerspectiveFovLH(
             XMConvertToRadians(EffectiveCameraFOV()),
             RenderWidth() / height,
-            cameraNear, EffectiveCameraFarPlane());
+            EffectiveCameraNearPlane(), EffectiveCameraFarPlane());
     }
 
     // -- Ejected free camera (Unreal's F8) --------------------------------------

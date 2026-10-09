@@ -960,7 +960,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     CullAndBatchDrawItems(scene, view, proj, drawItems);
 
     scene.clusteredRenderer.setScreenSize(scene.RenderWidth(), scene.RenderHeight());
-    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
+    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.EffectiveCameraNearPlane(),
         scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
 
@@ -1375,7 +1375,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             g_profiler, "VB Resolve", g_dx12.commandList.Get());
         vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
             previousViewProjection,
-            scene.camera.VisualPosition(), scene.cameraNear,
+            scene.camera.VisualPosition(), scene.EffectiveCameraNearPlane(),
             scene.EffectiveCameraFarPlane(),
             scene.contactShadowStrength, scene.ambientOcclusionRadius,
             scene.contactShadowLinearDepth,

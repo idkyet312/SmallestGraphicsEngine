@@ -987,7 +987,7 @@ public:
 
     std::array<XMMATRIX, SHADOW_CASCADE_COUNT> ComputeCascadeMatrices(
         const Scene& scene) const {
-        const float nearDepth = (std::max)(scene.cameraNear, 0.05f);
+        const float nearDepth = (std::max)(scene.EffectiveCameraNearPlane(), 0.05f);
         const float farDepth = (std::min)(scene.EffectiveCameraFarPlane(),
             (std::max)(180.0f, scene.shadowFarPlane * 2.0f));
         constexpr float splitLambda = 0.65f;
@@ -1689,7 +1689,7 @@ public:
             const bool projectionChanged = !cacheViewValid ||
                 std::abs(cachedFov - scene.EffectiveCameraFOV()) > 0.001f ||
                 std::abs(cachedAspect - aspect) > 0.0001f ||
-                std::abs(cachedNear - scene.cameraNear) > 0.0001f ||
+                std::abs(cachedNear - scene.EffectiveCameraNearPlane()) > 0.0001f ||
                 std::abs(cachedFar - cameraFar) > 0.01f ||
                 XMVectorGetX(XMVector3Dot(
                     XMLoadFloat3(&cachedLightDirection),
@@ -1697,7 +1697,7 @@ public:
             if (projectionChanged) farCacheValid.fill(false);
             cachedFov = scene.EffectiveCameraFOV();
             cachedAspect = aspect;
-            cachedNear = scene.cameraNear;
+            cachedNear = scene.EffectiveCameraNearPlane();
             cachedFar = cameraFar;
             cachedLightDirection = lightDirection;
             cacheViewValid = true;
