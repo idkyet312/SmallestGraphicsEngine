@@ -149,6 +149,57 @@ static void ApplyPrefabMaterialOverrides(const PrefabAsset& prefab,
     }
 }
 
+// Flags cutout materials whose vertex normals disagree with their triangle
+// faces on more than a fifth of triangles. Bistro's cypress cards measure 50%
+// (outward volume normals); its hedges, linde and ivy leaves 0-0.1%. Those
+// materials keep authored normals in Forward (alphaCut mode 4).
+static void MarkBentNormalCutouts(const std::shared_ptr<SceneNode>& root,
+                                  const std::string& prefabId) {
+    struct Tally { size_t opposed = 0, total = 0; };
+    std::unordered_map<SceneMaterial*, Tally> tallies;
+    const auto walk = [&](const auto& self, const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) {
+            for (const MeshPrimitive& primitive : node->mesh->primitives) {
+                SceneMaterial* material = primitive.material.get();
+                if (!material || !material->alphaCutout || material->foliageShading)
+                    continue;
+                const std::vector<float>& v = primitive.vertices;
+                const std::vector<unsigned int>& idx = primitive.indices;
+                const size_t vertexCount = v.size() / 12;
+                Tally& tally = tallies[material];
+                for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+                    const size_t a = idx[t], b = idx[t + 1], c = idx[t + 2];
+                    if (a >= vertexCount || b >= vertexCount || c >= vertexCount) continue;
+                    const XMVECTOR pa = XMVectorSet(v[a * 12], v[a * 12 + 1], v[a * 12 + 2], 0);
+                    const XMVECTOR face = XMVector3Cross(
+                        XMVectorSubtract(XMVectorSet(v[b * 12], v[b * 12 + 1], v[b * 12 + 2], 0), pa),
+                        XMVectorSubtract(XMVectorSet(v[c * 12], v[c * 12 + 1], v[c * 12 + 2], 0), pa));
+                    if (XMVectorGetX(XMVector3LengthSq(face)) < 1e-20f) continue;
+                    const XMVECTOR normal = XMVectorSet(
+                        v[a * 12 + 3] + v[b * 12 + 3] + v[c * 12 + 3],
+                        v[a * 12 + 4] + v[b * 12 + 4] + v[c * 12 + 4],
+                        v[a * 12 + 5] + v[b * 12 + 5] + v[c * 12 + 5], 0);
+                    ++tally.total;
+                    if (XMVectorGetX(XMVector3Dot(face, normal)) < 0.0f) ++tally.opposed;
+                }
+            }
+        }
+        for (const auto& child : node->children) self(self, child);
+    };
+    walk(walk, root);
+    for (auto& [material, tally] : tallies) {
+        if (tally.total == 0) continue;
+        const float opposed = static_cast<float>(tally.opposed) / tally.total;
+        material->bentNormals = opposed > 0.2f;
+        if (material->bentNormals)
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                prefabId + ": " + material->name + " keeps bent normals (" +
+                std::to_string(static_cast<int>(opposed * 100.0f + 0.5f)) +
+                "% of " + std::to_string(tally.total) + " triangles oppose their face)");
+    }
+}
+
 static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     auto cached = g_prefabModelCache.find(prefab.id);
     if (cached != g_prefabModelCache.end()) return &cached->second;
@@ -212,6 +263,7 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         };
         forceDoubleSided(forceDoubleSided, model);
     }
+    MarkBentNormalCutouts(model, prefab.id);
     if (prefab.transparencyPass != "auto") {
         const WaterTransparencyMode waterMode =
             prefab.transparencyPass == "afterWater"

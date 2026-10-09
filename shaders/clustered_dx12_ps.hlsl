@@ -38,7 +38,7 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float alphaCut;          // -1: alpha blend; 1: foliage; 2: luminance; 3: hard cutout
+    float alphaCut;          // -1: alpha blend; 1: foliage; 2: luminance; 3: hard cutout; 4: 3 + bent normals
     float alphaCutoff;       // clip threshold for modes 1 and 3
     float ambientScale;
     float occlusionStrength;
@@ -1076,7 +1076,9 @@ float4 main(PS_INPUT input) : SV_TARGET
         ? faceCross * rsqrt(faceLengthSq) : normal;
     if (dot(faceNormal, viewDir) < 0.0)
         faceNormal = -faceNormal;
-    if (dot(normal, faceNormal) < 0.0)
+    // Mode 4 cutouts carry normals bent away from their faces (bush volume
+    // normals); flipping those per card inverted about half of them.
+    if (alphaCut < 3.5 && dot(normal, faceNormal) < 0.0)
         normal = -normal;
 
     const bool isWater = materialType > 0.5 && materialType < 2.5;

@@ -2293,8 +2293,11 @@ public:
         // path. Foliage keeps mode 1 (edge bleed + dark-texel lift); anything
         // else alpha-tested is mode 3 and clips at its authored cutoff.
         const bool foliageShading = !cacheOwner || cacheOwner->foliageShading;
+        // Mode 4 is mode 3 that keeps bent normals unflipped.
         data.alphaCut = alphaFromLuminance ? 2.0f
-                        : (alphaCut ? (foliageShading ? 1.0f : 3.0f)
+                        : (alphaCut ? (foliageShading ? 1.0f
+                                       : (cacheOwner && cacheOwner->bentNormals
+                                           ? 4.0f : 3.0f))
                                     : (cacheOwner && cacheOwner->alphaBlend
                                         ? -1.0f : 0.0f));
         data.alphaCutoff = cacheOwner ? cacheOwner->alphaCutoff : 0.20f;

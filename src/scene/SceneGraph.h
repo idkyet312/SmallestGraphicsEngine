@@ -70,6 +70,12 @@ struct SceneMaterial {
     // Dark leaf photos need some recovery, but palm crowns must retain their
     // texture contrast rather than borrowing the grass's bright shadow floor.
     float foliageShadowLift = 0.72f;
+    // Cutout cards whose vertex normals are bent away from their faces (a
+    // bush's outward "sphere" normals). Forward's two-sided flip compares the
+    // normal with the camera-facing face, which turns roughly half such cards
+    // inward and shades the bush as dark clumps; these keep authored normals.
+    // Measured from the mesh at prefab load, see MarkBentNormalCutouts.
+    bool bentNormals = false;
     // glTF alphaMode=BLEND. Kept separate from alphaCutout so texture-driven
     // glass can use blending even when baseColorFactor alpha itself is 1.
     bool alphaBlend = false;
