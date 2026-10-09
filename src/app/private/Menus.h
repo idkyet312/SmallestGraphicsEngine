@@ -3260,7 +3260,8 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                     break;
                 case 3: // Time of day, applied live like the panel's buttons.
                     for (const TimeOfDay time : { TimeOfDay::Noon, TimeOfDay::Afternoon,
-                                                  TimeOfDay::Dusk, TimeOfDay::Night }) {
+                                                  TimeOfDay::Dusk, TimeOfDay::Night,
+                                                  TimeOfDay::MaxFidelity }) {
                         char text[24];
                         std::snprintf(text, sizeof(text), "%s", TimeOfDayName(time));
                         for (char* c = text; *c; ++c)

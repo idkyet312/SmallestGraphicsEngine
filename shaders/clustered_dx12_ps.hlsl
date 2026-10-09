@@ -1263,6 +1263,11 @@ float4 main(PS_INPUT input) : SV_TARGET
     ambient += skyContribution * diffuseAlbedo * ambientScale;
     ambient *= ambientOcclusion * ambientLightingIntensity;
     float3 result = ambient;
+#ifdef SGE_BINDLESS_MATERIALS
+    // Match the opt-in editor fill in the VB resolve for Forward comparison.
+    if (shPadding.x > 0.0)
+        result += shPadding.x * diffuseAlbedo * ambientScale;
+#endif
     
     // Main directional/point light
     float3 lightDir;

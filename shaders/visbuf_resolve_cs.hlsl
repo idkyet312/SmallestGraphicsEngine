@@ -1027,6 +1027,13 @@ float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
 // tinted by the hit albedo; the sky is the smaller ambient part of it.
 static const float kBounceSkyDamping = 0.25;
 
+// Lumen far field. Past kLumenFarFieldEnd from the eye no GI ray is traced and
+// the pixel takes the unoccluded sky irradiance, the same ambient the
+// non-Lumen path uses. Between the two distances the traced and sky terms
+// cross-fade so the cutoff has no seam.
+static const float kLumenFarFieldStart = 900.0;
+static const float kLumenFarFieldEnd = 1000.0;
+
 // Ambient light arriving at a ray hit. Default: damped sky only (single
 // bounce). Lumen mode reads the probe grid at the hit as a world-space
 // radiance cache: probes already hold sky plus earlier bounces, so feeding
@@ -1218,6 +1225,13 @@ bool ShadeRayHitSurface(RayHit hit, float3 rayDir, out float3 hitPos,
         float2 uv1 = pv1.d1.zw;
         float2 uv2 = pv2.d1.zw;
         float2 hitUV = uv0 * weights.x + uv1 * weights.y + uv2 * weights.z;
+#ifdef SGE_BINDLESS_MATERIALS
+        if (hitMaterial.shadingParams.w > 0.0) {
+            Texture2D<float4> hitEmissionTexture =
+                MAT_TEX((uint)hitMaterial.shadingParams.w - 1);
+            hitEmissive *= hitEmissionTexture.SampleLevel(texSampler, hitUV, 0).rgb;
+        }
+#endif
 
         if (MAT_TEX_BOUND(hitMaterial.textureIndices.x)) {
             Texture2D<float4> albedoTexture =
@@ -2663,6 +2677,11 @@ Surface EvaluateSurface(float3 fragPos,
     // to remove.
 #ifdef SGE_BINDLESS_MATERIALS
     MaterialData material = materials[min(dc.materialID, 4095u)];
+    if (material.shadingParams.w > 0.0) {
+        Texture2D<float4> emissiveTexture = MAT_TEX(uint(material.shadingParams.w) - 1u);
+        material.emissiveOcclusion.rgb *= emissiveTexture.SampleGrad(
+            texSampler, texCoord, albedoDx, albedoDy).rgb;
+    }
 #else
     MaterialData material = materials[min(dc.materialID, 255u)];
 #endif
@@ -2914,7 +2933,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     // already carries sky light with real occlusion. Adding the unoccluded sky
     // term on top double counts it and lights interiors as if they were
     // outdoors -- measured: the hangar interior moved 0.4 luma with it kept.
-    if (enhancedLumenGI != 0) diffuseIBL = 0.0;
+    // 1 inside the near field, 0 past kLumenFarFieldEnd.
+    const float lumenNearWeight = saturate(
+        (kLumenFarFieldEnd - length(cameraPos - surface.fragPos)) /
+        (kLumenFarFieldEnd - kLumenFarFieldStart));
+    const bool lumenFarField = enhancedLumenGI != 0 && lumenNearWeight <= 0.0;
+    if (enhancedLumenGI != 0) diffuseIBL *= 1.0 - lumenNearWeight;
     // Probe-miss RT fallback: trace a bounce only where the sparse grid
     // reported it had nothing, so cost scales with the miss fraction rather
     // than with screen area. Falls back to the unclassified path whenever the
@@ -2927,8 +2951,11 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     // mistake reflectionEligible exists to prevent on the specular side.
     float3 tracedGIIrradiance = 0.0;
     bool giTraced = false;
-    const bool lumenGI = enhancedLumenGI != 0;
-    if (lumenGI || (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
+    const bool lumenGI = enhancedLumenGI != 0 && !lumenFarField;
+    if (lumenFarField) {
+        // Sky irradiance is already in diffuseIBL; no ray, no denoiser signal.
+        giIrradiance = 0.0;
+    } else if (lumenGI || (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
         sparseProbeCount > 0 && sparseCellCount > 0)) {
         bool probeResolved = false;
         // Lumen mode traces every pixel and does not need the probe grid at
@@ -2959,10 +2986,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
         if (traceThisPixel) {
             bool giRayExecuted = true;
             float3 traced;
+            // Scaled before the blend below, so the denoiser sees the same
+            // faded quantity that lights the pixel.
             if (lumenGI)
                 traced = SampleLumenGI(surface.fragPos, ambientNormal, pixel,
                                        stableSurfaceID, commitTemporalHistory,
-                                       giRayExecuted);
+                                       giRayExecuted) * lumenNearWeight;
             else
                 traced = RayTracedProbeMissGI(
                     surface.fragPos, ambientNormal, pixel);
@@ -3209,6 +3238,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
                   ambientOcclusion * ambientLightingIntensity;
     }
     }
+#ifdef SGE_BINDLESS_MATERIALS
+    // Explicit editor fill must survive GI's removal of the legacy bounce
+    // approximation. Keep it separate from AO and the environment multiplier.
+    if (shPadding.x > 0.0)
+        result += shPadding.x * diffuseAlbedo * ambientScale;
+#endif
     result += surface.material.emissiveOcclusion.rgb * emissiveIntensity;
     
     float3 numerator = NDF * G * F;

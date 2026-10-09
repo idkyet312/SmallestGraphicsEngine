@@ -17,7 +17,22 @@ enum class TextureFormat : uint32_t {
     None = 0,
     BC3 = 1,
     BC5 = 2,
+    BC1 = 3,
 };
+
+inline uint32_t TextureBlockBytes(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::BC1: return 8;
+    case TextureFormat::BC3:
+    case TextureFormat::BC5: return 16;
+    default: return 0;
+    }
+}
+
+inline uint64_t TextureRowBytes(TextureFormat format, uint32_t width) {
+    const uint64_t blocks = (uint64_t(width) + 3u) / 4u;
+    return (blocks ? blocks : 1u) * TextureBlockBytes(format);
+}
 
 enum AssetFlags : uint32_t {
     HasGeometry = 1u << 0,
@@ -121,7 +136,25 @@ enum MaterialFlags : uint32_t {
     RoughnessOnly = 1u << 1,
     AlphaCutout = 1u << 2,
     AlphaBlend = 1u << 3,
+    // Spare fields are meaningful only with this bit; old caches wrote zeros.
+    TexturedEmission = 1u << 4,
+    DirectXNormal = 1u << 5,
+    PackedOcclusion = 1u << 6,
+    QuantizedOcclusion = 1u << 7,
 };
+
+// The upper flag bits preserve glTF's fractional AO strength without changing
+// the on-disk record. PackedOcclusion alone remains strength 1 for old cooks.
+inline void SetOcclusionStrength(uint32_t& flags, float strength) {
+    strength = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+    flags = (flags & 0x0000ff3fu) | PackedOcclusion | QuantizedOcclusion |
+        (static_cast<uint32_t>(strength * 65535.0f + 0.5f) << 16);
+}
+
+inline float OcclusionStrength(uint32_t flags) {
+    if (!(flags & PackedOcclusion)) return 0.0f;
+    return flags & QuantizedOcclusion ? float(flags >> 16) / 65535.0f : 1.0f;
+}
 
 struct Material {
     uint32_t name = 0;
@@ -129,7 +162,7 @@ struct Material {
     uint32_t baseColorTexture = kInvalidIndex;
     uint32_t normalTexture = kInvalidIndex;
     uint32_t metallicRoughnessTexture = kInvalidIndex;
-    uint32_t reserved0 = 0;
+    uint32_t reserved0 = 0; // emissive texture index when TexturedEmission
     float baseColor[4] = { 1, 1, 1, 1 };
     float metallic = 1.0f;
     float roughness = 1.0f;
@@ -138,7 +171,7 @@ struct Material {
     // file cooked before this field wrote zero here, which the loader treats
     // as "unspecified" and replaces with the glTF default.
     float alphaCutoff = 0.0f;
-    float reserved1 = 0.0f;
+    float reserved1 = 0.0f; // emissive strength when TexturedEmission
 };
 
 struct Texture {

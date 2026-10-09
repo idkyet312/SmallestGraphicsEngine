@@ -737,7 +737,7 @@ static VolumetricFogSettings MakeDefaultVolumetricFogSettings(TimeOfDay time) {
             preset.volumetricFogTint};
 }
 
-constexpr int kTimeOfDayCount = 4;
+constexpr int kTimeOfDayCount = 5;
 
 // Indexed by TimeOfDay. Written by the deployment-screen sliders and read back
 // by ApplyTimeOfDay, so a tuned look survives switching away and back.
@@ -746,6 +746,7 @@ VolumetricFogSettings g_volumetricFogByTime[kTimeOfDayCount] = {
     MakeDefaultVolumetricFogSettings(TimeOfDay::Afternoon),
     MakeDefaultVolumetricFogSettings(TimeOfDay::Dusk),
     MakeDefaultVolumetricFogSettings(TimeOfDay::Night),
+    MakeDefaultVolumetricFogSettings(TimeOfDay::MaxFidelity),
 };
 
 static VolumetricFogSettings& VolumetricFogFor(TimeOfDay time) {

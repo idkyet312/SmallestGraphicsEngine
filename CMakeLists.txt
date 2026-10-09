@@ -908,6 +908,8 @@ endif()
 add_executable(AssetCooker
     tools/AssetCooker.cpp
     src/assets/cooked/CookedAssetFormat.h)
+add_executable(BistroSceneConvert tools/BistroSceneConvert.cpp)
+target_link_libraries(BistroSceneConvert PRIVATE ufbx nlohmann_json::nlohmann_json)
 target_link_libraries(AssetCooker PRIVATE
     SGEProjectHeaders
     assimp::assimp

@@ -225,6 +225,11 @@ struct alignas(256) VBExposureConstants {
 
 class VisibilityBufferDX12 {
 public:
+    UINT geometryVertexCapacity = VB_MAX_VERTICES;
+    UINT geometryIndexCapacity = VB_MAX_INDICES;
+    UINT geometryTriangleCapacity = VB_MAX_TRIANGLES;
+    UINT geometryGeneration = 0;
+    bool texturedEmissionEnabled = false;
     // Descriptor-table sizes include the final t92 spot shadow atlas slot.
     // Keep allocation and copy counts tied to these values: omitting the last
     // descriptor makes bindless sample an uninitialized heap entry.
@@ -764,8 +769,8 @@ public:
     // Transient geometry -- destruction re-merges its chunk batches every time
     // a fracture changes the chunk set -- returns its storage to this pool
     // instead of leaking it. See VisibilityGeometryPool.h.
-    VisibilityGeometryPool geometryPool{ VB_MAX_VERTICES, VB_MAX_INDICES,
-                                         VB_MAX_TRIANGLES, FRAME_COUNT };
+    VisibilityGeometryPool geometryPool{ geometryVertexCapacity, geometryIndexCapacity,
+                                         geometryTriangleCapacity, FRAME_COUNT };
     std::vector<UINT> freeMeshSlots;
     // Slot indices released this frame. Held back one frame before joining
     // freeMeshSlots, for the same reason the geometry ranges are quarantined:
@@ -1087,11 +1092,11 @@ public:
                         D3D12_HEAP_TYPE_UPLOAD, view->drawCallUpload[frame]) ||
                 !buffer(VB_CLUSTER_COUNT * sizeof(VBClusterData),
                         D3D12_HEAP_TYPE_UPLOAD, view->clusterDataUpload[frame]) ||
-                !buffer(VB_MAX_VERTICES * sizeof(VBPackedVertex),
+                !buffer(geometryVertexCapacity * sizeof(VBPackedVertex),
                         D3D12_HEAP_TYPE_UPLOAD, view->vertexDataUpload[frame]) ||
-                !buffer(VB_MAX_INDICES * sizeof(UINT),
+                !buffer(geometryIndexCapacity * sizeof(UINT),
                         D3D12_HEAP_TYPE_UPLOAD, view->indexDataUpload[frame]) ||
-                !buffer(VB_MAX_TRIANGLES * sizeof(UINT),
+                !buffer(geometryTriangleCapacity * sizeof(UINT),
                         D3D12_HEAP_TYPE_UPLOAD, view->stableTriangleDataUpload[frame])) return false;
             desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
             desc.NumDescriptors = kEnhancedResolveDescriptorCount;
@@ -1432,9 +1437,9 @@ public:
         if (!require(exposureConstantBuffer.Create(FRAME_COUNT), "exposure constants")) return false;
 
         cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
-        cpuVertices.resize(VB_MAX_VERTICES);
-        cpuIndices.resize(VB_MAX_INDICES);
-        cpuStableTriangleIDs.resize(VB_MAX_TRIANGLES);
+        cpuVertices.resize(geometryVertexCapacity);
+        cpuIndices.resize(geometryIndexCapacity);
+        cpuStableTriangleIDs.resize(geometryTriangleCapacity);
         cpuClusters.resize(VB_CLUSTER_COUNT);
         previousModels.resize(VB_MAX_DRAW_CALLS);
         if (mappedMaterials) mappedMaterials[0] = VBMaterialData{};
@@ -1564,7 +1569,7 @@ public:
                                   BindlessHeapDX12& heap) {
         if (!material || !heap.Initialized() || !mappedBindlessMaterials) return 0;
 
-        const auto updateParameters = [material](VBMaterialData& data) {
+        const auto updateParameters = [this, material](VBMaterialData& data) {
             data.baseColorFactor = material->baseColorFactor;
             data.emissiveOcclusion.x = material->emissiveFactor.x;
             data.emissiveOcclusion.y = material->emissiveFactor.y;
@@ -1575,6 +1580,11 @@ public:
             data.shadingParams = XMFLOAT4(material->ambientScale,
                 material->viewFillStrength,
                 material->foliageShading ? material->foliageShadowLift : 0.7f, 0.0f);
+            // Zero preserves the old constant-emission path. Index+1 keeps
+            // absence distinct from a valid bindless slot zero.
+            if (texturedEmissionEnabled && material->emissiveTexture &&
+                material->bindlessEmissiveIndex != BINDLESS_INVALID_INDEX)
+                data.shadingParams.w = float(material->bindlessEmissiveIndex + 1u);
         };
 
         // The material's cached indices are only meaningful for the allocator
@@ -1601,7 +1611,13 @@ public:
                     BINDLESS_FALLBACK_METALROUGH,
                     needsComputeTransition(
                         material->metallicRoughnessTexture.Get()));
+            material->bindlessEmissiveIndex = heap.RegisterTexture(
+                material->emissiveTexture.Get(), BINDLESS_FALLBACK_BLACK,
+                needsComputeTransition(material->emissiveTexture.Get()));
         }
+        if (texturedEmissionEnabled && material->emissiveTexture)
+            material->bindlessEmissiveIndex = heap.RegisterTexture(
+                material->emissiveTexture.Get(), BINDLESS_FALLBACK_BLACK, true);
 
         auto found = bindlessMaterialLookup.find(material);
         if (found != bindlessMaterialLookup.end()) {
@@ -2006,6 +2022,80 @@ public:
 
     // Upload-once mesh registration. Instances reference this immutable geometry
     // every frame instead of duplicating vertices per draw.
+    // Caller owns the level-load GPU drain. Build every replacement first so
+    // an allocation failure keeps the previous pool and registrations usable.
+    bool SetGeometryCapacity(UINT vertices, UINT indices, UINT triangles) {
+        if (vertices == geometryVertexCapacity && indices == geometryIndexCapacity &&
+            triangles == geometryTriangleCapacity) return true;
+        if (!initialized || ScopeSurfaceBound() || !vertices || !indices || !triangles)
+            return false;
+        std::array<ComPtr<ID3D12Resource>, 3> buffers;
+        std::array<std::array<ComPtr<ID3D12Resource>, FRAME_COUNT>, 3> uploads, scopeUploads;
+        const UINT64 bytes[3] = { UINT64(vertices) * sizeof(VBPackedVertex),
+            UINT64(indices) * sizeof(UINT), UINT64(triangles) * sizeof(UINT) };
+        auto create = [](UINT64 size, D3D12_HEAP_TYPE type,
+                         ComPtr<ID3D12Resource>& resource) {
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = type;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = size; desc.Height = 1; desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return SUCCEEDED(g_dx12.device->CreateCommittedResource(&heap,
+                D3D12_HEAP_FLAG_NONE, &desc, type == D3D12_HEAP_TYPE_UPLOAD
+                    ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(&resource)));
+        };
+        for (UINT b = 0; b < 3; ++b) {
+            if (!create(bytes[b], D3D12_HEAP_TYPE_DEFAULT, buffers[b])) return false;
+            for (UINT f = 0; f < FRAME_COUNT; ++f) {
+                if (!create(bytes[b], D3D12_HEAP_TYPE_UPLOAD, uploads[b][f])) return false;
+                if (scopeView && !create(bytes[b], D3D12_HEAP_TYPE_UPLOAD, scopeUploads[b][f]))
+                    return false;
+            }
+        }
+        std::vector<VBPackedVertex> vertexMirror(vertices);
+        std::vector<UINT> indexMirror(indices), triangleMirror(triangles);
+        vertexDataBuffer = std::move(buffers[0]);
+        indexDataBuffer = std::move(buffers[1]);
+        stableTriangleDataBuffer = std::move(buffers[2]);
+        for (UINT f = 0; f < FRAME_COUNT; ++f) {
+            vertexDataUpload[f] = std::move(uploads[0][f]);
+            indexDataUpload[f] = std::move(uploads[1][f]);
+            stableTriangleDataUpload[f] = std::move(uploads[2][f]);
+            if (scopeView) {
+                scopeView->vertexDataUpload[f] = std::move(scopeUploads[0][f]);
+                scopeView->indexDataUpload[f] = std::move(scopeUploads[1][f]);
+                scopeView->stableTriangleDataUpload[f] = std::move(scopeUploads[2][f]);
+            }
+        }
+        cpuVertices.swap(vertexMirror); cpuIndices.swap(indexMirror);
+        cpuStableTriangleIDs.swap(triangleMirror);
+        geometryVertexCapacity = vertices; geometryIndexCapacity = indices;
+        geometryTriangleCapacity = triangles;
+        geometryPool = VisibilityGeometryPool(vertices, indices, triangles, FRAME_COUNT);
+        primitiveMeshLookup.clear(); meshes.clear(); freeMeshSlots.clear();
+        retiredMeshSlots.clear(); transientMeshSlots.clear();
+        persistentVertexCount = persistentIndexCount = persistentTriangleCount = 0;
+        persistentAuthoredTriangleCount = 0; geometryRegistrationFailures = 0;
+        geometryDirty = geometryUploaded = false;
+        dirtyVertices.Clear(); dirtyIndices.Clear(); dirtyTriangles.Clear();
+        previousModelByInstance.clear(); previousDrawCount = currentDrawCall = 0;
+        hitGeometryCount = 0;
+        ++geometryGeneration;
+        InvalidateTemporalHistory();
+        UpdateComputeDescriptors(); UpdatePostDescriptors();
+        for (UINT f = 0; f < FRAME_COUNT; ++f) RefreshEnhancedDescriptors(f);
+        if (scopeView) {
+            SwapScopeViewStorage();
+            UpdateComputeDescriptors(); UpdatePostDescriptors();
+            for (UINT f = 0; f < FRAME_COUNT; ++f) RefreshEnhancedDescriptors(f);
+            PatchScopeDescriptors();
+            SwapScopeViewStorage();
+        }
+        return true;
+    }
+
     UINT RegisterMesh(const float* vertexData, UINT vertexCount,
                       const UINT* indexData, UINT indexCount,
                       UINT vertexStrideFloats = 8,
@@ -5632,15 +5722,15 @@ private:
                                      drawCallBuffer, drawCallUpload[0]))
             return false;
 
-        if (!CreateDefaultAndUpload(VB_MAX_VERTICES * sizeof(VBPackedVertex),
+        if (!CreateDefaultAndUpload(geometryVertexCapacity * sizeof(VBPackedVertex),
                                      vertexDataBuffer, vertexDataUpload[0]))
             return false;
 
-        if (!CreateDefaultAndUpload(VB_MAX_INDICES * sizeof(UINT),
+        if (!CreateDefaultAndUpload(geometryIndexCapacity * sizeof(UINT),
                                      indexDataBuffer, indexDataUpload[0]))
             return false;
 
-        if (!CreateDefaultAndUpload(VB_MAX_TRIANGLES * sizeof(UINT),
+        if (!CreateDefaultAndUpload(geometryTriangleCapacity * sizeof(UINT),
                                      stableTriangleDataBuffer,
                                      stableTriangleDataUpload[0]))
             return false;
@@ -5651,11 +5741,11 @@ private:
         for (UINT frame = 1; frame < FRAME_COUNT; ++frame) {
             if (!CreateUpload(VB_MAX_DRAW_CALLS * sizeof(VBDrawCallData),
                               drawCallUpload[frame]) ||
-                !CreateUpload(VB_MAX_VERTICES * sizeof(VBPackedVertex),
+                !CreateUpload(geometryVertexCapacity * sizeof(VBPackedVertex),
                               vertexDataUpload[frame]) ||
-                !CreateUpload(VB_MAX_INDICES * sizeof(UINT),
+                !CreateUpload(geometryIndexCapacity * sizeof(UINT),
                               indexDataUpload[frame]) ||
-                !CreateUpload(VB_MAX_TRIANGLES * sizeof(UINT),
+                !CreateUpload(geometryTriangleCapacity * sizeof(UINT),
                               stableTriangleDataUpload[frame]))
                 return false;
         }
@@ -7763,7 +7853,7 @@ private:
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Buffer.FirstElement = 0;
-            srv.Buffer.NumElements = VB_MAX_TRIANGLES;
+            srv.Buffer.NumElements = geometryTriangleCapacity;
             srv.Buffer.StructureByteStride = sizeof(UINT);
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 95;
@@ -8587,7 +8677,7 @@ private:
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Buffer.FirstElement = 0;
-            srvDesc.Buffer.NumElements = VB_MAX_VERTICES;
+            srvDesc.Buffer.NumElements = geometryVertexCapacity;
             srvDesc.Buffer.StructureByteStride = sizeof(VBPackedVertex);
             g_dx12.device->CreateShaderResourceView(vertexDataBuffer.Get(), &srvDesc, cpuHandle);
             cpuHandle.ptr += descSize;
@@ -8600,7 +8690,7 @@ private:
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Buffer.FirstElement = 0;
-            srvDesc.Buffer.NumElements = VB_MAX_INDICES;
+            srvDesc.Buffer.NumElements = geometryIndexCapacity;
             srvDesc.Buffer.StructureByteStride = sizeof(UINT);
             g_dx12.device->CreateShaderResourceView(indexDataBuffer.Get(), &srvDesc, cpuHandle);
             cpuHandle.ptr += descSize;
@@ -9658,7 +9748,7 @@ private:
             stableTriangleSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             stableTriangleSrv.Shader4ComponentMapping =
                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            stableTriangleSrv.Buffer.NumElements = VB_MAX_TRIANGLES;
+            stableTriangleSrv.Buffer.NumElements = geometryTriangleCapacity;
             stableTriangleSrv.Buffer.StructureByteStride = sizeof(UINT);
             g_dx12.device->CreateShaderResourceView(
                 stableTriangleDataBuffer.Get(), &stableTriangleSrv, handle);

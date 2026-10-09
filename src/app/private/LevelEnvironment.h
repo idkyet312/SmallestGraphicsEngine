@@ -206,15 +206,26 @@ static void RebuildScalableEnvironment() {
     // Follow the island the way the ocean and crater sizing already do
     // (kShoreOuter * islandScale), and take whichever is larger: the island
     // itself, or the spread of the placed entities plus a margin.
+    //
+    // Past kMaxNavmeshIslandScale (100x) there is no navmesh at all. One solo
+    // Recast build measures 55-60 s on a 24x island at 0.3 m cells and grows
+    // with the area. Bandits fall back to direct steering.
     float extent = g_stressTestMode ? 122.0f : 61.0f;
+    bool buildNavmesh = true;
     if (g_customLevelMode) {
         constexpr float kShoreOuter = 88.0f;
         const float islandScale = (std::max)(1.0f,
             (std::max)(terrainParams.islandScaleX, terrainParams.islandScaleZ));
         extent = (std::max)({ 122.0f, kShoreOuter * islandScale,
                               CurrentPhysicsTerrainExtent() });
+        buildNavmesh = islandScale <= kMaxNavmeshIslandScale;
     }
-    {
+    if (!buildNavmesh) {
+        g_navigation.Reset();
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Navmesh skipped: island scale above " +
+            std::to_string(static_cast<int>(kMaxNavmeshIslandScale)) + "x");
+    } else {
         ProfilerDX12::CpuScope navmeshProfile(g_profiler, "Editor/Navmesh");
         const auto navigationBegin = std::chrono::steady_clock::now();
         std::vector<float> propTriangles;

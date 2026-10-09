@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "name": "Bistro Exterior",
+  "insertionMode": "spawn",
+  "patrolBoatEnabled": false,
+  "environmentMap": "Content/Textures/Sky/san_giuseppe_bridge_4k.hdr",
+  "renderingProfile": "bistroExterior",
+  "terrain": {
+    "heightScale": 0,
+    "flat": true,
+    "tilesX": 16,
+    "tilesZ": 16,
+    "autoFoliage": false,
+    "sculpt": []
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Bistro Overview",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          131.69026263722506,
+          -247.29895127071032
+        ],
+        "rotation": [
+          -25,
+          180,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "type": "prefab",
+      "prefab": "scenes/bistro-exterior",
+      "name": "Bistro Exterior",
+      "enabled": true,
+      "transform": {
+        "position": [
+          -24.421855926513672,
+          10.311875820159912,
+          -4.272247314453125
+        ],
+        "rotation": [
+          0,
+          0,
+          0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      }
+    }
+  ]
+}

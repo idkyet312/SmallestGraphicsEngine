@@ -300,6 +300,7 @@ static void InitializeLevelHumveePhysics() {
 
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
+    RequestLevelRenderingSettings(g_game.world.Level());
     const RuntimeLevelPlan plan =
         LevelRuntimeBuilder::Build(g_game.world.Level());
     g_levelPatrolBoatEnabled = plan.patrolBoatEnabled;
@@ -823,6 +824,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         scene.ambientStrength = 0.07f;
     }
     g_game.session.SetScreen(GameScreen::Level1);
+    RequestLevelRenderingSettings(customLevel ? *customLevel : LevelDefinition{});
     g_customLevelMode = !stressTest && !emptyLevel;
     // Reset before the branch: ApplyRuntimeLevelBasics refines this from the
     // level plan, but it early-returns for the stress and empty test levels,
@@ -940,7 +942,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // The hub opens at sunset. Applied without touching g_selectedTimeOfDay:
     // that is the mission's choice, and the next deployment screen re-applies
     // it, so the base's light never leaks into the run planned from it.
-    if (g_baseMode) ApplyTimeOfDay(
+    if (g_baseMode && (!customLevel || customLevel->renderingProfile != "bistroExterior")) ApplyTimeOfDay(
         g_game.world.Level().mapType == LevelMapType::Snowy
             ? TimeOfDay::Noon : TimeOfDay::Dusk);
     if (modeAssetsLoaded)
@@ -1129,7 +1131,7 @@ static void StartBase(HWND hwnd) {
 //
 // Quotes are honoured so a path with spaces still arrives in one piece; an
 // unquoted one does not, which is the same deal every other argument gets.
-static std::filesystem::path StartupLevelPath(const char* commandLine) {
+static std::vector<std::string> StartupArguments(const char* commandLine) {
     if (!commandLine) return {};
     std::vector<std::string> tokens;
     std::string current;
@@ -1147,6 +1149,17 @@ static std::filesystem::path StartupLevelPath(const char* commandLine) {
         has = true;
     }
     if (has) tokens.push_back(current);
+
+    return tokens;
+}
+
+static bool StartupEditorRequested(const char* commandLine) {
+    const auto tokens = StartupArguments(commandLine);
+    return std::find(tokens.begin(), tokens.end(), "--editor") != tokens.end();
+}
+
+static std::filesystem::path StartupLevelPath(const char* commandLine) {
+    const auto tokens = StartupArguments(commandLine);
 
     constexpr const char* prefix = "--level";
     const size_t prefixLength = std::strlen(prefix);

@@ -87,6 +87,13 @@ static bool g_skyEnvironmentSwapPending = false;
 // lighting change land first means the scene has already gone dark by the time
 // that stall happens, instead of the frozen frame being the old daylight one.
 static float g_skyEnvironmentSwapDelay = 0.0f;
+static std::string g_requestedLevelEnvironment = kSkyEnvironmentPath;
+static std::string g_requestedRenderingProfile = "default";
+static std::string g_appliedRenderingProfile = "default";
+static bool g_levelRenderingProfilePending = false;
+static bool g_levelGeometryBindingsPending = false;
+static bool g_levelProfileForcedForward = false;
+static bool g_levelProfilePreviousVB = true;
 static constexpr float kSkyEnvironmentSwapDelaySeconds = 1.0f;
 
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay) {
@@ -94,18 +101,25 @@ static void RequestTimeOfDaySkyEnvironment(TimeOfDay) {
     // swap to queue. Kept as a no-op rather than deleted: the time-of-day code
     // calls this from several places, and a preset that wants its own sky again
     // only has to fill this back in.
-    g_skyEnvironmentSwapPending = false;
-    g_skyEnvironmentSwapDelay = 0.0f;
+    // Presets retain the level's environment, including a pending level load.
 }
 
-// Runs between frames only. See g_skyEnvironmentSwapPending.
-static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
-    // No-op for the same reason as RequestTimeOfDaySkyEnvironment above: with
-    // one environment map there is nothing to upload and no IBL to re-derive.
-    // Dropping the night EXR removed this function's cost entirely -- it used
-    // to decode a 70 MB file and recompute the irradiance SH mid-run, which is
-    // what made switching into Night hitch.
+static void RequestLevelRenderingSettings(const LevelDefinition& level) {
+    const std::string environment = level.environmentMap.empty()
+        ? kSkyEnvironmentPath : level.environmentMap;
+    if (environment != g_requestedLevelEnvironment) {
+        g_requestedLevelEnvironment = environment;
+        g_skyEnvironmentSwapPending = true;
+        g_skyEnvironmentSwapDelay = 0.0f;
+    }
+    if (level.renderingProfile != g_requestedRenderingProfile) {
+        g_requestedRenderingProfile = level.renderingProfile;
+        g_levelRenderingProfilePending = true;
+    }
 }
+
+
+// Runs between frames only. See g_skyEnvironmentSwapPending.
 ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
 ID3D12Resource*             g_spotShadowAtlasResource = nullptr;
 ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
@@ -362,3 +376,97 @@ static bool                 firearmAssetsLoaded = false;
 static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
 static std::future<bool> levelDestructionLoadFuture;
 static bool levelDestructionLoadInFlight = false;
+
+static void ApplyPendingLevelRenderingProfile() {
+    if (!g_levelRenderingProfilePending || !visBuffer.initialized) return;
+    g_levelRenderingProfilePending = false;
+    const bool bistro = g_requestedRenderingProfile == "bistroExterior";
+    if (!bistro && g_levelProfileForcedForward) {
+        scene.useVisibilityBuffer = g_levelProfilePreviousVB;
+        g_levelProfileForcedForward = false;
+    }
+    const auto forwardFallback = []() {
+        if (!g_levelProfileForcedForward) g_levelProfilePreviousVB = scene.useVisibilityBuffer;
+        g_levelProfileForcedForward = true;
+        scene.useVisibilityBuffer = false;
+    };
+    UINT vertices = VB_MAX_VERTICES, indices = VB_MAX_INDICES, triangles = VB_MAX_TRIANGLES;
+    if (bistro) {
+        try {
+            std::ifstream stream("Content/Cooked/Models/BistroExterior/BistroExterior.sgeasset.stats.json");
+            nlohmann::json stats; stream >> stats;
+            auto capacity = [&stats](const char* field, UINT base) {
+                const uint64_t total = stats.at(field).get<uint64_t>() + base;
+                if (total > UINT_MAX) throw std::runtime_error("Bistro geometry capacity overflow");
+                return UINT(total);
+            };
+            vertices = capacity("vertices", vertices);
+            indices = capacity("indices", indices);
+            triangles = capacity("triangles", triangles);
+        } catch (const std::exception& error) {
+            SGE_LOG("LogRender", EngineLog::Level::Error,
+                std::string("Bistro profile metadata unavailable; using Forward: ") + error.what());
+            forwardFallback();
+            return;
+        }
+    }
+    if (vertices != visBuffer.geometryVertexCapacity || indices != visBuffer.geometryIndexCapacity ||
+        triangles != visBuffer.geometryTriangleCapacity) {
+        WaitForGPUAllFrames();
+        try {
+            if (!visBuffer.SetGeometryCapacity(vertices, indices, triangles))
+                throw std::runtime_error("geometry buffer allocation failed");
+        } catch (const std::exception& error) {
+            SGE_LOG("LogRender", EngineLog::Level::Error,
+                std::string("Level geometry profile failed; using Forward: ") + error.what());
+            forwardFallback();
+            return;
+        }
+        g_dxrDDGI.MarkLayoutDirty();
+        g_levelGeometryBindingsPending = true;
+        SGE_LOG("LogRender", EngineLog::Level::Display,
+            "VB geometry profile: " + g_requestedRenderingProfile + ", " +
+            std::to_string(vertices) + " vertices, " + std::to_string(indices) + " indices");
+    }
+    visBuffer.texturedEmissionEnabled = bistro;
+    g_appliedRenderingProfile = g_requestedRenderingProfile;
+    if (bistro && !bindlessHeap.Initialized()) {
+        SGE_LOG("LogRender", EngineLog::Level::Warning,
+            "Bistro full material profile requires bindless materials; using Forward");
+        forwardFallback();
+    }
+}
+
+
+static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
+    if (skyRenderer.EnvironmentPath() == g_requestedLevelEnvironment) return;
+    ID3D12GraphicsCommandList* list = skyRenderer.BeginEnvironmentSwap();
+    if (!list) {
+        SGE_LOG("LogRender", EngineLog::Level::Warning, "Level environment swap unavailable");
+        return;
+    }
+    const bool loaded = skyRenderer.SetEnvironment(g_requestedLevelEnvironment, list);
+    if (loaded) {
+        g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
+        if (environmentIBL.Init(g_skyEnvironmentResource, kSkyEnvironmentRotationRadians, list)) {
+            g_specularEnvironmentResource = environmentIBL.prefilteredEnvironment.Get();
+            g_brdfIntegrationResource = environmentIBL.brdfIntegrationLUT.Get();
+        } else {
+            g_specularEnvironmentResource = g_skyEnvironmentResource;
+            g_brdfIntegrationResource = nullptr;
+            SGE_LOG("LogRender", EngineLog::Level::Warning, "Level IBL prefilter failed; using raw HDRI");
+        }
+    }
+    skyRenderer.EndEnvironmentSwap();
+    if (!loaded) {
+        SGE_LOG("LogRender", EngineLog::Level::Warning,
+            "Level environment failed; retaining previous HDRI: " + g_requestedLevelEnvironment);
+        return;
+    }
+    mainShader.SetSkyIrradiance(GLBImporter::ComputeSkyIrradianceSH(
+        g_requestedLevelEnvironment, kSkyEnvironmentRotationRadians), 1.0f);
+    visBuffer.UpdateEnvironmentMap(g_specularEnvironmentResource, g_brdfIntegrationResource);
+    visBuffer.InvalidateTemporalHistory();
+    SGE_LOG("LogRender", EngineLog::Level::Display, "Level environment loaded: " + g_requestedLevelEnvironment);
+}
+

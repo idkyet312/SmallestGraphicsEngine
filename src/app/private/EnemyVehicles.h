@@ -949,6 +949,28 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     // Weather remains authoritative over its fog component when the sun moves.
     // Custom retains the per-time fog that was just restored above.
     ApplyLiveWeatherState(scene.weatherState);
+    // Renderer knobs only MaxFidelity drives. Saved on entry and restored on
+    // exit, so leaving it hands back the level's own GI/emission/reflections.
+    static bool  s_extrasSaved = false;
+    static float s_savedGI = 0.0f;
+    static float s_savedEmission = 1.0f;
+    static bool  s_savedRTReflections = false;
+    if (settings.giIntensity >= 0.0f) {
+        if (!s_extrasSaved) {
+            s_savedGI = scene.giIntensity;
+            s_savedEmission = g_emissiveIntensity;
+            s_savedRTReflections = scene.enhancedRTReflections;
+            s_extrasSaved = true;
+        }
+        scene.giIntensity = settings.giIntensity;
+        g_emissiveIntensity = settings.emissiveIntensity;
+        scene.enhancedRTReflections = settings.rtReflections;
+    } else if (s_extrasSaved) {
+        scene.giIntensity = s_savedGI;
+        g_emissiveIntensity = s_savedEmission;
+        scene.enhancedRTReflections = s_savedRTReflections;
+        s_extrasSaved = false;
+    }
     // The demo light animation walks lightPos around on its own, which would
     // drag a chosen sun back out of place within a few seconds.
     scene.animateDemoLights = false;

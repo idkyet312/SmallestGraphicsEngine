@@ -133,7 +133,9 @@ public:
         data.intensity = intensity;
         data.fallSpeed = kFallSpeed;
         data.windVelocity = windVelocity;
-        // 24 matches kMaxTerrainIslandScale (LevelDefinition.h).
+        // Capped at 24x, below kMaxTerrainIslandScale (400): the drop count is
+        // fixed, so a larger domain thins the rain with its area. Past 2.5 km
+        // from the centre of a larger island it simply does not rain.
         data.worldExtentX = kBaseWorldExtent * (std::max)(
             0.5f, (std::min)(scene.terrainIslandScaleX, 24.0f));
         data.worldExtentZ = kBaseWorldExtent * (std::max)(

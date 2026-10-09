@@ -31,6 +31,7 @@ struct LevelEditorActions {
     // other rebuild is pending can leave the prop missing until an unrelated
     // edit forces a compile. This is the manual way out.
     bool refreshVisuals = false;
+    bool toggleLighting = false;
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
@@ -73,6 +74,7 @@ public:
     // Whether the editor viewport wants volumetric fog drawn. The editor does
     // not reach into Scene itself, so the caller reads this and applies it.
     bool FogEnabled() const { return fogEnabled_; }
+    void SetFogEnabled(bool enabled) { fogEnabled_ = enabled; }
     // Whether the viewport wants the deployment overview's terrain LOD.
     bool BirdseyeEnabled() const { return birdseyeEnabled_; }
     // Whether the viewport wants the walkable navmesh drawn over the ground.

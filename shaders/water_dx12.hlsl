@@ -678,10 +678,13 @@ VSOutput VSMain(VSInput input)
         mul(float4(previousPosition, 1.0), previousViewProjection);
     output.clipmapData = float2(input.tangent.w, input.texCoord.y);
     output.position = output.currentClip;
-    if (volume0.w > 0.5 && volume1.z < 0.5 && output.position.w > 0.0) {
+    if (volume0.w > 0.5 && output.position.w > 0.0) {
         // Gameplay uses an 800 m far plane for useful depth precision. Clamp
         // only the ocean inside it so the visual horizon ring survives far
         // clipping; its world position remains untouched for stable shading.
+        // The deployment sea takes the same clamp: it spans far past the
+        // overview's far plane, which only has to enclose the terrain. Water
+        // has no depth target bound, so the clamped depth is never tested.
         output.position.z = min(
             output.position.z, output.position.w * 0.99998);
     }

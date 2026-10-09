@@ -967,6 +967,11 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // Register immutable meshes once. Frames upload instance/material records only.
     static UINT cubeMesh = VB_INVALID_MESH;
     static UINT planeMesh = VB_INVALID_MESH;
+    static UINT geometryGeneration = 0;
+    if (geometryGeneration != vb.geometryGeneration) {
+        cubeMesh = planeMesh = VB_INVALID_MESH;
+        geometryGeneration = vb.geometryGeneration;
+    }
     if (cubeMesh == VB_INVALID_MESH)
         cubeMesh = vb.RegisterMesh(packed.cubeFloats.data(),
             (UINT)(packed.cubeFloats.size() / 8), nullptr, 0);

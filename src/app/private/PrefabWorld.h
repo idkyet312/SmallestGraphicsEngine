@@ -631,7 +631,7 @@ static void RebuildPrefabRenderBatches(bool refreshAssets = true) {
         // too, as chunk geometry. Adding the prefab's bounds box on top would
         // put a second, coarser collider around the same mast.
         if (collision != "none" && !skipRenderBatch) {
-            if (collision == "mesh") {
+            if (collision == "mesh" || collision == "floor") {
                 if (cachedModel->collisionMesh &&
                     !cachedModel->collisionMesh->Empty()) {
                     CollisionMeshInstance instance;

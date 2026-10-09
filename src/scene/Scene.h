@@ -448,9 +448,11 @@ struct Scene {
     // Everything else (grass, particles, water, actors) belongs in the scope
     // image exactly as it does in the main view.
     bool   drawViewmodel = true;
+    bool   editorCameraPass = false;
+    float  editorAmbientFill = 0.0f;
 
     bool ShouldDrawViewmodel() const {
-        return drawViewmodel && !sniperScopeCameraPass;
+        return drawViewmodel && !sniperScopeCameraPass && !editorCameraPass;
     }
     float  renderWidthOverride = 0.0f;
     float  renderHeightOverride = 0.0f;

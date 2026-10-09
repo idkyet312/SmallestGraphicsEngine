@@ -342,8 +342,16 @@ static bool BuildDXRDDGIAccelerationScene() {
         params.heightScale = scene.terrainHeightScale;
         const float width = params.tilesX * params.tileSize;
         const float depth = params.tilesZ * params.tileSize;
-        const float step = (std::max)(2.0f,
-            g_game.world.Level().dxrDDGI.surfaceSpacing);
+        // The first build usually happens on the planning screen, where these
+        // params are the whole-island overview grid. At a 3 m step that grid
+        // was 78M vertices on a 150x island and threw bad_alloc on a 400x one,
+        // so the step widens to keep at most kMaxColumns per axis (a 24x
+        // island stays under it and keeps its authored spacing).
+        constexpr float kMaxColumns = 2048.0f;
+        const float step = (std::max)({ 2.0f,
+            g_game.world.Level().dxrDDGI.surfaceSpacing,
+            (std::max)(params.tilesX * params.tileSize,
+                       params.tilesZ * params.tileSize) / kMaxColumns });
         const uint32_t columns =
             static_cast<uint32_t>(std::ceil(width / step));
         const uint32_t rows =

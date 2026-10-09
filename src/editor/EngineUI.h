@@ -3,6 +3,7 @@
 
 #include <imgui.h>
 #include "Scene.h"
+#include "TimeOfDay.h"
 #include "VisibilityBufferDX12.h"
 #include "DestructionDX12.h"
 #include "VirtualInput.h"
@@ -1886,6 +1887,96 @@ inline void DrawVirtualShadowPageGrid() {
 
     ImGui::TextDisabled("Green: cached  Red: redrawn  Grey: unused");
     ImGui::TextDisabled("Number is the clipmap level the page belongs to.");
+}
+
+inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
+                               bool& open, bool& fog, bool& rayGI, bool& vsm,
+                               TimeOfDay& timeOfDay, bool& timeOfDayChanged) {
+    if (!open) return false;
+    ImGui::SetNextWindowPos(ImVec2(16, 220), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
+    bool changed = false;
+    if (ImGui::Begin("Editor Lighting", &open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Game time of day");
+        for (int i = 0; i <= static_cast<int>(TimeOfDay::MaxFidelity); ++i) {
+            const auto time = static_cast<TimeOfDay>(i);
+            if (i != 0 && time != TimeOfDay::MaxFidelity) ImGui::SameLine();
+            if (ImGui::RadioButton(TimeOfDayName(time), timeOfDay == time)) {
+                timeOfDay = time;
+                timeOfDayChanged = true;
+                changed = true;
+            }
+        }
+        if (timeOfDay == TimeOfDay::MaxFidelity)
+            ImGui::TextDisabled("Fog 25%, sun 45 deg, GI 1.2x, emission 0.8x, RT reflections.");
+        ImGui::Separator();
+        const float radius = (std::max)(1.0f, std::sqrt(
+            scene.lightPos.x * scene.lightPos.x + scene.lightPos.y * scene.lightPos.y +
+            scene.lightPos.z * scene.lightPos.z));
+        float azimuth = DirectX::XMConvertToDegrees(std::atan2(scene.lightPos.z, scene.lightPos.x));
+        if (azimuth < 0.0f) azimuth += 360.0f;
+        float elevation = DirectX::XMConvertToDegrees(std::atan2(scene.lightPos.y,
+            std::sqrt(scene.lightPos.x * scene.lightPos.x + scene.lightPos.z * scene.lightPos.z)));
+        bool directionChanged = ImGui::SliderFloat("Sun azimuth", &azimuth, 0.0f, 360.0f, "%.1f deg");
+        directionChanged |= ImGui::SliderFloat("Sun elevation", &elevation, -89.0f, 89.0f, "%.1f deg");
+        if (directionChanged) {
+            const float a = DirectX::XMConvertToRadians(azimuth);
+            const float e = DirectX::XMConvertToRadians(elevation);
+            scene.lightPos = { radius * std::cos(e) * std::cos(a),
+                               radius * std::sin(e), radius * std::cos(e) * std::sin(a) };
+            scene.lightType = 0;
+            scene.animateLight = false;
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Sun intensity", &scene.directionalLightIntensity, 0.0f, 20.0f, "%.2f");
+        changed |= ImGui::ColorEdit3("Sun color", &scene.lightColor.x);
+        changed |= ImGui::SliderFloat("Ambient fill", &scene.editorAmbientFill, 0.0f, 2.0f, "%.3f");
+        changed |= ImGui::SliderFloat("Environment / GI gain", &scene.ambientLightingIntensity, 0.0f, 2.0f, "%.3f");
+        changed |= ImGui::SliderFloat("Emission", &g_emissiveIntensity, 0.0f, 8.0f, "%.2fx");
+        ImGui::Separator();
+        ImGui::BeginDisabled(!g_inlineRaytracingSupported);
+        changed |= ImGui::Checkbox("Ray-traced GI", &rayGI);
+        if (rayGI)
+            changed |= ImGui::SliderFloat("GI intensity", &scene.giIntensity, 0.0f, 5.0f, "%.2fx");
+        ImGui::EndDisabled();
+        const bool rayGIActive = scene.useVisibilityBuffer && vb.lumenGIActive &&
+            vb.enhancedVisualsActive && vb.enhancedTLASAddress != 0;
+        if (rayGIActive)
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1), "GI: ray-traced bounce active");
+        else if (!g_inlineRaytracingSupported)
+            ImGui::TextDisabled("GI: HDR environment (DXR 1.1 unavailable)");
+        else if (!scene.useVisibilityBuffer)
+            ImGui::TextDisabled("GI: HDR environment (Forward)");
+        else if (rayGI)
+            ImGui::TextDisabled("GI: requested; waiting for the RT scene");
+        else
+            ImGui::TextDisabled("GI: HDR environment; ray-traced bounce off");
+        ImGui::TextDisabled("Ambient fill adds light even when GI is active.");
+        ImGui::TextDisabled("Fill requires bindless; 0 keeps authored lighting.");
+        ImGui::Separator();
+        changed |= ImGui::Checkbox("Fog", &fog);
+        ImGui::BeginDisabled(!fog);
+        changed |= ImGui::SliderFloat("Fog amount", &scene.volumetricFogDensity,
+            0.0f, 0.05f, "%.4f",
+            ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0 = clear; higher values make thicker fog. Ctrl-click to enter a value.");
+        ImGui::EndDisabled();
+        changed |= ImGui::Checkbox("Clouds", &scene.enableFlyableClouds);
+        changed |= ImGui::Checkbox("Virtual shadow maps", &vsm);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Unchecked uses the cascade shadow map for comparison.");
+        if (vsm && g_vsmUnavailable)
+            ImGui::TextDisabled("VSM unavailable: using cascade shadows");
+        changed |= ImGui::Checkbox("Visibility Buffer", &scene.useVisibilityBuffer);
+        ImGui::TextDisabled("Unchecked uses Forward for comparison.");
+        if (scene.useVisibilityBuffer && !g_bindlessMaterialsActive)
+            ImGui::TextColored(ImVec4(1, 0.65f, 0.25f, 1), "Full Bistro materials need bindless; use Forward.");
+        ImGui::TextDisabled("Live preview controls; not saved in the level.");
+    }
+    ImGui::End();
+    if (changed) vb.InvalidateTemporalHistory();
+    return changed;
 }
 
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {

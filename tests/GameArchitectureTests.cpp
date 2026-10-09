@@ -1621,11 +1621,13 @@ int main() {
         CHECK(!TimeOfDayIsDark(TimeOfDay::Dusk));
         CHECK(!TimeOfDayIsDark(TimeOfDay::Noon));
         CHECK(!TimeOfDayIsDark(TimeOfDay::Afternoon));
+        CHECK(!TimeOfDayIsDark(TimeOfDay::MaxFidelity));
 
         // Every preset needs a name and a briefing for the deployment screen,
         // and no two may share a name or the buttons become ambiguous.
         const TimeOfDay all[] = { TimeOfDay::Noon, TimeOfDay::Afternoon,
-                                  TimeOfDay::Dusk, TimeOfDay::Night };
+                                  TimeOfDay::Dusk, TimeOfDay::Night,
+                                  TimeOfDay::MaxFidelity };
         for (const TimeOfDay time : all) {
             CHECK(TimeOfDayName(time) != nullptr);
             CHECK(TimeOfDayName(time)[0] != '\0');

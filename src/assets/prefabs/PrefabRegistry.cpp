@@ -319,8 +319,16 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
         } else if (prefab.basePrefabId.empty()) {
             throw std::runtime_error("components.staticMesh is required without extends");
         }
-        if (components.contains("collision"))
-            prefab.collision = components.at("collision").value("shape", "none");
+        if (components.contains("collision")) {
+            const json& collision = components.at("collision");
+            prefab.collision = collision.value("shape", "none");
+            if (collision.contains("materials")) {
+                if (!collision.at("materials").is_array())
+                    throw std::runtime_error("collision.materials must be an array");
+                for (const json& name : collision.at("materials"))
+                    prefab.collisionMaterials.push_back(name.get<std::string>());
+            }
+        }
         if (components.contains("light")) {
             const json& light = components.at("light");
             prefab.light.enabled = true;
@@ -414,8 +422,10 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             SGE::Cooked::FindAssetForSource(prefab.modelPath).empty())
             throw std::runtime_error("model does not exist: " + Generic(prefab.modelPath));
         if (prefab.collision != "none" && prefab.collision != "box" &&
-            prefab.collision != "mesh")
-            throw std::runtime_error("collision shape must be none, box, or mesh");
+            prefab.collision != "mesh" && prefab.collision != "floor")
+            throw std::runtime_error("collision shape must be none, box, mesh, or floor");
+        if (prefab.collision == "floor" && prefab.collisionMaterials.empty())
+            throw std::runtime_error("floor collision needs collision.materials");
         // script.path remains reserved. Runtime/language integration is deferred.
     } catch (const std::exception& error) {
         prefab.error = path.string() + ": " + error.what();
@@ -595,8 +605,10 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 std::copy(std::begin(local.defaultScale), std::end(local.defaultScale),
                           std::begin(merged.defaultScale));
             }
-            if (local.components.contains("collision"))
+            if (local.components.contains("collision")) {
                 merged.collision = local.collision;
+                merged.collisionMaterials = local.collisionMaterials;
+            }
             if (local.components.contains("light")) merged.light = local.light;
             if (local.components.contains("audio")) merged.audio = local.audio;
             if (local.components.contains("destructible"))
@@ -714,8 +726,12 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
         return result;
     }
     if (prefab.collision != "none" && prefab.collision != "box" &&
-        prefab.collision != "mesh") {
-        result.error = "collision shape must be none, box, or mesh";
+        prefab.collision != "mesh" && prefab.collision != "floor") {
+        result.error = "collision shape must be none, box, mesh, or floor";
+        return result;
+    }
+    if (prefab.collision == "floor" && prefab.collisionMaterials.empty()) {
+        result.error = "floor collision needs collision.materials";
         return result;
     }
     if (prefab.targetSize < 0.0f || !std::isfinite(prefab.targetSize)) {

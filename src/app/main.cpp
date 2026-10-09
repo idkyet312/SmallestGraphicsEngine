@@ -773,7 +773,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     std::cout << "Controls: WASD, Mouse, F3=UI, TAB=Scoreboard, F11=Fullscreen, ESC=Exit\n";
 
     const std::filesystem::path startupLevel = StartupLevelPath(commandLine);
-    if (!startupLevel.empty()) StartCustomLevel(hwnd, startupLevel);
+    if (StartupEditorRequested(commandLine)) StartLevelEditor(hwnd, startupLevel);
+    else if (!startupLevel.empty()) StartCustomLevel(hwnd, startupLevel);
+    const auto startupTokens = StartupArguments(commandLine);
+    if (std::find(startupTokens.begin(), startupTokens.end(), "--forward") != startupTokens.end())
+        scene.useVisibilityBuffer = false;
 
     // Multiplayer is opt-in from the command line for now: -host [port], or
     // -join <address> [port]. A menu belongs here eventually, but two instances
@@ -837,8 +841,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         GetEnvironmentVariableA("SGE_CAPTURE_ALL_STATES", nullptr, 0) > 0;
     UINT poseCaptureFrames = 0;
     UINT poseCaptureTarget = 180;
+    std::vector<std::filesystem::path> captureLevelSequence;
+    size_t captureLevelIndex = 0;
+    if (poseCapture && captureAllStates) {
+        char sequence[8192] = {};
+        if (GetEnvironmentVariableA("SGE_CAPTURE_LEVEL_SEQUENCE", sequence, sizeof(sequence)) > 0) {
+            std::stringstream stream(sequence);
+            std::string path;
+            while (std::getline(stream, path, '|'))
+                if (!path.empty()) captureLevelSequence.emplace_back(path);
+        }
+    }
     if (poseCapture) {
         char text[MAX_PATH] = {};
+        if (GetEnvironmentVariableA("SGE_CAPTURE_AMBIENT", text, sizeof(text)) > 0)
+            scene.editorAmbientFill = static_cast<float>(atof(text));
         if (GetEnvironmentVariableA("SGE_CAPTURE_FRAMES", text, sizeof(text)) > 0)
             poseCaptureTarget = static_cast<UINT>((std::max)(1, atoi(text)));
         if (GetEnvironmentVariableA("SGE_CAPTURE_LEVEL", text, sizeof(text)) > 0 &&
@@ -1528,369 +1545,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 << GroundHeightAt(g_debugTeleportPose[0],
                                   g_debugTeleportPose[2])
                 << std::endl;
-        }
-        if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
-            char captureBoat[16] = {};
-            GetEnvironmentVariableA("SGE_CAPTURE_BOAT", captureBoat, sizeof(captureBoat));
-            const bool captureBoatWalk = std::strcmp(captureBoat, "walk") == 0;
-            const bool captureBoatWake = std::strcmp(captureBoat, "wake") == 0;
-            static bool captureBoatWalkStarted = false;
-            const float sweepFrames = static_cast<float>(poseCaptureFrames) -
-                static_cast<float>(poseCaptureTarget - 1u);
-            if (!captureBoatWalk || !captureBoatWalkStarted) {
-                scene.camera.Position = { capturePose[0] + captureSweep[1] * sweepFrames,
-                                          capturePose[1],
-                                          capturePose[2] + captureSweep[2] * sweepFrames };
-                scene.camera.SetViewAngles(
-                    capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
-            }
-            // Exercise the actual driver camera against the imported cabin;
-            // fixed world poses alone cannot catch a helm point inside a wall.
-            if (g_insertionBoatModel && captureBoat[0]) {
-                if (captureBoatWalk ? !captureBoatWalkStarted :
-                                     !g_game.vehicles.drivingInsertionBoat) {
-                    g_game.vehicles.DisableBlackHawkInsertion();
-                    g_blackHawkInsertionRestartPending = false;
-                    g_insertionBoatRestartPending = false;
-                    const XMFLOAT3 hull{capturePose[0], capturePose[1], capturePose[2]};
-                    g_game.vehicles.BeginInsertionBoatRun(hull, hull.y,
-                        XM_PIDIV2 - XMConvertToRadians(capturePose[3]));
-                    g_game.vehicles.insertionBoatPosition = hull;
-                    scene.player.godMode = true;
-                    if (captureBoatWalk) {
-                        // Keep the automatic approach running while exercising
-                        // actual walking input relative to its moving deck.
-                        const float heading = g_game.vehicles.insertionBoatYaw;
-                        g_game.vehicles.insertionBoatLanding = {
-                            hull.x + std::sin(heading) * 180.0f, hull.y,
-                            hull.z + std::cos(heading) * 180.0f};
-                        captureBoatWalkStarted = true;
-                    } else {
-                        ToggleBoatDriving(true);
-                        if (captureBoatWake) g_game.vehicles.boatSpeed = 12.0f;
-                    }
-                }
-                g_insertionChoicePending = false;
-                if (captureBoatWalk) {
-                    if (!g_game.vehicles.insertionBoatPassengerPlacementPending &&
-                        poseCaptureFrames < poseCaptureTarget) {
-                        PlayerInput walk;
-                        walk.yaw = scene.camera.Yaw;
-                        walk.pitch = scene.camera.Pitch;
-                        walk.deltaTime = 1.0f / 75.0f;
-                        walk.forward = poseCaptureFrames < poseCaptureTarget / 2 ? 0.4f : 0.0f;
-                        walk.strafe = poseCaptureFrames >= poseCaptureTarget / 2 ? 0.3f : 0.0f;
-                        walk.Set(PlayerInput::Jump, poseCaptureFrames == 10);
-                        scene.camera.ApplyInput(walk);
-                    }
-                    if (poseCaptureFrames + 1 == poseCaptureTarget) {
-                        const auto& boat = g_game.vehicles;
-                        const float dx = scene.camera.Position.x - boat.insertionBoatPosition.x;
-                        const float dz = scene.camera.Position.z - boat.insertionBoatPosition.z;
-                        std::ofstream("boat_walk_capture.log", std::ios::trunc)
-                            << "Boat walking capture: localX="
-                            << dx * std::cos(boat.insertionBoatYaw) - dz * std::sin(boat.insertionBoatYaw)
-                            << " localZ=" << dx * std::sin(boat.insertionBoatYaw) + dz * std::cos(boat.insertionBoatYaw)
-                            << " grounded=" << scene.camera.IsGrounded
-                            << " passenger=" << boat.insertionBoatCarryingPlayer
-                            << " feetAboveDeck=" << scene.camera.Position.y - scene.camera.PlayerHeight -
-                                (boat.insertionBoatPosition.y - boat.insertionBoatSinkOffset + boat.insertionBoatDeckOffset)
-                            << " boatTravel=" << std::hypot(boat.insertionBoatPosition.x - capturePose[0],
-                                                           boat.insertionBoatPosition.z - capturePose[2])
-                            << std::endl;
-                    }
-                } else {
-                    scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
-                    if (captureBoatWake)
-                        g_game.vehicles.SetBoatInput(1.0f, 0.15f, false);
-                }
-            }
-            // SGE_CAPTURE_HELI="distance,rise,bearing" re-places the camera on
-            // the enemy gunship every frame instead -- it flies, so no fixed
-            // pose frames it. Bearing is degrees clockwise from its nose.
-            char captureHeli[64] = {};
-            float heliView[3] = {};
-            if (g_helicopterModel &&
-                GetEnvironmentVariableA("SGE_CAPTURE_HELI", captureHeli,
-                                        sizeof(captureHeli)) > 0 &&
-                sscanf_s(captureHeli, "%f,%f,%f", &heliView[0], &heliView[1],
-                         &heliView[2]) == 3) {
-                const float bearing =
-                    g_helicopterYaw + XMConvertToRadians(heliView[2]);
-                scene.camera.Position = {
-                    g_helicopterPosition.x + std::sin(bearing) * heliView[0],
-                    g_helicopterPosition.y + heliView[1],
-                    g_helicopterPosition.z + std::cos(bearing) * heliView[0] };
-                const float dx = g_helicopterPosition.x - scene.camera.Position.x;
-                const float dy = g_helicopterPosition.y - scene.camera.Position.y;
-                const float dz = g_helicopterPosition.z - scene.camera.Position.z;
-                scene.camera.SetViewAngles(
-                    XMConvertToDegrees(std::atan2(dz, dx)),
-                    XMConvertToDegrees(std::atan2(
-                        dy, std::sqrt(dx * dx + dz * dz))));
-            }
-            // SGE_CAPTURE_HUMVEE="distance,rise,bearing" does the same for
-            // Humvee 0, which drives off once its gunner has a target.
-            // Bearing is degrees about world +Y from +Z.
-            char captureHumvee[64] = {};
-            float humveeView[3] = {};
-            XMFLOAT4X4 humveePose;
-            XMFLOAT3 humveeAt;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_HUMVEE", captureHumvee,
-                                        sizeof(captureHumvee)) > 0 &&
-                sscanf_s(captureHumvee, "%f,%f,%f", &humveeView[0],
-                         &humveeView[1], &humveeView[2]) == 3 &&
-                HumveeVisualPose(0, humveePose, &humveeAt)) {
-                const float bearing = XMConvertToRadians(humveeView[2]);
-                scene.camera.Position = {
-                    humveeAt.x + std::sin(bearing) * humveeView[0],
-                    humveeAt.y + humveeView[1],
-                    humveeAt.z + std::cos(bearing) * humveeView[0] };
-                const float dx = humveeAt.x - scene.camera.Position.x;
-                const float dy = humveeAt.y + 1.0f - scene.camera.Position.y;
-                const float dz = humveeAt.z - scene.camera.Position.z;
-                scene.camera.SetViewAngles(
-                    XMConvertToDegrees(std::atan2(dz, dx)),
-                    XMConvertToDegrees(std::atan2(
-                        dy, std::sqrt(dx * dx + dz * dz))));
-            }
-            // A stray ESC during a long unattended run would park the capture
-            // behind the pause screen.
-            g_gamePaused = false;
-            // SGE_CAPTURE_FIRE=N fires the player's weapon N frames before the
-            // captured one, so a round's first rendered frames can be dumped.
-            char captureFire[8] = {};
-            if (GetEnvironmentVariableA("SGE_CAPTURE_FIRE", captureFire,
-                                        sizeof(captureFire)) > 0 &&
-                poseCaptureFrames + 1u + static_cast<UINT>(atoi(captureFire)) ==
-                    poseCaptureTarget)
-                ShootPlayerWeapon();
-            // SGE_CAPTURE_HURT=<severity 0..1> / SGE_CAPTURE_LOWHP=<pulse 0..1>
-            // hold the hit flash / low-health overlay on for the capture.
-            char captureHurt[16] = {};
-            if (GetEnvironmentVariableA("SGE_CAPTURE_HURT", captureHurt,
-                                        sizeof(captureHurt)) > 0) {
-                scene.player.damageFlash = 0.4f;
-                scene.player.damageFlashSeverity =
-                    static_cast<float>(atof(captureHurt));
-            }
-            if (GetEnvironmentVariableA("SGE_CAPTURE_LOWHP", captureHurt,
-                                        sizeof(captureHurt)) > 0)
-                scene.player.lowHealthPulse =
-                    static_cast<float>(atof(captureHurt));
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSSR", nullptr, 0) > 0)
-                scene.enableScreenSpaceReflections = false;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
-                scene.useVisibilityBuffer = false;
-            // DLSS A/B: off entirely, or with the jitter sign flipped.
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NODLSS", nullptr, 0) > 0)
-                DLSS::GetSettings().enabled = false;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_FXAA", nullptr, 0) > 0)
-                scene.enableFXAA = true;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NORR", nullptr, 0) > 0)
-                DLSS::GetSettings().rayReconstruction = false;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
-                scene.enableVolumetricFog = false;
-            // World cloud volumes and the sky's cloud layer both off, so an
-            // overview from above the cloud base sees the ground.
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOCLOUDS", nullptr, 0) > 0) {
-                scene.enableFlyableClouds = false;
-                scene.atmosphereCloudCoverage = 0.0f;
-            }
-            if (GetEnvironmentVariableA("SGE_CAPTURE_HQ_LENS", nullptr, 0) > 0)
-                visBuffer.highQualityLensEnabled = true;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOAO", nullptr, 0) > 0)
-                scene.enableAmbientOcclusion = false;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSVGF", nullptr, 0) > 0)
-                visBuffer.svgfTemporalEnabled = false;
-            if (GetEnvironmentVariableA("SGE_CAPTURE_NOATROUS", nullptr, 0) > 0)
-                visBuffer.svgfAtrousEnabled = false;
-            {
-                char iters[8] = {};
-                if (GetEnvironmentVariableA("SGE_CAPTURE_ATROUS_ITERS", iters,
-                                            sizeof(iters)) > 0)
-                    visBuffer.svgfAtrousIterations =
-                        static_cast<UINT>((std::max)(1, atoi(iters)));
-            }
-            if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
-                visBuffer.temporalEffectsEnabled = true;
-            if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
-                DLSS::GetSettings().invertJitter = true;
-            // "f1,f2,..." -> whether an odd number of those capture frames
-            // have passed, i.e. a setting flipped at each one is inverted.
-            const auto flippedAt = [&](const char* name, bool& present) {
-                char text[64] = {};
-                present = GetEnvironmentVariableA(name, text, sizeof(text)) > 0;
-                bool flipped = false;
-                for (const char* p = text; present && *p;) {
-                    char* end = nullptr;
-                    const long flipAt = std::strtol(p, &end, 10);
-                    if (end == p) break;
-                    if (static_cast<long>(poseCaptureFrames) >= flipAt)
-                        flipped = !flipped;
-                    p = *end ? end + 1 : end;
-                }
-                return flipped;
-            };
-            // Replays menu on/off/on runs. Lumen starts off; Ray Tracing
-            // Quality starts at the saved value and goes through the same
-            // ApplyGameSettings call as the menu combo.
-            bool togglePresent = false;
-            const bool lumenFlipped =
-                flippedAt("SGE_CAPTURE_LUMEN_TOGGLE", togglePresent);
-            if (togglePresent) g_settings.lumenGI = lumenFlipped;
-            const bool halfGIFlipped =
-                flippedAt("SGE_CAPTURE_HALF_GI_TOGGLE", togglePresent);
-            if (togglePresent) g_settings.lumenGIHalfResolution = halfGIFlipped;
-            const bool rtFlipped =
-                flippedAt("SGE_CAPTURE_RT_TOGGLE", togglePresent);
-            static const int rtInitialQuality = g_settings.rayTracingQuality;
-            // SGE_CAPTURE_DLSS_PCT pins the screen percentage the toggle's
-            // ApplyGameSettings restores (100 = no resize on the RR switch).
-            char dlssPct[16] = {};
-            if (GetEnvironmentVariableA("SGE_CAPTURE_DLSS_PCT", dlssPct,
-                                        sizeof(dlssPct)) > 0)
-                g_settings.dlssScreenPercentage =
-                    static_cast<float>(atof(dlssPct));
-            if (togglePresent) {
-                const bool startUltra =
-                    rtInitialQuality == GameSettings::kRayTracingUltra;
-                const int quality = (startUltra != rtFlipped)
-                    ? GameSettings::kRayTracingUltra
-                    : GameSettings::kRayTracingOff;
-                if (quality != g_settings.rayTracingQuality) {
-                    g_settings.rayTracingQuality = quality;
-                    ApplyGameSettings();
-                }
-            }
-            // Walks the runtime DLSS toggles (off, DLAA, SR, RR, preset) every
-            // 40 frames, so the resize/feature-switch paths run unattended.
-            if (GetEnvironmentVariableA("SGE_DLSS_CYCLE", nullptr, 0) > 0 &&
-                poseCaptureFrames % 40u == 0u) {
-                struct Step { bool on; float pct; bool rr; int preset; };
-                static constexpr Step steps[] = {
-                    { false, 100.0f, false, 1 }, { true, 100.0f, false, 1 },
-                    { true, 50.0f, false, 1 },   { true, 50.0f, true, 1 },
-                    { true, 33.0f, false, 2 },   { true, 67.0f, false, 0 },
-                    { true, 100.0f, true, 1 },   { true, 58.0f, false, 1 },
-                    { false, 58.0f, false, 1 },  { true, 100.0f, false, 1 } };
-                const Step& step = steps[(poseCaptureFrames / 40u) %
-                    (sizeof(steps) / sizeof(steps[0]))];
-                DLSS::Settings& dlss = DLSS::GetSettings();
-                dlss.enabled = step.on;
-                dlss.screenPercentage = step.pct;
-                dlss.rayReconstruction = step.rr;
-                dlss.preset = static_cast<DLSS::Preset>(step.preset);
-                std::cout << "DLSS cycle: on=" << step.on << " pct="
-                          << step.pct << " rr=" << step.rr << " preset="
-                          << step.preset << std::endl;
-            }
-            // Weapon index (GunModel::WeaponName). Every frame, since level
-            // start applies the loadout after the capture is armed.
-            char captureWeapon[8] = {};
-            if (GetEnvironmentVariableA("SGE_CAPTURE_WEAPON", captureWeapon,
-                                        sizeof(captureWeapon)) > 0)
-                GunModel::SelectedWeapon() = atoi(captureWeapon);
-            // A GUI-subsystem exe has no stdout to redirect, so the state line
-            // also goes to a file an unattended run can read back.
-            std::ofstream captureStateLog;
-            if (captureAllStates || poseCaptureFrames + 60 >= poseCaptureTarget)
-                captureStateLog.open("capture_state.log", std::ios::app);
-            if (captureStateLog)
-                captureStateLog << "render=" << g_dx12.screenWidth << "x"
-                                << g_dx12.screenHeight << " display="
-                                << g_dx12.displayWidth << "x"
-                                << g_dx12.displayHeight
-                                << " dlss=" << visBuffer.dlssActive
-                                << " rr=" << visBuffer.rayReconstructionActive
-                                << " enhanced=" << visBuffer.enhancedVisualsActive
-                                << " enhancedReady="
-                                << visBuffer.EnhancedVisualsReady()
-                                << " hitGeometry=" << visBuffer.HitGeometryReady()
-                                << " vb=" << scene.useVisibilityBuffer
-                                << " dxr=" << g_dxrDDGI.GetStatus().dxrSupported
-                                << " inlineRT="
-                                << g_dxrDDGI.GetStatus().inlineRaytracingSupported
-                                << " tlas=" << (g_dxrDDGI.Scene().TLASAddress() != 0)
-                                << " lumenSetting=" << g_settings.lumenGI
-                                << " lumen=" << visBuffer.lumenGIActive
-                                << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
-                                << " rc=" << visBuffer.radianceCascadesGIActive
-                                << " rcStatus=" << visBuffer.RadianceCascadesStatus()
-                                << " giCache=" << visBuffer.giRadianceCacheMode
-                                << " restir=" << visBuffer.lumenReSTIRMode
-                                << " giCacheMs=" << g_profiler.GpuScopeMs("Lumen Radiance Cache")
-                                << " captureFrame=" << poseCaptureFrames
-                                << " useDDGI=" << scene.useDDGI
-                                << " giIntensity=" << scene.giIntensity
-                                << " ambient=" << scene.ambientLightingIntensity
-                                << " svgfValid=" << visBuffer.svgfHistoryValid
-                                << " giRays="
-                                << visBuffer.EnhancedGIRayFraction()
-                                << " reflRays="
-                                << visBuffer.EnhancedReflectionRayFraction()
-                                << " vbGpuMs="
-                                << g_profiler.GpuScopeMs("Visibility Buffer")
-                                << " gpuFrameMs=" << g_profiler.GpuFrameMs()
-                                << " lensMs=" << g_profiler.GpuScopeMs("Lens Flare")
-                                << " hqLens=" << visBuffer.highQualityLensEnabled
-                                << " genericMs=" << g_profiler.GpuScopeMs("VB Shade Generic")
-                                << " terrainResolveMs=" << g_profiler.GpuScopeMs("VB Terrain Resolve")
-                                << " replayMs="
-                                << g_profiler.GpuScopeMs("VB Depth Replay")
-                                << " rrMs="
-                                << g_profiler.GpuScopeMs("DLSS Ray Reconstruction")
-                                << " dlssMs=" << g_profiler.GpuScopeMs("DLSS")
-                                << " rrLastEval=" << DLSS::LastEvaluatedRR()
-                                << " rasterMs="
-                                << g_profiler.GpuScopeMs("VB Raster")
-                                << " terrainMs="
-                                << g_profiler.GpuScopeMs("VB Terrain")
-                                << " waterQuality=" << static_cast<int>(scene.waterQuality)
-                                << " waterMs="
-                                << g_profiler.GpuScopeMs("Tropical Water")
-                                << " lightPos=" << scene.lightPos.x << ","
-                                << scene.lightPos.y << "," << scene.lightPos.z
-                                << " lightType=" << scene.lightType
-                                << " sunLens=" << scene.enableSunLens
-                                << " sunDisc=" << scene.sunDiscIntensity
-                                << " sunHalo=" << scene.sunHaloIntensity
-                                << " cam=" << scene.camera.Position.x << ","
-                                << scene.camera.Position.y << ","
-                                << scene.camera.Position.z
-                                << std::endl;
-            if (poseCaptureFrames + 1 >= poseCaptureTarget)
-                std::cout << "Capture frame " << poseCaptureFrames + 1
-                          << ": render " << g_dx12.screenWidth << "x"
-                          << g_dx12.screenHeight << " display "
-                          << g_dx12.displayWidth << "x"
-                          << g_dx12.displayHeight << " dlss="
-                          << visBuffer.dlssActive << " rr="
-                          << visBuffer.rayReconstructionActive
-                          << " extMV=" << visBuffer.extensionMotionVectors
-                          << " lumen=" << visBuffer.lumenGIActive
-                          << " vbGpuMs="
-                          << g_profiler.GpuScopeMs("Visibility Buffer")
-                          << std::endl;
-            if (++poseCaptureFrames == poseCaptureTarget) {
-                char path[MAX_PATH] = "capture.ppm";
-                GetEnvironmentVariableA("SGE_CAPTURE_PATH", path, sizeof(path));
-                g_frameCapturePath = path;
-            } else if (poseCaptureFrames == poseCaptureTarget + 1) {
-                // Optional next-frame dump: diffing two consecutive frames of a
-                // pinned camera shows sub-pixel jitter nothing resolved.
-                char path[MAX_PATH] = {};
-                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH2", path,
-                                            sizeof(path)) > 0)
-                    g_frameCapturePath = path;
-            } else if (poseCaptureFrames == poseCaptureTarget + 2) {
-                char path[MAX_PATH] = {};
-                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH3", path,
-                                            sizeof(path)) > 0)
-                    g_frameCapturePath = path;
-            } else if (poseCaptureFrames > poseCaptureTarget + 3) {
-                PostQuitMessage(0);
-            }
         }
         if (molotovSmokeTest && !molotovSmokeInjected && IsSceneScreen() &&
             !g_game.loading.Active()) {
@@ -5041,6 +4695,417 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         }
 
+        if (poseCapture && IsSceneScreen() && !g_game.loading.Active()) {
+            char captureBoat[16] = {};
+            GetEnvironmentVariableA("SGE_CAPTURE_BOAT", captureBoat, sizeof(captureBoat));
+            const bool captureBoatWalk = std::strcmp(captureBoat, "walk") == 0;
+            const bool captureBoatWake = std::strcmp(captureBoat, "wake") == 0;
+            static bool captureBoatWalkStarted = false;
+            const float sweepFrames = static_cast<float>(poseCaptureFrames) -
+                static_cast<float>(poseCaptureTarget - 1u);
+            if (!captureBoatWalk || !captureBoatWalkStarted) {
+                scene.camera.Position = { capturePose[0] + captureSweep[1] * sweepFrames,
+                                          capturePose[1],
+                                          capturePose[2] + captureSweep[2] * sweepFrames };
+                scene.camera.SetViewAngles(
+                    capturePose[3] + captureSweep[0] * sweepFrames, capturePose[4]);
+            }
+            // Exercise the actual driver camera against the imported cabin;
+            // fixed world poses alone cannot catch a helm point inside a wall.
+            if (g_insertionBoatModel && captureBoat[0]) {
+                if (captureBoatWalk ? !captureBoatWalkStarted :
+                                     !g_game.vehicles.drivingInsertionBoat) {
+                    g_game.vehicles.DisableBlackHawkInsertion();
+                    g_blackHawkInsertionRestartPending = false;
+                    g_insertionBoatRestartPending = false;
+                    const XMFLOAT3 hull{capturePose[0], capturePose[1], capturePose[2]};
+                    g_game.vehicles.BeginInsertionBoatRun(hull, hull.y,
+                        XM_PIDIV2 - XMConvertToRadians(capturePose[3]));
+                    g_game.vehicles.insertionBoatPosition = hull;
+                    scene.player.godMode = true;
+                    if (captureBoatWalk) {
+                        // Keep the automatic approach running while exercising
+                        // actual walking input relative to its moving deck.
+                        const float heading = g_game.vehicles.insertionBoatYaw;
+                        g_game.vehicles.insertionBoatLanding = {
+                            hull.x + std::sin(heading) * 180.0f, hull.y,
+                            hull.z + std::cos(heading) * 180.0f};
+                        captureBoatWalkStarted = true;
+                    } else {
+                        ToggleBoatDriving(true);
+                        if (captureBoatWake) g_game.vehicles.boatSpeed = 12.0f;
+                    }
+                }
+                g_insertionChoicePending = false;
+                if (captureBoatWalk) {
+                    if (!g_game.vehicles.insertionBoatPassengerPlacementPending &&
+                        poseCaptureFrames < poseCaptureTarget) {
+                        PlayerInput walk;
+                        walk.yaw = scene.camera.Yaw;
+                        walk.pitch = scene.camera.Pitch;
+                        walk.deltaTime = 1.0f / 75.0f;
+                        walk.forward = poseCaptureFrames < poseCaptureTarget / 2 ? 0.4f : 0.0f;
+                        walk.strafe = poseCaptureFrames >= poseCaptureTarget / 2 ? 0.3f : 0.0f;
+                        walk.Set(PlayerInput::Jump, poseCaptureFrames == 10);
+                        scene.camera.ApplyInput(walk);
+                    }
+                    if (poseCaptureFrames + 1 == poseCaptureTarget) {
+                        const auto& boat = g_game.vehicles;
+                        const float dx = scene.camera.Position.x - boat.insertionBoatPosition.x;
+                        const float dz = scene.camera.Position.z - boat.insertionBoatPosition.z;
+                        std::ofstream("boat_walk_capture.log", std::ios::trunc)
+                            << "Boat walking capture: localX="
+                            << dx * std::cos(boat.insertionBoatYaw) - dz * std::sin(boat.insertionBoatYaw)
+                            << " localZ=" << dx * std::sin(boat.insertionBoatYaw) + dz * std::cos(boat.insertionBoatYaw)
+                            << " grounded=" << scene.camera.IsGrounded
+                            << " passenger=" << boat.insertionBoatCarryingPlayer
+                            << " feetAboveDeck=" << scene.camera.Position.y - scene.camera.PlayerHeight -
+                                (boat.insertionBoatPosition.y - boat.insertionBoatSinkOffset + boat.insertionBoatDeckOffset)
+                            << " boatTravel=" << std::hypot(boat.insertionBoatPosition.x - capturePose[0],
+                                                           boat.insertionBoatPosition.z - capturePose[2])
+                            << std::endl;
+                    }
+                } else {
+                    scene.camera.SetViewAngles(capturePose[3], capturePose[4]);
+                    if (captureBoatWake)
+                        g_game.vehicles.SetBoatInput(1.0f, 0.15f, false);
+                }
+            }
+            // SGE_CAPTURE_HELI="distance,rise,bearing" re-places the camera on
+            // the enemy gunship every frame instead -- it flies, so no fixed
+            // pose frames it. Bearing is degrees clockwise from its nose.
+            char captureHeli[64] = {};
+            float heliView[3] = {};
+            if (g_helicopterModel &&
+                GetEnvironmentVariableA("SGE_CAPTURE_HELI", captureHeli,
+                                        sizeof(captureHeli)) > 0 &&
+                sscanf_s(captureHeli, "%f,%f,%f", &heliView[0], &heliView[1],
+                         &heliView[2]) == 3) {
+                const float bearing =
+                    g_helicopterYaw + XMConvertToRadians(heliView[2]);
+                scene.camera.Position = {
+                    g_helicopterPosition.x + std::sin(bearing) * heliView[0],
+                    g_helicopterPosition.y + heliView[1],
+                    g_helicopterPosition.z + std::cos(bearing) * heliView[0] };
+                const float dx = g_helicopterPosition.x - scene.camera.Position.x;
+                const float dy = g_helicopterPosition.y - scene.camera.Position.y;
+                const float dz = g_helicopterPosition.z - scene.camera.Position.z;
+                scene.camera.SetViewAngles(
+                    XMConvertToDegrees(std::atan2(dz, dx)),
+                    XMConvertToDegrees(std::atan2(
+                        dy, std::sqrt(dx * dx + dz * dz))));
+            }
+            // SGE_CAPTURE_HUMVEE="distance,rise,bearing" does the same for
+            // Humvee 0, which drives off once its gunner has a target.
+            // Bearing is degrees about world +Y from +Z.
+            char captureHumvee[64] = {};
+            float humveeView[3] = {};
+            XMFLOAT4X4 humveePose;
+            XMFLOAT3 humveeAt;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HUMVEE", captureHumvee,
+                                        sizeof(captureHumvee)) > 0 &&
+                sscanf_s(captureHumvee, "%f,%f,%f", &humveeView[0],
+                         &humveeView[1], &humveeView[2]) == 3 &&
+                HumveeVisualPose(0, humveePose, &humveeAt)) {
+                const float bearing = XMConvertToRadians(humveeView[2]);
+                scene.camera.Position = {
+                    humveeAt.x + std::sin(bearing) * humveeView[0],
+                    humveeAt.y + humveeView[1],
+                    humveeAt.z + std::cos(bearing) * humveeView[0] };
+                const float dx = humveeAt.x - scene.camera.Position.x;
+                const float dy = humveeAt.y + 1.0f - scene.camera.Position.y;
+                const float dz = humveeAt.z - scene.camera.Position.z;
+                scene.camera.SetViewAngles(
+                    XMConvertToDegrees(std::atan2(dz, dx)),
+                    XMConvertToDegrees(std::atan2(
+                        dy, std::sqrt(dx * dx + dz * dz))));
+            }
+            // A stray ESC during a long unattended run would park the capture
+            // behind the pause screen.
+            g_gamePaused = false;
+            // SGE_CAPTURE_FIRE=N fires the player's weapon N frames before the
+            // captured one, so a round's first rendered frames can be dumped.
+            char captureFire[8] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FIRE", captureFire,
+                                        sizeof(captureFire)) > 0 &&
+                poseCaptureFrames + 1u + static_cast<UINT>(atoi(captureFire)) ==
+                    poseCaptureTarget)
+                ShootPlayerWeapon();
+            // SGE_CAPTURE_HURT=<severity 0..1> / SGE_CAPTURE_LOWHP=<pulse 0..1>
+            // hold the hit flash / low-health overlay on for the capture.
+            char captureHurt[16] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HURT", captureHurt,
+                                        sizeof(captureHurt)) > 0) {
+                scene.player.damageFlash = 0.4f;
+                scene.player.damageFlashSeverity =
+                    static_cast<float>(atof(captureHurt));
+            }
+            if (GetEnvironmentVariableA("SGE_CAPTURE_LOWHP", captureHurt,
+                                        sizeof(captureHurt)) > 0)
+                scene.player.lowHealthPulse =
+                    static_cast<float>(atof(captureHurt));
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSSR", nullptr, 0) > 0)
+                scene.enableScreenSpaceReflections = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FORWARD", nullptr, 0) > 0)
+                scene.useVisibilityBuffer = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_VALIDATION", nullptr, 0) > 0) {
+                visBuffer.validationMode = true;
+                visBuffer.bloomStrength = 0.0f;
+            }
+            char captureSun[128] = {};
+            float sun[4] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_SUN", captureSun, sizeof(captureSun)) > 0 &&
+                sscanf_s(captureSun, "%f,%f,%f,%f", &sun[0], &sun[1], &sun[2], &sun[3]) == 4) {
+                scene.lightPos = {sun[0], sun[1], sun[2]};
+                scene.lightColor = {1, 1, 1};
+                scene.directionalLightIntensity = sun[3];
+                scene.animateLight = false;
+            }
+            // DLSS A/B: off entirely, or with the jitter sign flipped.
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NODLSS", nullptr, 0) > 0)
+                DLSS::GetSettings().enabled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FXAA", nullptr, 0) > 0)
+                scene.enableFXAA = true;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NORR", nullptr, 0) > 0)
+                DLSS::GetSettings().rayReconstruction = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
+                scene.enableVolumetricFog = false;
+            // World cloud volumes and the sky's cloud layer both off, so an
+            // overview from above the cloud base sees the ground.
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOCLOUDS", nullptr, 0) > 0) {
+                scene.enableFlyableClouds = false;
+                scene.atmosphereCloudCoverage = 0.0f;
+            }
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HQ_LENS", nullptr, 0) > 0)
+                visBuffer.highQualityLensEnabled = true;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOAO", nullptr, 0) > 0)
+                scene.enableAmbientOcclusion = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOSVGF", nullptr, 0) > 0)
+                visBuffer.svgfTemporalEnabled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOATROUS", nullptr, 0) > 0)
+                visBuffer.svgfAtrousEnabled = false;
+            {
+                char iters[8] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_ATROUS_ITERS", iters,
+                                            sizeof(iters)) > 0)
+                    visBuffer.svgfAtrousIterations =
+                        static_cast<UINT>((std::max)(1, atoi(iters)));
+            }
+            if (GetEnvironmentVariableA("SGE_CAPTURE_TAA", nullptr, 0) > 0)
+                visBuffer.temporalEffectsEnabled = true;
+            if (GetEnvironmentVariableA("SGE_DLSS_INVERT_JITTER", nullptr, 0) > 0)
+                DLSS::GetSettings().invertJitter = true;
+            // "f1,f2,..." -> whether an odd number of those capture frames
+            // have passed, i.e. a setting flipped at each one is inverted.
+            const auto flippedAt = [&](const char* name, bool& present) {
+                char text[64] = {};
+                present = GetEnvironmentVariableA(name, text, sizeof(text)) > 0;
+                bool flipped = false;
+                for (const char* p = text; present && *p;) {
+                    char* end = nullptr;
+                    const long flipAt = std::strtol(p, &end, 10);
+                    if (end == p) break;
+                    if (static_cast<long>(poseCaptureFrames) >= flipAt)
+                        flipped = !flipped;
+                    p = *end ? end + 1 : end;
+                }
+                return flipped;
+            };
+            // Replays menu on/off/on runs. Lumen starts off; Ray Tracing
+            // Quality starts at the saved value and goes through the same
+            // ApplyGameSettings call as the menu combo.
+            bool togglePresent = false;
+            const bool lumenFlipped =
+                flippedAt("SGE_CAPTURE_LUMEN_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.lumenGI = lumenFlipped;
+            const bool halfGIFlipped =
+                flippedAt("SGE_CAPTURE_HALF_GI_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.lumenGIHalfResolution = halfGIFlipped;
+            const bool rtFlipped =
+                flippedAt("SGE_CAPTURE_RT_TOGGLE", togglePresent);
+            static const int rtInitialQuality = g_settings.rayTracingQuality;
+            // SGE_CAPTURE_DLSS_PCT pins the screen percentage the toggle's
+            // ApplyGameSettings restores (100 = no resize on the RR switch).
+            char dlssPct[16] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_DLSS_PCT", dlssPct,
+                                        sizeof(dlssPct)) > 0)
+                g_settings.dlssScreenPercentage =
+                    static_cast<float>(atof(dlssPct));
+            if (togglePresent) {
+                const bool startUltra =
+                    rtInitialQuality == GameSettings::kRayTracingUltra;
+                const int quality = (startUltra != rtFlipped)
+                    ? GameSettings::kRayTracingUltra
+                    : GameSettings::kRayTracingOff;
+                if (quality != g_settings.rayTracingQuality) {
+                    g_settings.rayTracingQuality = quality;
+                    ApplyGameSettings();
+                }
+            }
+            // Walks the runtime DLSS toggles (off, DLAA, SR, RR, preset) every
+            // 40 frames, so the resize/feature-switch paths run unattended.
+            if (GetEnvironmentVariableA("SGE_DLSS_CYCLE", nullptr, 0) > 0 &&
+                poseCaptureFrames % 40u == 0u) {
+                struct Step { bool on; float pct; bool rr; int preset; };
+                static constexpr Step steps[] = {
+                    { false, 100.0f, false, 1 }, { true, 100.0f, false, 1 },
+                    { true, 50.0f, false, 1 },   { true, 50.0f, true, 1 },
+                    { true, 33.0f, false, 2 },   { true, 67.0f, false, 0 },
+                    { true, 100.0f, true, 1 },   { true, 58.0f, false, 1 },
+                    { false, 58.0f, false, 1 },  { true, 100.0f, false, 1 } };
+                const Step& step = steps[(poseCaptureFrames / 40u) %
+                    (sizeof(steps) / sizeof(steps[0]))];
+                DLSS::Settings& dlss = DLSS::GetSettings();
+                dlss.enabled = step.on;
+                dlss.screenPercentage = step.pct;
+                dlss.rayReconstruction = step.rr;
+                dlss.preset = static_cast<DLSS::Preset>(step.preset);
+                std::cout << "DLSS cycle: on=" << step.on << " pct="
+                          << step.pct << " rr=" << step.rr << " preset="
+                          << step.preset << std::endl;
+            }
+            // Weapon index (GunModel::WeaponName). Every frame, since level
+            // start applies the loadout after the capture is armed.
+            char captureWeapon[8] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_WEAPON", captureWeapon,
+                                        sizeof(captureWeapon)) > 0)
+                GunModel::SelectedWeapon() = atoi(captureWeapon);
+            // A GUI-subsystem exe has no stdout to redirect, so the state line
+            // also goes to a file an unattended run can read back.
+            std::ofstream captureStateLog;
+            if (captureAllStates || poseCaptureFrames + 60 >= poseCaptureTarget)
+                captureStateLog.open("capture_state.log", std::ios::app);
+            if (captureStateLog)
+                captureStateLog << "render=" << g_dx12.screenWidth << "x"
+                                << g_dx12.screenHeight << " display="
+                                << g_dx12.displayWidth << "x"
+                                << g_dx12.displayHeight
+                                << " dlss=" << visBuffer.dlssActive
+                                << " rr=" << visBuffer.rayReconstructionActive
+                                << " enhanced=" << visBuffer.enhancedVisualsActive
+                                << " enhancedReady="
+                                << visBuffer.EnhancedVisualsReady()
+                                << " hitGeometry=" << visBuffer.HitGeometryReady()
+                                << " vb=" << scene.useVisibilityBuffer
+                                << " dxr=" << g_dxrDDGI.GetStatus().dxrSupported
+                                << " inlineRT="
+                                << g_dxrDDGI.GetStatus().inlineRaytracingSupported
+                                << " tlas=" << (g_dxrDDGI.Scene().TLASAddress() != 0)
+                                << " lumenSetting=" << g_settings.lumenGI
+                                << " lumen=" << visBuffer.lumenGIActive
+                                << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
+                                << " rc=" << visBuffer.radianceCascadesGIActive
+                                << " rcStatus=" << visBuffer.RadianceCascadesStatus()
+                                << " giCache=" << visBuffer.giRadianceCacheMode
+                                << " restir=" << visBuffer.lumenReSTIRMode
+                                << " giCacheMs=" << g_profiler.GpuScopeMs("Lumen Radiance Cache")
+                                << " captureFrame=" << poseCaptureFrames
+                                << " useDDGI=" << scene.useDDGI
+                                << " giIntensity=" << scene.giIntensity
+                                << " ambient=" << scene.ambientLightingIntensity
+                                << " svgfValid=" << visBuffer.svgfHistoryValid
+                                << " giRays="
+                                << visBuffer.EnhancedGIRayFraction()
+                                << " reflRays="
+                                << visBuffer.EnhancedReflectionRayFraction()
+                                << " vbGpuMs="
+                                << g_profiler.GpuScopeMs("Visibility Buffer")
+                                << " gpuFrameMs=" << g_profiler.GpuFrameMs()
+                                << " lensMs=" << g_profiler.GpuScopeMs("Lens Flare")
+                                << " hqLens=" << visBuffer.highQualityLensEnabled
+                                << " genericMs=" << g_profiler.GpuScopeMs("VB Shade Generic")
+                                << " terrainResolveMs=" << g_profiler.GpuScopeMs("VB Terrain Resolve")
+                                << " replayMs="
+                                << g_profiler.GpuScopeMs("VB Depth Replay")
+                                << " rrMs="
+                                << g_profiler.GpuScopeMs("DLSS Ray Reconstruction")
+                                << " dlssMs=" << g_profiler.GpuScopeMs("DLSS")
+                                << " rrLastEval=" << DLSS::LastEvaluatedRR()
+                                << " rasterMs="
+                                << g_profiler.GpuScopeMs("VB Raster")
+                                << " terrainMs="
+                                << g_profiler.GpuScopeMs("VB Terrain")
+                                << " waterQuality=" << static_cast<int>(scene.waterQuality)
+                                << " waterMs="
+                                << g_profiler.GpuScopeMs("Tropical Water")
+                                << " lightPos=" << scene.lightPos.x << ","
+                                << scene.lightPos.y << "," << scene.lightPos.z
+                                << " lightType=" << scene.lightType
+                                << " sunLens=" << scene.enableSunLens
+                                << " sunDisc=" << scene.sunDiscIntensity
+                                << " sunHalo=" << scene.sunHaloIntensity
+                                << " cam=" << scene.camera.Position.x << ","
+                                << scene.camera.Position.y << ","
+                                << scene.camera.Position.z
+                                << std::endl;
+            if (poseCaptureFrames + 1 >= poseCaptureTarget)
+                std::cout << "Capture frame " << poseCaptureFrames + 1
+                          << ": render " << g_dx12.screenWidth << "x"
+                          << g_dx12.screenHeight << " display "
+                          << g_dx12.displayWidth << "x"
+                          << g_dx12.displayHeight << " dlss="
+                          << visBuffer.dlssActive << " rr="
+                          << visBuffer.rayReconstructionActive
+                          << " extMV=" << visBuffer.extensionMotionVectors
+                          << " lumen=" << visBuffer.lumenGIActive
+                          << " vbGpuMs="
+                          << g_profiler.GpuScopeMs("Visibility Buffer")
+                          << std::endl;
+            if (++poseCaptureFrames == poseCaptureTarget) {
+                const auto memory = GetVideoMemoryStatsDX12();
+                char path[MAX_PATH] = "capture.ppm";
+                GetEnvironmentVariableA("SGE_CAPTURE_PATH", path, sizeof(path));
+                std::filesystem::path capturePath(path);
+                if (!captureLevelSequence.empty())
+                    capturePath.replace_filename(capturePath.stem().string() + "-" +
+                        std::to_string(captureLevelIndex) + capturePath.extension().string());
+                std::ofstream metrics(capturePath.string() + ".metrics.json");
+                nlohmann::json result = {
+                    {"profile", g_appliedRenderingProfile},
+                    {"environment", skyRenderer.EnvironmentPath()},
+                    {"visibilityBuffer", scene.useVisibilityBuffer},
+                    {"rayGIRequested", g_settings.lumenGI || g_settings.radianceCascadesGI},
+                    {"rayGIActive", visBuffer.lumenGIActive && visBuffer.enhancedVisualsActive &&
+                        visBuffer.enhancedTLASAddress != 0},
+                    {"giIntensity", scene.giIntensity},
+                    {"ambientFill", scene.editorAmbientFill},
+                    {"bindless", g_bindlessMaterialsReady && scene.bindlessMaterials},
+                    {"cpuFrameMs", g_profiler.CpuFrameMs()},
+                    {"cpuWallMs", g_profiler.CpuFrameWallMs()},
+                    {"gpuFrameMs", g_profiler.GpuFrameMs()},
+                    {"gpuMemoryBytes", memory.usageBytes}, {"gpuBudgetBytes", memory.budgetBytes},
+                    {"verticesCapacity", visBuffer.geometryVertexCapacity},
+                    {"indicesCapacity", visBuffer.geometryIndexCapacity},
+                    {"geometryGeneration", visBuffer.geometryGeneration},
+                    {"geometryRegistrationFailures", visBuffer.geometryRegistrationFailures},
+                    {"registeredVertices", visBuffer.persistentVertexCount},
+                    {"registeredIndices", visBuffer.persistentIndexCount}};
+                for (const auto& sample : g_profiler.GpuSamples())
+                    result["gpuScopesMs"][sample.name] = sample.milliseconds;
+                metrics << result.dump(2);
+                g_frameCapturePath = capturePath.string();
+            } else if (poseCaptureFrames == poseCaptureTarget + 1) {
+                // Optional next-frame dump: diffing two consecutive frames of a
+                // pinned camera shows sub-pixel jitter nothing resolved.
+                char path[MAX_PATH] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH2", path,
+                                            sizeof(path)) > 0)
+                    g_frameCapturePath = path;
+            } else if (poseCaptureFrames == poseCaptureTarget + 2) {
+                char path[MAX_PATH] = {};
+                if (GetEnvironmentVariableA("SGE_CAPTURE_PATH3", path,
+                                            sizeof(path)) > 0)
+                    g_frameCapturePath = path;
+            } else if (poseCaptureFrames > poseCaptureTarget + 3) {
+                if (captureLevelIndex < captureLevelSequence.size()) {
+                    // Exercise the same deferred editor load boundary as the
+                    // Load dialog, including repeated loads and HDR failures.
+                    StartLevelEditor(hwnd, captureLevelSequence[captureLevelIndex++]);
+                    poseCaptureFrames = 0;
+                } else PostQuitMessage(0);
+            }
+        }
+
         // Everything from here to EndFrame used to be unmeasured on the CPU
         // side: "Update" closes above, and the next CPU scope was "Editor/UI"
         // two thousand lines below. A frame could report 24 ms of CPU with the
@@ -5063,7 +5128,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Held for a second after the preset's lighting has been applied, so the
         // scene visibly goes dark first and the swap's stall lands on an already
         // night-lit frame rather than freezing on the old daylight one.
-        if (g_skyEnvironmentSwapPending) {
+        if (g_skyEnvironmentSwapPending && skyRenderer.initialized) {
             // Clamped: a load-sized frame would otherwise burn the whole delay
             // in one step and put the stall right back where it started.
             g_skyEnvironmentSwapDelay -= (std::min)(deltaTime, 0.05f);
@@ -5103,6 +5168,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_sceneDescriptorResetPending = false;
         }
         if (g_sceneRenderAssetsPending) EnsureSceneRenderAssets();
+        scene.editorCameraPass = IsEditorEditing();
+        mainShader.editorAmbientFill = scene.editorCameraPass ? scene.editorAmbientFill : 0.0f;
+        ApplyPendingLevelRenderingProfile();
+        if (g_levelGeometryBindingsPending && !g_game.loading.Active() &&
+            visBuffer.geometryUploaded && !visBuffer.geometryDirty) {
+            g_dxrDDGI.MarkLayoutDirty();
+            g_levelGeometryBindingsPending = false;
+        }
         ApplyPendingTerrainTextures();
         MatchFoliageMaterialToGrass();
 
@@ -5820,9 +5893,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // At the editor's maximum insertion radius the deployment
                 // camera orbits 1.33 km from the island. A +/-1.6 km ocean left
                 // its edge only a few hundred metres behind that camera and the
-                // square boundary entered the view. +/-4.096 km covers the
-                // complete deployment far plane at every supported radius.
-                constexpr float kSeaSpan = 8192.0f;
+                // square boundary entered the view. A 400x island's seabed
+                // reaches 35 km, so the sea is sized from the planner's span.
+                constexpr float kSeaSpan = DeploymentPlanner::OceanHalfSpan * 2.0f;
                 constexpr float kSeaDepth = 12.0f;
                 // Near-shore reflections and wave/terrain intersections need
                 // enough vertices to avoid exposing individual ocean triangles.
@@ -8182,6 +8255,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_game.commands.Set(
                 GameCommand::EditorReturnToMenu, actions.returnToMenu);
             g_editorFullReconcileRequested |= actions.fullReconcile;
+            static bool editorLightingOpen = true;
+            if (actions.toggleLighting) editorLightingOpen = !editorLightingOpen;
+            if (!g_levelEditor.IsPlaying()) {
+                bool fog = g_levelEditor.FogEnabled();
+                const bool previousFog = fog;
+                const float previousFogDensity = scene.volumetricFogDensity;
+                bool timeOfDayChanged = false;
+                const bool previousRayGI = g_settings.lumenGI || g_settings.radianceCascadesGI;
+                bool rayGI = previousRayGI;
+                bool vsm = scene.virtualShadowMaps;
+                if (DrawEditorLighting(scene, visBuffer, editorLightingOpen, fog, rayGI, vsm,
+                                       g_selectedTimeOfDay, timeOfDayChanged)) {
+                    // Through the run default too: every editor sync re-runs
+                    // ApplyRuntimeLevelBasics, which rebuilds the flag from it.
+                    if (vsm != scene.virtualShadowMaps) {
+                        g_vsmRunDefault = vsm;
+                        scene.virtualShadowMaps = vsm;
+                    }
+                    if (timeOfDayChanged) {
+                        ApplyTimeOfDay(g_selectedTimeOfDay);
+                        scene.lightType = 0;
+                        scene.animateLight = false;
+                        scene.editorAmbientFill = 0.0f;
+                        fog = scene.enableVolumetricFog;
+                    } else if (fog != previousFog || scene.volumetricFogDensity != previousFogDensity) {
+                        // Keep editor tuning with the same per-time overrides
+                        // used by deployment, so switching away and back retains it.
+                        auto& timeFog = VolumetricFogFor(g_selectedTimeOfDay);
+                        timeFog.enabled = fog;
+                        timeFog.density = scene.volumetricFogDensity;
+                        scene.enableVolumetricFog = fog;
+                        ApplyLiveWeatherState(WeatherState::Custom);
+                    }
+                    g_levelEditor.SetFogEnabled(fog);
+                    shadowMap.InvalidateCachedCascades();
+                    if (rayGI != previousRayGI) {
+                        g_settings.lumenGI = rayGI;
+                        g_settings.radianceCascadesGI = false;
+                    }
+                }
+            }
             // Manual viewport refresh. Re-scans the prefab and asset registries
             // so a model added on disk since the editor opened is picked up,
             // then asks for the visual rebuild that actually loads what is not
@@ -8613,6 +8727,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 SGE_LOG("LogPrefab", overBudget ? EngineLog::Level::Error
                                                 : EngineLog::Level::Display,
                     budgets);
+            }
+            // Every placed mesh/floor collider: a 5x5 grid of downward casts
+            // across its world bounds, with the terrain under each, so a floor
+            // subset (Bistro streets) can be checked against where it renders.
+            for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+                int hits = 0;
+                float hitMin = FLT_MAX, hitMax = -FLT_MAX;
+                float terrainMin = FLT_MAX, terrainMax = -FLT_MAX;
+                for (int i = 0; i < 5; ++i) for (int j = 0; j < 5; ++j) {
+                    const float x = instance.worldBoundsMin.x + (i + 0.5f) / 5.0f *
+                        (instance.worldBoundsMax.x - instance.worldBoundsMin.x);
+                    const float z = instance.worldBoundsMin.z + (j + 0.5f) / 5.0f *
+                        (instance.worldBoundsMax.z - instance.worldBoundsMin.z);
+                    const XMFLOAT3 start(x, instance.worldBoundsMax.y + 1.0f, z);
+                    const XMFLOAT3 end(x, instance.worldBoundsMin.y - 1.0f, z);
+                    CollisionMeshRayHit probe;
+                    if (CollisionMeshInstanceRaycast(instance, start, end, 0.0f, probe)) {
+                        ++hits;
+                        hitMin = (std::min)(hitMin, probe.point.y);
+                        hitMax = (std::max)(hitMax, probe.point.y);
+                    }
+                    const float ground = GroundHeightAt(x, z);
+                    terrainMin = (std::min)(terrainMin, ground);
+                    terrainMax = (std::max)(terrainMax, ground);
+                }
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    "Mesh collider entity " + std::to_string(instance.entityId) +
+                    ": " + std::to_string(hits) + "/25 downward probes hit, y " +
+                    std::to_string(hitMin) + ".." + std::to_string(hitMax) +
+                    ", terrain y " + std::to_string(terrainMin) + ".." +
+                    std::to_string(terrainMax) + ", bounds y " +
+                    std::to_string(instance.worldBoundsMin.y) + ".." +
+                    std::to_string(instance.worldBoundsMax.y));
             }
             const bool passed = !airportPresent ||
                                 (built && hit && instanced && helperAgrees);

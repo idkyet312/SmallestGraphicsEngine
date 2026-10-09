@@ -11,6 +11,7 @@
 #include <assimp/scene.h>
 #include <meshoptimizer.h>
 #include <ufbx.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -660,6 +661,46 @@ struct CookContext {
     // either image makes the cook stale.
     fs::path secondarySource;
 
+    uint32_t AddDDS(const fs::path& path) {
+        const std::string key = path.lexically_normal().generic_string() + "#dds";
+        auto found = textureByKey.find(key);
+        if (found != textureByKey.end()) return found->second;
+        std::ifstream file(path, std::ios::binary);
+        std::array<uint32_t,32> header{};
+        if (!file.read(reinterpret_cast<char*>(header.data()),128) ||
+            header[0]!=0x20534444 || header[1]!=124 || header[19]!=32)
+            throw std::runtime_error("Invalid DDS header: "+path.string());
+        EncodedTexture texture;
+        uint32_t blockBytes=16;
+        switch(header[21]) {
+        case 0x31545844: texture.record.format=Cooked::TextureFormat::BC1;blockBytes=8;break;
+        case 0x35545844: texture.record.format=Cooked::TextureFormat::BC3;break;
+        case 0x32495441: texture.record.format=Cooked::TextureFormat::BC5;break;
+        default: throw std::runtime_error("Unsupported DDS encoding: "+path.string());
+        }
+        uint32_t w=header[4],h=header[3];
+        uint32_t mips=(std::max)(1u,header[7]);
+        if(!w || !h || mips>Cooked::kMaxTextureMips || header[28])
+            throw std::runtime_error("Unsupported DDS dimensions: "+path.string());
+        texture.record.width=w;texture.record.height=h;texture.record.mipCount=mips;
+        for(uint32_t mip=0;mip<mips;++mip) {
+            uint64_t size=uint64_t((w+3)/4)*((h+3)/4)*blockBytes;
+            if(size>UINT32_MAX || texture.data.size()+size>UINT32_MAX)
+                throw std::runtime_error("DDS too large: "+path.string());
+            texture.record.mipOffsets[mip]=uint32_t(texture.data.size());
+            texture.record.mipSizes[mip]=uint32_t(size);
+            size_t offset=texture.data.size();texture.data.resize(offset+size_t(size));
+            if(!file.read(reinterpret_cast<char*>(texture.data.data()+offset),std::streamsize(size)))
+                throw std::runtime_error("Truncated DDS mip: "+path.string());
+            w=(std::max)(1u,w/2);h=(std::max)(1u,h/2);
+        }
+        texture.record.dataSize=uint32_t(texture.data.size());
+        texture.record.name=strings.Add(path.filename().string());
+        texture.record.source=strings.Add(path.generic_string());
+        uint32_t index=uint32_t(textures.size());textures.push_back(std::move(texture));
+        textureByKey.emplace(key,index);return index;
+    }
+
     uint32_t AddTexture(const aiString& reference,
                         Cooked::TextureFormat format) {
         std::string raw = reference.C_Str();
@@ -793,6 +834,10 @@ void ExtractMaterials(CookContext& context) {
         material.baseColor[3] = color.a;
         source->Get(AI_MATKEY_METALLIC_FACTOR, material.metallic);
         source->Get(AI_MATKEY_ROUGHNESS_FACTOR, material.roughness);
+        float occlusionStrength = 0.0f;
+        if (source->Get(AI_MATKEY_GLTF_TEXTURE_STRENGTH(aiTextureType_LIGHTMAP, 0),
+                        occlusionStrength) == AI_SUCCESS && occlusionStrength > 0.0f)
+            Cooked::SetOcclusionStrength(material.flags, occlusionStrength);
         int twoSided = 0;
         source->Get(AI_MATKEY_TWOSIDED, twoSided);
         if (twoSided) material.flags |= Cooked::DoubleSided;
@@ -1408,6 +1453,24 @@ bool WriteAsset(CookContext& context, const fs::path& destination) {
         fs::remove(temporary);
         return false;
     }
+    fs::path bistroManifest=context.sourcePath;
+    bistroManifest.replace_extension(".bistro.json");
+    if(fs::exists(bistroManifest)) {
+        nlohmann::json stats={{"vertices",0ull},{"indices",0ull},{"triangles",0ull},
+            {"textures",nlohmann::json::array()},{"textureBytes",0ull}};
+        for(const auto& p:primitiveRecords) {
+            stats["vertices"]=stats["vertices"].get<uint64_t>()+p.vertexCount;
+            stats["indices"]=stats["indices"].get<uint64_t>()+p.indexCount;
+        }
+        stats["triangles"]=stats["indices"].get<uint64_t>()/3;
+        for(const auto& t:textureRecords) {
+            stats["textures"].push_back({{"source",context.strings.data.data()+t.source},
+                {"width",t.width},{"height",t.height},{"mips",t.mipCount},
+                {"format",uint32_t(t.format)},{"offset",t.data},{"size",t.dataSize}});
+            stats["textureBytes"]=stats["textureBytes"].get<uint64_t>()+t.dataSize;
+        }
+        std::ofstream(destination.string()+".stats.json")<<stats.dump(2)<<'\n';
+    }
     std::cout << destination.generic_string() << ": "
               << context.primitives.size() << " primitives, "
               << context.textures.size() << " BC textures, "
@@ -1417,12 +1480,18 @@ bool WriteAsset(CookContext& context, const fs::path& destination) {
 }
 
 bool Cook(const fs::path& source, const fs::path& destination) {
+    fs::path bistroManifest=source; bistroManifest.replace_extension(".bistro.json");
+    nlohmann::json bistro;
+    if(fs::exists(bistroManifest)) {
+        std::ifstream manifestFile(bistroManifest);manifestFile>>bistro;
+    }
     unsigned baseFlags = aiProcess_Triangulate |
         aiProcess_JoinIdenticalVertices |
         aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace |
         aiProcess_ImproveCacheLocality | aiProcess_OptimizeMeshes |
         aiProcess_OptimizeGraph | aiProcess_SortByPType |
         aiProcess_RemoveRedundantMaterials | aiProcess_LimitBoneWeights;
+    if(!bistro.is_null()) baseFlags &= ~aiProcess_RemoveRedundantMaterials;
     const std::string extension = LowerExtension(source);
     if (extension == ".fbx")
         baseFlags |= aiProcess_FlipWindingOrder;
@@ -1482,6 +1551,51 @@ bool Cook(const fs::path& source, const fs::path& destination) {
         }
         context.scene = scene;
         ExtractMaterials(context);
+        if(!bistro.is_null()) {
+            context.textures.clear();context.textureByKey.clear();
+            std::unordered_map<std::string,nlohmann::json> authored;
+            for(const auto& m:bistro.at("materials")) authored.emplace(m.at("name").get<std::string>(),m);
+            const fs::path root=bistro.at("textureRoot").get<std::string>();
+            for(uint32_t i=0;i<scene->mNumMaterials;++i) {
+                aiString name;scene->mMaterials[i]->Get(AI_MATKEY_NAME,name);
+                auto found=authored.find(name.C_Str());
+                if(found==authored.end()) {
+                    bool used=false;
+                    for(uint32_t mesh=0;mesh<scene->mNumMeshes;++mesh)
+                        used|=scene->mMeshes[mesh]->mMaterialIndex==i;
+                    if(used) throw std::runtime_error("Bistro material not found: "+std::string(name.C_Str()));
+                    continue;
+                }
+                const auto& m=found->second; auto& cooked=context.materials[i];
+                auto texture=[&](const char* field) {
+                    std::string reference=m.value(field,std::string());
+                    if(reference.empty()) return Cooked::kInvalidIndex;
+                    std::replace(reference.begin(),reference.end(),'\\','/');
+                    return context.AddDDS(root/fs::path(reference).filename());
+                };
+                cooked.baseColorTexture=texture("baseColor");
+                cooked.normalTexture=texture("normal");
+                cooked.metallicRoughnessTexture=texture("specular");
+                cooked.baseColor[0]=cooked.baseColor[1]=cooked.baseColor[2]=1.0f;
+                cooked.baseColor[3]=m.value("opacity",1.0f);
+                cooked.metallic=1.0f;cooked.roughness=1.0f;
+                cooked.flags=Cooked::DirectXNormal;
+                Cooked::SetOcclusionStrength(cooked.flags, m.value("occlusionStrength", 1.0f));
+                std::string alpha=m.value("alphaMode",std::string("OPAQUE"));
+                if(alpha=="MASK") cooked.flags|=Cooked::AlphaCutout;
+                if(alpha=="BLEND") cooked.flags|=Cooked::AlphaBlend;
+                if(m.value("doubleSided",false)) cooked.flags|=Cooked::DoubleSided;
+                cooked.alphaCutoff=m.value("alphaCutoff",0.5f);
+                auto emissive=texture("emissive");
+                if(emissive!=Cooked::kInvalidIndex) {
+                    const auto& tint=m.at("emissiveFactor");
+                    if(tint[0]!=tint[1] || tint[0]!=tint[2])
+                        throw std::runtime_error("Bistro emissive tint requires RGB storage: "+std::string(name.C_Str()));
+                    cooked.flags|=Cooked::TexturedEmission;cooked.reserved0=emissive;
+                    cooked.reserved1=tint[0].get<float>();
+                }
+            }
+        }
         if (context.preserveParts) {
             // One primitive per (node, mesh) instance, in node order, placed
             // by the node's global transform and named by its path. A node

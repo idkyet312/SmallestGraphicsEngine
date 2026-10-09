@@ -584,6 +584,7 @@ public:
     UploadBuffer<ShadowCascadeBufferDX12> shadowCascadeBuffer;
     std::array<XMFLOAT3, 9> pendingSHCoeffs{};
     float pendingSkyIntensity = 1.0f;
+    float editorAmbientFill = 0.0f;
     bool skyIrradianceValid = false;
     
     // Material/object data advances per primitive, while a scene node can share
@@ -2630,6 +2631,9 @@ public:
             data.shCoeffs[i] = XMFLOAT4(c.x, c.y, c.z, 0.0f);
         }
         data.skyIntensity = skyIrradianceValid ? pendingSkyIntensity : 0.0f;
+        // Shared by Forward and the VB resolve. The padding slot keeps the
+        // existing cbuffer offsets; zero retains the authored lighting.
+        data.shPadding[0] = editorAmbientFill;
         shBuffer.CopyData(ViewFrameIndex(), data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(ViewFrameIndex()));
     }

@@ -1399,6 +1399,10 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         }
         sceneMat->roughnessFactor = (float)mat.pbrMetallicRoughness.roughnessFactor;
         sceneMat->metallicFactor = (float)mat.pbrMetallicRoughness.metallicFactor;
+        // The engine shares AO's R channel with packed metallic-roughness.
+        if (mat.occlusionTexture.index >= 0 &&
+            mat.occlusionTexture.index == mat.pbrMetallicRoughness.metallicRoughnessTexture.index)
+            sceneMat->occlusionStrength = (float)mat.occlusionTexture.strength;
         sceneMat->doubleSided = mat.doubleSided;
         sceneMat->alphaCutout = mat.alphaMode == "MASK";
         sceneMat->alphaBlend = mat.alphaMode == "BLEND";

@@ -123,6 +123,7 @@ DXGI_FORMAT TextureFormat(Cooked::TextureFormat format) {
     switch (format) {
     case Cooked::TextureFormat::BC3: return DXGI_FORMAT_BC3_UNORM;
     case Cooked::TextureFormat::BC5: return DXGI_FORMAT_BC5_UNORM;
+    case Cooked::TextureFormat::BC1: return DXGI_FORMAT_BC1_UNORM;
     default: return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -208,7 +209,7 @@ ComPtr<ID3D12Resource> CreateTexture(
         const uint32_t height = (std::max)(1u, source.height >> mip);
         const uint32_t blockRows = (std::max)(1u, (height + 3) / 4);
         const uint32_t sourceRowBytes =
-            (std::max)(1u, (width + 3) / 4) * 16;
+            static_cast<uint32_t>(Cooked::TextureRowBytes(source.format, width));
         if (uint64_t(sourceRowBytes) * blockRows >
             source.mipSizes[mip]) {
             valid = false;
@@ -656,18 +657,25 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
     const auto tTex0 = std::chrono::steady_clock::now();
     std::vector<ComPtr<ID3D12Resource>> textureUploads;
     std::vector<ComPtr<ID3D12Resource>> textures(header.textureCount);
+    uint32_t loadedTextureCount = 0;
     for (uint32_t i = 0; loadTextures && i < header.textureCount; ++i) {
         textures[i] = CreateTexture(map, textureRecords[i], device.Get(),
                                     commandList.Get(), textureUploads);
         if (textures[i]) {
+            ++loadedTextureCount;
             const std::wstring name = cookedPath.wstring() + L" texture #" +
                 std::to_wstring(i);
             textures[i]->SetName(name.c_str());
+        } else {
+            std::cerr << "Cooked texture upload failed: " << cookedPath.string()
+                      << " texture #" << i << " " << GetString(map, header, textureRecords[i].source)
+                      << " (" << textureRecords[i].width << "x" << textureRecords[i].height
+                      << ", format " << static_cast<uint32_t>(textureRecords[i].format) << ")\n";
         }
         PumpPendingWindowMessages();
     }
 
-    std::cout << "[TIMING] cooked textures " << header.textureCount << " in "
+    std::cout << "[TIMING] cooked textures " << loadedTextureCount << "/" << header.textureCount << " in "
               << tMs(tTex0) << " ms\n";
     const auto tPrim0 = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<SceneMaterial>> materials;
@@ -680,6 +688,13 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
                     sizeof(source.baseColor));
         material->metallicFactor = source.metallic;
         material->roughnessFactor = source.roughness;
+        material->normalYSign = (source.flags & Cooked::DirectXNormal) ? -1.0f : 1.0f;
+        material->occlusionStrength = Cooked::OcclusionStrength(source.flags);
+        if ((source.flags & Cooked::TexturedEmission) && source.reserved0 < textures.size()) {
+            material->emissiveTexture = textures[source.reserved0];
+            material->emissiveFactor = DirectX::XMFLOAT3(source.reserved1,
+                source.reserved1, source.reserved1);
+        }
         material->doubleSided =
             (source.flags & Cooked::DoubleSided) != 0;
         material->roughnessOnlyTexture =

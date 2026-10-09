@@ -9,10 +9,15 @@
 
 struct DeploymentPlanner {
     // Gameplay ring half-span is 10 m * 2^(R-1) (G = 20, 1 m base): 8 rings
-    // reach 1280 m, enough for a 12x island (1096 m); 9 reach 2560 m for the
-    // 24x maximum (2152 m). Too few rings drops the seabed past the last one.
-    static constexpr uint32_t MaxTerrainClipmapRings = 9;
+    // reach 1280 m, enough for a 12x island (1096 m); 13 reach 40960 m for the
+    // 400x maximum (35240 m). Too few rings drops the seabed past the last one.
+    static constexpr uint32_t MaxTerrainClipmapRings = 13;
     static constexpr float DeploymentTerrainTileSize = 8.0f;
+    // Half-width of the sea, gameplay volume and deployment grid alike. Covers
+    // the 400x island's seabed edge (35240 m) with at least the ~3x apron the old
+    // 4096 m sea had around a 12x island, so the square edge stays past the
+    // overview's horizon haze.
+    static constexpr float OceanHalfSpan = 131072.0f;
 
     struct CameraFrame {
         float orbitRadius = 95.0f;
@@ -113,19 +118,24 @@ struct DeploymentPlanner {
 
     // Overview tile size for an authored vertex spacing in metres (1, 2, 4 or
     // 8). Anything else is Auto: the finest spacing whose grid fits the budget.
+    // Auto goes coarser than the authored choices: a 400x island's 35240 m
+    // radius needs 64 m (138 tiles a side) to fit, where 8 m would be 1102.
+    static constexpr int DeploymentTerrainAutoMaxSpacing = 128;
     static float DeploymentTerrainTileSizeFor(float requiredRadius,
                                               int spacingMetres) {
         if (spacingMetres == 1 || spacingMetres == 2 || spacingMetres == 4 ||
             spacingMetres == 8)
             return DeploymentTerrainTileSize * static_cast<float>(spacingMetres);
-        for (int spacing = 1; spacing < 8; spacing *= 2) {
+        for (int spacing = 1; spacing < DeploymentTerrainAutoMaxSpacing;
+             spacing *= 2) {
             const float tileSize =
                 DeploymentTerrainTileSize * static_cast<float>(spacing);
             if (DeploymentTerrainGridSide(requiredRadius, tileSize) <=
                 DeploymentTerrainAutoMaxSide)
                 return tileSize;
         }
-        return DeploymentTerrainTileSize * 8.0f;
+        return DeploymentTerrainTileSize *
+            static_cast<float>(DeploymentTerrainAutoMaxSpacing);
     }
 
     static float HeadingTowardIslandCenter(

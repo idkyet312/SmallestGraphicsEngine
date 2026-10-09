@@ -181,8 +181,23 @@ public:
         // reallocating them -- see BuildTerrainBLAS, where allocating first
         // freed the very buffers this early-out then kept pointing at.
         auto current = meshes_.find(meshId);
-        if (current != meshes_.end() && current->second.sourceHash == sourceHash)
+        if (current != meshes_.end() && current->second.sourceHash == sourceHash) {
+            // A level profile can replace VB storage without changing BLAS
+            // geometry. Refresh its offset/material snapshots without rebuilding.
+            size_t index = 0;
+            for (const Geometry& geometry : geometries) {
+                if (!geometry.vertexAddress || geometry.vertexCount < 3) continue;
+                if (index >= current->second.geometries.size()) break;
+                Geometry& retained = current->second.geometries[index++];
+                retained.vbVertexOffset = geometry.vbVertexOffset;
+                retained.vbIndexOffset = geometry.vbIndexOffset;
+                retained.vbHasIndices = geometry.vbHasIndices;
+                retained.vbMaterialID = geometry.vbMaterialID;
+                retained.vbBindlessMaterialID = geometry.vbBindlessMaterialID;
+                retained.vbMeshValid = geometry.vbMeshValid;
+            }
             return true;
+        }
 
         std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> descriptions;
         std::vector<Geometry> validGeometries;

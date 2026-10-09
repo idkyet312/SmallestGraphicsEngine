@@ -718,6 +718,37 @@ int main() {
         CHECK(!std::filesystem::exists(TerrainSplatSidecarPath(levelPath)));
     }
 
+    {
+        LevelDefinition bistro = MakeFlatLevelTemplate();
+        bistro.environmentMap = "Content/Textures/Sky/san_giuseppe_bridge_4k.hdr";
+        bistro.renderingProfile = "bistroExterior";
+        const auto path = root / "bistro-roundtrip.json";
+        CHECK(SaveLevel(bistro, path).ok);
+        const auto loaded = LoadLevel(path);
+        CHECK(loaded.ok);
+        CHECK(loaded.level.environmentMap == bistro.environmentMap);
+        CHECK(loaded.level.renderingProfile == bistro.renderingProfile);
+        bistro.renderingProfile = "unknown";
+        CHECK(!ValidateLevel(bistro).ok);
+        bistro.renderingProfile = "default";
+        for (const char* invalid : { "../sky.hdr", "Content/../sky.hdr",
+                                     "C:/sky.hdr", "Content/Textures/sky.png" }) {
+            bistro.environmentMap = invalid;
+            CHECK(!ValidateLevel(bistro).ok);
+        }
+        const auto defaults = MakeFlatLevelTemplate();
+        CHECK(defaults.environmentMap.empty());
+        CHECK(defaults.renderingProfile == "default");
+        CHECK(SaveLevel(defaults, path).ok);
+        std::ifstream input(path);
+        nlohmann::json document; input >> document;
+        CHECK(!document.contains("environmentMap"));
+        CHECK(!document.contains("renderingProfile"));
+        const auto defaultLoaded = LoadLevel(path);
+        CHECK(defaultLoaded.ok);
+        CHECK(defaultLoaded.level.environmentMap.empty());
+        CHECK(defaultLoaded.level.renderingProfile == "default");
+    }
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
     return failures ? 1 : 0;

@@ -6,6 +6,7 @@
 #include "Scene.h"
 #include "WaterVolume.h"
 #include "UltraWaterSimulationDX12.h"
+#include "DeploymentPlanner.h"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <array>
@@ -673,7 +674,7 @@ private:
                    ultraClipVertexView_, ultraClipIndexView_,
                    ultraClipIndexCount_) &&
                CreateGridMesh(
-                   128, 4096.0f,
+                   256, DeploymentPlanner::OceanHalfSpan,
                    deploymentClipVertexBuffer_, deploymentClipIndexBuffer_,
                    deploymentClipVertexView_, deploymentClipIndexView_,
                    deploymentClipIndexCount_);

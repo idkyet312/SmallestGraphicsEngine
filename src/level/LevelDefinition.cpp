@@ -394,6 +394,18 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         result.errors.push_back("unsupported schemaVersion " +
                                 std::to_string(level.schemaVersion));
     if (level.name.empty()) result.errors.push_back("level name is empty");
+    if (level.renderingProfile != "default" && level.renderingProfile != "bistroExterior")
+        result.errors.push_back("unknown renderingProfile '" + level.renderingProfile + "'");
+    if (!level.environmentMap.empty()) {
+        const std::filesystem::path environment(level.environmentMap);
+        const std::string extension = environment.extension().string();
+        bool traversal = false;
+        for (const auto& part : environment) traversal |= part == "..";
+        if (environment.is_absolute() || traversal ||
+            level.environmentMap.rfind("Content/", 0) != 0 ||
+            (extension != ".hdr" && extension != ".exr"))
+            result.errors.push_back("environmentMap must be a relative Content/ HDR or EXR path");
+    }
     if (!std::isfinite(level.deploymentRadius) ||
         level.deploymentRadius < kMinDeploymentRadius ||
         level.deploymentRadius > kMaxDeploymentRadius)
@@ -438,7 +450,8 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         !std::isfinite(level.terrainIslandScaleZ) ||
         level.terrainIslandScaleZ < 0.5f ||
         level.terrainIslandScaleZ > kMaxTerrainIslandScale)
-        result.errors.push_back("terrain island scale must be between 0.5 and 12");
+        result.errors.push_back("terrain island scale must be between 0.5 and " +
+            std::to_string(static_cast<int>(kMaxTerrainIslandScale)));
     if (level.terrainOriginTileX < -256 || level.terrainOriginTileX > 256 ||
         level.terrainOriginTileZ < -256 || level.terrainOriginTileZ > 256)
         result.errors.push_back("terrain origin tile offset out of range");
@@ -572,6 +585,8 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         LevelDefinition level;
         level.schemaVersion = root.at("schemaVersion").get<uint32_t>();
         level.name = root.at("name").get<std::string>();
+        level.environmentMap = root.value("environmentMap", std::string());
+        level.renderingProfile = root.value("renderingProfile", std::string("default"));
         // Absent on levels saved before insertion modes existed, which all
         // arrived by helicopter.
         if (root.contains("insertionMode")) {
@@ -914,6 +929,8 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             }}}},
             {"entities", std::move(entities)}
         };
+        if (!level.environmentMap.empty()) root["environmentMap"] = level.environmentMap;
+        if (level.renderingProfile != "default") root["renderingProfile"] = level.renderingProfile;
         // Only levels that actually use splines gain the key, so files authored
         // before this feature round-trip unchanged.
         if (!splines.empty()) root["splines"] = std::move(splines);

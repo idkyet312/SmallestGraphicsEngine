@@ -214,17 +214,23 @@ enum class LevelInsertionMode : uint32_t {
 
 inline constexpr float kDefaultDeploymentRadius = 34.0f;
 inline constexpr float kMinDeploymentRadius = 5.0f;
-// Sized for the largest island: a 24x island's land reaches 43 * 24 = 1032 m,
+// Sized for the largest island: a 400x island's land reaches 43 * 400 = 17200 m,
 // so the insertion ring has to be able to sit offshore of that.
-inline constexpr float kMaxDeploymentRadius = 1200.0f;
-// Coastline stretch per axis. 24x puts the seabed edge (88 m * scale + 40 m
-// margin) at 2152 m, which DeploymentPlanner::MaxTerrainClipmapRings covers.
-inline constexpr float kMaxTerrainIslandScale = 24.0f;
+inline constexpr float kMaxDeploymentRadius = 20000.0f;
+// Coastline stretch per axis. 400x puts the seabed edge (88 m * scale + 40 m
+// margin) at 35240 m, which DeploymentPlanner::MaxTerrainClipmapRings covers
+// and DeploymentPlanner::OceanHalfSpan encloses.
+inline constexpr float kMaxTerrainIslandScale = 400.0f;
+// Islands larger than this get no navmesh: one Recast build is 55-60 s at 24x
+// and grows with area. AI uses direct steering instead.
+inline constexpr float kMaxNavmeshIslandScale = 100.0f;
 inline constexpr int kDeploymentZoneCount = 20;
 
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
+    std::string environmentMap;
+    std::string renderingProfile = "default";
     LevelMapType mapType = LevelMapType::Tropical;
     TerrainTextureLayers terrainTextureLayers{};
     bool terrainAutoFoliage = true;

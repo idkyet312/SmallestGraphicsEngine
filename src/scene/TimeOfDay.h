@@ -21,7 +21,11 @@ enum class TimeOfDay : uint8_t {
     Noon = 0,
     Afternoon = 1,
     Dusk = 2,
-    Night = 3
+    Night = 3,
+    // Not a clock time: the street-scale inspection look (thin haze, 45 deg
+    // sun, stronger GI, RT reflections) promoted from the editor checkbox so
+    // it can be picked on any map. Excluded from the deployment randomizer.
+    MaxFidelity = 4
 };
 
 inline const char* TimeOfDayName(TimeOfDay time) {
@@ -30,6 +34,7 @@ inline const char* TimeOfDayName(TimeOfDay time) {
     case TimeOfDay::Afternoon: return "Afternoon";
     case TimeOfDay::Dusk: return "Dusk";
     case TimeOfDay::Night: return "Night";
+    case TimeOfDay::MaxFidelity: return "Max fidelity";
     default: return "Afternoon";
     }
 }
@@ -44,6 +49,8 @@ inline const char* TimeOfDayBriefing(TimeOfDay time) {
         return "Long shadows, low sun. Good cover on the east approach.";
     case TimeOfDay::Night:
         return "Minimal light. Hard to be seen, hard to see.";
+    case TimeOfDay::MaxFidelity:
+        return "Clear high sun, thin haze. Inspection look.";
     default:
         return "Angled light, clear visibility.";
     }
@@ -72,6 +79,12 @@ struct TimeOfDaySettings {
     DirectX::XMFLOAT3 volumetricFogTint{
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
     };
+    // Renderer knobs outside the lighting set. Only MaxFidelity drives them;
+    // ApplyTimeOfDay saves the prior values on entry and restores them when
+    // another preset is picked, so negative/false here means "leave alone".
+    float giIntensity = -1.0f;
+    float emissiveIntensity = -1.0f;
+    bool  rtReflections = false;
 };
 
 // The sun's height above the horizon, as the y of the normalised direction.
@@ -227,6 +240,19 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         settings.volumetricFogTint = {
             5.0f / 255.0f, 5.0f / 255.0f, 5.0f / 255.0f
         };
+        break;
+    case TimeOfDay::MaxFidelity:
+        // Afternoon azimuth at 45 degrees elevation (|lightPos| stays 10), so
+        // the sun clears street rooflines. Fog at a quarter of the 0.009
+        // default: ~89% transmittance at 50 m instead of ~64%, keeping a depth
+        // cue without washing a street out within 20 m.
+        settings.lightPos = { 3.5212f, 7.0711f, -6.1320f };
+        settings.lightColor = { 1.0f, 245.0f / 255.0f, 225.0f / 255.0f };
+        settings.ambientLightingIntensity = 1.0f;
+        settings.volumetricFogDensity = 0.009f * 0.25f;
+        settings.giIntensity = 1.2f;
+        settings.emissiveIntensity = 0.8f;
+        settings.rtReflections = true;
         break;
     case TimeOfDay::Afternoon:
     default:

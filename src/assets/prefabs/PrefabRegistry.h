@@ -129,6 +129,11 @@ struct PrefabAsset {
     float materialAmbientScale = 1.0f;
     float materialViewFillStrength = 0.0f;
     std::string collision = "none";
+    // "floor" only: per-triangle collision built from the primitives whose
+    // material name starts with one of these prefixes. Lets a scene-sized
+    // model (Bistro) collide on its streets without putting every wall,
+    // flower and chair into the tree and the navmesh.
+    std::vector<std::string> collisionMaterials;
     PrefabLightComponent light;
     PrefabAudioComponent audio;
     PrefabDestructibleComponent destructible;

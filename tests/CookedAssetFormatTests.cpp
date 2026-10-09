@@ -4,11 +4,41 @@
 #include <cassert>
 #include <cstdint>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <stdexcept>
 
 int main() {
     using namespace SGE::Cooked;
+    static_assert(sizeof(Material) == 56, "existing cooked material ABI");
+    static_assert(offsetof(Material, reserved0) == 20, "emission index ABI");
+    static_assert(offsetof(Material, reserved1) == 52, "emission strength ABI");
+    const auto checkMaterial = [](bool ok) {
+        if (!ok) throw std::runtime_error("cooked material compatibility regression");
+    };
+    Material legacy;
+    checkMaterial(!(legacy.flags & TexturedEmission));
+    checkMaterial(OcclusionStrength(legacy.flags) == 0.0f);
+    uint32_t flags = DoubleSided | AlphaCutout | TexturedEmission | DirectXNormal;
+    const uint32_t originalFlags = flags;
+    SetOcclusionStrength(flags, 0.375f);
+    checkMaterial((flags & originalFlags) == originalFlags);
+    checkMaterial(std::abs(OcclusionStrength(flags) - 0.375f) < 0.00002f);
+    SetOcclusionStrength(flags, 0.0f);
+    checkMaterial(OcclusionStrength(flags) == 0.0f);
+    SetOcclusionStrength(flags, 1.0f);
+    checkMaterial(OcclusionStrength(flags) == 1.0f);
+    checkMaterial(OcclusionStrength(PackedOcclusion) == 1.0f);
+    checkMaterial(TextureRowBytes(TextureFormat::BC1, 2048) == 4096);
+    checkMaterial(TextureRowBytes(TextureFormat::BC3, 2048) == 8192);
+    checkMaterial(TextureRowBytes(TextureFormat::BC5, 2048) == 8192);
+    for (uint32_t width : { 1u, 2u, 3u, 4u }) {
+        checkMaterial(TextureRowBytes(TextureFormat::BC1, width) == 8);
+        checkMaterial(TextureRowBytes(TextureFormat::BC5, width) == 16);
+    }
+    checkMaterial(TextureRowBytes(TextureFormat::BC1, 5) == 16);
+    checkMaterial(TextureRowBytes(TextureFormat::None, 2048) == 0);
     Header header;
     header.headerSize = sizeof(Header);
     header.fileSize = 4096;

@@ -740,6 +740,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 OpenMainMenu();
             else PostQuitMessage(0);
         }
+        // F9 hides every ImGui window for a clean shot. Ahead of the editor
+        // branch, which otherwise takes all keys while editing.
+        else if (wParam == VK_F9 && !(lParam & 0x40000000)) {
+            g_deploymentDebugHideUI = !g_deploymentDebugHideUI;
+            SGE_LOG("LogRender", EngineLog::Level::Display,
+                std::string("UI hidden for screenshot: ") +
+                (g_deploymentDebugHideUI ? "ON (F9 to restore)" : "OFF"));
+        }
         else if (IsEditorEditing()) {
             const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (!(FocusedKeyState(VK_RBUTTON) & 0x8000))
@@ -938,14 +946,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::string("Mouse-walk test mode ") +
                 (g_mouseWalkTestMode ? "ON (RMB walks forward, ADS off)"
                                      : "OFF"));
-        }
-        else if (wParam == VK_F9 && !(lParam & 0x40000000)) {
-            // The only way out of the clean-shot mode: the checkbox that sets
-            // it is itself hidden the moment it takes effect.
-            g_deploymentDebugHideUI = !g_deploymentDebugHideUI;
-            SGE_LOG("LogRender", EngineLog::Level::Display,
-                std::string("UI hidden for screenshot: ") +
-                (g_deploymentDebugHideUI ? "ON (F9 to restore)" : "OFF"));
         }
         else if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);

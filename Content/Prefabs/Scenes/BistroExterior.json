@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 2,
+  "id": "scenes/bistro-exterior",
+  "name": "Bistro Exterior",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/BistroExterior/BistroExterior.gltf",
+      "defaultScale": [
+        1,
+        1,
+        1
+      ],
+      "targetSize": 0,
+      "castShadow": true,
+      "useMaterials": true,
+      "automaticLod": false
+    },
+    "collision": {
+      "shape": "floor",
+      "materials": [
+        "Pavement_"
+      ]
+    }
+  }
+}

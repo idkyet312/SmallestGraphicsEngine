@@ -574,7 +574,8 @@ static unsigned int RandomizeDeployment(unsigned int seed = 0) {
     if (seed == 0) seed = static_cast<unsigned int>(std::time(nullptr));
     std::mt19937 generator(seed);
 
-    // Time of day: all four presets are equally likely.
+    // Time of day: the four clock presets are equally likely. MaxFidelity is
+    // an inspection look, not a mission condition, so it is never rolled.
     std::uniform_int_distribution<int> pickTime(
         0, static_cast<int>(TimeOfDay::Night));
     g_selectedTimeOfDay = static_cast<TimeOfDay>(pickTime(generator));

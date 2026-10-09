@@ -80,7 +80,8 @@ const LevelEntityType kBuiltInSpawnTypes[] = {
 // The complete set of collision shapes the runtime understands. Shared by the
 // prefab authoring panel and the per-entity override row so the two can never
 // drift, and so neither offers a value the loader would reject.
-const char* const kCollisionShapes[] = { "none", "box", "mesh" };
+// "floor" also needs collision.materials in the prefab JSON; the loader says so.
+const char* const kCollisionShapes[] = { "none", "box", "mesh", "floor" };
 
 int CollisionShapeIndex(const std::string& shape) {
     for (int i = 0; i < IM_ARRAYSIZE(kCollisionShapes); ++i)
@@ -902,6 +903,9 @@ bool LevelEditor::LoadFrom(const std::filesystem::path& path) {
     terrainStampPreviewAnchor_.reset();
     terrainStampPreviewNeedsMove_ = false;
     level_ = std::move(result.level);
+    // Start the fidelity scene with its surfaces visible; Fog remains a live
+    // viewport toggle, so the user can still inspect the atmospheric result.
+    if (level_.renderingProfile == "bistroExterior") fogEnabled_ = false;
     currentPath_ = path;
     strncpy_s(levelName_, level_.name.c_str(), _TRUNCATE);
     // A level with no entities would make front() undefined behaviour. Levels
@@ -1014,6 +1018,8 @@ bool LevelEditor::FoliageChanged(const LevelDefinition& before) const {
 // the rebuild reads is listed. PlayerSpawn / EnemySpawn / AllySpawn /
 // ExplosiveBarrel / Helicopter contribute nothing to it.
 bool LevelEditor::EnvironmentChanged(const LevelDefinition& before) const {
+    if (before.environmentMap != level_.environmentMap ||
+        before.renderingProfile != level_.renderingProfile) return true;
     if (FoliageChanged(before) || TerrainChanged(before)) return true;
 
     const auto affectsEnvironment = [](LevelEntityType type) {
@@ -2134,6 +2140,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::Button("Load")) { RefreshLevelFiles(); ImGui::OpenPopup("Load Level"); }
     ImGui::SameLine();
     if (ImGui::Button("Assets")) assetBrowserOpen_ = !assetBrowserOpen_;
+    ImGui::SameLine();
+    if (ImGui::Button("Lighting")) actions.toggleLighting = true;
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) actions.refreshVisuals = true;
     if (ImGui::IsItemHovered())
@@ -3464,15 +3472,22 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island width (X)",
-            &level_.terrainIslandScaleX, 0.5f, kMaxTerrainIslandScale, "%.2f x");
+            &level_.terrainIslandScaleX, 0.5f, kMaxTerrainIslandScale, "%.2f x",
+            ImGuiSliderFlags_Logarithmic);
         TrackItemEdit(before, changed);
     }
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island depth (Z)",
-            &level_.terrainIslandScaleZ, 0.5f, kMaxTerrainIslandScale, "%.2f x");
+            &level_.terrainIslandScaleZ, 0.5f, kMaxTerrainIslandScale, "%.2f x",
+            ImGuiSliderFlags_Logarithmic);
         TrackItemEdit(before, changed);
     }
+    if ((std::max)(level_.terrainIslandScaleX, level_.terrainIslandScaleZ) >
+        kMaxNavmeshIslandScale)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+            "Above %.0fx: no navmesh is built, AI uses direct steering.",
+            kMaxNavmeshIslandScale);
     // Link toggle: drag either slider with this on to scale both together.
     {
         const LevelDefinition before = level_;

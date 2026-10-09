@@ -41,10 +41,14 @@ static bool ComputePrefabModelBounds(const std::shared_ptr<SceneNode>& model,
 //
 // Returns false when no primitive carried CPU-side vertices -- a GPU-only
 // optimization upstream would otherwise yield a silently empty tree (R2).
+//
+// materialPrefixes, when given, keeps only primitives whose material name
+// starts with one of them ("floor" collision).
 static bool ExtractPrefabCollisionTriangles(const std::shared_ptr<SceneNode>& model,
                                             std::vector<float>& triangles,
                                             std::string* emptyPrimitives = nullptr,
-                                            const SceneNode* skippedSubtree = nullptr) {
+                                            const SceneNode* skippedSubtree = nullptr,
+                                            const std::vector<std::string>* materialPrefixes = nullptr) {
     triangles.clear();
     size_t primitiveCount = 0;
     size_t emptyCount = 0;
@@ -55,6 +59,15 @@ static bool ExtractPrefabCollisionTriangles(const std::shared_ptr<SceneNode>& mo
         if (!node || node.get() == skippedSubtree) return;
         const XMMATRIX nodeWorld = XMLoadFloat4x4(&node->globalTransform);
         if (node->mesh) for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            if (materialPrefixes) {
+                const std::string& material =
+                    primitive.material ? primitive.material->name : std::string();
+                if (std::none_of(materialPrefixes->begin(), materialPrefixes->end(),
+                        [&material](const std::string& prefix) {
+                            return material.compare(0, prefix.size(), prefix) == 0;
+                        }))
+                    continue;
+            }
             ++primitiveCount;
             const size_t vertexCount = primitive.vertices.size() / 12;
             if (vertexCount == 0) {
@@ -147,6 +160,13 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Loaded cooked asset for " + prefab.id);
     } else {
+        auto requiredCook = prefab.modelPath;
+        requiredCook.replace_extension(".bistro.json");
+        if (std::filesystem::exists(requiredCook)) {
+            SGE_LOG("LogPrefab", EngineLog::Level::Error,
+                "Bistro requires its BC cook; run scripts/Import-Bistro.ps1: " + cookedError);
+            return nullptr;
+        }
         if (!cookedError.empty()) {
             SGE_LOG("LogPrefab", EngineLog::Level::Warning,
                 "Cooked asset unavailable for " + prefab.id + ": " +
@@ -262,7 +282,8 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     // Per-triangle collision, built here so it shares the post-normalization
     // space the bounds above were measured in. Only prefabs that ask for it pay
     // the build; everything else keeps the bounds box and is untouched.
-    if (prefab.collision == "mesh") {
+    const bool floorCollision = prefab.collision == "floor";
+    if (prefab.collision == "mesh" || floorCollision) {
         // The cache is keyed on the source model plus the transform the tree was
         // baked in, so a targetSize edit or a re-export invalidates it without
         // any manual cleanup.
@@ -273,6 +294,16 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         cacheKey.transformHash = CollisionCache::HashTransform(
             prefab.targetSize, model->scale, model->translation);
         cacheKey.buildParamsHash = CollisionCache::HashBuildParams(buildParams);
+        // The cache file is per prefab id, so a mesh <-> floor switch or a new
+        // material list has to change the key or the old tree is reused.
+        if (floorCollision) {
+            std::string filter = "floor";
+            for (const std::string& prefix : prefab.collisionMaterials)
+                filter += '\n' + prefix;
+            cacheKey.buildParamsHash ^= std::hash<std::string>{}(filter) +
+                0x9e3779b97f4a7c15ull + (cacheKey.buildParamsHash << 6) +
+                (cacheKey.buildParamsHash >> 2);
+        }
 
         auto collisionMesh = std::make_shared<CollisionMesh>();
         std::string cacheError;
@@ -293,8 +324,9 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         std::vector<float> triangles;
         std::string emptyPrimitives;
         const auto extractStarted = std::chrono::steady_clock::now();
-        const bool extracted =
-            ExtractPrefabCollisionTriangles(model, triangles, &emptyPrimitives);
+        const bool extracted = ExtractPrefabCollisionTriangles(model, triangles,
+            &emptyPrimitives, nullptr,
+            floorCollision ? &prefab.collisionMaterials : nullptr);
         const double extractMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - extractStarted).count();
 
@@ -302,7 +334,9 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
             // Never build an empty tree silently: that would look like "the
             // airport has no collision" rather than "the vertices went away".
             SGE_LOG("LogPrefab", EngineLog::Level::Error,
-                "Mesh collision requested but no CPU vertices available: " +
+                (floorCollision
+                    ? "Floor collision: no CPU vertices on primitives matching collision.materials: "
+                    : "Mesh collision requested but no CPU vertices available: ") +
                 prefab.id + (emptyPrimitives.empty() ? "" : " -- " + emptyPrimitives));
         } else {
             if (!emptyPrimitives.empty()) {
@@ -332,7 +366,16 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
                 std::abs(soupMaximum.x - entry.boundsMaximum.x),
                 std::abs(soupMaximum.y - entry.boundsMaximum.y),
                 std::abs(soupMaximum.z - entry.boundsMaximum.z) });
-            if (boundsDrift > 1e-3f) {
+            // A floor subset is legitimately smaller than the whole model; it
+            // can only be checked for lying inside it.
+            const bool soupOutsideModel =
+                soupMinimum.x < entry.boundsMinimum.x - 1e-3f ||
+                soupMinimum.y < entry.boundsMinimum.y - 1e-3f ||
+                soupMinimum.z < entry.boundsMinimum.z - 1e-3f ||
+                soupMaximum.x > entry.boundsMaximum.x + 1e-3f ||
+                soupMaximum.y > entry.boundsMaximum.y + 1e-3f ||
+                soupMaximum.z > entry.boundsMaximum.z + 1e-3f;
+            if (floorCollision ? soupOutsideModel : boundsDrift > 1e-3f) {
                 SGE_LOG("LogPrefab", EngineLog::Level::Error,
                     "Collision soup bounds differ from model bounds by " +
                     std::to_string(boundsDrift) + " for " + prefab.id +
