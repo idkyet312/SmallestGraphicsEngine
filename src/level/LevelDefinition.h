@@ -191,6 +191,19 @@ struct LevelDXRDDGISettings {
     bool showProbes = false;
 };
 
+// Opt-in fog model for levels whose fog must match their own lighting. The
+// default fog is lit by a fixed sky colour plus a 0.82 forward lobe, so away
+// from the sun it adds only ~0.03 of sunlight and reads as a grey veil over a
+// 12-intensity street. Enabled, fog takes the HDRI's mean radiance times the
+// Environment gain and physically scaled sun scattering with a broad lobe, and
+// pools between baseHeight and the rooftops instead of the jungle's 0.4 m.
+struct LevelSceneLitFog {
+    bool enabled = false;
+    float baseHeight = 2.7f;
+    float heightFalloff = 0.18f;
+    float anisotropy = 0.4f;
+};
+
 // How the player arrives at the start of a level.
 enum class LevelInsertionMode : uint32_t {
     // Flown in by the BlackHawk. The historical behaviour, and the default for
@@ -256,6 +269,7 @@ struct LevelDefinition {
     // that sets it false falls back to the cascade path on load and any other
     // level restores it, rather than the choice leaking across a level change.
     bool virtualShadowMaps = true;
+    LevelSceneLitFog sceneLitFog;
     float terrainHeightScale = 3.057f;
     // Flat authoring mode: suppress every procedural landform -- the fbm relief,
     // the pool basin carved near the origin, and the beach/seabed coast falloff

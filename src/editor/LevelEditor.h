@@ -32,6 +32,7 @@ struct LevelEditorActions {
     // edit forces a compile. This is the manual way out.
     bool refreshVisuals = false;
     bool toggleLighting = false;
+    bool togglePerformance = false;
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
@@ -75,6 +76,9 @@ public:
     // not reach into Scene itself, so the caller reads this and applies it.
     bool FogEnabled() const { return fogEnabled_; }
     void SetFogEnabled(bool enabled) { fogEnabled_ = enabled; }
+    // Edits from the Editor Lighting panel, which lives outside the editor
+    // window. A slider drag lands as one undo step, pushed on commit.
+    void EditSceneLitFog(const LevelSceneLitFog& value, bool commit);
     // Whether the viewport wants the deployment overview's terrain LOD.
     bool BirdseyeEnabled() const { return birdseyeEnabled_; }
     // Whether the viewport wants the walkable navmesh drawn over the ground.
@@ -322,6 +326,7 @@ private:
     // not a change to the level. Nothing here is serialized, and the scene flag
     // is restored the moment the toggle goes back on.
     bool fogEnabled_ = true;
+    std::optional<LevelDefinition> sceneLitFogBefore_;
     // Draws the editor viewport with the deployment overview's terrain topology
     // instead of the gameplay clipmap: uniform 8 m tiles at full tessellation
     // all the way out, rather than exponentially coarser outer rings. Costs

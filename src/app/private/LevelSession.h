@@ -298,6 +298,13 @@ static void InitializeLevelHumveePhysics() {
     }
 }
 
+static void ApplySceneLitFog(const LevelSceneLitFog& fog) {
+    scene.sceneLitFog = fog.enabled;
+    scene.sceneLitFogBaseHeight = fog.baseHeight;
+    scene.sceneLitFogHeightFalloff = fog.heightFalloff;
+    scene.sceneLitFogAnisotropy = fog.anisotropy;
+}
+
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     RequestLevelRenderingSettings(g_game.world.Level());
@@ -305,6 +312,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
         LevelRuntimeBuilder::Build(g_game.world.Level());
     g_levelPatrolBoatEnabled = plan.patrolBoatEnabled;
     scene.virtualShadowMaps = g_vsmRunDefault && plan.virtualShadowMaps;
+    ApplySceneLitFog(plan.sceneLitFog);
     scene.terrainHeightScale = plan.terrainHeightScale;
     scene.terrainFlat = plan.terrainFlat;
     scene.terrainTilesX = plan.terrainTilesX;
@@ -692,7 +700,7 @@ static void EnsureSceneRenderAssets() {
     {
         auto skySH = GLBImporter::ComputeSkyIrradianceSH(
             kSkyEnvironmentPath, kSkyEnvironmentRotationRadians);
-        mainShader.SetSkyIrradiance(skySH, 1.0f);
+        SetSceneSkyIrradiance(skySH);
         const HDRISunLight hdriSun =
             GLBImporter::ExtractHDRISunLight(
                 kSkyEnvironmentPath, 2.1f,
@@ -830,6 +838,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // level plan, but it early-returns for the stress and empty test levels,
     // which would otherwise inherit whatever the previous level chose.
     scene.virtualShadowMaps = g_vsmRunDefault;
+    ApplySceneLitFog(LevelSceneLitFog{});
     // The network identity of this level. Every start funnels through here, so
     // this is the one place that cannot be forgotten; StartCustomLevel fills in
     // the file name afterwards, since only the caller with the path knows it.

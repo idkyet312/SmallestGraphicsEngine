@@ -120,6 +120,20 @@ int main() {
         CHECK(defaults.vsync == GameSettings::kDefaultVsync);
     }
 
+    // Scene-lit fog mode round-trips and falls back to Level default when out of range.
+    {
+        GameSettings written;
+        written.sceneLitFog = GameSettings::kSceneLitFogAllLevels;
+        CHECK(SaveGameSettings(written));
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.sceneLitFog == GameSettings::kSceneLitFogAllLevels);
+        WriteSettingsFile("SceneLitFog=7\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.sceneLitFog == GameSettings::kDefaultSceneLitFog);
+        CHECK(GameSettings{}.sceneLitFog == GameSettings::kSceneLitFogLevelDefault);
+    }
+
     // DLSS choice, preset and render percentage survive restarts and reject bad INI values.
     {
         GameSettings written;

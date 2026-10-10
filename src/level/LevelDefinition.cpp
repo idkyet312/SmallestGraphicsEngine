@@ -473,6 +473,13 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         !std::isfinite(gi.multiBounceStrength) ||
         gi.multiBounceStrength < 0.0f || gi.multiBounceStrength > 1.0f)
         result.errors.push_back("lighting.dxrDDGI contains invalid settings");
+    const LevelSceneLitFog& litFog = level.sceneLitFog;
+    if (!std::isfinite(litFog.baseHeight) || litFog.baseHeight < -100.0f ||
+        litFog.baseHeight > 1000.0f || !std::isfinite(litFog.heightFalloff) ||
+        litFog.heightFalloff < 0.0f || litFog.heightFalloff > 2.0f ||
+        !std::isfinite(litFog.anisotropy) || litFog.anisotropy < -0.9f ||
+        litFog.anisotropy > 0.95f)
+        result.errors.push_back("lighting.sceneLitFog contains invalid settings");
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
         const float maxStampRadius =
             stamp.operation == TerrainSculptOperation::Heightmap
@@ -683,6 +690,20 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
             level.dxrDDGI.multiBounceStrength =
                 source.value("multiBounceStrength", 0.35f);
             level.dxrDDGI.showProbes = source.value("showProbes", false);
+        }
+        if (root.contains("lighting") && root.at("lighting").is_object() &&
+            root.at("lighting").contains("sceneLitFog")) {
+            const json& source = root.at("lighting").at("sceneLitFog");
+            if (!source.is_object())
+                throw std::runtime_error("lighting.sceneLitFog must be an object");
+            const LevelSceneLitFog defaults;
+            level.sceneLitFog.enabled = source.value("enabled", false);
+            level.sceneLitFog.baseHeight =
+                source.value("baseHeight", defaults.baseHeight);
+            level.sceneLitFog.heightFalloff =
+                source.value("heightFalloff", defaults.heightFalloff);
+            level.sceneLitFog.anisotropy =
+                source.value("anisotropy", defaults.anisotropy);
         }
         const json& terrain = root.at("terrain");
         if (terrain.contains("sculpt")) {
@@ -931,6 +952,15 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         };
         if (!level.environmentMap.empty()) root["environmentMap"] = level.environmentMap;
         if (level.renderingProfile != "default") root["renderingProfile"] = level.renderingProfile;
+        // Opt-in, so levels that never enabled it round-trip unchanged.
+        if (level.sceneLitFog.enabled) {
+            root["lighting"]["sceneLitFog"] = {
+                {"enabled", level.sceneLitFog.enabled},
+                {"baseHeight", level.sceneLitFog.baseHeight},
+                {"heightFalloff", level.sceneLitFog.heightFalloff},
+                {"anisotropy", level.sceneLitFog.anisotropy}
+            };
+        }
         // Only levels that actually use splines gain the key, so files authored
         // before this feature round-trip unchanged.
         if (!splines.empty()) root["splines"] = std::move(splines);

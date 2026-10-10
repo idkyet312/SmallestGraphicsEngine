@@ -231,6 +231,9 @@ private:
         // base height, thickness, density, coverage. Density <= 0 disables the
         // layer, so the branch costs nothing when the feature is off.
         XMFLOAT4 flyableCloudParams;
+        // rgb = sky mean radiance x Environment gain, w = 1 for scene-lit fog
+        // (Scene::sceneLitFog). w = 0 keeps the legacy fixed-colour lighting.
+        XMFLOAT4 sceneLitFog;
         // Spot shadow atlas transforms, matching the shading passes. Without
         // these a shadowed headlight would still fog straight through a wall:
         // the beam is drawn by lit froxels along it, and a froxel behind an
@@ -535,13 +538,26 @@ private:
                 ? scene.volumetricFogDensity : 0.0f
         };
         const XMFLOAT3 effectiveLightColor = scene.EffectiveLightColor();
+        // Scene-lit fog substitutes the level's own height profile and lobe for
+        // the preset values, which time of day and weather keep rewriting.
+        const bool sceneLit = scene.SceneLitFogLighting();
+        const bool levelProfile = scene.SceneLitFogProfile();
         constants.sunColorAnisotropy = {
             effectiveLightColor.x, effectiveLightColor.y,
-            effectiveLightColor.z, scene.volumetricFogAnisotropy
+            effectiveLightColor.z,
+            levelProfile ? scene.sceneLitFogAnisotropy : scene.volumetricFogAnisotropy
         };
-        constants.fogParams = { scene.volumetricFogHeightFalloff,
-            scene.volumetricFogBaseHeight, scene.EffectiveVolumetricFogDistance(),
+        constants.fogParams = {
+            levelProfile ? scene.sceneLitFogHeightFalloff : scene.volumetricFogHeightFalloff,
+            levelProfile ? scene.sceneLitFogBaseHeight : scene.volumetricFogBaseHeight,
+            scene.EffectiveVolumetricFogDistance(),
             shadowResource ? 1.0f : 0.0f };
+        const float environmentGain = scene.ambientLightingIntensity;
+        constants.sceneLitFog = {
+            scene.skyMeanRadiance.x * environmentGain,
+            scene.skyMeanRadiance.y * environmentGain,
+            scene.skyMeanRadiance.z * environmentGain,
+            sceneLit ? 1.0f : 0.0f };
         constants.ambientFogColor = {
             scene.volumetricFogTint.x,
             scene.volumetricFogTint.y,

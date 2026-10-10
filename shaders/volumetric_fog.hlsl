@@ -50,6 +50,7 @@ cbuffer FogConstants : register(b0)
     // without it the spot matrices below would read the cloud params instead.
     float4 flyableCloudParamsUnused;
 #endif
+    float4 sceneLitFog;           // rgb = sky mean radiance x env gain, w = enabled
     // Spot shadow atlas transforms; see FogConstants in VolumetricFogDX12.h.
     float4x4 spotShadowMatrices[3];
     uint4 spotShadowCount;        // x = live slices, yzw unused
@@ -498,6 +499,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // explode into a white veil that erases trees in front of the sun.
     const float phase = min(HenyeyGreenstein(
         dot(lightDirection, ray), sunColorAnisotropy.w), 1.65);
+    // Scene-lit fog: a third of the lobe is isotropic so sunlight reaches the
+    // fog from every view direction, and the 0.42 artistic scale is dropped so
+    // a sunlit froxel matches the albedo/pi * E surface shading (isotropic
+    // single scatter is E/4pi). Ambient is the HDRI mean radiance x Environment.
+    const bool sceneLit = sceneLitFog.w > 0.5;
+    const float sunScatter = sceneLit
+        ? lerp(phase, 0.0795775, 0.35)
+        : phase * 0.42;
 
     // Each froxel takes a single shadow sample, so a shaft edge that falls
     // mid-slice snaps to the froxel boundary and the shaft reads as stepped.
@@ -644,8 +653,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         shadow *= CloudSunVisibility(worldPosition);
         // Daylight fog must replace attenuated scene energy with sky irradiance.
         // A tiny ambient term made the former pass behave like red/brown smoke.
-        float3 lighting = AtmosphereAmbient(ray, aboveBase) +
-            sunColorAnisotropy.xyz * phase * shadow * 0.42;
+        float3 lighting = (sceneLit ? sceneLitFog.rgb
+                                    : AtmosphereAmbient(ray, aboveBase)) +
+            sunColorAnisotropy.xyz * sunScatter * shadow;
 
 #ifdef SGE_WORLD_CLOUDS
         // Dense interiors transition from forward Mie scattering toward a broad

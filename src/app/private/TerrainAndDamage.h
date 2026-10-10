@@ -732,6 +732,7 @@ static void ApplyGameSettings() {
     DLSS::GetSettings().preset = static_cast<DLSS::Preset>(g_settings.dlssPreset);
     DLSS::GetSettings().screenPercentage = g_settings.dlssScreenPercentage;
     scene.cameraFOV = g_settings.fieldOfView;
+    scene.sceneLitFogMode = g_settings.sceneLitFog;
     // Push the saved mix onto the live submix graph. Safe before the device is
     // up: AudioDevice stores the value and applies it to the voice when one
     // exists, which is what lets this run at boot as well as on every change.

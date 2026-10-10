@@ -11,6 +11,7 @@ struct RuntimeLevelPlan {
     bool terrainFlat = false;
     bool patrolBoatEnabled = true;
     bool virtualShadowMaps = true;
+    LevelSceneLitFog sceneLitFog;
     uint32_t terrainTilesX = 16;
     uint32_t terrainTilesZ = 16;
     float terrainIslandScaleX = 1.0f;
@@ -33,6 +34,7 @@ public:
         plan.terrainFlat = level.terrainFlat;
         plan.patrolBoatEnabled = level.patrolBoatEnabled;
         plan.virtualShadowMaps = level.virtualShadowMaps;
+        plan.sceneLitFog = level.sceneLitFog;
         plan.terrainTilesX = level.terrainTilesX;
         plan.terrainTilesZ = level.terrainTilesZ;
         plan.terrainIslandScaleX = level.terrainIslandScaleX;

@@ -5,6 +5,14 @@
   "patrolBoatEnabled": false,
   "environmentMap": "Content/Textures/Sky/san_giuseppe_bridge_4k.hdr",
   "renderingProfile": "bistroExterior",
+  "lighting": {
+    "sceneLitFog": {
+      "enabled": true,
+      "baseHeight": 2.7,
+      "heightFalloff": 0.18,
+      "anisotropy": 0.4
+    }
+  },
   "terrain": {
     "heightScale": 0,
     "flat": true,

@@ -4881,6 +4881,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
                 scene.enableVolumetricFog = false;
+            // Scene-lit fog A/B: force a density, or the legacy grey lighting.
+            char captureFogDensity[16] = {};
+            if (GetEnvironmentVariableA("SGE_CAPTURE_FOG_DENSITY", captureFogDensity,
+                                        sizeof(captureFogDensity)) > 0) {
+                scene.enableVolumetricFog = true;
+                scene.volumetricFogDensity = static_cast<float>(atof(captureFogDensity));
+            }
+            if (GetEnvironmentVariableA("SGE_CAPTURE_LEGACY_FOG", nullptr, 0) > 0)
+                scene.sceneLitFog = false;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOBLOOM", nullptr, 0) > 0)
                 visBuffer.bloomStrength = 0.0f;
             if (GetEnvironmentVariableA("SGE_CAPTURE_BLOOM_JITTERED", nullptr, 0) > 0)
@@ -8278,6 +8287,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_editorFullReconcileRequested |= actions.fullReconcile;
             static bool editorLightingOpen = true;
             if (actions.toggleLighting) editorLightingOpen = !editorLightingOpen;
+            // SGE_CAPTURE_EDITOR_PERF=1 starts it open, for unattended captures.
+            static bool editorPerformanceOpen =
+                GetEnvironmentVariableA("SGE_CAPTURE_EDITOR_PERF", nullptr, 0) > 0;
+            if (actions.togglePerformance) editorPerformanceOpen = !editorPerformanceOpen;
+            // Drawn during playtests too: that is when frame time matters most.
+            DrawEditorPerformance(editorPerformanceOpen, &g_levelEditor.Level());
             if (!g_levelEditor.IsPlaying()) {
                 bool fog = g_levelEditor.FogEnabled();
                 const bool previousFog = fog;
@@ -8286,8 +8301,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const bool previousRayGI = g_settings.lumenGI || g_settings.radianceCascadesGI;
                 bool rayGI = previousRayGI;
                 bool vsm = scene.virtualShadowMaps;
-                if (DrawEditorLighting(scene, visBuffer, editorLightingOpen, fog, rayGI, vsm,
-                                       g_selectedTimeOfDay, timeOfDayChanged)) {
+                LevelSceneLitFog levelFog = g_levelEditor.Level().sceneLitFog;
+                bool levelFogEdited = false;
+                bool levelFogCommitted = false;
+                const bool lightingChanged = DrawEditorLighting(
+                    scene, visBuffer, editorLightingOpen, fog, rayGI, vsm,
+                    g_selectedTimeOfDay, timeOfDayChanged,
+                    &levelFog, &levelFogEdited, &levelFogCommitted);
+                if (levelFogEdited || levelFogCommitted)
+                    g_levelEditor.EditSceneLitFog(levelFog, levelFogCommitted);
+                // Every editor frame, not only on edit: undo/redo and level
+                // loads replace the editor's copy without passing through here.
+                ApplySceneLitFog(g_levelEditor.Level().sceneLitFog);
+                // The editor previews what the level file asks for; the
+                // player's Scene-Lit Fog setting returns at the next level
+                // start, which re-runs ApplyGameSettings.
+                scene.sceneLitFogMode = GameSettings::kSceneLitFogLevelDefault;
+                if (lightingChanged) {
                     // Through the run default too: every editor sync re-runs
                     // ApplyRuntimeLevelBasics, which rebuilds the flag from it.
                     if (vsm != scene.virtualShadowMaps) {

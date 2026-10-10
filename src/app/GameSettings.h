@@ -141,6 +141,15 @@ struct GameSettings {
     static constexpr int kRayTracingUltra = 1;
     static constexpr int kMinRayTracingQuality = kRayTracingOff;
     static constexpr int kMaxRayTracingQuality = kRayTracingUltra;
+    // Scene-lit fog: fog lit by the level's sun and HDRI rather than a fixed
+    // grey. Level default follows each level file's lighting.sceneLitFog;
+    // All levels also applies the lighting where a level did not opt in (that
+    // level keeps its own fog height profile); Off forces the legacy fog.
+    int sceneLitFog = 0;
+    static constexpr int kSceneLitFogLevelDefault = 0;
+    static constexpr int kSceneLitFogAllLevels = 1;
+    static constexpr int kSceneLitFogOff = 2;
+    static constexpr int kDefaultSceneLitFog = kSceneLitFogLevelDefault;
     // Streamline DLSS preset: K=0, L=1, M=2. L is the SDK default.
     int dlssPreset = 1;
     static constexpr int kMinDLSSPreset = 0;
@@ -245,6 +254,8 @@ struct GameSettings {
                       (std::min)(kMaxFieldOfView, fieldOfView));
         dlssPreset = (std::max)(kMinDLSSPreset,
                      (std::min)(kMaxDLSSPreset, dlssPreset));
+        if (sceneLitFog < kSceneLitFogLevelDefault || sceneLitFog > kSceneLitFogOff)
+            sceneLitFog = kDefaultSceneLitFog;
         rayTracingQuality = (std::max)(kMinRayTracingQuality,
                             (std::min)(kMaxRayTracingQuality, rayTracingQuality));
         rtReflectionRoughnessCutoff = (std::max)(
@@ -286,6 +297,7 @@ struct GameSettings {
         rrForwardGuides = kDefaultRRForwardGuides;
         dlssForwardMotion = kDefaultDLSSForwardMotion;
         rtReflectionRoughnessCutoff = kDefaultRTReflectionRoughnessCutoff;
+        sceneLitFog = kDefaultSceneLitFog;
         dlssPreset = kDefaultDLSSPreset;
         extensionMotionVectors = kDefaultExtensionMotionVectors;
         dlssScreenPercentage = kDefaultDLSSScreenPercentage;
@@ -437,6 +449,9 @@ inline bool LoadGameSettings(GameSettings& out) {
             const bool enabled = value == "1" || value == "true" || value == "yes";
             if (enabled) out.rayTracingQuality = GameSettings::kRayTracingUltra;
         }
+        else if (key == "SceneLitFog") {
+            out.sceneLitFog = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
+        }
         else if (key == "DLSSPreset") {
             out.dlssPreset = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
         }
@@ -522,6 +537,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << settings.rtReflectionRoughnessCutoff << "\n"
          << "DLSSPreset="
          << settings.dlssPreset << "\n"
+         << "SceneLitFog="
+         << settings.sceneLitFog << "\n"
          << "ExtensionMotionVectors="
          << (settings.extensionMotionVectors ? 1 : 0) << "\n"
          << "DLSSScreenPercentage="

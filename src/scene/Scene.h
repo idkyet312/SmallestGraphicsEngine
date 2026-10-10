@@ -971,6 +971,29 @@ struct Scene {
     float volumetricFogAnisotropy = 0.82f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
+    // Per-level opt-in (LevelSceneLitFog). Kept apart from the volumetricFog*
+    // fields above because weather and time-of-day presets rewrite those; the
+    // fog pass substitutes these while sceneLitFog is set.
+    bool  sceneLitFog = false;
+    // Player setting (GameSettings::sceneLitFog): 0 level default, 1 scene-lit
+    // lighting on every level, 2 legacy fog everywhere.
+    int   sceneLitFogMode = 0;
+    // Scene-lit lighting model in use this frame.
+    bool SceneLitFogLighting() const {
+        return sceneLitFogMode == 1 || (sceneLitFogMode == 0 && sceneLitFog);
+    }
+    // The level's own height profile and lobe. Only a level that opted in has
+    // one; All levels keeps the preset profile elsewhere, since a 2.7 m street
+    // profile would strip the fog off every island hillside.
+    bool SceneLitFogProfile() const {
+        return sceneLitFog && sceneLitFogMode != 2;
+    }
+    float sceneLitFogBaseHeight = 2.7f;
+    float sceneLitFogHeightFalloff = 0.18f;
+    float sceneLitFogAnisotropy = 0.4f;
+    // Mean radiance of the level HDRI over the full sphere (SH L0), set
+    // wherever the sky irradiance SH is computed. Scene-lit fog's ambient term.
+    XMFLOAT3 skyMeanRadiance = { 0.0f, 0.0f, 0.0f };
     // World clouds live inside the froxel volume, so scene depth occludes them
     // and the player can pass through their 3D density. When enabled they
     // replace the sky-pass cloud layer instead of drawing a duplicate behind it.

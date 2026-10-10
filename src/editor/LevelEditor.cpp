@@ -454,6 +454,16 @@ void LevelEditor::MarkTransformRuntimeDirty(uint64_t entityId) {
     }
 }
 
+void LevelEditor::EditSceneLitFog(const LevelSceneLitFog& value, bool commit) {
+    if (!sceneLitFogBefore_) sceneLitFogBefore_ = level_;
+    level_.sceneLitFog = value;
+    dirty_ = true;
+    if (commit) {
+        PushUndo(*sceneLitFogBefore_);
+        sceneLitFogBefore_.reset();
+    }
+}
+
 void LevelEditor::MarkChanged(const LevelDefinition& before,
                               uint64_t transformEntityId) {
     PushUndo(before);
@@ -2142,6 +2152,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::Button("Assets")) assetBrowserOpen_ = !assetBrowserOpen_;
     ImGui::SameLine();
     if (ImGui::Button("Lighting")) actions.toggleLighting = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Performance")) actions.togglePerformance = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Frame time, CPU/GPU split, GPU passes and scene counts.");
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) actions.refreshVisuals = true;
     if (ImGui::IsItemHovered())

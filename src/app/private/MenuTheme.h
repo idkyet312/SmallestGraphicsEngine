@@ -793,6 +793,16 @@ static void VideoTab() {
     ImGui::EndDisabled();
     ImGui::EndDisabled();
 
+    static const char* sceneLitFogModes[] = {"Level default", "All levels", "Off"};
+    if (ImGui::Combo("Scene-Lit Fog", &g_settings.sceneLitFog,
+                     sceneLitFogModes, IM_ARRAYSIZE(sceneLitFogModes))) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextDisabled("Lights fog with the level's sun and sky instead of a "
+                        "flat grey. Level default: only levels that enable it.");
+
     const SliderResult fov = SliderRow(
         "Field of View", "Hip-fire vertical field of view.", "##fov",
         &g_settings.fieldOfView, GameSettings::kMinFieldOfView,

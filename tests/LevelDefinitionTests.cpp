@@ -105,6 +105,7 @@ int main() {
     level.deploymentTerrainSpacing = 4;
     level.defaultInsertionPoint = kDeploymentZoneCount;
     level.patrolBoatEnabled = false;
+    level.sceneLitFog = { true, 3.25f, 0.2f, 0.35f };
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -258,6 +259,10 @@ int main() {
     CHECK(loaded.level.deploymentRadius == 137.5f);
     CHECK(loaded.level.deploymentTerrainSpacing == 4);
     CHECK(!loaded.level.patrolBoatEnabled);
+    CHECK(loaded.level.sceneLitFog.enabled);
+    CHECK(loaded.level.sceneLitFog.baseHeight == 3.25f);
+    CHECK(loaded.level.sceneLitFog.heightFalloff == 0.2f);
+    CHECK(loaded.level.sceneLitFog.anisotropy == 0.35f);
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     CHECK(ParseLevelInsertionMode("boat", insertion));
     CHECK(insertion == LevelInsertionMode::Boat);
@@ -388,6 +393,7 @@ int main() {
     CHECK(legacyLoaded.level.deploymentTerrainSpacing == 0);
     CHECK(legacyLoaded.level.defaultInsertionPoint == 0);
     CHECK(legacyLoaded.level.patrolBoatEnabled);
+    CHECK(!legacyLoaded.level.sceneLitFog.enabled);
 
     {
         LevelDefinition pointLevel = legacyLoaded.level;

@@ -437,6 +437,19 @@ static void ApplyPendingLevelRenderingProfile() {
     }
 }
 
+// One entry point for the sky SH so the surfaces and scene-lit fog always see
+// the same HDRI. L0 times Y00 (0.282095) is the mean radiance over the sphere;
+// the CPU fold multiplies band 0 by A0 = 1, so L0 is unscaled here.
+static void SetSceneSkyIrradiance(const std::array<XMFLOAT3, 9>& sh) {
+    mainShader.SetSkyIrradiance(sh, 1.0f);
+    constexpr float kY00 = 0.282095f;
+    scene.skyMeanRadiance = { sh[0].x * kY00, sh[0].y * kY00, sh[0].z * kY00 };
+    char line[128];
+    snprintf(line, sizeof(line), "Sky mean radiance %.3f %.3f %.3f",
+             scene.skyMeanRadiance.x, scene.skyMeanRadiance.y,
+             scene.skyMeanRadiance.z);
+    SGE_LOG("LogRender", EngineLog::Level::Display, line);
+}
 
 static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
     if (skyRenderer.EnvironmentPath() == g_requestedLevelEnvironment) return;
@@ -463,8 +476,8 @@ static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
             "Level environment failed; retaining previous HDRI: " + g_requestedLevelEnvironment);
         return;
     }
-    mainShader.SetSkyIrradiance(GLBImporter::ComputeSkyIrradianceSH(
-        g_requestedLevelEnvironment, kSkyEnvironmentRotationRadians), 1.0f);
+    SetSceneSkyIrradiance(GLBImporter::ComputeSkyIrradianceSH(
+        g_requestedLevelEnvironment, kSkyEnvironmentRotationRadians));
     visBuffer.UpdateEnvironmentMap(g_specularEnvironmentResource, g_brdfIntegrationResource);
     visBuffer.InvalidateTemporalHistory();
     SGE_LOG("LogRender", EngineLog::Level::Display, "Level environment loaded: " + g_requestedLevelEnvironment);

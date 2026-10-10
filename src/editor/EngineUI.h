@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include "Scene.h"
 #include "TimeOfDay.h"
+#include "LevelDefinition.h"
 #include "VisibilityBufferDX12.h"
 #include "DestructionDX12.h"
 #include "VirtualInput.h"
@@ -22,6 +23,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1743,6 +1745,191 @@ inline void DrawProfilerWindow() {
     ImGui::End();
 }
 
+// Level editor Performance window, toggled from the editor's top bar. Keeps
+// its own frame history so the graph and percentiles cover the last few
+// seconds of editing, not just the current frame the Profiler shows.
+struct EditorPerformanceHistory {
+    static constexpr int kFrames = 300;
+    float frameMs[kFrames] = {};
+    float cpuMs[kFrames] = {};
+    float gpuMs[kFrames] = {};
+    int next = 0;
+    int count = 0;
+    void Push(float frame, float cpu, float gpu) {
+        frameMs[next] = frame;
+        cpuMs[next] = cpu;
+        gpuMs[next] = gpu;
+        next = (next + 1) % kFrames;
+        count = (std::min)(count + 1, kFrames);
+    }
+    // Oldest-first copy, which is the order PlotLines draws left to right.
+    void Ordered(const float* source, float* out) const {
+        const int start = count < kFrames ? 0 : next;
+        for (int i = 0; i < count; ++i) out[i] = source[(start + i) % kFrames];
+    }
+};
+inline EditorPerformanceHistory g_editorPerformanceHistory;
+
+inline void DrawEditorPerformance(bool& open, const LevelDefinition* level) {
+    // Recorded even while closed, so opening the window shows a full graph.
+    const ImGuiIO& io = ImGui::GetIO();
+    const float frameMs = io.DeltaTime * 1000.0f;
+    const float cpuMs = static_cast<float>(g_profiler.CpuFrameMs());
+    const float gpuMs = g_profiler.IsInitialized()
+        ? static_cast<float>(g_profiler.GpuFrameMs()) : 0.0f;
+    EditorPerformanceHistory& history = g_editorPerformanceHistory;
+    history.Push(frameMs, cpuMs, gpuMs);
+    if (!open) return;
+
+    ImGui::SetNextWindowPos(ImVec2(372, 220), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(470, 560), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Performance", &open)) {
+        ImGui::End();
+        return;
+    }
+
+    float frames[EditorPerformanceHistory::kFrames];
+    float cpu[EditorPerformanceHistory::kFrames];
+    float gpu[EditorPerformanceHistory::kFrames];
+    history.Ordered(history.frameMs, frames);
+    history.Ordered(history.cpuMs, cpu);
+    history.Ordered(history.gpuMs, gpu);
+    const int n = history.count;
+
+    float sum = 0.0f, worst = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += frames[i];
+        worst = (std::max)(worst, frames[i]);
+    }
+    const float average = n > 0 ? sum / n : 0.0f;
+    std::vector<float> sorted(frames, frames + n);
+    std::sort(sorted.begin(), sorted.end());
+    // 1% low: the frame time 99% of frames beat, shown as FPS like a benchmark.
+    const float p99 = n > 0 ? sorted[(std::min)(n - 1, (n * 99) / 100)] : 0.0f;
+    int hitches = 0;
+    for (int i = 0; i < n; ++i)
+        if (average > 0.0f && frames[i] > 2.0f * average) ++hitches;
+
+    if (ImGui::BeginTabBar("##editorPerformanceTabs")) {
+        if (ImGui::BeginTabItem("Overview")) {
+            ImGui::Text("FPS        %6.1f   (avg %.1f, 1%% low %.1f)",
+                        io.Framerate, average > 0.0f ? 1000.0f / average : 0.0f,
+                        p99 > 0.0f ? 1000.0f / p99 : 0.0f);
+            ImGui::Text("Frame      %6.2f ms  (avg %.2f, worst %.2f)",
+                        frameMs, average, worst);
+            ImGui::Text("CPU        %6.2f ms", cpuMs);
+            if (g_profiler.IsInitialized())
+                ImGui::Text("GPU        %6.2f ms  (p95 %.2f)",
+                            gpuMs, g_profiler.GpuFrameP95Ms());
+            else
+                ImGui::TextDisabled("GPU           -- ms");
+            ImGui::TextDisabled("Wait       %6.2f ms  (present + fence)",
+                                g_profiler.CpuFrameWaitMs());
+            const ImVec4 hitchColor = hitches > 0
+                ? ImVec4(1.0f, 0.72f, 0.35f, 1.0f)
+                : ImVec4(0.65f, 0.70f, 0.67f, 1.0f);
+            ImGui::TextColored(hitchColor, "Hitches    %d in last %d frames (>2x avg)",
+                               hitches, n);
+            ImGui::Separator();
+            // Shared vertical scale so the three graphs compare directly.
+            const float scale = (std::max)(worst, 16.7f) * 1.1f;
+            const float width = ImGui::GetContentRegionAvail().x;
+            char overlay[48];
+            snprintf(overlay, sizeof(overlay), "frame %.2f ms", frameMs);
+            ImGui::PlotLines("##frame", frames, n, 0, overlay, 0.0f, scale,
+                             ImVec2(width, 70.0f));
+            snprintf(overlay, sizeof(overlay), "CPU %.2f ms", cpuMs);
+            ImGui::PlotLines("##cpu", cpu, n, 0, overlay, 0.0f, scale,
+                             ImVec2(width, 50.0f));
+            if (g_profiler.IsInitialized()) {
+                snprintf(overlay, sizeof(overlay), "GPU %.2f ms", gpuMs);
+                ImGui::PlotLines("##gpu", gpu, n, 0, overlay, 0.0f, scale,
+                                 ImVec2(width, 50.0f));
+            }
+            ImGui::TextDisabled("Last %d frames, 0 to %.1f ms.", n, scale);
+            if (ImGui::Button("Reset history")) history = {};
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GPU passes")) {
+            if (!g_profiler.IsInitialized()) {
+                ImGui::TextDisabled("GPU timestamp queries unavailable");
+            } else {
+                // Top-level passes only: FE/* and Terrain nest inside Forward
+                // Extensions, and adding them in would count them twice.
+                std::vector<const ProfilerSampleDX12*> passes;
+                for (const auto& sample : g_profiler.GpuSamples())
+                    if (sample.name.rfind("FE/", 0) != 0 && sample.name != "Terrain")
+                        passes.push_back(&sample);
+                std::sort(passes.begin(), passes.end(),
+                    [](const ProfilerSampleDX12* a, const ProfilerSampleDX12* b) {
+                        return a->milliseconds > b->milliseconds;
+                    });
+                const float total = (std::max)(gpuMs, 0.001f);
+                for (const ProfilerSampleDX12* pass : passes) {
+                    const float share = static_cast<float>(pass->milliseconds) / total;
+                    char label[96];
+                    snprintf(label, sizeof(label), "%.3f ms  %.0f%%",
+                             pass->milliseconds, share * 100.0f);
+                    ImGui::ProgressBar((std::min)(share, 1.0f), ImVec2(150.0f, 0.0f), label);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(pass->name.c_str());
+                }
+                ImGui::TextDisabled("Share of the %.2f ms GPU frame. Delayed by frames in flight.",
+                                    gpuMs);
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Scene")) {
+            if (level) {
+                int enabled = 0;
+                std::map<std::string, int> byType;
+                for (const LevelEntity& entity : level->entities) {
+                    if (!entity.enabled) continue;
+                    ++enabled;
+                    ++byType[entity.type == LevelEntityType::Prefab
+                        ? "prefab " + entity.prefabId
+                        : std::string(LevelEntityTypeName(entity.type))];
+                }
+                ImGui::Text("Entities   %d enabled / %zu", enabled, level->entities.size());
+                ImGui::Text("Splines    %zu", level->splines.size());
+                ImGui::Text("Sculpt     %zu stamps", level->terrainSculpt.size());
+                if (ImGui::TreeNode("By type")) {
+                    for (const auto& [name, count] : byType)
+                        ImGui::BulletText("%s: %d", name.c_str(), count);
+                    ImGui::TreePop();
+                }
+                ImGui::Separator();
+            }
+            ImGui::Text("Prefabs drawn  %d / %d",
+                        g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
+            ImGui::Text("Palms drawn    %d / %d",
+                        g_palmDrawStats.drawn, g_palmDrawStats.considered);
+            const VideoMemoryStatsDX12 memory = GetVideoMemoryStatsDX12();
+            if (memory.valid) {
+                constexpr double kMiB = 1024.0 * 1024.0;
+                ImGui::Text("VRAM           %.0f / %.0f MB budget",
+                            static_cast<double>(memory.usageBytes) / kMiB,
+                            static_cast<double>(memory.budgetBytes) / kMiB);
+                if (memory.budgetBytes > 0)
+                    ImGui::ProgressBar(static_cast<float>(
+                        static_cast<double>(memory.usageBytes) /
+                        static_cast<double>(memory.budgetBytes)));
+                const StaticBufferStatsDX12 buffers = GetStaticBufferStatsDX12();
+                ImGui::TextDisabled("Geometry buffers %.0f MB in %u",
+                                    static_cast<double>(buffers.bytes) / kMiB,
+                                    buffers.resources);
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Detail")) {
+            ProfilerPanelBody();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+
 // -- Settings search --------------------------------------------------------
 // The panel has grown past a dozen collapsing sections, so finding one slider
 // means remembering which header it lives under.
@@ -1904,7 +2091,10 @@ inline void DrawVirtualShadowPageGrid() {
 
 inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
                                bool& open, bool& fog, bool& rayGI, bool& vsm,
-                               TimeOfDay& timeOfDay, bool& timeOfDayChanged) {
+                               TimeOfDay& timeOfDay, bool& timeOfDayChanged,
+                               LevelSceneLitFog* levelFog = nullptr,
+                               bool* levelFogEdited = nullptr,
+                               bool* levelFogCommitted = nullptr) {
     if (!open) return false;
     ImGui::SetNextWindowPos(ImVec2(16, 220), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
@@ -1980,6 +2170,35 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
             ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("0 = clear; higher values make thicker fog. Ctrl-click to enter a value.");
+        // Saved with the level, so it is edited through the editor's copy and
+        // reported back rather than written into Scene here.
+        if (levelFog && levelFogEdited && levelFogCommitted) {
+            bool edited = ImGui::Checkbox("Scene-lit fog (this level)", &levelFog->enabled);
+            bool committed = edited;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Light fog with this level's sun and HDRI instead of the\n"
+                                  "fixed grey sky colour, with a broad scattering lobe and\n"
+                                  "its own height profile. Saved in the level file.");
+            if (levelFog->enabled) {
+                ImGui::Indent();
+                edited |= ImGui::SliderFloat("Fog base height", &levelFog->baseHeight,
+                    -10.0f, 50.0f, "%.2f m");
+                committed |= ImGui::IsItemDeactivatedAfterEdit();
+                edited |= ImGui::SliderFloat("Fog height falloff", &levelFog->heightFalloff,
+                    0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+                committed |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Per metre above the base. 0.18 halves the fog every ~4 m.");
+                edited |= ImGui::SliderFloat("Fog anisotropy", &levelFog->anisotropy,
+                    0.0f, 0.9f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                committed |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Forward scattering. Lower spreads sunlight to every view direction.");
+                ImGui::Unindent();
+            }
+            *levelFogEdited = edited;
+            *levelFogCommitted = committed;
+        }
         ImGui::EndDisabled();
         changed |= ImGui::Checkbox("Clouds", &scene.enableFlyableClouds);
         changed |= ImGui::Checkbox("Virtual shadow maps", &vsm);
