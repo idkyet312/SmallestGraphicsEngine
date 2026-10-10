@@ -281,6 +281,7 @@ static void BeginEditorPlaytest(HWND hwnd) {
     ReleaseAmmoPickupBodies();
     scene.ResetLevelRuntimeState();
     SynchronizeEditorRuntime(true);
+    ApplyNightPlayFog();
     scene.player.godMode = true;
     scene.RestorePlayerHealth();
     ResetSprintStamina();

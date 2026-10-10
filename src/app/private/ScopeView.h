@@ -103,8 +103,10 @@ static void RenderSniperScopeTexture(float now, bool hideFog) {
                 g_profiler, "Scope/Sky", g_dx12.commandList.Get());
             skyRenderer.SetHDRIEnabled(scene.enableHDRISky);
             skyRenderer.SetDepthTestEnabled(lateScopeSky);
+            skyRenderer.SetMoon(scene.moonIsKeyLight, scene.lightPos,
+                                scene.moonDiscIntensity);
             skyRenderer.Render(
-                scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
+                scene.camera, scene.EffectiveCameraFOV(), scene.SkySunDirection(), now,
                 scene.enablePhysicalAtmosphere, false,
                 XMFLOAT4(scene.atmosphereRayleighStrength,
                          scene.atmosphereMieStrength,

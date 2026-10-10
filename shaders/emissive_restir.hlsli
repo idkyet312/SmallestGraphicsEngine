@@ -229,6 +229,36 @@ float3 EmissiveDirectLighting(uint2 pixel, float3 position, float3 normal,
         }
     }
 
+    // A single spatial donor, chosen by primary geometry only. Both temporal
+    // and spatial inputs are from the completed previous parity; the selected
+    // emitter still gets exactly one final visibility ray at this receiver.
+    if (commit && emissiveCGNS == 2u) {
+        int2 donor;
+        if (EmissiveSelectCompatibleNeighbor(pixel, position, normal, donor) &&
+            any(donor != int2(previousUV * float2(screenWidth, screenHeight)))) {
+            uint4 stored = emissiveReservoirs[
+                EmissiveReservoirIndex(uint2(donor), parity ^ 1u)];
+            uint storedM = stored.w & 0xffffu;
+            float storedW = asfloat(stored.z);
+            bool valid = stored.x < count && storedM > 0u &&
+                storedM <= EMISSIVE_MAX_M &&
+                (stored.w >> 16u) == EmissiveCheck(stored.x, stored.y) &&
+                isfinite(storedW) && storedW > 0.0;
+            if (valid) {
+                float u = (float)(stored.y & 0xffffu) / 65535.0;
+                float v = (float)(stored.y >> 16u) / 65535.0;
+                EmissivePoint p = EmissiveEvaluate(stored.x, u, v);
+                float3 direction;
+                float distance;
+                float target = EmissiveLuma(p.radiance) *
+                    EmissiveGeometry(p, position, normal, direction, distance);
+                EmissiveUpdate(r, stored.x, u, v, target,
+                    target * storedW * (float)storedM, EmissiveRandom(rng));
+                r.M += storedM;
+            }
+        }
+    }
+
     float3 lighting = 0.0;
     float W = 0.0;
     if (r.index != 0xffffffffu && r.targetSelected > 0.0) {
@@ -286,8 +316,14 @@ float3 EmissiveDirectLighting(uint2 pixel, float3 position, float3 normal,
 float3 EmissiveHitIncoming(float3 position, float3 normal) {
     uint count = EmissiveLightCount();
     if (count == 0u) return 0.0;
+    uint shadeSequence = enhancedFrameIndex;
+#if SGE_VARIABLE_RATE_GI
+    // Gradient replay includes the stochastic emitter choices at the hit, not
+    // just the primary hemisphere ray, so noise cannot masquerade as a change.
+    if (gVRRTOverride) shadeSequence = gVRRTSequence;
+#endif
     uint rng = EmissivePcg(asuint(position.x) ^ EmissivePcg(asuint(position.y) ^
-        EmissivePcg(asuint(position.z) ^ enhancedFrameIndex)));
+        EmissivePcg(asuint(position.z) ^ shadeSequence)));
     EmissiveReservoir r;
     r.index = 0xffffffffu;
     r.u = r.v = 0.0;

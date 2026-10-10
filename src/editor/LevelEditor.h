@@ -33,6 +33,7 @@ struct LevelEditorActions {
     bool refreshVisuals = false;
     bool toggleLighting = false;
     bool togglePerformance = false;
+    bool openSettings = false;
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
@@ -79,6 +80,12 @@ public:
     // Edits from the Editor Lighting panel, which lives outside the editor
     // window. A slider drag lands as one undo step, pushed on commit.
     void EditSceneLitFog(const LevelSceneLitFog& value, bool commit);
+    // Same drag-to-one-undo contract as EditSceneLitFog.
+    void EditExposure(float value, bool commit);
+    // One clock time's lighting (index in TimeOfDay order, Noon..Night);
+    // a disabled value clears it back to the preset. Same undo contract.
+    void EditTimeOfDayLighting(int index, const LevelTimeOfDayLighting& value,
+                               bool commit);
     // Whether the viewport wants the deployment overview's terrain LOD.
     bool BirdseyeEnabled() const { return birdseyeEnabled_; }
     // Whether the viewport wants the walkable navmesh drawn over the ground.
@@ -327,6 +334,8 @@ private:
     // is restored the moment the toggle goes back on.
     bool fogEnabled_ = true;
     std::optional<LevelDefinition> sceneLitFogBefore_;
+    std::optional<LevelDefinition> exposureBefore_;
+    std::optional<LevelDefinition> timeOfDayLightingBefore_;
     // Draws the editor viewport with the deployment overview's terrain topology
     // instead of the gameplay clipmap: uniform 8 m tiles at full tessellation
     // all the way out, rather than exponentially coarser outer rings. Costs

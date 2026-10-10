@@ -204,6 +204,51 @@ struct LevelSceneLitFog {
     float anisotropy = 0.4f;
 };
 
+// The sun the Max fidelity preset uses on this level, for a level whose
+// environment map carries its own (Bistro's san_giuseppe_bridge HDRI). The
+// engine strips that disc from the IBL, so this analytic light stands in for
+// it: direction toward the sun, colour and intensity measured from the
+// removed energy. Disabled keeps the preset's generic 45-degree sun.
+struct LevelMaxFidelitySun {
+    bool enabled = false;
+    float direction[3] = {0.0f, 1.0f, 0.0f};
+    float color[3] = {1.0f, 1.0f, 1.0f};
+    float intensity = 12.18f;
+};
+
+// One clock time's lighting as tuned in the editor's Lighting window for this
+// level. Replaces that time-of-day preset's sun, environment gain, emission,
+// bloom, GI and fog density; unset times keep the preset. Indexed Noon,
+// Afternoon, Dusk, Night (TimeOfDay order); Max fidelity has maxFidelitySun.
+struct LevelTimeOfDayLighting {
+    bool enabled = false;
+    float sunDirection[3] = {0.0f, 1.0f, 0.0f};  // toward the sun
+    float sunColor[3] = {1.0f, 1.0f, 1.0f};
+    float sunIntensity = 12.18f;
+    float environmentGain = 0.42f;
+    float emission = 1.0f;
+    float bloom = 0.16f;
+    float giIntensity = 1.0f;
+    float fogDensity = 0.009f;
+};
+inline bool operator==(const LevelTimeOfDayLighting& a,
+                       const LevelTimeOfDayLighting& b) {
+    for (int i = 0; i < 3; ++i)
+        if (a.sunDirection[i] != b.sunDirection[i] || a.sunColor[i] != b.sunColor[i])
+            return false;
+    return a.enabled == b.enabled && a.sunIntensity == b.sunIntensity &&
+        a.environmentGain == b.environmentGain && a.emission == b.emission &&
+        a.bloom == b.bloom && a.giIntensity == b.giIntensity &&
+        a.fogDensity == b.fogDensity;
+}
+inline bool operator!=(const LevelTimeOfDayLighting& a,
+                       const LevelTimeOfDayLighting& b) {
+    return !(a == b);
+}
+inline constexpr int kLevelTimeOfDayCount = 4;
+inline constexpr const char* kLevelTimeOfDayKeys[kLevelTimeOfDayCount] = {
+    "noon", "afternoon", "dusk", "night" };
+
 // How the player arrives at the start of a level.
 enum class LevelInsertionMode : uint32_t {
     // Flown in by the BlackHawk. The historical behaviour, and the default for
@@ -270,6 +315,12 @@ struct LevelDefinition {
     // level restores it, rather than the choice leaking across a level change.
     bool virtualShadowMaps = true;
     LevelSceneLitFog sceneLitFog;
+    LevelMaxFidelitySun maxFidelitySun;
+    LevelTimeOfDayLighting timeOfDayLighting[kLevelTimeOfDayCount];
+    // Multiplies the post exposure (lighting.exposure). Auto exposure pulls
+    // every level to mid grey, so this is how a level is made brighter or
+    // darker than that; brighter lights alone are normalised away.
+    float exposure = 1.0f;
     float terrainHeightScale = 3.057f;
     // Flat authoring mode: suppress every procedural landform -- the fbm relief,
     // the pool basin carved near the origin, and the beach/seabed coast falloff

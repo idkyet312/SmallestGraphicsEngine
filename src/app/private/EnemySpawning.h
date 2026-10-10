@@ -593,7 +593,7 @@ static unsigned int RandomizeDeployment(unsigned int seed = 0) {
     // preset rather than picking an absolute keeps a Clear roll thin and a Fog
     // roll thick, so the weather choice still means something.
     {
-        VolumetricFogSettings& fog = VolumetricFogFor(g_selectedTimeOfDay);
+        VolumetricFogSettings& fog = LiveVolumetricFog(g_selectedTimeOfDay);
         if (fog.enabled) {
             std::uniform_real_distribution<float> jitter(0.65f, 1.55f);
             fog.density = std::clamp(fog.density * jitter(generator),

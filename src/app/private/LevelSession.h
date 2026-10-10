@@ -306,13 +306,33 @@ static void ApplySceneLitFog(const LevelSceneLitFog& fog) {
 }
 
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
-    if (!g_customLevelMode) return;
+    if (!g_customLevelMode) {
+        // Built-in levels author no per-time lighting; drop a custom level's.
+        RestoreLevelTimeOfDayLighting();
+        for (LevelTimeOfDayLighting& light : g_levelTimeOfDayLighting)
+            light = LevelTimeOfDayLighting{};
+        return;
+    }
     RequestLevelRenderingSettings(g_game.world.Level());
     const RuntimeLevelPlan plan =
         LevelRuntimeBuilder::Build(g_game.world.Level());
     g_levelPatrolBoatEnabled = plan.patrolBoatEnabled;
     scene.virtualShadowMaps = g_vsmRunDefault && plan.virtualShadowMaps;
     ApplySceneLitFog(plan.sceneLitFog);
+    g_exposureScale = plan.exposure;
+    // Re-applied only when the level's sun changes (load, edit), so editor
+    // syncs do not undo a sun moved by hand under Max fidelity.
+    const LevelMaxFidelitySun& sun = plan.maxFidelitySun;
+    const LevelMaxFidelitySun& held = g_levelMaxFidelitySun;
+    bool sunChanged = sun.enabled != held.enabled ||
+        sun.intensity != held.intensity;
+    for (int i = 0; i < 3; ++i)
+        sunChanged = sunChanged || sun.direction[i] != held.direction[i] ||
+            sun.color[i] != held.color[i];
+    if (sunChanged) {
+        g_levelMaxFidelitySun = plan.maxFidelitySun;
+        ApplyLevelMaxFidelitySun();
+    }
     scene.terrainHeightScale = plan.terrainHeightScale;
     scene.terrainFlat = plan.terrainFlat;
     scene.terrainTilesX = plan.terrainTilesX;
@@ -325,6 +345,24 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     scene.useDDGI = plan.dxrDDGI.enabled &&
         g_dxrDDGI.GetStatus().dxrSupported;
     scene.giIntensity = plan.dxrDDGI.intensity;
+    // The level's own GI is what a time without a tuned override returns to.
+    if (g_timeOfDayLightingBaseline.saved)
+        g_timeOfDayLightingBaseline.giIntensity = scene.giIntensity;
+    // Per-time lighting: a change (load, undo, redo) re-runs the time so the
+    // whole look follows; otherwise only re-assert the GI reset just above.
+    // The Lighting window keeps g_levelTimeOfDayLighting in step as it edits,
+    // so its own drags never come through here as a change.
+    bool timeLightingChanged = false;
+    for (int t = 0; t < kLevelTimeOfDayCount; ++t)
+        timeLightingChanged = timeLightingChanged ||
+            plan.timeOfDayLighting[t] != g_levelTimeOfDayLighting[t];
+    if (timeLightingChanged) {
+        for (int t = 0; t < kLevelTimeOfDayCount; ++t)
+            g_levelTimeOfDayLighting[t] = plan.timeOfDayLighting[t];
+        ApplyTimeOfDay(g_appliedTimeOfDay);
+    } else if (const LevelTimeOfDayLighting* light = AppliedLevelTimeOfDayLighting()) {
+        scene.giIntensity = light->giIntensity;
+    }
     scene.giMaxDistance = plan.dxrDDGI.maxRayDistance;
     scene.normalBias = plan.dxrDDGI.normalBias;
     scene.probeSpacing = plan.dxrDDGI.surfaceSpacing;

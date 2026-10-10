@@ -11,7 +11,22 @@
       "baseHeight": 2.7,
       "heightFalloff": 0.18,
       "anisotropy": 0.4
-    }
+    },
+    "maxFidelitySun": {
+      "enabled": true,
+      "direction": [
+        0.5145,
+        0.479,
+        0.7112
+      ],
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "intensity": 4.47
+    },
+    "exposure": 1.6
   },
   "terrain": {
     "heightScale": 0,
@@ -25,17 +40,17 @@
     {
       "id": 1,
       "type": "player_spawn",
-      "name": "Bistro Overview",
+      "name": "Falcor Camera",
       "enabled": true,
       "transform": {
         "position": [
-          0.0,
-          123.84838681706506,
-          -247.29895127071032
+          -9.81,
+          6.763,
+          46.082
         ],
         "rotation": [
-          -25,
-          180,
+          -3.98,
+          341.4,
           0
         ],
         "scale": [
@@ -55,7 +70,7 @@
         "position": [
           -24.421855926513672,
           2.47,
-          -4.272247314453125
+          4.272247314453125
         ],
         "rotation": [
           0,

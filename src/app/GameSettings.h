@@ -69,6 +69,11 @@ struct GameSettings {
     // picture rather than a HUD overlay.
     bool showCrosshair = true;
 
+    // Settings page without its near-opaque full-screen scrim. Only the row
+    // column, header and footer keep a plate, so a graphics change made from
+    // the pause settings shows on the live frame beside them.
+    bool clearSettingsBackdrop = false;
+
     // Audio mix, 0..1 each. These mirror the submix graph in GunAudio.h: one
     // master trim and one fader per bus. Stored here rather than left on the
     // AudioDevice because the device's values are runtime-only -- the editor
@@ -102,6 +107,11 @@ struct GameSettings {
     // DLSS reconstructs a smaller visibility render into the display target;
     // at 100% it runs native DLAA. Keep it opt-in until measured.
     bool dlssEnabled = false;
+    bool dlssFrameGeneration = false;
+    int nvidiaReflex = 0;
+    // Max fidelity's renderer set (haze, GI, RT reflections, cascades) at
+    // every time of day; the clock only moves the sun, sky light and emission.
+    bool maxFidelityLighting = false;
     // Ray-traced quality tier. Ultra traces every pixel (no confidence
     // classification) and denoises with DLSS Ray Reconstruction at native
     // resolution. Off leaves ray tracing to the editor's own toggles.
@@ -112,6 +122,9 @@ struct GameSettings {
     bool radianceCascadesGI = false;
     // Opt-in sample sharing; full-resolution GI remains the parity reference.
     bool lumenGIHalfResolution = false;
+    bool lumenVariableRateGI = false;
+    float lumenVariableRateBudget = 0.5f;
+    bool emissiveReSTIRCompatibility = false;
     // World-space radiance cache at Lumen ray hits: cached multi-bounce and
     // local-light bounce instead of shading every hit live.
     bool lumenRadianceCache = false;
@@ -203,6 +216,7 @@ struct GameSettings {
     static constexpr bool  kDefaultRealisticAiming = false;
     static constexpr bool  kDefaultShowCrosshair = true;
     static constexpr bool  kDefaultDebugLoadingScreen = false;
+    static constexpr bool  kDefaultClearSettingsBackdrop = false;
     static constexpr bool  kDefaultSeeThroughWeapon = false;
     static constexpr float kDefaultSeeThroughStrength = 1.0f;
     static constexpr float kMinSeeThroughStrength = 0.0f;
@@ -214,6 +228,9 @@ struct GameSettings {
     static constexpr bool  kDefaultLumenGI = false;
     static constexpr bool  kDefaultRadianceCascadesGI = false;
     static constexpr bool  kDefaultLumenGIHalfResolution = false;
+    static constexpr bool  kDefaultLumenVariableRateGI = false;
+    static constexpr float kDefaultLumenVariableRateBudget = 0.5f;
+    static constexpr bool  kDefaultEmissiveReSTIRCompatibility = false;
     static constexpr bool  kDefaultLumenRadianceCache = false;
     static constexpr bool  kDefaultLumenReSTIR = false;
     static constexpr bool  kDefaultFastGIDenoise = false;
@@ -227,6 +244,8 @@ struct GameSettings {
     static constexpr bool  kDefaultInvertMouseY = false;
 
     void Clamp() {
+        lumenVariableRateBudget = lumenVariableRateBudget >= 0.125f
+            ? (std::min)(1.0f, lumenVariableRateBudget) : 0.125f;
         if (radianceCascadesGI) lumenGI = false;
         mouseSensitivity = (std::max)(kMinSensitivity,
                            (std::min)(kMaxSensitivity, mouseSensitivity));
@@ -254,6 +273,7 @@ struct GameSettings {
                       (std::min)(kMaxFieldOfView, fieldOfView));
         dlssPreset = (std::max)(kMinDLSSPreset,
                      (std::min)(kMaxDLSSPreset, dlssPreset));
+        nvidiaReflex = (std::max)(0, (std::min)(2, nvidiaReflex));
         if (sceneLitFog < kSceneLitFogLevelDefault || sceneLitFog > kSceneLitFogOff)
             sceneLitFog = kDefaultSceneLitFog;
         rayTracingQuality = (std::max)(kMinRayTracingQuality,
@@ -278,6 +298,7 @@ struct GameSettings {
         realisticAiming = kDefaultRealisticAiming;
         showCrosshair = kDefaultShowCrosshair;
         debugLoadingScreen = kDefaultDebugLoadingScreen;
+        clearSettingsBackdrop = kDefaultClearSettingsBackdrop;
         masterVolume = kDefaultMasterVolume;
         weaponsVolume = kDefaultWeaponsVolume;
         voicesVolume = kDefaultBusVolume;
@@ -286,10 +307,16 @@ struct GameSettings {
         musicVolume = kDefaultMusicVolume;
         vsync = kDefaultVsync;
         dlssEnabled = kDefaultDLSS;
+        dlssFrameGeneration = false;
+        nvidiaReflex = 0;
+        maxFidelityLighting = false;
         rayTracingQuality = kDefaultRayTracingQuality;
         lumenGI = kDefaultLumenGI;
         radianceCascadesGI = kDefaultRadianceCascadesGI;
         lumenGIHalfResolution = kDefaultLumenGIHalfResolution;
+        lumenVariableRateGI = kDefaultLumenVariableRateGI;
+        lumenVariableRateBudget = kDefaultLumenVariableRateBudget;
+        emissiveReSTIRCompatibility = kDefaultEmissiveReSTIRCompatibility;
         lumenRadianceCache = kDefaultLumenRadianceCache;
         lumenReSTIR = kDefaultLumenReSTIR;
         fastGIDenoise = kDefaultFastGIDenoise;
@@ -368,6 +395,10 @@ inline bool LoadGameSettings(GameSettings& out) {
             out.showCrosshair =
                 !(value == "0" || value == "false" || value == "no");
         }
+        else if (key == "ClearSettingsBackdrop") {
+            out.clearSettingsBackdrop =
+                value == "1" || value == "true" || value == "yes";
+        }
         else if (key == "DebugLoadingScreen") {
             out.debugLoadingScreen =
                 value == "1" || value == "true" || value == "yes";
@@ -404,9 +435,27 @@ inline bool LoadGameSettings(GameSettings& out) {
         else if (key == "RayTracingQuality") {
             out.rayTracingQuality = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
         }
+        else if (key == "DLSSFrameGeneration") {
+            out.dlssFrameGeneration = value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "MaxFidelityLighting") {
+            out.maxFidelityLighting = value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "NVIDIAReflex") {
+            out.nvidiaReflex = static_cast<int>(std::strtol(value.c_str(), nullptr, 10));
+        }
         else if (key == "LumenGI") {
             out.lumenGI =
                 value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "LumenVariableRateGI") {
+            out.lumenVariableRateGI = value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "LumenVariableRateBudget") {
+            out.lumenVariableRateBudget = std::strtof(value.c_str(), nullptr);
+        }
+        else if (key == "EmissiveReSTIRCompatibility") {
+            out.emissiveReSTIRCompatibility = value == "1" || value == "true" || value == "yes";
         }
         else if (key == "LumenGIHalfResolution") {
             out.lumenGIHalfResolution =
@@ -513,12 +562,18 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << (settings.vsync ? 1 : 0) << "\n"
          << "DLSS="
          << (settings.dlssEnabled ? 1 : 0) << "\n"
+         << "DLSSFrameGeneration=" << (settings.dlssFrameGeneration ? 1 : 0) << "\n"
+         << "NVIDIAReflex=" << settings.nvidiaReflex << "\n"
+         << "MaxFidelityLighting=" << (settings.maxFidelityLighting ? 1 : 0) << "\n"
          << "RayTracingQuality="
          << settings.rayTracingQuality << "\n"
          << "LumenGI="
          << (settings.lumenGI ? 1 : 0) << "\n"
          << "RadianceCascadesGI="
          << (settings.radianceCascadesGI ? 1 : 0) << "\n"
+         << "LumenVariableRateGI=" << (settings.lumenVariableRateGI ? 1 : 0) << "\n"
+         << "LumenVariableRateBudget=" << settings.lumenVariableRateBudget << "\n"
+         << "EmissiveReSTIRCompatibility=" << (settings.emissiveReSTIRCompatibility ? 1 : 0) << "\n"
          << "LumenGIHalfResolution="
          << (settings.lumenGIHalfResolution ? 1 : 0) << "\n"
          << "LumenRadianceCache="
@@ -550,6 +605,8 @@ inline bool SaveGameSettings(const GameSettings& settings) {
          << "[HUD]\n"
          << "ShowCrosshair="
          << (settings.showCrosshair ? 1 : 0) << "\n"
+         << "ClearSettingsBackdrop="
+         << (settings.clearSettingsBackdrop ? 1 : 0) << "\n"
          << "[Audio]\n"
          << "MasterVolume=" << settings.masterVolume << "\n"
          << "WeaponsVolume=" << settings.weaponsVolume << "\n"

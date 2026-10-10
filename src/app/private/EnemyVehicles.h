@@ -886,6 +886,15 @@ static void UpdateEnemyVisionForCurrentConditions() {
     g_enemyVisionScale = TimeOfDayVisibilityFactor(applied);
 }
 
+// The level's editor-tuned lighting for the time on screen, or null for Max
+// fidelity and for a time the level never tuned.
+static const LevelTimeOfDayLighting* AppliedLevelTimeOfDayLighting() {
+    const int index = static_cast<int>(g_appliedTimeOfDay);
+    if (index < 0 || index >= kLevelTimeOfDayCount) return nullptr;
+    const LevelTimeOfDayLighting& light = g_levelTimeOfDayLighting[index];
+    return light.enabled ? &light : nullptr;
+}
+
 // Weather is an authored group rather than a rain toggle: every preset moves
 // precipitation, wind, both cloud layers and fog together. The fog copy is
 // kept with the selected time so switching the sun away and back does not
@@ -911,9 +920,25 @@ void ApplyLiveWeatherState(WeatherState state) {
         scene.volumetricFogHeightFalloff = nightWeather.fogHeightFalloff;
         scene.volumetricFogAnisotropy = nightWeather.fogAnisotropy;
     }
+    // The level's tuned fog for this time, else Max fidelity's haze (under Max
+    // fidelity or Max Fidelity Lighting), wins over the clear-sky weathers.
+    // Fog, Rain and Storm keep theirs: thicker is the point.
+    if (state == WeatherState::Clear || state == WeatherState::Cloudy) {
+        // Clear-sky nights default to no fog; Custom (the editor checkbox)
+        // can still turn it on.
+        if (g_selectedTimeOfDay == TimeOfDay::Night)
+            scene.enableVolumetricFog =
+                MakeTimeOfDaySettings(TimeOfDay::Night).enableVolumetricFog;
+        if (const LevelTimeOfDayLighting* light = AppliedLevelTimeOfDayLighting())
+            scene.volumetricFogDensity = light->fogDensity;
+        else if (g_appliedTimeOfDay == TimeOfDay::MaxFidelity ||
+                 g_settings.maxFidelityLighting)
+            scene.volumetricFogDensity =
+                MakeTimeOfDaySettings(TimeOfDay::MaxFidelity).volumetricFogDensity;
+    }
     if (state != WeatherState::Custom) {
         VolumetricFogSettings& fog =
-            VolumetricFogFor(g_selectedTimeOfDay);
+            LiveVolumetricFog(g_selectedTimeOfDay);
         fog = {scene.enableVolumetricFog,
                scene.volumetricFogDensity,
                scene.volumetricFogAnisotropy,
@@ -932,11 +957,98 @@ void ApplyLiveWeatherState(WeatherState state) {
 // the sky, volumetric fog and DDGI all read scene.lightPos as the sun
 // direction, so changing the key light without the atmosphere alongside it
 // gives a midnight sun over a blue afternoon sky.
+// Max fidelity on a level whose HDRI carries a sun: light from where that sun
+// is, with its colour and strength, so the shadows match the sky.
+static void ApplyLevelMaxFidelitySun() {
+    const LevelMaxFidelitySun& sun = g_levelMaxFidelitySun;
+    if (g_appliedTimeOfDay != TimeOfDay::MaxFidelity || !sun.enabled) return;
+    const XMVECTOR direction = XMVector3Normalize(
+        XMVectorSet(sun.direction[0], sun.direction[1], sun.direction[2], 0.0f));
+    // |lightPos| 10, as every preset authors it.
+    XMStoreFloat3(&scene.lightPos, XMVectorScale(direction, 10.0f));
+    scene.lightColor = {sun.color[0], sun.color[1], sun.color[2]};
+    scene.directionalLightIntensity = sun.intensity;
+}
+
+// visBuffer is declared in Environment.h, after this file.
+static float BloomStrength();
+static void SetBloomStrength(float strength);
+
+// Hands back the GI/emission/bloom the last level override displaced.
+static void RestoreLevelTimeOfDayLighting() {
+    TimeOfDayLightingBaseline& base = g_timeOfDayLightingBaseline;
+    if (!base.saved) return;
+    scene.giIntensity = base.giIntensity;
+    g_emissiveIntensity = base.emission;
+    SetBloomStrength(base.bloom);
+    base.saved = false;
+}
+
+// The level's editor-tuned lighting for the time on screen, replacing the
+// preset's. Runs last in ApplyTimeOfDay, so it also wins over Max fidelity's
+// GI and emission under Max Fidelity Lighting.
+static void ApplyLevelTimeOfDayLighting() {
+    const LevelTimeOfDayLighting* light = AppliedLevelTimeOfDayLighting();
+    if (!light) return;
+    TimeOfDayLightingBaseline& base = g_timeOfDayLightingBaseline;
+    if (!base.saved) {
+        base.giIntensity = scene.giIntensity;
+        base.emission = g_emissiveIntensity;
+        base.bloom = BloomStrength();
+        base.saved = true;
+    }
+    const XMVECTOR direction = XMVector3Normalize(XMVectorSet(
+        light->sunDirection[0], light->sunDirection[1], light->sunDirection[2], 0.0f));
+    // Under a moon the saved key light is the moon. A night saved before the
+    // moon existed holds the set sun below the horizon instead, which would
+    // fade the key to nothing: keep the preset's moon and take the rest.
+    const bool savedSetSun =
+        scene.moonIsKeyLight && XMVectorGetY(direction) <= 0.0f;
+    if (!savedSetSun) {
+        XMStoreFloat3(&scene.lightPos, XMVectorScale(direction, 10.0f));
+        scene.lightColor = {light->sunColor[0], light->sunColor[1], light->sunColor[2]};
+        scene.directionalLightIntensity = light->sunIntensity;
+    }
+    scene.ambientLightingIntensity = light->environmentGain;
+    scene.giIntensity = light->giIntensity;
+    g_emissiveIntensity = light->emission;
+    SetBloomStrength(light->bloom);
+    // Clear/Cloudy already took it in ApplyLiveWeatherState; Custom takes it
+    // here. Fog, Rain and Storm keep their own density.
+    if (scene.weatherState == WeatherState::Custom)
+        scene.volumetricFogDensity = light->fogDensity;
+}
+
+// Night plays without fog, whatever the per-time store or weather says. Only
+// the live flag: the store keeps the editor's and deployment screen's choice,
+// so editing still shows (and saves) what was tuned.
+static void ApplyNightPlayFog() {
+    const bool editorEditing =
+        g_game.session.Screen() == GameScreen::LevelEditor &&
+        !g_levelEditor.IsPlaying();
+    if (g_appliedTimeOfDay == TimeOfDay::Night && !editorEditing)
+        scene.enableVolumetricFog = false;
+}
+
 static void ApplyTimeOfDay(TimeOfDay time) {
-    TimeOfDaySettings settings = MakeTimeOfDaySettings(time);
+    // Back to the state before the last override, so the preset logic below
+    // saves and restores the level's own values rather than an override's.
+    RestoreLevelTimeOfDayLighting();
+    TimeOfDaySettings settings = g_settings.maxFidelityLighting
+        ? MakeMaxFidelityLightingSettings(time) : MakeTimeOfDaySettings(time);
+    g_appliedTimeOfDay = time;
     scene.lightPos = settings.lightPos;
     scene.lightColor = settings.lightColor;
     scene.directionalLightIntensity = settings.directionalLightIntensity;
+    // A moon takes over the key light; the sky keeps the set sun. A level's
+    // own lighting for this time, applied below, then moves the moon.
+    scene.moonIsKeyLight = settings.moonIntensity > 0.0f;
+    scene.setSunPos = settings.lightPos;
+    if (scene.moonIsKeyLight) {
+        scene.lightPos = settings.moonPos;
+        scene.lightColor = settings.moonColor;
+        scene.directionalLightIntensity = settings.moonIntensity;
+    }
     scene.ambientStrength = settings.ambientStrength;
     scene.ambientLightingIntensity = settings.ambientLightingIntensity;
     scene.clearColor = settings.clearColor;
@@ -945,7 +1057,7 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     scene.atmosphereAerialDensity = settings.atmosphereAerialDensity;
     // Fog comes from the per-time override rather than the preset, so values
     // tuned on the deployment screen survive DEPLOY and any later re-apply.
-    ApplyVolumetricFogSettings(VolumetricFogFor(time));
+    ApplyVolumetricFogSettings(LiveVolumetricFog(time));
     // Weather remains authoritative over its fog component when the sun moves.
     // Custom retains the per-time fog that was just restored above.
     ApplyLiveWeatherState(scene.weatherState);
@@ -955,26 +1067,57 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     static float s_savedGI = 0.0f;
     static float s_savedEmission = 1.0f;
     static bool  s_savedRTReflections = false;
+    static bool  s_savedVSM = true;
     if (settings.giIntensity >= 0.0f) {
         if (!s_extrasSaved) {
             s_savedGI = scene.giIntensity;
             s_savedEmission = g_emissiveIntensity;
             s_savedRTReflections = scene.enhancedRTReflections;
+            s_savedVSM = g_vsmRunDefault;
             s_extrasSaved = true;
         }
         scene.giIntensity = settings.giIntensity;
-        g_emissiveIntensity = settings.emissiveIntensity;
+        // Negative: Max Fidelity Lighting at Dusk/Night, the level's own.
+        g_emissiveIntensity = settings.emissiveIntensity >= 0.0f
+            ? settings.emissiveIntensity : s_savedEmission;
         scene.enhancedRTReflections = settings.rtReflections;
+        // Through the run default, like the editor's VSM checkbox: every level
+        // sync rebuilds scene.virtualShadowMaps from it, and the checkbox can
+        // still turn VSM back on.
+        if (settings.cascadeShadows) {
+            g_vsmRunDefault = false;
+            scene.virtualShadowMaps = false;
+        }
     } else if (s_extrasSaved) {
         scene.giIntensity = s_savedGI;
         g_emissiveIntensity = s_savedEmission;
         scene.enhancedRTReflections = s_savedRTReflections;
+        g_vsmRunDefault = s_savedVSM;
+        scene.virtualShadowMaps = s_savedVSM && g_game.world.Level().virtualShadowMaps;
         s_extrasSaved = false;
     }
+    ApplyLevelMaxFidelitySun();
+    ApplyLevelTimeOfDayLighting();
+    ApplyNightPlayFog();
     // The demo light animation walks lightPos around on its own, which would
     // drag a chosen sun back out of place within a few seconds.
     scene.animateDemoLights = false;
 
+    {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "Time of day %s%s%s: sun %.3f, ambient %.2f, emission %.2f, GI %.2f, "
+            "RT reflections %d, VSM %d, fog %d %.5f, moon %d",
+            TimeOfDayName(time),
+            g_settings.maxFidelityLighting ? " (max fidelity lighting)" : "",
+            AppliedLevelTimeOfDayLighting() ? " (level lighting)" : "",
+            scene.directionalLightIntensity, scene.ambientLightingIntensity,
+            g_emissiveIntensity, scene.giIntensity,
+            scene.enhancedRTReflections ? 1 : 0, scene.virtualShadowMaps ? 1 : 0,
+            scene.enableVolumetricFog ? 1 : 0, scene.volumetricFogDensity,
+            scene.moonIsKeyLight ? 1 : 0);
+        SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
+    }
     // Night swaps the environment map too. Only requested here: replacing a
     // texture still sampled by in-flight frames has to run between frames rather
     // than from the UI callback that picked the preset.

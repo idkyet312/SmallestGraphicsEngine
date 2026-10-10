@@ -330,6 +330,9 @@ static VisibilityBufferDX12 visBuffer;
 static SniperScopeDX12      g_sniperScope;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
+// Declared in EnemyVehicles.h for the level's per-time lighting.
+static float BloomStrength() { return visBuffer.bloomStrength; }
+static void SetBloomStrength(float strength) { visBuffer.bloomStrength = strength; }
 // Directional shadow state carried to the sniper scope pass.
 //
 // The scope renders early in the frame -- before the main view's shadow pass
@@ -476,8 +479,10 @@ static void ApplyTimeOfDaySkyEnvironment(TimeOfDay) {
             "Level environment failed; retaining previous HDRI: " + g_requestedLevelEnvironment);
         return;
     }
+    // Sun-free for level HDRIs, matching the mips SkyRendererDX12 builds.
     SetSceneSkyIrradiance(GLBImporter::ComputeSkyIrradianceSH(
-        g_requestedLevelEnvironment, kSkyEnvironmentRotationRadians));
+        g_requestedLevelEnvironment, kSkyEnvironmentRotationRadians,
+        g_requestedLevelEnvironment != kSkyEnvironmentPath));
     visBuffer.UpdateEnvironmentMap(g_specularEnvironmentResource, g_brdfIntegrationResource);
     visBuffer.InvalidateTemporalHistory();
     SGE_LOG("LogRender", EngineLog::Level::Display, "Level environment loaded: " + g_requestedLevelEnvironment);

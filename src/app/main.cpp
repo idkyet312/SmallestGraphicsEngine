@@ -819,6 +819,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         scene.terrainPOM = true;
         scene.terrainPOMDepthOffset = true;
     }
+    if (GetEnvironmentVariableA("SGE_TERRAIN_SCREEN_DISPLACEMENT", nullptr, 0) > 0)
+        scene.terrainScreenDisplacement = true;
     UINT terrainLODBenchmarkFrames = 0;
     bool terrainLODBenchmarkComplete = false;
     std::vector<double> terrainLODScopeSamples;
@@ -1168,13 +1170,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         BootTimer::Log(text);
     }
     bool bootFirstFrameLogged = false;
+    const bool frameGenerationTest =
+        GetEnvironmentVariableA("SGE_FRAME_GENERATION_TEST", nullptr, 0) > 0;
+    UINT frameGenerationTestFrames = 0;
+    UINT frameGenerationTestActive = 0;
     while (msg.message != WM_QUIT) {
         PumpDeferredShaderCompiles();
-        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        {
+            DX12BlockingWaitTimer timer;
+            DLSS::BeginAppFrame();
+        }
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            DLSS::HandleLatencyMessage(msg.message);
+            if (msg.message == WM_QUIT) break;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
-            continue;
         }
+        if (msg.message == WM_QUIT) break;
 
         RunPendingLoadingAction();
 
@@ -4857,6 +4869,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (GetEnvironmentVariableA("SGE_CAPTURE_SUN", captureSun, sizeof(captureSun)) > 0 &&
                 sscanf_s(captureSun, "%f,%f,%f,%f", &sun[0], &sun[1], &sun[2], &sun[3]) == 4) {
                 scene.lightPos = {sun[0], sun[1], sun[2]};
+                scene.moonIsKeyLight = false;
                 scene.lightColor = {1, 1, 1};
                 scene.directionalLightIntensity = sun[3];
                 scene.animateLight = false;
@@ -4950,6 +4963,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const bool halfGIFlipped =
                 flippedAt("SGE_CAPTURE_HALF_GI_TOGGLE", togglePresent);
             if (togglePresent) g_settings.lumenGIHalfResolution = halfGIFlipped;
+            const bool variableGIFlipped = flippedAt("SGE_CAPTURE_VRRT_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.lumenVariableRateGI = variableGIFlipped;
+            const bool cgnsFlipped = flippedAt("SGE_CAPTURE_CGNS_TOGGLE", togglePresent);
+            if (togglePresent) g_settings.emissiveReSTIRCompatibility = cgnsFlipped;
             const bool rtFlipped =
                 flippedAt("SGE_CAPTURE_RT_TOGGLE", togglePresent);
             static const int rtInitialQuality = g_settings.rayTracingQuality;
@@ -5023,6 +5040,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " lumenSetting=" << g_settings.lumenGI
                                 << " lumen=" << visBuffer.lumenGIActive
                                 << " halfGI=" << visBuffer.lumenGIHalfResolutionActive
+                                << " vrrt=" << visBuffer.VariableRateGIActive()
+                                << " vrrtBudget=" << visBuffer.VariableRateGIRayBudget()
+                                << " vrrtRays=" << visBuffer.VariableRateGIMeasuredRays()
+                                << " vrrtMeasuredBudget=" << visBuffer.VariableRateGIMeasuredBudget()
+                                << " cgns=" << visBuffer.emissiveCGNSMode
                                 << " rc=" << visBuffer.radianceCascadesGIActive
                                 << " rcStatus=" << visBuffer.RadianceCascadesStatus()
                                 << " giCache=" << visBuffer.giRadianceCacheMode
@@ -5057,6 +5079,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 << " waterQuality=" << static_cast<int>(scene.waterQuality)
                                 << " waterMs="
                                 << g_profiler.GpuScopeMs("Tropical Water")
+                                << " terrainDisp=" << scene.terrainScreenDisplacement
+                                << " terrainDispMs="
+                                << g_profiler.GpuScopeMs("Terrain Displacement Raymarch") +
+                                   g_profiler.GpuScopeMs("Terrain Displacement Height") +
+                                   g_profiler.GpuScopeMs("Terrain Displacement Snapshot")
                                 << " lightPos=" << scene.lightPos.x << ","
                                 << scene.lightPos.y << "," << scene.lightPos.z
                                 << " lightType=" << scene.lightType
@@ -5134,6 +5161,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 } else PostQuitMessage(0);
             }
         }
+
+        DLSS::MarkLatency(DLSS::LatencyMarker::SimulationEnd);
+        DLSS::MarkLatency(DLSS::LatencyMarker::RenderSubmitStart);
+        if (frameGenerationTest && !g_game.loading.Active() && visBuffer.initialized) {
+            scene.useVisibilityBuffer = true;
+            DLSS::GetSettings().enabled = true;
+            DLSS::GetSettings().rayReconstruction = false;
+            DLSS::GetSettings().screenPercentage = 100.0f;
+            const UINT testFrame = frameGenerationTestFrames++;
+            DLSS::GetSettings().frameGeneration =
+                testFrame < 60 || (testFrame >= 120 && testFrame < 180);
+            DLSS::GetSettings().reflex = static_cast<DLSS::ReflexMode>((testFrame / 60) % 3);
+            // A single status sample can land between interpolated presents;
+            // count active frames over each 60-frame window instead.
+            if (testFrame % 60 == 0) frameGenerationTestActive = 0;
+            if (std::strcmp(DLSS::FrameGenerationStatus(), "2x Frame Generation active") == 0)
+                ++frameGenerationTestActive;
+            if (testFrame % 60 == 59) {
+                std::ofstream log("frame_generation_smoke.log", std::ios::app);
+                log << "frame=" << testFrame << " supported=" << DLSS::FrameGenerationAvailable()
+                    << " loaded=" << DLSS::FrameGenerationLoaded()
+                    << " active=" << frameGenerationTestActive << "/60"
+                    << " status=" << DLSS::FrameGenerationStatus()
+                    << " reflex=" << DLSS::ReflexStatus() << '\n';
+            }
+            if (testFrame >= 240) PostQuitMessage(0);
+        }
+        UpdateFrameGenerationSwapChain(hwnd);
 
         // Everything from here to EndFrame used to be unmeasured on the CPU
         // side: "Update" closes above, and the next CPU scope was "Editor/UI"
@@ -5662,9 +5717,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             visBuffer.SetRadianceCascadesGI(g_settings.radianceCascadesGI);
             visBuffer.SetLumenRadianceCache(g_settings.lumenRadianceCache);
             visBuffer.SetLumenReSTIR(g_settings.lumenReSTIR);
+            visBuffer.SetVariableRateGI(g_settings.lumenVariableRateGI,
+                                       g_settings.lumenVariableRateBudget);
+            visBuffer.SetEmissiveCGNS(g_settings.emissiveReSTIRCompatibility);
             visBuffer.svgfFastAtrous = g_settings.fastGIDenoise;
             const bool halfGI = visBuffer.lumenGIActive &&
-                g_settings.lumenGIHalfResolution &&
+                g_settings.lumenGIHalfResolution && !g_settings.lumenVariableRateGI &&
                 visBuffer.lumenGIHalfResolutionSupported;
             if (halfGI != visBuffer.lumenGIHalfResolutionActive) {
                 visBuffer.lumenGIHalfResolutionActive = halfGI;
@@ -5748,7 +5806,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             scene.sunAngularRadiusDegrees)) /
             tanf(XMConvertToRadians(scene.EffectiveCameraFOV()) * 0.5f);
         visBuffer.SetSunLens(
-            scene.enableSunLens && !deploymentHideAtmosphere,
+            scene.enableSunLens && !deploymentHideAtmosphere &&
+                !scene.moonIsKeyLight,
             scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
             scene.camera.VisualPosition(), scene.lightPos, scene.lightColor,
             scene.directionalLightIntensity);
@@ -5775,8 +5834,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 sunLensEnabled, scene.lightColor,
                 scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
                 scene.sunHaloIntensity);
+            skyRenderer.SetMoon(scene.moonIsKeyLight, scene.lightPos,
+                                scene.moonDiscIntensity);
             skyRenderer.Render(
-                scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
+                scene.camera, scene.EffectiveCameraFOV(), scene.SkySunDirection(), now,
                 scene.enablePhysicalAtmosphere,
                 scene.enableVolumetricClouds && !deploymentHideAtmosphere,
                 XMFLOAT4(scene.atmosphereRayleighStrength,
@@ -7790,6 +7851,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     visBuffer.CaptureJitterProbe(g_dx12.commandList.Get(), meta);
                 }
                 const bool dlssEvaluated = DLSS::Evaluate(dlssInputs);
+                if (dlssEvaluated) DLSS::TagFrameGenerationInputs(dlssInputs);
                 if (visBuffer.motionDebugMode != 0)
                     visBuffer.AnnotateJitterProbe(DLSS::LastEvalDebug());
                 if (dlssEvaluated) {
@@ -7979,6 +8041,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                   scene.EffectiveCameraFarPlane());
             }
         }
+
+        const bool frameGenerationFrame = DLSS::FrameGenerationLoaded() &&
+            DLSS::FrameGenerationInputsReady() &&
+            g_frameGenerationUI.Ready() && usingVisibility &&
+            visBuffer.dlssActive && !visibilityValidation &&
+            visBuffer.debugViewMode == 0 && visBuffer.motionDebugMode == 0 &&
+            !bentGTAODiagnosticActive && !g_game.loading.Active() &&
+            !g_pendingLoadingAction && !g_gamePaused && !g_showSettingsMenu &&
+            g_game.session.Screen() != GameScreen::MainMenu &&
+            !IsIconic(hwnd) && (HasInputFocus() || frameGenerationTest);
+        if (!frameGenerationFrame) DLSS::SuspendFrameGeneration();
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
         {
@@ -8256,6 +8329,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             DrawProfilerWindow();
         } else if (g_game.session.Screen() == GameScreen::WinScreen) {
             RenderWinScreen(hwnd);
+        } else if (g_game.session.Screen() == GameScreen::LevelEditor &&
+                   g_showPauseSettings) {
+            // Instead of the editor panels: the page's scrim is a background
+            // draw list, so editor windows would otherwise sit on top of it.
+            RenderSettingsMenu(g_showPauseSettings);
         } else if (g_game.session.Screen() == GameScreen::LevelEditor) {
             const DXRDDGIRenderer::Status& ddgiStatus = g_dxrDDGI.GetStatus();
             g_levelEditor.SetDXRDDGIStatus({
@@ -8285,6 +8363,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_game.commands.Set(
                 GameCommand::EditorReturnToMenu, actions.returnToMenu);
             g_editorFullReconcileRequested |= actions.fullReconcile;
+            if (actions.openSettings) g_showPauseSettings = true;
             static bool editorLightingOpen = true;
             if (actions.toggleLighting) editorLightingOpen = !editorLightingOpen;
             // SGE_CAPTURE_EDITOR_PERF=1 starts it open, for unattended captures.
@@ -8304,15 +8383,92 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 LevelSceneLitFog levelFog = g_levelEditor.Level().sceneLitFog;
                 bool levelFogEdited = false;
                 bool levelFogCommitted = false;
+                float levelExposure = g_levelEditor.Level().exposure;
+                bool levelExposureEdited = false;
+                bool levelExposureCommitted = false;
+                const bool maxFidelityLightingBefore = g_settings.maxFidelityLighting;
+                // The Lighting window's per-time values, saved into the level
+                // for the clock time on screen (none for Max fidelity).
+                const auto captureTimeLighting = [&]() {
+                    LevelTimeOfDayLighting light;
+                    light.enabled = true;
+                    const float length = (std::max)(1e-6f, std::sqrt(
+                        scene.lightPos.x * scene.lightPos.x +
+                        scene.lightPos.y * scene.lightPos.y +
+                        scene.lightPos.z * scene.lightPos.z));
+                    light.sunDirection[0] = scene.lightPos.x / length;
+                    light.sunDirection[1] = scene.lightPos.y / length;
+                    light.sunDirection[2] = scene.lightPos.z / length;
+                    light.sunColor[0] = scene.lightColor.x;
+                    light.sunColor[1] = scene.lightColor.y;
+                    light.sunColor[2] = scene.lightColor.z;
+                    light.sunIntensity = scene.directionalLightIntensity;
+                    light.environmentGain = scene.ambientLightingIntensity;
+                    light.emission = g_emissiveIntensity;
+                    light.bloom = visBuffer.bloomStrength;
+                    light.giIntensity = scene.giIntensity;
+                    light.fogDensity = scene.volumetricFogDensity;
+                    return light;
+                };
+                const int timeLightingIndex = static_cast<int>(g_appliedTimeOfDay);
+                const bool timeLightingSlot =
+                    timeLightingIndex >= 0 && timeLightingIndex < kLevelTimeOfDayCount;
+                const LevelTimeOfDayLighting timeLightingBefore = captureTimeLighting();
+                bool resetTimeLighting = false;
                 const bool lightingChanged = DrawEditorLighting(
                     scene, visBuffer, editorLightingOpen, fog, rayGI, vsm,
                     g_selectedTimeOfDay, timeOfDayChanged,
-                    &levelFog, &levelFogEdited, &levelFogCommitted);
+                    &levelFog, &levelFogEdited, &levelFogCommitted,
+                    &levelExposure, &levelExposureEdited,
+                    &levelExposureCommitted, &g_settings.maxFidelityLighting,
+                    timeLightingSlot &&
+                        g_levelEditor.Level().timeOfDayLighting[timeLightingIndex].enabled,
+                    timeLightingSlot ? &resetTimeLighting : nullptr);
+                if (g_settings.maxFidelityLighting != maxFidelityLightingBefore)
+                    SaveGameSettings(g_settings);
+                // A drag lands as one undo step, committed on release. The held
+                // runtime copy follows each edit so the next level sync does not
+                // read the drag as a change and re-run the whole time of day.
+                static bool timeLightingEditPending = false;
+                if (timeLightingSlot && resetTimeLighting) {
+                    g_levelEditor.EditTimeOfDayLighting(
+                        timeLightingIndex, LevelTimeOfDayLighting{}, true);
+                    g_levelTimeOfDayLighting[timeLightingIndex] = LevelTimeOfDayLighting{};
+                    timeLightingEditPending = false;
+                    ApplyTimeOfDay(g_appliedTimeOfDay);
+                } else if (timeLightingSlot && !timeOfDayChanged) {
+                    const LevelTimeOfDayLighting after = captureTimeLighting();
+                    if (after != timeLightingBefore) {
+                        // First edit of an untuned time: what it displaced is
+                        // the preset's, handed back when an untuned time follows.
+                        TimeOfDayLightingBaseline& base = g_timeOfDayLightingBaseline;
+                        if (!base.saved) {
+                            base.giIntensity = timeLightingBefore.giIntensity;
+                            base.emission = timeLightingBefore.emission;
+                            base.bloom = timeLightingBefore.bloom;
+                            base.saved = true;
+                        }
+                        g_levelEditor.EditTimeOfDayLighting(timeLightingIndex, after, false);
+                        g_levelTimeOfDayLighting[timeLightingIndex] = after;
+                        timeLightingEditPending = true;
+                    }
+                }
+                if (timeLightingEditPending && !ImGui::IsAnyItemActive()) {
+                    if (timeLightingSlot)
+                        g_levelEditor.EditTimeOfDayLighting(timeLightingIndex,
+                            g_levelEditor.Level().timeOfDayLighting[timeLightingIndex], true);
+                    timeLightingEditPending = false;
+                }
                 if (levelFogEdited || levelFogCommitted)
                     g_levelEditor.EditSceneLitFog(levelFog, levelFogCommitted);
+                if (levelExposureEdited || levelExposureCommitted)
+                    g_levelEditor.EditExposure(levelExposure,
+                                               levelExposureCommitted);
                 // Every editor frame, not only on edit: undo/redo and level
                 // loads replace the editor's copy without passing through here.
                 ApplySceneLitFog(g_levelEditor.Level().sceneLitFog);
+                // Level exposure, every editor frame for the same reason.
+                g_exposureScale = g_levelEditor.Level().exposure;
                 // The editor previews what the level file asks for; the
                 // player's Scene-Lit Fog setting returns at the next level
                 // start, which re-runs ApplyGameSettings.
@@ -8333,7 +8489,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     } else if (fog != previousFog || scene.volumetricFogDensity != previousFogDensity) {
                         // Keep editor tuning with the same per-time overrides
                         // used by deployment, so switching away and back retains it.
-                        auto& timeFog = VolumetricFogFor(g_selectedTimeOfDay);
+                        auto& timeFog = LiveVolumetricFog(g_selectedTimeOfDay);
                         timeFog.enabled = fog;
                         timeFog.density = scene.volumetricFogDensity;
                         scene.enableVolumetricFog = fog;
@@ -8372,6 +8528,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (ImGui::IsKeyPressed(ImGuiKey_F8, false))
                 g_showProfilerWindow = !g_showProfilerWindow;
             DrawProfilerWindow();
+            // F3 debug UI, same window as gameplay (editing and playtest).
+            if (showUI) RenderUI(scene, visBuffer);
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
             // Authoring aid, so it is hidden during a playtest: that view has to
@@ -8508,11 +8666,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // Everything ImGui produced this frame is dropped on the floor when the
         // clean-shot toggle is on. ImGui::Render() above still runs: it ends the
         // frame, and skipping it would leave the next NewFrame asserting.
+        if (frameGenerationFrame) {
+            ProfilerDX12::Scope profile(g_profiler, "DLSS FG HUD Capture", g_dx12.commandList.Get());
+            g_frameGenerationUI.BeginUI(g_dx12.commandList.Get(),
+                g_dx12.renderTargets[g_dx12.frameIndex].Get(), g_dx12.frameIndex);
+        }
         if (!g_deploymentDebugHideUI) {
             ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
             g_dx12.commandList->SetDescriptorHeaps(1, heaps);
             ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(),
                                           g_dx12.commandList.Get());
+        }
+        if (frameGenerationFrame) {
+            ProfilerDX12::Scope profile(g_profiler, "DLSS FG UI Composite", g_dx12.commandList.Get());
+            auto rtv = GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(),
+                g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
+            g_frameGenerationUI.Composite(g_dx12.commandList.Get(), rtv,
+                g_dx12.frameIndex, g_dx12.displayWidth, g_dx12.displayHeight);
+            if (g_game.loading.Active() || g_pendingLoadingAction || g_gamePaused)
+                DLSS::SuspendFrameGeneration();
+            else DLSS::TagFrameGenerationColor(g_dx12.commandList.Get(),
+                g_frameGenerationUI.Hudless(g_dx12.frameIndex),
+                g_frameGenerationUI.UI(g_dx12.frameIndex),
+                g_dx12.displayWidth, g_dx12.displayHeight);
         }
         }
 

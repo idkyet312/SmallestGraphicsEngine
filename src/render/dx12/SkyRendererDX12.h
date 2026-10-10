@@ -6,6 +6,7 @@
 #include "CameraDX12.h"
 #include "GLBImporter.h"
 #include <algorithm>
+#include <cstddef>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -43,8 +44,16 @@ struct alignas(256) SkyBufferDX12 {
     // RGB is the direct-light tint; alpha is the wide atmospheric halo.
     XMFLOAT4 sunLensColorHalo;
     float hdriEnabled;
-    XMFLOAT3 skyPadding;
+    // Toward the moon; drawn only when moonIntensity > 0.
+    XMFLOAT3 moonDirection;
+    float moonIntensity;
+    XMFLOAT3 moonPadding;
 };
+// HLSL packs float3 after a scalar into the same register; pin the C++ side.
+static_assert(offsetof(SkyBufferDX12, moonDirection) == 148,
+              "SkyBuffer moonDirection must match sky_ps.hlsl");
+static_assert(offsetof(SkyBufferDX12, moonIntensity) == 160,
+              "SkyBuffer moonIntensity must match sky_ps.hlsl");
 
 class SkyRendererDX12 {
 public:
@@ -89,6 +98,9 @@ public:
     float sunAngularRadius = XMConvertToRadians(0.88f);
     float sunDiscIntensity = 80.0f;
     float sunHaloIntensity = 4.00f;
+    bool moonEnabled = false;
+    XMFLOAT3 moonDirection = { 0.0f, 1.0f, 0.0f };
+    float moonIntensity = 0.0f;
     XMFLOAT3 sunLensColor = { 1.0f, 0.92f, 0.70f };
 
     bool Init() {
@@ -296,8 +308,12 @@ public:
         if (path == loadedEnvironmentPath) return true;
 
         std::vector<ComPtr<ID3D12Resource>> pendingUploads;
+        // A level-authored HDRI (Bistro's san_giuseppe_bridge) can carry a sun
+        // disc the analytic sun already provides; keep it out of the IBL and GI
+        // mips. The default sky stays as tuned.
         ComPtr<ID3D12Resource> loaded = GLBImporter::LoadEXRTextureFromFile(
-            path, g_dx12.device, commandList, pendingUploads);
+            path, g_dx12.device, commandList, pendingUploads,
+            path != kSkyEnvironmentPath);
         if (!loaded) return false;
 
         skyTexture = loaded;
@@ -330,6 +346,13 @@ public:
             (std::max)(0.05f, angularRadiusDegrees));
         sunDiscIntensity = (std::max)(0.0f, discIntensity);
         sunHaloIntensity = (std::max)(0.0f, haloIntensity);
+    }
+
+    // Per draw, like SetSunLens: the main view and the scope both set it.
+    void SetMoon(bool enabled, const XMFLOAT3& direction, float discIntensity) {
+        moonEnabled = enabled;
+        moonDirection = direction;
+        moonIntensity = (std::max)(0.0f, discIntensity);
     }
 
     // Points the cloud raymarch at the baked noise volumes. Copies the views
@@ -408,6 +431,9 @@ public:
             sunLensColor.x, sunLensColor.y, sunLensColor.z,
             sunHaloIntensity
         };
+        XMStoreFloat3(&data.moonDirection,
+            XMVector3Normalize(XMLoadFloat3(&moonDirection)));
+        data.moonIntensity = moonEnabled ? moonIntensity : 0.0f;
         const UINT constantIndex = g_dx12.frameIndex * 2 +
             (std::min)(renderSlot, 1u);
         constants.CopyData(constantIndex, data);

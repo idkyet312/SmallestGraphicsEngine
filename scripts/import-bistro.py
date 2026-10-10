@@ -58,6 +58,11 @@ def prepare(source, repo, configuration="Release"):
         material["alphaCutoff"] = 0.5
         material["doubleSided"] |= "doublesided" in name or "foliage" in name
         specular = material["specular"]
+        if not specular:
+            # Paris_LiquorBottle_01_Labels has no specular map at all.
+            material["occlusionStrength"] = 0.0
+            alpha_modes[material["name"]] = {"mode": mode, "alphaMin": low, "alphaMax": high}
+            continue
         if specular not in occlusion_strengths:
             red = np.asarray(Image.open(source / "Textures" / specular).convert("RGB"))[:, :, 0]
             # The supplied Bistro maps leave R entirely blank. Treat that as

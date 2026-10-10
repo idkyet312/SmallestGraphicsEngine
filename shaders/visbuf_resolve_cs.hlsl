@@ -382,6 +382,8 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // Measured on Base (1080p, raw lit noise 4.21 without ReSTIR): 0 taps
     // 2.78 at +0.45 ms, 1 tap 2.03 at +0.62, 3 taps 1.89 at +0.78.
     uint  lumenReSTIRSpatialTaps;
+    uint  emissiveCGNS; // 0 off, 1 warmup, 2 valid previous reservoirs
+    uint3 emissiveCGNSPadding;
 };
 #if SGE_RADIANCE_CASCADES
 cbuffer RadianceCascadeConstants : register(b6) {
@@ -1077,6 +1079,14 @@ float3 RayHitAmbient(float3 hitPos, float3 n) {
 // reflection or radiance-cascade paths that share ShadeRayHit.
 static bool gLumenGIHitShading = false;
 
+#if SGE_VARIABLE_RATE_GI
+static bool gVRRTOverride = false;
+static bool gVRRTGradient = false;
+static uint gVRRTSeed = 0u;
+static uint gVRRTSequence = 0u;
+#endif
+bool EmissiveSelectCompatibleNeighbor(uint2 pixel, float3 position,
+                                      float3 normal, out int2 previousPixel);
 #include "emissive_restir.hlsli"
 
 // Light arriving at a ray-hit surface: ambient (sky, or probes in Lumen mode)
@@ -1437,6 +1447,12 @@ GISample TraceLumenGISample(float3 worldPos, float3 normal, uint2 pixel) {
     uint pixelSeed = MatVarHashUint(pixel.x * 2654435761u ^
                                     pixel.y * 2246822519u);
     uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
+#if SGE_VARIABLE_RATE_GI
+    if (gVRRTOverride) {
+        pixelSeed = gVRRTSeed;
+        sampleIndex = (pixelSeed + gVRRTSequence) & 63u;
+    }
+#endif
     float2 xi = Hammersley2D(sampleIndex, 64u);
     xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
 
@@ -1493,7 +1509,11 @@ GISample TraceLumenGISample(float3 worldPos, float3 normal, uint2 pixel) {
             uint cacheState = GI_CACHE_FULL;
             uint cacheSlot = 0u;
             GICacheKey cacheKey = (GICacheKey)0;
-            [branch] if (giRadianceCache != 0u) {
+            [branch] if (giRadianceCache != 0u
+#if SGE_VARIABLE_RATE_GI
+                && !gVRRTGradient
+#endif
+            ) {
                 float3 hitPos = ray.Origin + rayDir * query.CommittedRayT();
                 uint lod = GICacheLod(hitPos);
                 float3 lookup = GICacheJitter(hitPos, lod,
@@ -1666,11 +1686,18 @@ float3 LumenReSTIRGI(float3 worldPos, float3 normal, uint2 pixel,
 float3 SampleRadianceCascades(float3 position, float3 normal, uint2 pixel,
                               out bool resolved);
 #endif
+#if SGE_VARIABLE_RATE_GI
+float3 SampleVariableRateGI(float3 position, float3 normal, uint2 pixel,
+                            uint surface, out bool tracedRay);
+#endif
 float3 SampleLumenGI(float3 worldPos, float3 normal, uint2 pixel,
                      uint2 stableSurfaceID, bool commitHistory,
                      out bool tracedRay) {
     const uint surfaceNamespace = stableSurfaceID.x;
     tracedRay = true;
+#if SGE_VARIABLE_RATE_GI
+    return SampleVariableRateGI(worldPos, normal, pixel, surfaceNamespace, tracedRay);
+#endif
 #if SGE_RADIANCE_CASCADES
     if (rcEnabled != 0u) {
         bool resolved;
@@ -2068,6 +2095,12 @@ float3 ComputeBarycentrics(float3 worldPos, float3 wp0, float3 wp1, float3 wp2) 
     
     return float3(u, v, w);
 }
+
+// The full lighting reference does not reconstruct any extra guides.
+#if SGE_ENHANCED_VISUALS
+#include "restir_neighbor_selection.hlsli"
+#include "primary_ray_guide.hlsli"
+#endif
 
 void ComputeUVGradients(float3 wp0, float3 wp1, float3 wp2,
                         float2 uv0, float2 uv1, float2 uv2,
@@ -4210,4 +4243,8 @@ void RayQueryWarmupMain() {
     if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         outputRayMask[uint2(0, 0)] = 0u;
 }
+#endif
+
+#if SGE_ENHANCED_VISUALS && SGE_VARIABLE_RATE_GI
+#include "variable_rate_gi.hlsli"
 #endif

@@ -673,10 +673,40 @@ void FreeHDRPixels(float* pixels, bool isStbAllocation) {
     if (isStbAllocation) stbi_image_free(pixels);
     else free(pixels);
 }
+
+// Scales every pixel brighter than 32x the upper hemisphere's median
+// luminance down to that ceiling. That removes a captured sun disc and leaves
+// the sky: san_giuseppe_bridge's disc peaks at 82,637 over ~350 texels and is
+// 53% of the up-facing irradiance, while the sky's 99th percentile is 4.6
+// against a median of 0.28. Sky-only up irradiance is (0.56, 0.65, 0.82) --
+// blue -- against (1.36, 1.31, 1.22) with the disc, which is the warm,
+// unshadowed second sun the IBL and GI misses were adding.
+void ClampHDRISun(float* rgba, int width, int height) {
+    const size_t upperCount = (size_t)width * (size_t)(height / 2);
+    if (upperCount == 0) return;
+    auto luminance = [](const float* p) {
+        return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+    };
+    std::vector<float> upper(upperCount);
+    for (size_t i = 0; i < upperCount; ++i) upper[i] = luminance(rgba + i * 4);
+    std::nth_element(upper.begin(), upper.begin() + upperCount / 2, upper.end());
+    const float ceiling = 32.0f * upper[upperCount / 2];
+    if (!(ceiling > 0.0f)) return;
+    const size_t count = (size_t)width * (size_t)height;
+    for (size_t i = 0; i < count; ++i) {
+        float* p = rgba + i * 4;
+        const float l = luminance(p);
+        if (l > ceiling) {
+            const float scale = ceiling / l;
+            p[0] *= scale; p[1] *= scale; p[2] *= scale;
+        }
+    }
+}
 }  // namespace
 
 ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps,
+    bool removeSunFromMips) {
     int width = 0, height = 0;
     bool isRadianceHDR = false;
     float* pixels =
@@ -696,13 +726,20 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
     mipW[0] = baseW; mipH[0] = baseH;
     mips[0].assign(pixels, pixels + (size_t)baseW * baseH * 4);
     FreeHDRPixels(pixels, isRadianceHDR);
+    // Mip 1 is filtered from this sun-free copy instead of mip 0.
+    std::vector<float> sunFreeBase;
+    if (removeSunFromMips) {
+        sunFreeBase = mips[0];
+        ClampHDRISun(sunFreeBase.data(), width, height);
+    }
 
     for (UINT16 level = 1; level < mipLevels; ++level) {
         UINT sw = mipW[level - 1], sh = mipH[level - 1];
         UINT dw = std::max(1u, sw / 2), dh = std::max(1u, sh / 2);
         mipW[level] = dw; mipH[level] = dh;
         mips[level].resize((size_t)dw * dh * 4);
-        const std::vector<float>& s = mips[level - 1];
+        const std::vector<float>& s = (level == 1 && removeSunFromMips)
+            ? sunFreeBase : mips[level - 1];
         std::vector<float>& d = mips[level];
         for (UINT y = 0; y < dh; ++y) {
             UINT y0 = std::min(y * 2, sh - 1);
@@ -823,7 +860,8 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
 }
 
 std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(
-    const std::string& filepath, float environmentRotationRadians) {
+    const std::string& filepath, float environmentRotationRadians,
+    bool removeSun) {
     std::array<XMFLOAT3, 9> coeffs{};
     for (auto& c : coeffs) c = XMFLOAT3(0, 0, 0);
 
@@ -832,6 +870,7 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(
     float* pixels =
         LoadHDRPixels(filepath, "sky SH", width, height, isStbAllocation);
     if (!pixels) return coeffs;
+    if (removeSun) ClampHDRISun(pixels, width, height);
 
     // Real SH basis function values (unnormalized-direction form), L0-L2.
     double sh[9];

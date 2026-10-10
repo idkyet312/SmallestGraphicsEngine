@@ -9,6 +9,9 @@
 #include <sl_consts.h>
 #include <sl_dlss.h>
 #include <sl_dlss_d.h>
+#include <sl_dlss_g.h>
+#include <sl_reflex.h>
+#include <sl_pcl.h>
 #include <sl_security.h>
 
 #include <wrl/client.h>
@@ -33,12 +36,22 @@ struct Api {
     PFun_slIsFeatureLoaded* isFeatureLoaded = nullptr;
     PFun_slSetD3DDevice* setD3DDevice = nullptr;
     PFun_slUpgradeInterface* upgradeInterface = nullptr;
+    PFun_slGetNativeInterface* getNativeInterface = nullptr;
     PFun_slGetNewFrameToken* getNewFrameToken = nullptr;
     PFun_slSetConstants* setConstants = nullptr;
     PFun_slSetTagForFrame* setTagForFrame = nullptr;
     PFun_slEvaluateFeature* evaluateFeature = nullptr;
     PFun_slFreeResources* freeResources = nullptr;
     PFun_slGetFeatureFunction* getFeatureFunction = nullptr;
+    PFun_slSetFeatureLoaded* setFeatureLoaded = nullptr;
+    PFun_slReflexSetOptions* reflexSetOptions = nullptr;
+    PFun_slReflexGetState* reflexGetState = nullptr;
+    PFun_slReflexSleep* reflexSleep = nullptr;
+    PFun_slPCLSetMarker* pclSetMarker = nullptr;
+    PFun_slPCLSetOptions* pclSetOptions = nullptr;
+    PFun_slPCLGetState* pclGetState = nullptr;
+    PFun_slDLSSGSetOptions* fgSetOptions = nullptr;
+    PFun_slDLSSGGetState* fgGetState = nullptr;
     PFun_slDLSSSetOptions* dlssSetOptions = nullptr;
     PFun_slDLSSGetOptimalSettings* dlssGetOptimalSettings = nullptr;
     PFun_slDLSSDSetOptions* dlssdSetOptions = nullptr;
@@ -53,8 +66,27 @@ struct State {
     bool rrSupported = false;
     std::string rrStatus = "Not started";
     ID3D12Device* device = nullptr;
+    ComPtr<ID3D12Device> queueDeviceProxy;
     std::string status = "Not started";
     Settings settings;
+    bool reflexSupported = false;
+    bool reflexLowLatency = false;
+    bool pclSupported = false;
+    bool fgSupported = false;
+    bool fgLoaded = false;
+    bool fgEnabled = false;
+    bool fgInputs = false;
+    bool fgFault = false;
+    uint32_t fgPresentedFrames = 0;  // presents since the window started
+    uint32_t fgAppFrames = 0;        // rendered frames in that window
+    UINT pclMessage = 0;
+    std::string reflexStatus = "Not started";
+    std::string fgStatus = "Not started";
+    ReflexMode appliedReflex = ReflexMode::Off;
+    bool reflexOptionsSet = false;
+    sl::FrameToken* frame = nullptr;
+    uint32_t currentFrameIndex = 0;
+    bool constantsSet = false;
 
     ComPtr<ID3D12Resource> output;
     UINT outputWidth = 0;
@@ -97,6 +129,14 @@ void Log(const std::string& message) {
     }
 }
 
+void FeatureLog(const std::string& message) {
+    FILE* file = nullptr;
+    if (fopen_s(&file, "nvidia_features.log", "a") == 0 && file) {
+        std::fprintf(file, "%s\n", message.c_str());
+        std::fclose(file);
+    }
+}
+
 std::wstring ExeDirectory() {
     wchar_t path[MAX_PATH] = {};
     const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -109,6 +149,49 @@ template <typename T>
 bool Resolve(HMODULE module, const char* name, T*& out) {
     out = reinterpret_cast<T*>(GetProcAddress(module, name));
     return out != nullptr;
+}
+
+template <typename T>
+bool FeatureFunction(sl::Feature feature, const char* name, T*& out) {
+    void* address = nullptr;
+    if (S().api.getFeatureFunction(feature, name, address) != sl::Result::eOk)
+        return false;
+    out = reinterpret_cast<T*>(address);
+    return out != nullptr;
+}
+
+bool FeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapter,
+                      std::string& status) {
+    const sl::Result result = S().api.isFeatureSupported(feature, adapter);
+    if (result == sl::Result::eOk) return true;
+    switch (result) {
+    case sl::Result::eErrorOSOutOfDate: status = "Windows update required"; break;
+    case sl::Result::eErrorDriverOutOfDate: status = "NVIDIA driver update required"; break;
+    case sl::Result::eErrorOSDisabledHWS: status = "Enable hardware-accelerated GPU scheduling in Windows"; break;
+    default: status = "Unsupported adapter or runtime (sl::Result " +
+        std::to_string(static_cast<int>(result)) + ")"; break;
+    }
+    return false;
+}
+
+void ApplyReflexOptions() {
+    State& s = S();
+    if (!s.reflexSupported) return;
+    ReflexMode mode = s.reflexLowLatency ? s.settings.reflex : ReflexMode::Off;
+    if (s.fgLoaded && mode == ReflexMode::Off) mode = ReflexMode::On;
+    if (s.reflexOptionsSet && s.appliedReflex == mode) return;
+    sl::ReflexOptions options{};
+    options.mode = static_cast<sl::ReflexMode>(mode);
+    const auto result = s.api.reflexSetOptions(options);
+    s.reflexOptionsSet = result == sl::Result::eOk;
+    if (s.reflexOptionsSet) {
+        s.appliedReflex = mode;
+        s.reflexStatus = !s.reflexLowLatency ? "Low latency unavailable on this adapter" :
+            mode == ReflexMode::Off ? "Off" :
+            mode == ReflexMode::OnWithBoost ? "On + Boost" :
+            s.settings.reflex == ReflexMode::Off ? "On (required by Frame Generation)" : "On";
+    } else s.reflexStatus = "Reflex options failed (sl::Result " +
+        std::to_string(static_cast<int>(result)) + ")";
 }
 
 sl::float4x4 ToSL(const XMFLOAT4X4& m) {
@@ -217,6 +300,7 @@ bool Startup() {
         !Resolve(s.module, "slIsFeatureLoaded", a.isFeatureLoaded) ||
         !Resolve(s.module, "slSetD3DDevice", a.setD3DDevice) ||
         !Resolve(s.module, "slUpgradeInterface", a.upgradeInterface) ||
+        !Resolve(s.module, "slGetNativeInterface", a.getNativeInterface) ||
         !Resolve(s.module, "slGetNewFrameToken", a.getNewFrameToken) ||
         !Resolve(s.module, "slSetConstants", a.setConstants) ||
         !Resolve(s.module, "slSetTagForFrame", a.setTagForFrame) ||
@@ -228,9 +312,11 @@ bool Startup() {
         s.module = nullptr;
         return false;
     }
+    Resolve(s.module, "slSetFeatureLoaded", a.setFeatureLoaded);
 
     static const sl::Feature features[] = {
-        sl::kFeatureDLSS, sl::kFeatureDLSS_RR };
+        sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureReflex,
+        sl::kFeaturePCL, sl::kFeatureDLSS_G };
     static const std::wstring pluginDir = dir;
     static const wchar_t* pluginPaths[] = { pluginDir.c_str() };
     sl::Preferences pref{};
@@ -273,6 +359,10 @@ bool Startup() {
         return false;
     }
     s.initialized = true;
+    // Loading DLSS-G changes swap-chain creation even with interpolation off.
+    // Unload before creating the default swap chain to preserve its cost.
+    if (a.setFeatureLoaded)
+        a.setFeatureLoaded(sl::kFeatureDLSS_G, false);
     Log("Streamline initialised");
     return true;
 }
@@ -294,6 +384,37 @@ void SetDevice(ID3D12Device* device, IDXGIAdapter1* adapter) {
         info.deviceLUID = reinterpret_cast<uint8_t*>(&desc.AdapterLuid);
         info.deviceLUIDSizeInBytes = sizeof(LUID);
     }
+    s.reflexSupported = FeatureSupported(sl::kFeatureReflex, info, s.reflexStatus) &&
+        FeatureFunction(sl::kFeatureReflex, "slReflexSetOptions", s.api.reflexSetOptions) &&
+        FeatureFunction(sl::kFeatureReflex, "slReflexGetState", s.api.reflexGetState) &&
+        FeatureFunction(sl::kFeatureReflex, "slReflexSleep", s.api.reflexSleep);
+    if (s.reflexSupported) {
+        sl::ReflexState state{};
+        s.reflexLowLatency = s.api.reflexGetState(state) == sl::Result::eOk &&
+            state.lowLatencyAvailable;
+        ApplyReflexOptions();
+    }
+    std::string pclStatus;
+    s.pclSupported = FeatureSupported(sl::kFeaturePCL, info, pclStatus) &&
+        FeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", s.api.pclSetMarker) &&
+        FeatureFunction(sl::kFeaturePCL, "slPCLSetOptions", s.api.pclSetOptions) &&
+        FeatureFunction(sl::kFeaturePCL, "slPCLGetState", s.api.pclGetState);
+    if (s.pclSupported) {
+        sl::PCLOptions options{};
+        options.idThread = GetCurrentThreadId();
+        sl::PCLState state{};
+        s.pclSupported = s.api.pclSetOptions(options) == sl::Result::eOk &&
+            s.api.pclGetState(state) == sl::Result::eOk;
+        if (s.pclSupported) s.pclMessage = state.statsWindowMessage;
+    }
+    s.fgSupported = s.api.setFeatureLoaded &&
+        FeatureSupported(sl::kFeatureDLSS_G, info, s.fgStatus);
+    if (s.fgSupported && (!s.reflexLowLatency || !s.pclSupported)) {
+        s.fgSupported = false;
+        s.fgStatus = "Frame Generation requires Reflex and PCL";
+    } else if (s.fgSupported) s.fgStatus = "Off (2x Frame Generation available)";
+    FeatureLog("Reflex: " + s.reflexStatus);
+    FeatureLog("Frame Generation: " + s.fgStatus);
     result = s.api.isFeatureSupported(sl::kFeatureDLSS, info);
     if (result != sl::Result::eOk) {
         Log("DLSS not supported on this adapter, sl::Result " +
@@ -365,8 +486,31 @@ IDXGIFactory2* SwapChainFactory(IDXGIFactory2* nativeFactory) {
         sl::Result::eOk) {
         Log("slUpgradeInterface(factory) failed");
         s.supported = false;
+        s.fgSupported = false;
+        s.fgStatus = "Swap-chain proxy unavailable";
     }
     return factory;
+}
+
+HRESULT CreateCommandQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc,
+                           REFIID iid, void** queue) {
+    State& s = S();
+    if (!s.initialized) return device->CreateCommandQueue(desc, iid, queue);
+    if (!s.queueDeviceProxy) {
+        device->AddRef();
+        ID3D12Device* upgraded = device;
+        s.api.upgradeInterface(reinterpret_cast<void**>(&upgraded));
+        s.queueDeviceProxy.Attach(upgraded);
+    }
+    void* created = nullptr;
+    const HRESULT hr = s.queueDeviceProxy->CreateCommandQueue(desc, iid, &created);
+    if (FAILED(hr)) return hr;
+    // SDK queue proxies borrow their parent device proxy without AddRef.
+    // Keep that parent alive, and return native queues to the engine so every
+    // operation except the mandatory creation hook retains native semantics.
+    const auto result = s.api.getNativeInterface(created, queue);
+    static_cast<IUnknown*>(created)->Release();
+    return result == sl::Result::eOk ? S_OK : E_FAIL;
 }
 
 bool Available() { return S().supported; }
@@ -377,6 +521,198 @@ bool LastEvaluatedRR() { return S().lastEvaluatedRR; }
 static EvalDebug g_evalDebug;
 const EvalDebug& LastEvalDebug() { return g_evalDebug; }
 Settings& GetSettings() { return S().settings; }
+
+bool ReflexAvailable() { return S().reflexLowLatency; }
+const char* ReflexStatus() { return S().initialized ? S().reflexStatus.c_str() : Status(); }
+bool FrameGenerationAvailable() { return S().fgSupported; }
+const char* FrameGenerationStatus() { return S().initialized ? S().fgStatus.c_str() : Status(); }
+bool FrameGenerationLoaded() { return S().fgLoaded; }
+bool FrameGenerationInputsReady() { return S().fgInputs && !S().fgFault; }
+
+void MarkLatency(LatencyMarker marker) {
+    State& s = S();
+    if (!s.pclSupported || !s.frame) return;
+    static const sl::PCLMarker markers[] = {
+        sl::PCLMarker::eSimulationStart, sl::PCLMarker::eSimulationEnd,
+        sl::PCLMarker::eRenderSubmitStart, sl::PCLMarker::eRenderSubmitEnd,
+        sl::PCLMarker::ePresentStart, sl::PCLMarker::ePresentEnd,
+        sl::PCLMarker::eTriggerFlash, sl::PCLMarker::ePCLatencyPing };
+    const auto result = s.api.pclSetMarker(markers[static_cast<int>(marker)], *s.frame);
+    if (result != sl::Result::eOk) {
+        s.reflexStatus = "Latency marker failed (sl::Result " +
+            std::to_string(static_cast<int>(result)) + ")";
+        s.fgFault = true;
+    }
+}
+
+void HandleLatencyMessage(UINT message) {
+    if (message == WM_LBUTTONDOWN) MarkLatency(LatencyMarker::TriggerFlash);
+    if (S().pclMessage && message == S().pclMessage) MarkLatency(LatencyMarker::Ping);
+}
+
+void BeginAppFrame() {
+    State& s = S();
+    s.frame = nullptr;
+    s.constantsSet = false;
+    s.fgInputs = false;
+    if (!s.initialized) return;
+    s.currentFrameIndex = s.frameIndex++;
+    if (s.api.getNewFrameToken(s.frame, &s.currentFrameIndex) != sl::Result::eOk)
+        s.frame = nullptr;
+    ApplyReflexOptions();
+    if (s.reflexSupported && s.frame && s.reflexOptionsSet) {
+        const auto result = s.api.reflexSleep(*s.frame);
+        if (result != sl::Result::eOk)
+            s.reflexStatus = "Reflex sleep failed (sl::Result " +
+                std::to_string(static_cast<int>(result)) + ")";
+    }
+    MarkLatency(LatencyMarker::SimulationStart);
+}
+
+void SuspendFrameGeneration() {
+    State& s = S();
+    if (!s.fgLoaded || !s.api.fgSetOptions) return;
+    // DLSS-G warns on a second slDLSSGSetOptions in one frame. A freshly
+    // loaded plugin starts in eOff, so only an enabled mode needs turning off.
+    if (s.fgEnabled) {
+        sl::DLSSGOptions options{};
+        s.api.fgSetOptions(sl::ViewportHandle(0u), options);
+        if (!s.fgFault) s.fgStatus = "Suspended; waiting for valid gameplay inputs";
+    }
+    s.fgEnabled = false;
+    s.fgInputs = false;
+    if (s.frame) {
+        const sl::ResourceTag tags[] = {
+            { nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent },
+            { nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent },
+            { nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent },
+            { nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent } };
+        s.api.setTagForFrame(*s.frame, sl::ViewportHandle(0u), tags, 4, nullptr);
+    }
+}
+
+bool LoadFrameGeneration(bool load) {
+    State& s = S();
+    if (load == s.fgLoaded) return true;
+    if (!s.initialized || !s.api.setFeatureLoaded || (load && !s.fgSupported)) return false;
+    SuspendFrameGeneration();
+    const auto result = s.api.setFeatureLoaded(sl::kFeatureDLSS_G, load);
+    if (result != sl::Result::eOk) {
+        s.fgStatus = "Frame Generation plugin transition failed (sl::Result " +
+            std::to_string(static_cast<int>(result)) + ")";
+        return false;
+    }
+    s.fgLoaded = load;
+    s.fgFault = false;
+    s.api.fgSetOptions = nullptr;
+    s.api.fgGetState = nullptr;
+    if (load && (!FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", s.api.fgSetOptions) ||
+                 !FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", s.api.fgGetState))) {
+        s.api.setFeatureLoaded(sl::kFeatureDLSS_G, false);
+        s.fgLoaded = false;
+        s.fgStatus = "Frame Generation plugin functions unavailable";
+        return false;
+    }
+    s.fgStatus = load ? "Waiting for gameplay with DLSS SR/DLAA or upscaling RR" : "Off";
+    FeatureLog("Frame Generation: " + s.fgStatus);
+    ApplyReflexOptions();
+    return true;
+}
+
+void TagFrameGenerationInputs(const DLSSFrameInputs& in) {
+    State& s = S();
+    if (!s.fgLoaded || !s.settings.frameGeneration || s.fgFault ||
+        !s.frame || !s.constantsSet || !in.cmdList || !in.depth || !in.motion) return;
+    sl::Resource depth(sl::ResourceType::eTex2d, in.depth, in.depthState);
+    sl::Resource motion(sl::ResourceType::eTex2d, in.motion,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const sl::Extent extent{ 0, 0, in.width, in.height };
+    // Depth is reused by forward draws; async compute can overwrite motion
+    // next frame. Copy both on the presenting queue instead of sharing them
+    // with the plugin's queue or introducing another cross-queue fence.
+    const sl::ResourceTag tags[] = {
+        { &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &extent },
+        { &motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &extent } };
+    s.fgInputs = s.api.setTagForFrame(*s.frame, sl::ViewportHandle(0u), tags, 2,
+                                    in.cmdList) == sl::Result::eOk;
+    if (!s.fgInputs) s.fgStatus = "Frame Generation depth/motion tagging failed";
+}
+
+bool TagFrameGenerationColor(ID3D12GraphicsCommandList* list,
+                            ID3D12Resource* hudless, ID3D12Resource* ui,
+                            UINT width, UINT height) {
+    State& s = S();
+    if (!s.fgLoaded || !s.fgInputs || !s.settings.frameGeneration ||
+        !s.settings.enabled || s.fgFault || !hudless || !ui) {
+        SuspendFrameGeneration();
+        return false;
+    }
+    sl::DLSSGState state{};
+    if (s.api.fgGetState(sl::ViewportHandle(0u), state, nullptr) != sl::Result::eOk ||
+        width < state.minWidthOrHeight || height < state.minWidthOrHeight ||
+        !s.reflexOptionsSet || s.appliedReflex == ReflexMode::Off) {
+        SuspendFrameGeneration();
+        s.fgStatus = "Frame Generation unavailable at this resolution or Reflex state";
+        return false;
+    }
+    const UINT readState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    sl::Resource color(sl::ResourceType::eTex2d, hudless, readState);
+    sl::Resource overlay(sl::ResourceType::eTex2d, ui, readState);
+    const sl::Extent extent{ 0, 0, width, height };
+    const sl::ResourceTag tags[] = {
+        { &color, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
+        { &overlay, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent } };
+    if (s.api.setTagForFrame(*s.frame, sl::ViewportHandle(0u), tags, 2, list) != sl::Result::eOk) {
+        SuspendFrameGeneration();
+        s.fgStatus = "Frame Generation color tagging failed";
+        return false;
+    }
+    sl::DLSSGOptions options{};
+    options.mode = sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = 1;
+    if (s.api.fgSetOptions(sl::ViewportHandle(0u), options) != sl::Result::eOk) {
+        SuspendFrameGeneration();
+        s.fgStatus = "Frame Generation options failed";
+        return false;
+    }
+    // numFramesActuallyPresented counts since the previous GetState, so the
+    // call above consumed part of the last frame's presents. FinishAppFrame
+    // judges 2x from both calls; presents before enabling were not generated.
+    if (!s.fgEnabled) {
+        s.fgPresentedFrames = 0;
+        s.fgAppFrames = 0;
+        s.fgStatus = "2x requested; awaiting presentation";
+    } else s.fgPresentedFrames += state.numFramesActuallyPresented;
+    s.fgEnabled = true;
+    return true;
+}
+
+void FinishAppFrame() {
+    State& s = S();
+    if (s.fgLoaded && s.fgEnabled) {
+        sl::DLSSGState state{};
+        const auto result = s.api.fgGetState(sl::ViewportHandle(0u), state, nullptr);
+        if (result != sl::Result::eOk || state.status != sl::DLSSGStatus::eOk) {
+            SuspendFrameGeneration();
+            s.fgFault = true;
+            s.fgStatus = "Frame Generation disabled after runtime error (result " +
+                std::to_string(static_cast<int>(result)) + ", status " +
+                std::to_string(static_cast<uint32_t>(state.status)) + "); toggle off/on to retry";
+            FeatureLog(s.fgStatus);
+            return;
+        }
+        // SL presents on its own pacing thread, so a single frame's split
+        // between the two GetState calls drifts; judge over a short window.
+        s.fgPresentedFrames += state.numFramesActuallyPresented;
+        if (++s.fgAppFrames >= 16) {
+            s.fgStatus = s.fgPresentedFrames * 2 >= s.fgAppFrames * 3
+                ? "2x Frame Generation active" : "On; waiting for interpolated frames";
+            s.fgPresentedFrames = 0;
+            s.fgAppFrames = 0;
+        }
+    }
+}
 
 bool RenderSize(UINT displayWidth, UINT displayHeight, float percentage,
                 UINT& renderWidth, UINT& renderHeight) {
@@ -508,11 +844,9 @@ bool Evaluate(const DLSSFrameInputs& in) {
         }
     }
 
-    sl::FrameToken* frame = nullptr;
-    const uint32_t frameIndex = s.frameIndex++;
-    if (s.api.getNewFrameToken(frame, &frameIndex) != sl::Result::eOk ||
-        !frame)
-        return false;
+    sl::FrameToken* frame = s.frame;
+    const uint32_t frameIndex = s.currentFrameIndex;
+    if (!frame) return false;
 
     const XMMATRIX view = XMLoadFloat4x4(&in.view);
     const XMMATRIX projection = XMLoadFloat4x4(&in.projection);
@@ -595,10 +929,11 @@ bool Evaluate(const DLSSFrameInputs& in) {
             g_evalDebug.resourceHeight[i] = desc.Height;
         }
     }
-    if (s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
+    if (!s.constantsSet && s.api.setConstants(consts, *frame, viewport) != sl::Result::eOk) {
         Log("slSetConstants failed");
         return false;
     }
+    s.constantsSet = true;
 
     const uint32_t readState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     sl::Resource depth(sl::ResourceType::eTex2d, in.depth, in.depthState);
@@ -707,6 +1042,7 @@ bool Evaluate(const DLSSFrameInputs& in) {
 
 void ReleaseResources() {
     State& s = S();
+    SuspendFrameGeneration();
     if (s.supported && s.api.freeResources)
         s.api.freeResources(sl::kFeatureDLSS, sl::ViewportHandle(0u));
     if (s.rrSupported && s.api.freeResources)
@@ -722,9 +1058,13 @@ void Shutdown() {
     if (!s.initialized) return;
     ReleaseResources();
     s.api.shutdown();
+    s.queueDeviceProxy.Reset();
     s.initialized = false;
     s.supported = false;
     s.rrSupported = false;
+    s.reflexSupported = s.reflexLowLatency = s.pclSupported = false;
+    s.fgSupported = s.fgLoaded = s.fgEnabled = false;
+    s.frame = nullptr;
     // sl.interposer.dll stays loaded: the swapchain is an SL proxy whose code
     // lives in it, and g_dx12 releases the swapchain after this runs.
     // Unloading here made that final Release an access violation.

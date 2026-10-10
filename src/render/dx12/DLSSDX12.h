@@ -62,9 +62,16 @@ namespace DLSS {
 // Presets exposed in the UI. L and M are the DLSS 4.5 second-generation
 // transformer models; K is the DLSS 4 transformer, SL's DLAA default.
 enum class Preset : int { K = 0, L = 1, M = 2 };
+enum class ReflexMode : int { Off = 0, On = 1, OnWithBoost = 2 };
+enum class LatencyMarker {
+    SimulationStart, SimulationEnd, RenderSubmitStart, RenderSubmitEnd,
+    PresentStart, PresentEnd, TriggerFlash, Ping
+};
 
 struct Settings {
     bool enabled = false;
+    bool frameGeneration = false;
+    ReflexMode reflex = ReflexMode::Off;
     Preset preset = Preset::L;
     float screenPercentage = 100.0f;
     bool rayReconstruction = false;
@@ -108,6 +115,8 @@ inline const char* EvalDebugResourceName(int i) {
 bool Startup();
 // Registers the device and checks DLSS support on its adapter.
 void SetDevice(ID3D12Device* device, IDXGIAdapter1* adapter);
+HRESULT CreateCommandQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc,
+                           REFIID iid, void** queue);
 // Returns an SL proxy of the factory to create the swapchain from, or the
 // factory itself (AddRef'd) when Streamline is not running. Release it after.
 IDXGIFactory2* SwapChainFactory(IDXGIFactory2* nativeFactory);
@@ -119,6 +128,24 @@ bool LastEvaluatedRR();
 const EvalDebug& LastEvalDebug();
 const char* Status();
 Settings& GetSettings();
+bool ReflexAvailable();
+const char* ReflexStatus();
+bool FrameGenerationAvailable();
+const char* FrameGenerationStatus();
+bool FrameGenerationLoaded();
+bool FrameGenerationInputsReady();
+// Call only after releasing the swap chain and draining engine queues.
+bool LoadFrameGeneration(bool load);
+void BeginAppFrame();
+void MarkLatency(LatencyMarker marker);
+void HandleLatencyMessage(UINT message);
+void SuspendFrameGeneration();
+// Copies volatile depth/motion now, before grass/depth are reused.
+void TagFrameGenerationInputs(const DLSSFrameInputs& inputs);
+bool TagFrameGenerationColor(ID3D12GraphicsCommandList* list,
+                            ID3D12Resource* hudless, ID3D12Resource* ui,
+                            UINT width, UINT height);
+void FinishAppFrame();
 // Returns an SDK-supported render size for the requested percentage. False
 // means use native resolution; the SDK could not validate an SR input size.
 bool RenderSize(UINT displayWidth, UINT displayHeight, float percentage,
@@ -132,6 +159,10 @@ void Shutdown();
 #else
 inline bool Startup() { return false; }
 inline void SetDevice(ID3D12Device*, IDXGIAdapter1*) {}
+inline HRESULT CreateCommandQueue(ID3D12Device* device,
+    const D3D12_COMMAND_QUEUE_DESC* desc, REFIID iid, void** queue) {
+    return device->CreateCommandQueue(desc, iid, queue);
+}
 inline IDXGIFactory2* SwapChainFactory(IDXGIFactory2* nativeFactory) {
     if (nativeFactory) nativeFactory->AddRef();
     return nativeFactory;
@@ -145,6 +176,21 @@ inline const char* Status() { return "Built without the Streamline SDK"; }
 inline bool LastEvaluatedRR() { return false; }
 inline const EvalDebug& LastEvalDebug() { static EvalDebug d; return d; }
 inline Settings& GetSettings() { static Settings settings; return settings; }
+inline bool ReflexAvailable() { return false; }
+inline const char* ReflexStatus() { return Status(); }
+inline bool FrameGenerationAvailable() { return false; }
+inline const char* FrameGenerationStatus() { return Status(); }
+inline bool FrameGenerationLoaded() { return false; }
+inline bool FrameGenerationInputsReady() { return false; }
+inline bool LoadFrameGeneration(bool) { return false; }
+inline void BeginAppFrame() {}
+inline void MarkLatency(LatencyMarker) {}
+inline void HandleLatencyMessage(UINT) {}
+inline void SuspendFrameGeneration() {}
+inline void TagFrameGenerationInputs(const DLSSFrameInputs&) {}
+inline bool TagFrameGenerationColor(ID3D12GraphicsCommandList*,
+    ID3D12Resource*, ID3D12Resource*, UINT, UINT) { return false; }
+inline void FinishAppFrame() {}
 inline bool RenderSize(UINT width, UINT height, float, UINT& renderWidth,
                        UINT& renderHeight) {
     renderWidth = width;

@@ -502,6 +502,18 @@ struct Scene {
     XMFLOAT3 lightPos    = { 4.735f, 3.095f, -8.246f };
     XMFLOAT3 lightColor  = { 1.0f, 0.92f, 0.70f };
     float    directionalLightIntensity = 12.18f;
+    // Night with a moon: lightPos above holds the moon, so it lights, shadows
+    // and fogs the scene like any key light, and the sky is handed the set sun
+    // in setSunPos instead -- the atmosphere stays dark and the moon disc is
+    // drawn at lightPos. Set only by ApplyTimeOfDay.
+    bool     moonIsKeyLight = false;
+    XMFLOAT3 setSunPos   = { -3.4f, -4.2f, 6.8f };
+    // HDR radiance of the moon disc in the sky pass, like sunDiscIntensity.
+    float    moonDiscIntensity = 3.0f;
+    // What the sky, the sun lens and every "is it night" fade read.
+    const XMFLOAT3& SkySunDirection() const {
+        return moonIsKeyLight ? setSunPos : lightPos;
+    }
     // Optical sun and camera-lens response. On by default: the look was
     // approved in motion and these values are the ones it was approved at.
     // Intensity is HDR radiance, not display brightness, so bloom and the tone
@@ -1311,8 +1323,11 @@ struct Scene {
     // changes the heightfield, and collision is sampled from the same function.
     bool  terrainDetailRelief = false;
     // Close-range material relief; does not alter the heightfield or collision.
-    bool  terrainPOM          = false;
-    bool  terrainPOMDepthOffset = false;
+    bool  terrainPOM          = true;
+    bool  terrainPOMDepthOffset = true;
+    bool  terrainScreenDisplacement = false;
+    float terrainScreenDisplacementStrength = 1.0f;
+    int   terrainScreenDisplacementSteps = 24;
     // Hollow-inspired projected-error tessellation and stitched tile edges.
     // Opt-in so the legacy distance LOD remains the default rendering path.
     bool  terrainErrorLOD      = false;

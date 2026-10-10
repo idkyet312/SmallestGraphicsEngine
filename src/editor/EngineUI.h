@@ -2094,7 +2094,13 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
                                TimeOfDay& timeOfDay, bool& timeOfDayChanged,
                                LevelSceneLitFog* levelFog = nullptr,
                                bool* levelFogEdited = nullptr,
-                               bool* levelFogCommitted = nullptr) {
+                               bool* levelFogCommitted = nullptr,
+                               float* levelExposure = nullptr,
+                               bool* levelExposureEdited = nullptr,
+                               bool* levelExposureCommitted = nullptr,
+                               bool* maxFidelityLighting = nullptr,
+                               bool timeLightingSaved = false,
+                               bool* resetTimeLighting = nullptr) {
     if (!open) return false;
     ImGui::SetNextWindowPos(ImVec2(16, 220), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
@@ -2111,7 +2117,29 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
             }
         }
         if (timeOfDay == TimeOfDay::MaxFidelity)
-            ImGui::TextDisabled("Fog 25%, sun 45 deg, GI 1.2x, emission 0.8x, RT reflections.");
+            ImGui::TextDisabled("Fog 0.0051, sun 45 deg (or the level's HDRI sun), GI 1.2x,\n"
+                                "emission off, cascade shadows, RT reflections.");
+        // The game setting of the same name; the caller saves and re-applies.
+        if (maxFidelityLighting &&
+            ImGui::Checkbox("Max fidelity lighting at all times", maxFidelityLighting)) {
+            timeOfDayChanged = true;
+            changed = true;
+        }
+        // The caller saves edits below into the level, per clock time.
+        if (resetTimeLighting && timeOfDay != TimeOfDay::MaxFidelity) {
+            if (timeLightingSaved) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1),
+                                   "%s lighting saved in this level", TimeOfDayName(timeOfDay));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset to preset")) {
+                    *resetTimeLighting = true;
+                    changed = true;
+                }
+            } else {
+                ImGui::TextDisabled("Edits below save to this level for %s.",
+                                    TimeOfDayName(timeOfDay));
+            }
+        }
         ImGui::Separator();
         const float radius = (std::max)(1.0f, std::sqrt(
             scene.lightPos.x * scene.lightPos.x + scene.lightPos.y * scene.lightPos.y +
@@ -2120,8 +2148,14 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
         if (azimuth < 0.0f) azimuth += 360.0f;
         float elevation = DirectX::XMConvertToDegrees(std::atan2(scene.lightPos.y,
             std::sqrt(scene.lightPos.x * scene.lightPos.x + scene.lightPos.z * scene.lightPos.z)));
-        bool directionChanged = ImGui::SliderFloat("Sun azimuth", &azimuth, 0.0f, 360.0f, "%.1f deg");
-        directionChanged |= ImGui::SliderFloat("Sun elevation", &elevation, -89.0f, 89.0f, "%.1f deg");
+        // At night the key light is the moon (ApplyTimeOfDay); same sliders.
+        const bool moon = scene.moonIsKeyLight;
+        bool directionChanged = ImGui::SliderFloat(
+            moon ? "Moon azimuth###keyAzimuth" : "Sun azimuth###keyAzimuth",
+            &azimuth, 0.0f, 360.0f, "%.1f deg");
+        directionChanged |= ImGui::SliderFloat(
+            moon ? "Moon elevation###keyElevation" : "Sun elevation###keyElevation",
+            &elevation, -89.0f, 89.0f, "%.1f deg");
         if (directionChanged) {
             const float a = DirectX::XMConvertToRadians(azimuth);
             const float e = DirectX::XMConvertToRadians(elevation);
@@ -2131,8 +2165,12 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
             scene.animateLight = false;
             changed = true;
         }
-        changed |= ImGui::SliderFloat("Sun intensity", &scene.directionalLightIntensity, 0.0f, 20.0f, "%.2f");
-        changed |= ImGui::ColorEdit3("Sun color", &scene.lightColor.x);
+        changed |= ImGui::SliderFloat(
+            moon ? "Moon intensity###keyIntensity" : "Sun intensity###keyIntensity",
+            &scene.directionalLightIntensity, 0.0f, 20.0f, "%.2f");
+        changed |= ImGui::ColorEdit3(
+            moon ? "Moon color###keyColor" : "Sun color###keyColor",
+            &scene.lightColor.x);
         changed |= ImGui::SliderFloat("Ambient fill", &scene.editorAmbientFill, 0.0f, 2.0f, "%.3f");
         changed |= ImGui::SliderFloat("Environment / GI gain", &scene.ambientLightingIntensity, 0.0f, 2.0f, "%.3f");
         changed |= ImGui::SliderFloat("Emission", &g_emissiveIntensity, 0.0f, 50.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
@@ -2142,6 +2180,16 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
             ImGuiSliderFlags_AlwaysClamp);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Glow around bright lights. 0 = off; default 0.16.");
+        // Saved with the level; reported back like scene-lit fog.
+        if (levelExposure && levelExposureEdited && levelExposureCommitted) {
+            *levelExposureEdited = ImGui::SliderFloat("Exposure", levelExposure,
+                0.1f, 8.0f, "%.2fx",
+                ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+            *levelExposureCommitted = ImGui::IsItemDeactivatedAfterEdit();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Brightness after auto exposure. 1 = default.\n"
+                                  "Saved in the level file.");
+        }
         ImGui::Separator();
         ImGui::BeginDisabled(!g_inlineRaytracingSupported);
         changed |= ImGui::Checkbox("Ray-traced GI", &rayGI);
@@ -2914,6 +2962,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     "Uses the visibility buffer, including painted terrain; "
                     "costs extra raster work.");
             ImGui::EndDisabled();
+            ImGui::Checkbox("Screen Space Displacement", &scene.terrainScreenDisplacement);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Raymarches the blended terrain height maps before lighting, "
+                    "including small silhouette changes. Requires terrain in the visibility buffer. "
+                    "Fades near screen edges; collision and ray-traced geometry stay unchanged.");
+            if (scene.terrainScreenDisplacement) {
+                ImGui::SliderFloat("Displacement Strength", &scene.terrainScreenDisplacementStrength, 0.0f, 4.0f);
+                ImGui::SliderInt("Displacement Steps", &scene.terrainScreenDisplacementSteps, 8, 48);
+            }
         }
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
 
@@ -3542,6 +3599,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     }
                 }
                 ImGui::TextDisabled("  DLSS: %s", DLSS::Status());
+                ImGui::BeginDisabled(!DLSS::FrameGenerationAvailable());
+                ImGui::Checkbox("DLSS Frame Generation (2x)", &dlss.frameGeneration);
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("  Frame Generation: %s", DLSS::FrameGenerationStatus());
+                ImGui::BeginDisabled(!DLSS::ReflexAvailable());
+                int reflex = static_cast<int>(dlss.reflex);
+                if (ImGui::Combo("NVIDIA Reflex", &reflex, "Off\0On\0On + Boost\0"))
+                    dlss.reflex = static_cast<DLSS::ReflexMode>(reflex);
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("  Reflex: %s", DLSS::ReflexStatus());
             }
             if (ImGui::Checkbox("Temporal AA (TAA)",
                                 &vb.temporalEffectsEnabled))

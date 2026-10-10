@@ -109,7 +109,10 @@ float3 TonemapAgX(float3 color) {
         -0.0990297441, -0.0989611768,  1.1510736726);
     const float minEv = -12.47393;
     const float maxEv = 4.026069;
-    color = mul(agxIn, max(color, 1e-10));
+    // The matrices are the reference GLSL mat3 values, which are column-major;
+    // HLSL's float3x3 constructor fills rows, so they apply as row vectors.
+    // mul(M, v) here tinted neutral grey red (1.5 -> 209,190,190).
+    color = mul(max(color, 1e-10), agxIn);
     color = (clamp(log2(color), minEv, maxEv) - minEv) / (maxEv - minEv);
     color = AgXContrast(color);
     float luma = Luminance(color);
@@ -117,7 +120,7 @@ float3 TonemapAgX(float3 color) {
     // renderer ownership/lighting, not two different display transforms.
     color = pow(saturate(color), 1.35);
     color = luma + 1.4 * (color - luma);
-    return saturate(mul(agxOut, color));
+    return saturate(mul(color, agxOut));
 }
 
 float3 TonemapSkyACES(float3 color) {

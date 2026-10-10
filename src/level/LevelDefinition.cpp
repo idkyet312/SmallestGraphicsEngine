@@ -480,6 +480,42 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         !std::isfinite(litFog.anisotropy) || litFog.anisotropy < -0.9f ||
         litFog.anisotropy > 0.95f)
         result.errors.push_back("lighting.sceneLitFog contains invalid settings");
+    const LevelMaxFidelitySun& sun = level.maxFidelitySun;
+    bool sunValid = std::isfinite(sun.intensity) && sun.intensity >= 0.0f &&
+        sun.intensity <= 1000.0f;
+    float sunLengthSq = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        sunValid = sunValid && std::isfinite(sun.direction[i]) &&
+            std::isfinite(sun.color[i]) && sun.color[i] >= 0.0f;
+        sunLengthSq += sun.direction[i] * sun.direction[i];
+    }
+    if (!sunValid || !(sunLengthSq > 1e-8f))
+        result.errors.push_back("lighting.maxFidelitySun contains invalid settings");
+    for (int t = 0; t < kLevelTimeOfDayCount; ++t) {
+        const LevelTimeOfDayLighting& light = level.timeOfDayLighting[t];
+        if (!light.enabled) continue;
+        const auto inRange = [](float v, float lo, float hi) {
+            return std::isfinite(v) && v >= lo && v <= hi;
+        };
+        bool valid = inRange(light.sunIntensity, 0.0f, 1000.0f) &&
+            inRange(light.environmentGain, 0.0f, 10.0f) &&
+            inRange(light.emission, 0.0f, 1000.0f) &&
+            inRange(light.bloom, 0.0f, 10.0f) &&
+            inRange(light.giIntensity, 0.0f, 10.0f) &&
+            inRange(light.fogDensity, 0.0f, 1.0f);
+        float lengthSq = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            valid = valid && std::isfinite(light.sunDirection[i]) &&
+                std::isfinite(light.sunColor[i]) && light.sunColor[i] >= 0.0f;
+            lengthSq += light.sunDirection[i] * light.sunDirection[i];
+        }
+        if (!valid || !(lengthSq > 1e-8f))
+            result.errors.push_back(std::string("lighting.timeOfDay.") +
+                kLevelTimeOfDayKeys[t] + " contains invalid settings");
+    }
+    if (!std::isfinite(level.exposure) || level.exposure < 0.1f ||
+        level.exposure > 8.0f)
+        result.errors.push_back("lighting.exposure must be between 0.1 and 8");
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
         const float maxStampRadius =
             stamp.operation == TerrainSculptOperation::Heightmap
@@ -704,6 +740,61 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 source.value("heightFalloff", defaults.heightFalloff);
             level.sceneLitFog.anisotropy =
                 source.value("anisotropy", defaults.anisotropy);
+        }
+        if (root.contains("lighting") && root.at("lighting").is_object())
+            level.exposure = root.at("lighting").value("exposure", 1.0f);
+        if (root.contains("lighting") && root.at("lighting").is_object() &&
+            root.at("lighting").contains("maxFidelitySun")) {
+            const json& source = root.at("lighting").at("maxFidelitySun");
+            if (!source.is_object())
+                throw std::runtime_error("lighting.maxFidelitySun must be an object");
+            LevelMaxFidelitySun& sun = level.maxFidelitySun;
+            sun.enabled = source.value("enabled", true);
+            const auto read3 = [&source](const char* key, float* out) {
+                if (!source.contains(key)) return;
+                const json& value = source.at(key);
+                if (!value.is_array() || value.size() != 3)
+                    throw std::runtime_error(
+                        std::string("lighting.maxFidelitySun.") + key +
+                        " must be a 3-element array");
+                for (int i = 0; i < 3; ++i) out[i] = value.at(i).get<float>();
+            };
+            read3("direction", sun.direction);
+            read3("color", sun.color);
+            sun.intensity = source.value("intensity", sun.intensity);
+        }
+        if (root.contains("lighting") && root.at("lighting").is_object() &&
+            root.at("lighting").contains("timeOfDay")) {
+            const json& times = root.at("lighting").at("timeOfDay");
+            if (!times.is_object())
+                throw std::runtime_error("lighting.timeOfDay must be an object");
+            for (int t = 0; t < kLevelTimeOfDayCount; ++t) {
+                if (!times.contains(kLevelTimeOfDayKeys[t])) continue;
+                const std::string path =
+                    std::string("lighting.timeOfDay.") + kLevelTimeOfDayKeys[t];
+                const json& source = times.at(kLevelTimeOfDayKeys[t]);
+                if (!source.is_object())
+                    throw std::runtime_error(path + " must be an object");
+                LevelTimeOfDayLighting& light = level.timeOfDayLighting[t];
+                light.enabled = true;
+                const auto read3 = [&source, &path](const char* key, float* out) {
+                    if (!source.contains(key)) return;
+                    const json& value = source.at(key);
+                    if (!value.is_array() || value.size() != 3)
+                        throw std::runtime_error(
+                            path + "." + key + " must be a 3-element array");
+                    for (int i = 0; i < 3; ++i) out[i] = value.at(i).get<float>();
+                };
+                read3("sunDirection", light.sunDirection);
+                read3("sunColor", light.sunColor);
+                light.sunIntensity = source.value("sunIntensity", light.sunIntensity);
+                light.environmentGain =
+                    source.value("environmentGain", light.environmentGain);
+                light.emission = source.value("emission", light.emission);
+                light.bloom = source.value("bloom", light.bloom);
+                light.giIntensity = source.value("giIntensity", light.giIntensity);
+                light.fogDensity = source.value("fogDensity", light.fogDensity);
+            }
         }
         const json& terrain = root.at("terrain");
         if (terrain.contains("sculpt")) {
@@ -961,6 +1052,32 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                 {"anisotropy", level.sceneLitFog.anisotropy}
             };
         }
+        if (level.maxFidelitySun.enabled) {
+            const LevelMaxFidelitySun& sun = level.maxFidelitySun;
+            root["lighting"]["maxFidelitySun"] = {
+                {"enabled", true},
+                {"direction", {sun.direction[0], sun.direction[1], sun.direction[2]}},
+                {"color", {sun.color[0], sun.color[1], sun.color[2]}},
+                {"intensity", sun.intensity}
+            };
+        }
+        // Only the times tuned in the editor, so untouched levels round-trip.
+        for (int t = 0; t < kLevelTimeOfDayCount; ++t) {
+            const LevelTimeOfDayLighting& light = level.timeOfDayLighting[t];
+            if (!light.enabled) continue;
+            root["lighting"]["timeOfDay"][kLevelTimeOfDayKeys[t]] = {
+                {"sunDirection", {light.sunDirection[0], light.sunDirection[1],
+                                  light.sunDirection[2]}},
+                {"sunColor", {light.sunColor[0], light.sunColor[1], light.sunColor[2]}},
+                {"sunIntensity", light.sunIntensity},
+                {"environmentGain", light.environmentGain},
+                {"emission", light.emission},
+                {"bloom", light.bloom},
+                {"giIntensity", light.giIntensity},
+                {"fogDensity", light.fogDensity}
+            };
+        }
+        if (level.exposure != 1.0f) root["lighting"]["exposure"] = level.exposure;
         // Only levels that actually use splines gain the key, so files authored
         // before this feature round-trip unchanged.
         if (!splines.empty()) root["splines"] = std::move(splines);

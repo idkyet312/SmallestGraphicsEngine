@@ -85,6 +85,16 @@ struct TimeOfDaySettings {
     float giIntensity = -1.0f;
     float emissiveIntensity = -1.0f;
     bool  rtReflections = false;
+    // Cascades instead of virtual shadow maps while the preset is active.
+    bool  cascadeShadows = false;
+    // The moon. Zero intensity means none. With a moon, ApplyTimeOfDay makes it
+    // the key light -- lighting, shadows, fog and water all follow it -- while
+    // the sky keeps lightPos above as the set sun, so the atmosphere stays dark.
+    // lightPos/lightColor/directionalLightIntensity stay the sun's values here,
+    // which is what the horizon fade and the enemy visibility curve read.
+    DirectX::XMFLOAT3 moonPos{ 0.0f, 1.0f, 0.0f };
+    DirectX::XMFLOAT3 moonColor{ 0.62f, 0.72f, 1.0f };
+    float moonIntensity = 0.0f;
 };
 
 // The sun's height above the horizon, as the y of the normalised direction.
@@ -228,10 +238,16 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         settings.atmosphereRayleighStrength = 0.035f;
         settings.atmosphereMieStrength = 0.01f;
         settings.atmosphereAerialDensity = 0.05f;
-        // Night needs a denser, nearly black ground layer than the daylight
-        // presets. Keep this authored separately so Reset Night fog restores
-        // the intended low-visibility look without changing other times.
-        settings.enableVolumetricFog = true;
+        // Moon at azimuth 116.6, elevation 18.7 degrees (|moonPos| 10), tuned
+        // in the editor. Just enough to pick out shapes; emissives and muzzle
+        // flashes still carry the scene.
+        settings.moonPos = { -4.2412f, 3.2061f, 8.4695f };
+        settings.moonColor = { 0.60f, 0.70f, 1.0f };
+        settings.moonIntensity = 0.01f;
+        // Fog off by default: the moonlit sky reads clearer without it. The
+        // layer below stays authored -- denser and nearly black -- so turning
+        // fog on (or Reset Night fog) gives the low-visibility night look.
+        settings.enableVolumetricFog = false;
         settings.volumetricFogDensity = 0.0116f;
         settings.volumetricFogAnisotropy = 0.31f;
         settings.volumetricFogHeightFalloff = 0.107f;
@@ -243,22 +259,56 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         break;
     case TimeOfDay::MaxFidelity:
         // Afternoon azimuth at 45 degrees elevation (|lightPos| stays 10), so
-        // the sun clears street rooflines. Fog at a quarter of the 0.009
-        // default: ~89% transmittance at 50 m instead of ~64%, keeping a depth
-        // cue without washing a street out within 20 m.
+        // the sun clears street rooflines. Fog density tuned by eye in the
+        // editor (0.0051, about 57% of the 0.009 default); it also replaces
+        // the Clear/Cloudy weather density under Max fidelity.
         settings.lightPos = { 3.5212f, 7.0711f, -6.1320f };
         settings.lightColor = { 1.0f, 245.0f / 255.0f, 225.0f / 255.0f };
         settings.ambientLightingIntensity = 1.0f;
-        settings.volumetricFogDensity = 0.009f * 0.25f;
+        settings.volumetricFogDensity = 0.0051f;
+        // Emission off: a daylight inspection look, matching the Falcor
+        // Bistro reference, which lights the street with the HDRI alone.
+        // Cascades: VSM pages blurred Bistro's sun shadows that cascades
+        // keep hard. A level with its own HDRI sun (lighting.maxFidelitySun)
+        // replaces this sun in ApplyTimeOfDay.
         settings.giIntensity = 1.2f;
-        settings.emissiveIntensity = 0.8f;
+        settings.emissiveIntensity = 0.0f;
         settings.rtReflections = true;
+        settings.cascadeShadows = true;
         break;
     case TimeOfDay::Afternoon:
     default:
         // The baseline values above are the authored default afternoon look.
         break;
     }
+    return settings;
+}
+
+// The "Max Fidelity Lighting" setting: Max fidelity's renderer set (thin haze,
+// GI, RT reflections, cascade shadows) at every clock time. The clock keeps its
+// sun and its sky light -- every preset shares the daylight HDRI, so Night
+// taking Max fidelity's ambient would be lit like day -- and sets emission:
+// off in daylight as Max fidelity has it, the level's own at Dusk and Night.
+// A negative emissiveIntensity here means "the level's own value".
+inline TimeOfDaySettings MakeMaxFidelityLightingSettings(TimeOfDay time) {
+    TimeOfDaySettings settings = MakeTimeOfDaySettings(time);
+    if (time == TimeOfDay::MaxFidelity) return settings;
+    const TimeOfDaySettings max = MakeTimeOfDaySettings(TimeOfDay::MaxFidelity);
+    // Night keeps its own fog switch (off by default).
+    if (time != TimeOfDay::Night)
+        settings.enableVolumetricFog = max.enableVolumetricFog;
+    settings.volumetricFogDensity = max.volumetricFogDensity;
+    settings.volumetricFogAnisotropy = max.volumetricFogAnisotropy;
+    settings.volumetricFogHeightFalloff = max.volumetricFogHeightFalloff;
+    settings.volumetricFogBaseHeight = max.volumetricFogBaseHeight;
+    settings.volumetricFogDistance = max.volumetricFogDistance;
+    settings.volumetricFogTint = max.volumetricFogTint;
+    settings.giIntensity = max.giIntensity;
+    settings.rtReflections = max.rtReflections;
+    settings.cascadeShadows = max.cascadeShadows;
+    settings.emissiveIntensity =
+        time == TimeOfDay::Dusk || time == TimeOfDay::Night
+            ? -1.0f : max.emissiveIntensity;
     return settings;
 }
 

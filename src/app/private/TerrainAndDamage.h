@@ -570,6 +570,13 @@ static bool HiddenFromEnemies(const SkinnedEnemy& actor) {
 // changes one. Whether the settings panel is currently open is UI state rather
 // than a setting, so it is not persisted.
 static GameSettings g_settings;
+
+// The per-time fog slot a time of day actually shows. Max Fidelity Lighting
+// keeps Max fidelity's haze at every time, so tuning edits that slot too.
+static VolumetricFogSettings& LiveVolumetricFog(TimeOfDay time) {
+    return VolumetricFogFor(g_settings.maxFidelityLighting ? TimeOfDay::MaxFidelity : time);
+}
+
 static bool g_showSettingsMenu = false;
 
 // In-game pause. ESC used to abandon the run outright and drop straight to the
@@ -581,6 +588,8 @@ static bool g_gamePaused = false;
 // from g_showSettingsMenu so the two cannot be confused: the same panel is
 // drawn by both, and sharing one flag would leave the main menu showing
 // settings after a paused player opened them and quit to the menu.
+// The level editor's Settings button opens it too: same in-level lifetime,
+// and ESC already closes it.
 static bool g_showPauseSettings = false;
 
 // Multiplayer session state. Declared here rather than in Multiplayer.h,
@@ -725,6 +734,8 @@ static void ApplyGameSettings() {
     // here so the menu and the file win over the editor panel's own sliders.
     scene.vsyncInterval = g_settings.vsync ? 1 : 0;
     DLSS::GetSettings().enabled = g_settings.dlssEnabled;
+    DLSS::GetSettings().frameGeneration = g_settings.dlssFrameGeneration;
+    DLSS::GetSettings().reflex = static_cast<DLSS::ReflexMode>(g_settings.nvidiaReflex);
     DLSS::GetSettings().rayReconstruction =
         g_settings.rayTracingQuality == GameSettings::kRayTracingUltra;
     DLSS::GetSettings().rayReconstructionUpscale =

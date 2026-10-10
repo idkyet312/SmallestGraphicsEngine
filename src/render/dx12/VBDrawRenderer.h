@@ -1210,7 +1210,16 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
                                      kShoreOuter * sp.islandScaleZ);
         }
     }
-    const bool terrainPOMDepth = scene.terrainPOM && scene.terrainPOMDepthOffset &&
+    vb.terrainScreenDisplacementPrepared = !isScopeView && !vb.validationMode &&
+        !scene.meshletWireframe && scene.terrainScreenDisplacement &&
+        scene.terrainScreenDisplacementStrength > 0.0f && scene.useMeshTerrain &&
+        vb.TerrainVisibilityReady() &&
+        vb.terrainScreenDisplacement.Prepare(vb.visBufferRT.Get(), vb.ActiveDepthBuffer());
+    vb.terrainScreenDisplacementActiveThisFrame = false;
+    vb.terrainScreenDisplacementStrength = scene.terrainScreenDisplacementStrength;
+    vb.terrainScreenDisplacementSteps = (UINT)(std::clamp)(scene.terrainScreenDisplacementSteps, 8, 48);
+    const bool terrainPOMDepth = !vb.terrainScreenDisplacementPrepared &&
+        scene.terrainPOM && scene.terrainPOMDepthOffset &&
         !scene.meshletWireframe && g_terrain.VisibilityPOMDepthSupported();
     if (scene.useMeshTerrain && g_terrain.VisibilitySupported() &&
         vb.TerrainVisibilityReady()) {
@@ -1286,6 +1295,36 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
+    if (vb.terrainScreenDisplacementPrepared && vb.terrainVisibilityActiveThisFrame) {
+        TerrainScreenDisplacementDX12::Constants displacement;
+        XMStoreFloat4x4(&displacement.viewProjection, XMMatrixTranspose(view * proj));
+        XMStoreFloat4x4(&displacement.inverseViewProjection,
+            XMMatrixTranspose(XMMatrixInverse(nullptr, view * proj)));
+        displacement.cameraPosition = scene.camera.VisualPosition();
+        displacement.screenSize = XMFLOAT2((float)vb.width, (float)vb.height);
+        displacement.strength = (std::clamp)(vb.terrainScreenDisplacementStrength, 0.0f, 4.0f);
+        displacement.marchSteps = vb.terrainScreenDisplacementSteps;
+        displacement.neutralHeightMask = vb.terrainNeutralHeightBlendMask;
+        displacement.authoredPaths = g_customLevelMode ? 0u : 1u;
+        displacement.splatEnabled = vb.terrainSplatMap &&
+            vb.terrainSplatExtentX > 1e-4f && vb.terrainSplatExtentZ > 1e-4f ? 1u : 0u;
+        if (displacement.splatEnabled)
+            displacement.splatInvExtent = XMFLOAT2(0.5f / vb.terrainSplatExtentX,
+                                                  0.5f / vb.terrainSplatExtentZ);
+        vb.terrainScreenDisplacement.Render(g_dx12.commandList.Get(), vb.visBufferRT.Get(),
+            vb.ActiveDepthBuffer(), vb.visRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+            vb.ActiveDSV(), vb.terrainAlbedoArray, vb.terrainNormalArray,
+            vb.terrainMetalRoughArray, vb.terrainSplatMap, displacement);
+        // The pass binds its own heap and root signature. Restore the main
+        // ones now: SetSH/SetDDGI below write root CBVs without rebinding.
+        shader.InvalidateGraphicsRootBinding();
+        shader.EnsureGraphicsRootBound();
+        vb.terrainScreenDisplacementActiveThisFrame = true;
+    }
+    if (!isScopeView && vb.terrainScreenDisplacementWasActive != vb.terrainScreenDisplacementActiveThisFrame) {
+        vb.InvalidateTemporalHistory();
+        vb.terrainScreenDisplacementWasActive = vb.terrainScreenDisplacementActiveThisFrame;
+    }
     viewState.replayValid = true;
     viewState.culledCount = culledCount;
     viewState.doubleSidedCount = doubleSidedCount;
@@ -1426,6 +1465,9 @@ inline bool ReplayVBDepth(Scene& scene, ShaderDX12& shader,
                           const XMFLOAT2& jitterPixels, bool replayTerrain) {
     VBViewDrawState& state = VBDrawStateForView(0);
     if (!state.replayValid) return false;
+    // Re-rasterizing the coarse mesh would erase the screen-space relief.
+    // Reuse the existing terrain-depth seed instead, including its silhouette.
+    if (vb.terrainScreenDisplacementActiveThisFrame) replayTerrain = false;
     ID3D12GraphicsCommandList* cmd = g_dx12.commandList.Get();
     bool terrainSeeded = false;
     if (!vb.BeginDepthReplay(cmd, jitterPixels,

@@ -464,6 +464,29 @@ void LevelEditor::EditSceneLitFog(const LevelSceneLitFog& value, bool commit) {
     }
 }
 
+void LevelEditor::EditExposure(float value, bool commit) {
+    if (!exposureBefore_) exposureBefore_ = level_;
+    level_.exposure = value;
+    dirty_ = true;
+    if (commit) {
+        PushUndo(*exposureBefore_);
+        exposureBefore_.reset();
+    }
+}
+
+void LevelEditor::EditTimeOfDayLighting(int index,
+                                        const LevelTimeOfDayLighting& value,
+                                        bool commit) {
+    if (index < 0 || index >= kLevelTimeOfDayCount) return;
+    if (!timeOfDayLightingBefore_) timeOfDayLightingBefore_ = level_;
+    level_.timeOfDayLighting[index] = value;
+    dirty_ = true;
+    if (commit) {
+        PushUndo(*timeOfDayLightingBefore_);
+        timeOfDayLightingBefore_.reset();
+    }
+}
+
 void LevelEditor::MarkChanged(const LevelDefinition& before,
                               uint64_t transformEntityId) {
     PushUndo(before);
@@ -2156,6 +2179,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::Button("Performance")) actions.togglePerformance = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Frame time, CPU/GPU split, GPU passes and scene counts.");
+    ImGui::SameLine();
+    if (ImGui::Button("Settings")) actions.openSettings = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The game's settings page: video, ray tracing, audio, input.");
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) actions.refreshVisuals = true;
     if (ImGui::IsItemHovered())

@@ -17,7 +17,9 @@ cbuffer SkyBuffer : register(b0) {
     float  sunDiscIntensity;
     float4 sunLensColorHalo;  // direct-light tint, wide-halo intensity
     float hdriEnabled;
-    float3 skyPadding;
+    float3 moonDirection;    // toward the moon
+    float  moonIntensity;    // disc HDR radiance; 0 = no moon
+    float3 moonPadding;
 };
 
 Texture2D skyEquirectangular : register(t0);
@@ -164,6 +166,44 @@ float3 OpticalSun(float3 ray) {
         innerHalo * 0.72 + wideHalo * 0.12;
     return tint * horizonFade *
         (disc * sunDiscIntensity + halo * sunLensColorHalo.a);
+}
+
+// The night key light's source. Same finite-disc treatment as OpticalSun, but
+// the sun's halo lobes would read as daylight glare, so only a tight glow.
+// Surface: a sphere normal across the disc for slight limb darkening, and two
+// octaves of value noise for the darker maria. Not a phase -- always full.
+float3 Moon(float3 ray) {
+    if (moonIntensity <= 0.0 || moonDirection.y <= -0.03)
+        return 0.0;
+
+    const float3 toMoon = normalize(moonDirection);
+    const float mu = clamp(dot(ray, toMoon), -1.0, 1.0);
+    // ~0.7 degrees: the sun's disc is drawn at 3x real size too.
+    const float radius = 0.0125;
+    const float angularDistance = sqrt(max(2.0 * (1.0 - mu), 0.0));
+    const float glow =
+        exp2(-angularDistance / (radius * 1.6)) * 0.012 +
+        exp2(-angularDistance / (radius * 9.0)) * 0.0025;
+    const float horizonFade = smoothstep(-0.03, 0.04, toMoon.y);
+    const float3 tint = float3(0.90, 0.94, 1.0);
+    // Derivative before the early-out: it needs every lane of the quad.
+    const float edgeWidth = max(fwidth(angularDistance) / radius * 1.5, 0.04);
+    if (angularDistance > radius * 1.5)
+        return tint * glow * moonIntensity * horizonFade;
+
+    // Disc-local coordinates, -1..1 across the face.
+    const float3 tangent = normalize(cross(float3(0.0, 1.0, 0.0), toMoon));
+    const float3 bitangent = cross(toMoon, tangent);
+    const float2 local = float2(dot(ray, tangent), dot(ray, bitangent)) / radius;
+    const float r2 = dot(local, local);
+    const float disc = 1.0 - smoothstep(1.0 - edgeWidth, 1.0 + edgeWidth, sqrt(r2));
+    const float facing = sqrt(saturate(1.0 - r2));
+    const float maria = ValueNoise(local * 2.1 + 7.3) * 0.65 +
+                        ValueNoise(local * 5.3 + 3.1) * 0.35;
+    const float albedo = lerp(1.0, 0.62, smoothstep(0.42, 0.68, maria));
+    const float limb = lerp(0.78, 1.0, facing);
+    return tint * moonIntensity * horizonFade *
+        (disc * albedo * limb + glow);
 }
 
 // -- Volumetric clouds --------------------------------------------------------
@@ -495,6 +535,9 @@ float4 main(PSInput input) : SV_Target {
     const float nightBlend = 1.0 - smoothstep(-0.10, 0.06, sunDirection.y);
     const float3 nightCeiling = float3(0.035, 0.045, 0.065);
     hdr = lerp(hdr, min(hdr, nightCeiling), nightBlend);
+    // After the ceiling, which would clip it to the night sky's black-blue.
+    // Clouds still cover it; thin cloud lets a little through.
+    hdr += Moon(ray) * saturate(1.0 - clouds.a * 0.9);
 
     float3 color;
 #ifdef SGE_HDR_TARGET

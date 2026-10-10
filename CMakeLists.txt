@@ -528,7 +528,8 @@ if(EXISTS "${SGE_STREAMLINE_DIR}/include/sl.h")
     target_include_directories(GraphicEngine PRIVATE "${SGE_STREAMLINE_DIR}/include")
     target_compile_definitions(GraphicEngine PRIVATE SGE_WITH_STREAMLINE=1)
     foreach(sl_dll sl.interposer.dll sl.common.dll sl.dlss.dll
-                   sl.dlss_d.dll nvngx_dlss.dll nvngx_dlssd.dll)
+                   sl.dlss_d.dll nvngx_dlss.dll nvngx_dlssd.dll
+                   sl.dlss_g.dll nvngx_dlssg.dll sl.reflex.dll sl.pcl.dll)
         add_custom_command(TARGET GraphicEngine POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${SGE_STREAMLINE_DIR}/bin/x64/${sl_dll}"
@@ -694,6 +695,12 @@ if(BUILD_TESTING)
     target_compile_definitions(ResolveShaderCanaryTests PRIVATE
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME ResolveShaderCanaryTests COMMAND ResolveShaderCanaryTests)
+
+    add_executable(TerrainScreenDisplacementTests tests/TerrainScreenDisplacementTests.cpp)
+    target_link_libraries(TerrainScreenDisplacementTests PRIVATE SGEProjectHeaders d3d12 dxgi d3dcompiler)
+    add_test(NAME TerrainScreenDisplacementTests COMMAND TerrainScreenDisplacementTests)
+    set_tests_properties(TerrainScreenDisplacementTests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     add_executable(SniperScopeProjectionTests tests/SniperScopeProjectionTests.cpp)
     target_link_libraries(SniperScopeProjectionTests PRIVATE

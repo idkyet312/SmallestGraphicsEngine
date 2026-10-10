@@ -1592,9 +1592,10 @@ int main() {
         // ...but darker than every daylight preset, or it is not night.
         CHECK(night.ambientStrength < dusk.ambientStrength);
         CHECK(night.ambientLightingIntensity < dusk.ambientLightingIntensity);
-        // Night owns a denser, neutral-black ground layer. These are the exact
-        // authored values restored by the deployment screen's Reset Night fog.
-        CHECK(night.enableVolumetricFog);
+        // Night fog is off by default, but still owns a denser, neutral-black
+        // ground layer for when it is turned on: the exact authored values
+        // restored by the deployment screen's Reset Night fog.
+        CHECK(!night.enableVolumetricFog);
         CHECK(std::abs(night.volumetricFogDensity - 0.0116f) < 0.0001f);
         CHECK(std::abs(night.volumetricFogAnisotropy - 0.31f) < 0.0001f);
         CHECK(std::abs(night.volumetricFogHeightFalloff - 0.107f) < 0.0001f);
@@ -1622,6 +1623,29 @@ int main() {
         CHECK(!TimeOfDayIsDark(TimeOfDay::Noon));
         CHECK(!TimeOfDayIsDark(TimeOfDay::Afternoon));
         CHECK(!TimeOfDayIsDark(TimeOfDay::MaxFidelity));
+
+        // Max Fidelity Lighting: the renderer set comes from Max fidelity, the
+        // sun and sky light from the clock, emission off by day and the
+        // level's own (negative) at Dusk and Night.
+        {
+            const TimeOfDaySettings max = MakeTimeOfDaySettings(TimeOfDay::MaxFidelity);
+            const TimeOfDaySettings mfNight = MakeMaxFidelityLightingSettings(TimeOfDay::Night);
+            const TimeOfDaySettings mfNoon = MakeMaxFidelityLightingSettings(TimeOfDay::Noon);
+            const TimeOfDaySettings mfDusk = MakeMaxFidelityLightingSettings(TimeOfDay::Dusk);
+            CHECK(mfNight.giIntensity == max.giIntensity);
+            CHECK(mfNight.rtReflections && mfNight.cascadeShadows);
+            CHECK(mfNight.volumetricFogDensity == max.volumetricFogDensity);
+            CHECK(max.volumetricFogDensity == 0.0051f);
+            CHECK(mfNight.lightPos.y == night.lightPos.y);
+            CHECK(mfNight.directionalLightIntensity == night.directionalLightIntensity);
+            CHECK(mfNight.ambientLightingIntensity == night.ambientLightingIntensity);
+            CHECK(mfNight.emissiveIntensity < 0.0f);
+            CHECK(mfDusk.emissiveIntensity < 0.0f);
+            CHECK(mfNoon.emissiveIntensity == max.emissiveIntensity);
+            CHECK(mfNoon.lightColor.z == noon.lightColor.z);
+            const TimeOfDaySettings mfMax = MakeMaxFidelityLightingSettings(TimeOfDay::MaxFidelity);
+            CHECK(mfMax.lightPos.y == max.lightPos.y && mfMax.emissiveIntensity == max.emissiveIntensity);
+        }
 
         // Every preset needs a name and a briefing for the deployment screen,
         // and no two may share a name or the buttons become ambiguous.

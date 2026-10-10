@@ -40,7 +40,10 @@ float3 tonemapAgXPunchy(float3 color) {
     const float minEv = -12.47393;
     const float maxEv =  4.026069;
 
-    color = mul(agxIn, color);
+    // The matrices are the reference GLSL mat3 values, which are column-major;
+    // HLSL's float3x3 constructor fills rows, so they apply as row vectors.
+    // mul(M, v) here tinted neutral grey red (1.5 -> 209,190,190).
+    color = mul(color, agxIn);
     color = clamp(log2(max(color, 1e-10)), minEv, maxEv);
     color = (color - minEv) / (maxEv - minEv);
     color = agxDefaultContrastApprox(color);
@@ -51,7 +54,7 @@ float3 tonemapAgXPunchy(float3 color) {
     color = pow(max(color, 0.0), 1.35);       // punchy contrast
     color = luma + 1.4 * (color - luma);      // punchy saturation
 
-    color = mul(agxOut, color);
+    color = mul(color, agxOut);
     return ApplySceneColorGrade(color);       // already display-encoded
 }
 

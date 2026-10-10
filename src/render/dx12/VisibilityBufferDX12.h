@@ -7,12 +7,20 @@
 #include "BindlessHeapDeviceDX12.h"
 #include "SceneGraph.h"
 #include "ProfilerDX12.h"
+#include "TerrainScreenDisplacementDX12.h"
 #include "VisibilityGeometryPool.h"
 #include "DLSSDX12.h"
 #include "BootTimer.h"
 #include "RadianceCascadesDX12.h"
+#include "VariableRateGIDX12.h"
 #include "GIRadianceCacheDX12.h"
 #include <DirectXPackedVector.h>
+
+// Scales VisibilityBufferDX12::exposure. A global like g_emissiveIntensity, so
+// the time-of-day code (compiled before the renderer object) can set it: auto
+// exposure normalises to mid grey, so brighter lights alone cannot brighten a
+// level, only this can.
+inline float g_exposureScale = 1.0f;
 #include <stb_image.h>
 #include <algorithm>
 #include <memory>
@@ -290,6 +298,12 @@ public:
     float terrainMaterialType = 0.0f;
     float terrainNormalYSign = 1.0f;
     bool terrainPOM = false;
+    TerrainScreenDisplacementDX12 terrainScreenDisplacement;
+    bool terrainScreenDisplacementPrepared = false;
+    bool terrainScreenDisplacementActiveThisFrame = false;
+    bool terrainScreenDisplacementWasActive = false;
+    float terrainScreenDisplacementStrength = 1.0f;
+    UINT terrainScreenDisplacementSteps = 24;
     UINT terrainNeutralHeightBlendMask = 0;
     // Non-owning terrain layer arrays, supplied by TerrainRendererDX12.
     ID3D12Resource* terrainAlbedoArray = nullptr;
@@ -591,6 +605,9 @@ public:
     UINT giRadianceCacheMode = 0;
     // ReSTIR GI for the Lumen bounce (settings LumenReSTIR). Mode is this
     // frame's b5 value: 0 off, 1 with last frame's reservoirs, 2 without.
+    bool emissiveCGNSRequested = false;
+    bool emissiveCGNSHistoryValid = false;
+    UINT emissiveCGNSMode = 0;
     bool lumenReSTIRRequested = false;
     UINT lumenReSTIRMode = 0;
     bool restirHistoryValid = false;
@@ -601,6 +618,10 @@ public:
     bool restirAllocationFailed = false;
 private:
     RadianceCascadesDX12 radianceCascades;
+    VariableRateGIDX12 variableRateGI;
+    bool variableRateGIRequested = false;
+    bool variableRateGIActive = false;
+    float variableRateGIBudget = 0.5f;
     GIRadianceCacheDX12 giRadianceCache;
     ResolveEntryPipelineDX12 rayQueryWarmup{ L"RayQueryWarmupMain",
                                              "Ray query warm-up" };
@@ -1341,6 +1362,8 @@ public:
         surfaceHistoryValid = false;
         svgfHistoryValid = false;
         restirHistoryValid = false;
+        emissiveCGNSHistoryValid = false;
+        variableRateGI.InvalidateHistory();
     }
 
     ID3D12Resource* StableSurfaceResource(UINT index) const {
@@ -1358,7 +1381,8 @@ public:
         return (surfaceIDTemporalEnabled && temporalEffectsEnabled) ||
                historyDebugView ||
                (enhancedResolve && svgfTemporalEnabled) ||
-               (enhancedResolve && lumenGIActive && lumenReSTIRRequested);
+               (enhancedResolve && lumenGIActive && lumenReSTIRRequested) ||
+               (enhancedResolve && emissiveCGNSRequested);
     }
 
     UINT StableSurfaceModeSignature(bool visibilityPath,
@@ -3558,7 +3582,9 @@ public:
         fc.terrainSplatInvExtent = splatUsable
             ? XMFLOAT2(0.5f / terrainSplatExtentX, 0.5f / terrainSplatExtentZ)
             : XMFLOAT2(0.0f, 0.0f);
-        fc.terrainPOMEnabled = terrainPOM ? 1u : 0u;
+        // The screen-space pass has already intersected the relief. Applying
+        // texture-space POM here would displace it a second time.
+        fc.terrainPOMEnabled = terrainPOM && !terrainScreenDisplacementActiveThisFrame ? 1u : 0u;
         fc.terrainNeutralHeightBlendMask = terrainNeutralHeightBlendMask;
         frameConstantBuffer.CopyData(ViewFrameIndex(), fc);
 
@@ -3608,13 +3634,20 @@ public:
         // half-resolution share replace the per-pixel ray it resamples).
         lumenReSTIRMode = 0;
         if (useEnhanced && lumenGIActive && lumenReSTIRRequested &&
-            !radianceCascadesGIRequested && !lumenGIHalfResolutionActive &&
+            !radianceCascadesGIRequested && !variableRateGIRequested && !lumenGIHalfResolutionActive &&
             !ScopeSurfaceBound() && EnsureReSTIRBuffers(width, height))
             lumenReSTIRMode = restirHistoryValid ? 1u : 2u;
         else if (!ScopeSurfaceBound())
             restirHistoryValid = false;  // a gap in the reservoir chain
         if (useEnhanced && !ScopeSurfaceBound())
             EnsureEmissiveReservoirs(width, height);
+        if (!ScopeSurfaceBound()) {
+            const bool active = useEnhanced && emissiveCGNSRequested &&
+                debugViewMode == 0 && emissiveReservoirBuffer;
+            emissiveCGNSMode = active
+                ? (emissiveCGNSHistoryValid && surfaceHistoryValid ? 2u : 1u) : 0u;
+            if (!active) emissiveCGNSHistoryValid = false;
+        }
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
         }
@@ -3768,8 +3801,28 @@ public:
                 }
             }
         }
-        if (!ScopeSurfaceBound())
+        bool useVariableRateGI = false;
+        D3D12_GPU_DESCRIPTOR_HANDLE variableRateTable{};
+        if (variableRateGIRequested && lumenGIActive && useEnhanced &&
+            !useRadianceCascades && !ScopeSurfaceBound() && debugViewMode == 0) {
+            useVariableRateGI = variableRateGI.Ensure(
+                ResolveTierSource(useBindless ? ResolveTierBindlessEnhanced : ResolveTierEnhanced),
+                useBindless, width, height);
+            if (useVariableRateGI) {
+                variableRateGI.PrepareDescriptors(frameSlot, enhancedDescHeap);
+                if (useBindless) {
+                    const UINT base = AllocateBindlessResolveTable(variableRateGI.StagingHeap(frameSlot),
+                        VariableRateGIDX12::DescriptorCount);
+                    useVariableRateGI = base != BINDLESS_INVALID_INDEX;
+                    if (useVariableRateGI) variableRateTable = bindlessHeap->GpuHandleAt(base);
+                } else variableRateTable = variableRateGI.Heap(frameSlot)->GetGPUDescriptorHandleForHeapStart();
+            }
+        }
+        if (!ScopeSurfaceBound()) {
+            variableRateGIActive = useVariableRateGI;
+            if (!useVariableRateGI) variableRateGI.InvalidateHistory();
             radianceCascadesGIActive = useRadianceCascades;
+        }
         // This frame writes every pixel's reservoir, so next frame may read.
         if (lumenReSTIRMode != 0u) restirHistoryValid = true;
 
@@ -3833,7 +3886,7 @@ public:
             TerrainOnlyResolveTiledPSOForTier(useBindless, useEnhanced);
         const bool useTileClassification =
             // The cascade tier builds no tile-classified permutations.
-            !useRadianceCascades &&
+            !useRadianceCascades && !useVariableRateGI &&
             !ScopeSurfaceBound() && useTerrainResolve && tileClassifyReady && tiledGenericPSO &&
             tiledTerrainPSO && tileClassifyPSO && tileClassifyResetPSO &&
             genericTileListBuffer && terrainTileListBuffer &&
@@ -3902,6 +3955,21 @@ public:
             selectedPSO = radianceCascades.ResolvePSO(
                 useBindless, useTerrainResolve, false);
             terrainOnlyPSO = radianceCascades.ResolvePSO(useBindless, true, true);
+            cmdList->SetPipelineState(selectedPSO);
+        }
+
+        if (useVariableRateGI) {
+            VariableRateGIDX12::Bindings bindings = {
+                frameConstantBuffer.GetGPUAddress(ViewFrameIndex()), giRadianceCache.Address(),
+                restirSampleBuffer ? restirSampleBuffer->GetGPUVirtualAddress() : 0,
+                restirWeightBuffer ? restirWeightBuffer->GetGPUVirtualAddress() : 0,
+                EmissiveTriangleAddress(), EmissiveReservoirAddress()
+            };
+            variableRateGI.Dispatch(cmdList, frameSlot, useBindless,
+                useBindless ? bindlessHeap->Heap() : variableRateGI.Heap(frameSlot),
+                variableRateTable, bindings, variableRateGIBudget);
+            selectedPSO = variableRateGI.ResolvePSO(useBindless, useTerrainResolve, false);
+            terrainOnlyPSO = variableRateGI.ResolvePSO(useBindless, true, true);
             cmdList->SetPipelineState(selectedPSO);
         }
 
@@ -4055,6 +4123,16 @@ public:
                     cmdList->Dispatch(groupsX, groupsY, 1);
                 }
             }
+        }
+
+        // Finish both disjoint halves before any future spatial reservoir read.
+        // No barrier is inserted between generic and terrain shading.
+        if (!ScopeSurfaceBound() && emissiveCGNSMode != 0u) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = emissiveReservoirBuffer.Get();
+            cmdList->ResourceBarrier(1, &barrier);
+            emissiveCGNSHistoryValid = true;
         }
 
         // Return all classifier outputs to UNORDERED_ACCESS for next frame.
@@ -4869,7 +4947,7 @@ public:
         VBPostConstants constants = {};
         constants.outputWidth = displayWidth;
         constants.outputHeight = displayHeight;
-        constants.exposure = validationMode ? 1.0f : exposure;
+        constants.exposure = validationMode ? 1.0f : exposure * g_exposureScale;
         constants.bloomStrength = validationMode ? 0.0f : bloomStrength;
         constants.vignetteStrength = validationMode ? 0.0f : vignetteStrength;
         constants.grainStrength = validationMode ? 0.0f : grainStrength;
@@ -5110,9 +5188,15 @@ public:
         displayWidth = targetDisplayWidth;
         displayHeight = targetDisplayHeight;
 
+        terrainScreenDisplacement.ResetResources();
+        terrainScreenDisplacementPrepared = false;
+        terrainScreenDisplacementActiveThisFrame = false;
         visBufferRT.Reset();
         surfaceHistoryValid = false;
         radianceCascades.ResetResources();
+        variableRateGI.ResetResources();
+        variableRateGIActive = false;
+        emissiveCGNSHistoryValid = false;
         outputTexture.Reset();
         dlssUpscaledTexture.Reset();
         presentTexture.Reset();
@@ -6415,8 +6499,10 @@ private:
             UINT  lumenReSTIR;
             UINT  lumenReSTIRDebug;
             UINT  lumenReSTIRSpatialTaps;
+            UINT  emissiveCGNS;
+            UINT  emissiveCGNSPadding[3];
         } constants;
-        static_assert(sizeof(EnhancedConstants) == 128,
+        static_assert(sizeof(EnhancedConstants) == 144,
                       "EnhancedVisualsBuffer C++ mirror is out of sync");
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
@@ -6487,6 +6573,9 @@ private:
                 ? static_cast<UINT>(std::clamp(atoi(text), 0, 8)) : 1u;
         }();
         constants.lumenReSTIRSpatialTaps = kReSTIRTaps;
+        constants.emissiveCGNS = ScopeSurfaceBound() ? 0u : emissiveCGNSMode;
+        std::fill(std::begin(constants.emissiveCGNSPadding),
+                  std::end(constants.emissiveCGNSPadding), 0u);
         // DLSS mip bias (DLSS Programming Guide 3.5): while DLSS / RR is the
         // temporal resolve, textures are sampled at display detail with
         // bias = log2(render / display) - 1 (-1 DLAA, -2 at 50%).
@@ -7126,6 +7215,8 @@ private:
                       "cascade tables must start where the enhanced table ends");
         if (!bindless)
             radianceCascades.Configure(ranges, _countof(ranges), samplers);
+        if (!bindless)
+            variableRateGI.Configure(ranges, _countof(ranges), samplers);
 
         D3D12_ROOT_PARAMETER params[8] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -8213,6 +8304,24 @@ public:
     }
     const char* LumenRadianceCacheStatus() const {
         return giRadianceCache.Status();
+    }
+
+    bool VariableRateGIActive() const { return variableRateGIActive; }
+    const char* VariableRateGIStatus() const { return variableRateGI.Status(); }
+    UINT VariableRateGIRayBudget() const { return variableRateGI.LastRayBudget(); }
+    UINT VariableRateGIMeasuredRays() const { return variableRateGI.MeasuredRays(); }
+    UINT VariableRateGIMeasuredBudget() const { return variableRateGI.MeasuredBudget(); }
+    bool VariableRateGIStatisticsValid() const { return variableRateGI.StatisticsValid(); }
+
+    void SetVariableRateGI(bool on, float budget) {
+        if (on != variableRateGIRequested) InvalidateTemporalHistory();
+        variableRateGIRequested = on;
+        variableRateGIBudget = std::clamp(budget, 0.125f, 1.0f);
+    }
+
+    void SetEmissiveCGNS(bool on) {
+        if (on != emissiveCGNSRequested) InvalidateTemporalHistory();
+        emissiveCGNSRequested = on;
     }
 
     void SetLumenReSTIR(bool on) {

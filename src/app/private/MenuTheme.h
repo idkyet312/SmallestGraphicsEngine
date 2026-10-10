@@ -628,6 +628,17 @@ static void AudioTab() {
 }
 
 static void VideoTab() {
+    // First on this tab because this is where it is needed: tuning a video
+    // setting from the pause menu is blind behind the full-screen scrim.
+    if (ToggleRow("Clear Settings Backdrop",
+                  "Removes the dark full-screen tint behind this page. Only "
+                  "the setting list keeps a plate, so changes show on the "
+                  "live frame to its right.",
+                  &g_settings.clearSettingsBackdrop)) {
+        // Read directly by RenderSettingsMenu each frame.
+        SaveGameSettings(g_settings);
+    }
+
     if (ToggleRow("Fullscreen (Borderless)",
                   "On: borderless fullscreen. Off: windowed.",
                   &g_settings.fullscreen)) {
@@ -654,6 +665,25 @@ static void VideoTab() {
         SaveGameSettings(g_settings);
     }
     ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(!DLSS::FrameGenerationAvailable());
+    if (ToggleRow("DLSS Frame Generation (2x)",
+                  "Requires DLSS SR/DLAA or upscaling RR; automatically enables Reflex.",
+                  &g_settings.dlssFrameGeneration)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Frame Generation: %s", DLSS::FrameGenerationStatus());
+    ImGui::BeginDisabled(!DLSS::ReflexAvailable());
+    if (ImGui::Combo("NVIDIA Reflex", &g_settings.nvidiaReflex,
+                     "Off\0On\0On + Boost\0")) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Reflex: %s", DLSS::ReflexStatus());
 
     ImGui::BeginDisabled(!dlssAvailable || !g_settings.dlssEnabled);
     if (ToggleRow("DLSS Foliage Motion Fix",
@@ -715,7 +745,37 @@ static void VideoTab() {
     if (ToggleRow("Experimental Radiance Cascades GI",
                   "Replaces Lumen's per-pixel bounce rays with shared ray-traced radiance cascades. Surface edges the probes cannot cover still trace Lumen rays. First use compiles shaders in the background.",
                   &g_settings.radianceCascadesGI)) {
+        if (g_settings.radianceCascadesGI) g_settings.lumenVariableRateGI = false;
         g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::BeginDisabled(!g_settings.lumenGI);
+    if (ToggleRow("Experimental Variable Rate Lumen GI",
+                  "Allocates a fixed bounce-ray budget to changing lighting and newly visible surfaces. Stable pixels reuse validated history. First use compiles shaders in the background.",
+                  &g_settings.lumenVariableRateGI)) {
+        if (g_settings.lumenVariableRateGI) {
+            g_settings.radianceCascadesGI = false;
+            g_settings.lumenGIHalfResolution = false;
+        }
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    if (g_settings.lumenVariableRateGI) {
+        const SliderResult budget = SliderRow("Lumen Ray Budget",
+            "Primary diffuse rays per screen pixel, including lighting-change probes. Hit shading and shadow-ray cost still varies with the scene.",
+            "##lumenraybudget", &g_settings.lumenVariableRateBudget, 0.125f, 1.0f, "%.3f",
+            ImGuiSliderFlags_AlwaysClamp, "Default %.2f", 0.5f);
+        if (budget.released) { g_settings.Clamp(); ApplyGameSettings(); SaveGameSettings(g_settings); }
+        ImGui::TextDisabled("Variable rate GI: %s", visBuffer.VariableRateGIStatus());
+        if (visBuffer.VariableRateGIStatisticsValid())
+            ImGui::TextDisabled("Primary rays: %u / %u (delayed)",
+                visBuffer.VariableRateGIMeasuredRays(), visBuffer.VariableRateGIMeasuredBudget());
+    }
+    ImGui::EndDisabled();
+    if (ToggleRow("Experimental Emissive ReSTIR Compatibility",
+                  "Selects compatible spatial neighbours for emissive triangle lighting using primary positions and normals, then tests the selected light's visibility.",
+                  &g_settings.emissiveReSTIRCompatibility)) {
         ApplyGameSettings();
         SaveGameSettings(g_settings);
     }
@@ -802,6 +862,15 @@ static void VideoTab() {
     }
     ImGui::TextDisabled("Lights fog with the level's sun and sky instead of a "
                         "flat grey. Level default: only levels that enable it.");
+
+    if (ToggleRow("Max Fidelity Lighting",
+                  "Max fidelity's haze, GI, RT reflections and cascade shadows at "
+                  "every time of day. The time only changes the sun and emission.",
+                  &g_settings.maxFidelityLighting)) {
+        // Takes effect now, not at the next deploy.
+        ApplyTimeOfDay(g_appliedTimeOfDay);
+        SaveGameSettings(g_settings);
+    }
 
     const SliderResult fov = SliderRow(
         "Field of View", "Hip-fire vertical field of view.", "##fov",
@@ -897,10 +966,14 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
 
     // Near-opaque: this page is the whole screen's subject. The pause copy
     // leaves a trace of the frame behind so it still reads as "in a mission".
-    ImGui::GetBackgroundDrawList()->AddRectFilledMultiColor(
-        ImVec2(0, 0), display,
-        IM_COL32(6, 10, 9, 236), IM_COL32(12, 20, 18, 236),
-        IM_COL32(4, 7, 6, 248), IM_COL32(3, 5, 5, 248));
+    // Clear mode skips it; plates under the header, list and footer are drawn
+    // once the layout below is known.
+    const bool clearBackdrop = g_settings.clearSettingsBackdrop;
+    if (!clearBackdrop)
+        ImGui::GetBackgroundDrawList()->AddRectFilledMultiColor(
+            ImVec2(0, 0), display,
+            IM_COL32(6, 10, 9, 236), IM_COL32(12, 20, 18, 236),
+            IM_COL32(4, 7, 6, 248), IM_COL32(3, 5, 5, 248));
 
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(display, ImGuiCond_Always);
@@ -1011,6 +1084,19 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
     const float listWidth = contentWidth * 0.62f;
     const float panelWidth = contentWidth - listWidth - gap;
 
+    if (clearBackdrop) {
+        // Only what text sits on gets a plate; the frame right of the list
+        // stays untinted so a change reads against the real image.
+        ImDrawList* plate = ImGui::GetBackgroundDrawList();
+        const ImU32 plateColor = IM_COL32(6, 10, 9, 200);
+        plate->AddRectFilled(ImVec2(0, 0), ImVec2(display.x, bodyTop - 12.0f),
+                             plateColor);
+        plate->AddRectFilled(ImVec2(side - 16.0f, bodyTop - 12.0f),
+                             ImVec2(side + listWidth + 16.0f, footerTop),
+                             plateColor);
+        plate->AddRectFilled(ImVec2(0, footerTop), display, plateColor);
+    }
+
     ImGui::SetCursorScreenPos(ImVec2(side, bodyTop));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
@@ -1043,7 +1129,9 @@ static void RenderSettingsMenu(bool& openFlag = g_showSettingsMenu) {
     // can stay one line tall.
     if (panelWidth > 160.0f) {
         ImGui::SetCursorScreenPos(ImVec2(side + listWidth + gap, bodyTop));
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.035f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, clearBackdrop
+            ? ImVec4(0.024f, 0.039f, 0.035f, 0.78f)
+            : ImVec4(1.0f, 1.0f, 1.0f, 0.035f));
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.10f));
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 22.0f));

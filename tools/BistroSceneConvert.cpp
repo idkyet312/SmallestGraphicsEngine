@@ -122,7 +122,12 @@ int main(int argc, char** argv) {
             auto* mesh=node->mesh; if(!mesh) continue;
             std::map<uint32_t,std::vector<Vertex>> groups;
             ufbx_matrix normalMatrix=ufbx_matrix_for_normals(&node->geometry_to_world);
-            bool mirror=ufbx_matrix_determinant(&node->geometry_to_world)<0;
+            // The engine is left-handed (XMMatrixLookAtLH) and reads glTF positions
+            // as-is, so the right-handed scene is converted here by negating Z.
+            // That is itself a mirror: winding flips unless the node already
+            // mirrors. Without it the whole street rendered back to front
+            // (menu boards read "UNEM", the scooter faced the wrong way).
+            bool mirror=ufbx_matrix_determinant(&node->geometry_to_world)>=0;
             std::vector<uint32_t> faceIndices(mesh->max_face_triangles*3);
             for(size_t f=0;f<mesh->faces.count;++f) {
                 uint32_t slot=mesh->face_material.count?mesh->face_material.data[f]:0;
@@ -136,8 +141,8 @@ int main(int argc, char** argv) {
                         auto p=ufbx_transform_position(&node->geometry_to_world,ufbx_get_vertex_vec3(&mesh->vertex_position,ix));
                         auto n=ufbx_vec3_normalize(ufbx_transform_direction(&normalMatrix,ufbx_get_vertex_vec3(&mesh->vertex_normal,ix)));
                         ufbx_vec2 uv=mesh->vertex_uv.exists?ufbx_get_vertex_vec2(&mesh->vertex_uv,ix):ufbx_vec2{};
-                        v.p[0]=float(p.x);v.p[1]=float(p.y);v.p[2]=float(p.z);
-                        v.n[0]=float(n.x);v.n[1]=float(n.y);v.n[2]=float(n.z);
+                        v.p[0]=float(p.x);v.p[1]=float(p.y);v.p[2]=-float(p.z);
+                        v.n[0]=float(n.x);v.n[1]=float(n.y);v.n[2]=-float(n.z);
                         v.uv[0]=float(uv.x);v.uv[1]=float(1.0-uv.y);
                         out.push_back(v);
                     }
@@ -181,6 +186,24 @@ int main(int argc, char** argv) {
         manifest["vertices"]=verticesTotal;manifest["indices"]=indicesTotal;manifest["triangles"]=indicesTotal/3;
         manifest["boundsMin"]=low;manifest["boundsMax"]=high;
         manifest["sourceUnitMeters"]=scene->settings.unit_meters;
+        // Authored cameras (Falcor opens the scene on the first one), in the
+        // same left-handed space as the geometry.
+        manifest["cameras"]=json::array();
+        for(auto* camera:scene->cameras) {
+            if(!camera->instances.count) continue;
+            const ufbx_matrix& m=camera->instances.data[0]->node_to_world;
+            static const double axis[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+            auto world=[&](ufbx_coordinate_axis a) {
+                ufbx_vec3 d={axis[a][0],axis[a][1],axis[a][2]};
+                return ufbx_vec3_normalize(ufbx_transform_direction(&m,d));
+            };
+            ufbx_vec3 f=world(camera->projection_axes.front),u=world(camera->projection_axes.up);
+            manifest["cameras"].push_back({{"name",Text(camera->name)},
+                {"position",{m.cols[3].x,m.cols[3].y,-m.cols[3].z}},
+                {"forward",{f.x,f.y,-f.z}},{"up",{u.x,u.y,-u.z}},
+                {"fovYDegrees",camera->field_of_view_deg.y},
+                {"aspect",camera->aspect_ratio}});
+        }
         std::ofstream(output/"BistroExterior.gltf")<<doc.dump(2)<<'\n';
         std::ofstream(output/"source-materials.json")<<manifest.dump(2)<<'\n';
         std::cout<<verticesTotal<<" vertices, "<<indicesTotal/3<<" triangles, "<<scene->materials.count<<" materials\n";

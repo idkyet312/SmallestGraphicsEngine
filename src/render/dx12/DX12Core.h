@@ -18,6 +18,7 @@
 #include <string>
 #include <stdexcept>
 #include "DLSSDX12.h"
+#include "FrameGenerationUIDX12.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -142,6 +143,7 @@ struct DX12Context {
 
 // Global DX12 context
 inline DX12Context g_dx12;
+inline FrameGenerationUIDX12 g_frameGenerationUI;
 
 // Helper function to check HRESULT
 inline void ThrowIfFailed(HRESULT hr, const char* message = "DX12 Error") {
@@ -346,6 +348,7 @@ inline void MoveToNextFrame() {
 
 // Initialize DX12
 inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
+    DLSS::Startup();
     g_dx12.screenWidth = width;
     g_dx12.screenHeight = height;
     g_dx12.displayWidth = width;
@@ -451,6 +454,7 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     
     // Create device
     ThrowIfFailed(D3D12CreateDevice(g_dx12.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dx12.device)));
+    DLSS::SetDevice(g_dx12.device.Get(), g_dx12.adapter.Get());
 
     // Disable break-on-error so an offscreen automated run doesn't halt in a
     // debugger trap. Register a callback (Win10 1903+) that writes validation
@@ -479,12 +483,12 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.commandQueue)));
+    ThrowIfFailed(DLSS::CreateCommandQueue(g_dx12.device.Get(), &queueDesc, IID_PPV_ARGS(&g_dx12.commandQueue)));
 
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.computeQueue)));
+    ThrowIfFailed(DLSS::CreateCommandQueue(g_dx12.device.Get(), &queueDesc, IID_PPV_ARGS(&g_dx12.computeQueue)));
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-    ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.copyQueue)));
+    ThrowIfFailed(DLSS::CreateCommandQueue(g_dx12.device.Get(), &queueDesc, IID_PPV_ARGS(&g_dx12.copyQueue)));
     
     // Create swap chain
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
@@ -501,8 +505,6 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     // only the factory that creates the swapchain is upgraded to an SL proxy
     // so Present reaches Streamline's per-frame bookkeeping. Without the SL
     // DLLs this is the native factory and nothing changes.
-    DLSS::Startup();
-    DLSS::SetDevice(g_dx12.device.Get(), g_dx12.adapter.Get());
     ComPtr<IDXGIFactory2> swapChainFactory;
     swapChainFactory.Attach(DLSS::SwapChainFactory(g_dx12.factory.Get()));
 
@@ -676,6 +678,7 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
 inline void ResizeDX12(UINT width, UINT height) {
     if (!g_dx12.initialized || width == 0 || height == 0) return;
     
+    DLSS::SuspendFrameGeneration();
     // Wait for GPU to finish
     WaitForGPU();
     DLSS::ReleaseResources();
@@ -744,6 +747,59 @@ inline void ResizeDX12(UINT width, UINT height) {
     g_dx12.viewport.Height = (float)height;
     g_dx12.scissorRect.right = (LONG)width;
     g_dx12.scissorRect.bottom = (LONG)height;
+    if (DLSS::FrameGenerationLoaded()) {
+        g_frameGenerationUI.Release();
+        if (!g_frameGenerationUI.Init(g_dx12.device.Get(), width, height, FRAME_COUNT))
+            std::cerr << "DLSS Frame Generation UI allocation failed\n";
+    }
+}
+
+// A user toggle is a rare GPU-idle event. Unloading DLSS-G and recreating the
+// swap chain removes its off-screen presentation copy when interpolation is off.
+inline void UpdateFrameGenerationSwapChain(HWND hwnd) {
+    const auto& settings = DLSS::GetSettings();
+    const bool requested = settings.frameGeneration && settings.enabled &&
+        DLSS::Available() && DLSS::FrameGenerationAvailable();
+    if (requested == DLSS::FrameGenerationLoaded()) return;
+    DLSS::SuspendFrameGeneration();
+    WaitForDirectQueueIdleIsolated();
+    WaitForFenceCPU(g_dx12.computeFence.Get(), g_dx12.computeFenceValue);
+    WaitForFenceCPU(g_dx12.copyFence.Get(), g_dx12.copyFenceValue);
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    ThrowIfFailed(g_dx12.swapChain->GetDesc1(&desc));
+    const UINT64 completed = g_dx12.fence->GetCompletedValue();
+    UINT64 nextFence = completed + 1;
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+        nextFence = (std::max)(nextFence, g_dx12.fenceValues[i]);
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        g_dx12.renderTargets[i].Reset();
+        g_dx12.fenceValues[i] = nextFence;
+    }
+    g_dx12.swapChain.Reset();
+    g_frameGenerationUI.Release();
+    if (!DLSS::LoadFrameGeneration(requested)) {
+        DLSS::GetSettings().frameGeneration = false;
+        DLSS::LoadFrameGeneration(false);
+    }
+    ComPtr<IDXGIFactory2> factory;
+    factory.Attach(DLSS::SwapChainFactory(g_dx12.factory.Get()));
+    ComPtr<IDXGISwapChain1> chain;
+    ThrowIfFailed(factory->CreateSwapChainForHwnd(g_dx12.commandQueue.Get(), hwnd,
+        &desc, nullptr, nullptr, &chain));
+    ThrowIfFailed(chain.As(&g_dx12.swapChain));
+    g_dx12.frameIndex = g_dx12.swapChain->GetCurrentBackBufferIndex();
+    auto rtv = g_dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        ThrowIfFailed(g_dx12.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_dx12.renderTargets[i])));
+        g_dx12.device->CreateRenderTargetView(g_dx12.renderTargets[i].Get(), nullptr, rtv);
+        rtv.ptr += g_dx12.rtvDescriptorSize;
+    }
+    if (DLSS::FrameGenerationLoaded() &&
+        !g_frameGenerationUI.Init(g_dx12.device.Get(), g_dx12.displayWidth,
+                                 g_dx12.displayHeight, FRAME_COUNT)) {
+        DLSS::GetSettings().frameGeneration = false;
+        std::cerr << "DLSS Frame Generation UI allocation failed\n";
+    }
 }
 
 // The swapchain stays at display size while the scene depth and viewport follow
@@ -808,6 +864,7 @@ inline void CleanupDX12() {
     }
     // Streamline must shut down before the device and swapchain it hooks.
     DLSS::Shutdown();
+    g_frameGenerationUI.Release();
 
     if (g_dx12.fenceEvent) {
         CloseHandle(g_dx12.fenceEvent);
@@ -1049,6 +1106,7 @@ inline void EndFrame() {
     // Execute command list
     ID3D12CommandList* commandLists[] = { g_dx12.commandList.Get() };
     g_dx12.commandQueue->ExecuteCommandLists(1, commandLists);
+    DLSS::MarkLatency(DLSS::LatencyMarker::RenderSubmitEnd);
 
     if (capture) {
         WaitForGPU();
@@ -1080,7 +1138,8 @@ inline void EndFrame() {
 
     // Present. ALLOW_TEARING is only legal on an unsynchronised present, so it
     // has to come off the moment vsync is on -- passing both fails Present.
-    const UINT syncInterval = g_dx12.syncInterval;
+    const UINT syncInterval = DLSS::FrameGenerationLoaded()
+        ? (std::min)(1u, g_dx12.syncInterval) : g_dx12.syncInterval;
     const UINT presentFlags =
         (syncInterval == 0 && g_dx12.tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     {
@@ -1089,7 +1148,10 @@ inline void EndFrame() {
         // the wait counter too -- otherwise every vsynced frame reports a CPU
         // cost equal to the refresh period no matter how little work it did.
         DX12BlockingWaitTimer presentTimer;
+        DLSS::MarkLatency(DLSS::LatencyMarker::PresentStart);
         ThrowIfFailed(g_dx12.swapChain->Present(syncInterval, presentFlags));
+        DLSS::MarkLatency(DLSS::LatencyMarker::PresentEnd);
+        DLSS::FinishAppFrame();
     }
 
     MoveToNextFrame();

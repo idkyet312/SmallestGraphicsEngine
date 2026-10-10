@@ -1113,6 +1113,21 @@ bool                        g_customLevelMode = false;
 // Levels can only turn VSM off from here, never on, so the env opt-out survives
 // a level change and a level's own choice cannot leak into the next one.
 bool                        g_vsmRunDefault = true;
+// The preset ApplyTimeOfDay last applied, and the level's Max fidelity sun
+// (LevelMaxFidelitySun) that preset substitutes for its own.
+TimeOfDay                   g_appliedTimeOfDay = TimeOfDay::Afternoon;
+LevelMaxFidelitySun         g_levelMaxFidelitySun;
+// The level's editor-tuned lighting per clock time (LevelTimeOfDayLighting),
+// and the GI/emission/bloom an applied override displaced, handed back when a
+// time without one is applied.
+LevelTimeOfDayLighting      g_levelTimeOfDayLighting[kLevelTimeOfDayCount];
+struct TimeOfDayLightingBaseline {
+    bool saved = false;
+    float giIntensity = 0.0f;
+    float emission = 1.0f;
+    float bloom = 0.0f;
+};
+TimeOfDayLightingBaseline   g_timeOfDayLightingBaseline;
 bool                        g_terrainInVisibilityBuffer = false;
 bool                        g_destructionInVisibilityBuffer = false;
 // Set when a runtime crater or gouge changes the terrain height field. The

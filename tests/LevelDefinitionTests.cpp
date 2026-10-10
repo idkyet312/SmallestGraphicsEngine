@@ -106,6 +106,18 @@ int main() {
     level.defaultInsertionPoint = kDeploymentZoneCount;
     level.patrolBoatEnabled = false;
     level.sceneLitFog = { true, 3.25f, 0.2f, 0.35f };
+    {
+        LevelTimeOfDayLighting& dusk = level.timeOfDayLighting[2];
+        dusk.enabled = true;
+        dusk.sunDirection[0] = 0.6f; dusk.sunDirection[1] = 0.1f; dusk.sunDirection[2] = -0.79f;
+        dusk.sunColor[0] = 1.0f; dusk.sunColor[1] = 0.5f; dusk.sunColor[2] = 0.25f;
+        dusk.sunIntensity = 6.5f;
+        dusk.environmentGain = 0.3f;
+        dusk.emission = 2.0f;
+        dusk.bloom = 0.25f;
+        dusk.giIntensity = 1.4f;
+        dusk.fogDensity = 0.0051f;
+    }
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -263,6 +275,16 @@ int main() {
     CHECK(loaded.level.sceneLitFog.baseHeight == 3.25f);
     CHECK(loaded.level.sceneLitFog.heightFalloff == 0.2f);
     CHECK(loaded.level.sceneLitFog.anisotropy == 0.35f);
+    // Only the tuned time saves; the others stay on their preset.
+    CHECK(loaded.level.timeOfDayLighting[2] == level.timeOfDayLighting[2]);
+    CHECK(!loaded.level.timeOfDayLighting[0].enabled);
+    CHECK(!loaded.level.timeOfDayLighting[1].enabled);
+    CHECK(!loaded.level.timeOfDayLighting[3].enabled);
+    {
+        LevelDefinition bad = level;
+        bad.timeOfDayLighting[2].fogDensity = -1.0f;
+        CHECK(!ValidateLevel(bad).errors.empty());
+    }
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     CHECK(ParseLevelInsertionMode("boat", insertion));
     CHECK(insertion == LevelInsertionMode::Boat);

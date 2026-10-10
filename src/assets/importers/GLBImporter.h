@@ -54,14 +54,21 @@ public:
 
     // Loads an equirectangular EXR as a linear R32G32B32A32_FLOAT texture
     // (single mip). Used for the HDRI sky dome so it keeps full dynamic range.
-    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadEXRTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+    //
+    // removeSunFromMips: build mips 1+ from a copy with the sun disc clamped
+    // (see ClampHDRISun). Mip 0 keeps the disc for the visible sky; the coarse
+    // mips feed the IBL prefilter and GI ray misses, where an HDRI sun would
+    // be a second, unshadowed copy of the analytic sun.
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadEXRTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps, bool removeSunFromMips = false);
 
     // Loads an equirectangular EXR and projects its radiance onto 9 (L2)
     // spherical harmonic coefficients for cheap diffuse ambient/IBL lighting.
     // Returns all-zero coefficients (caller should fall back to a flat
     // ambient term) if the file can't be loaded.
+    // removeSun clamps the sun disc first, for the same reason as above.
     static std::array<DirectX::XMFLOAT3, 9> ComputeSkyIrradianceSH(
-        const std::string& filepath, float environmentRotationRadians = 0.0f);
+        const std::string& filepath, float environmentRotationRadians = 0.0f,
+        bool removeSun = false);
 
     // Finds the compact brightest region in an equirectangular HDRI and
     // returns its world-space direction and radiance chromaticity. This keeps

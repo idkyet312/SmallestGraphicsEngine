@@ -106,6 +106,35 @@ int main() {
               GameSettings::kDefaultSeeThroughStrength);
     }
 
+    // Experimental ray budgets stay opt-in for old files and remain bounded
+    // even when a hand-edited INI contains NaN, infinity, or a negative number.
+    {
+        WriteSettingsFile("[Video]\nLumenGI=1\n");
+        GameSettings defaults;
+        CHECK(LoadGameSettings(defaults));
+        CHECK(!defaults.lumenVariableRateGI);
+        CHECK(!defaults.emissiveReSTIRCompatibility);
+        CHECK(defaults.lumenVariableRateBudget == 0.5f);
+        GameSettings written;
+        written.lumenVariableRateGI = true;
+        written.emissiveReSTIRCompatibility = true;
+        written.lumenVariableRateBudget = 0.25f;
+        CHECK(SaveGameSettings(written));
+        GameSettings read;
+        CHECK(LoadGameSettings(read));
+        CHECK(read.lumenVariableRateGI && read.emissiveReSTIRCompatibility);
+        CHECK(read.lumenVariableRateBudget == 0.25f);
+        for (const char* invalid : {"nan", "inf", "-1", "0", "5"}) {
+            WriteSettingsFile(std::string("LumenVariableRateBudget=") + invalid + "\n");
+            CHECK(LoadGameSettings(read));
+            CHECK(std::isfinite(read.lumenVariableRateBudget));
+            CHECK(read.lumenVariableRateBudget >= 0.125f && read.lumenVariableRateBudget <= 1.0f);
+        }
+        read.ResetToDefaults();
+        CHECK(!read.lumenVariableRateGI && !read.emissiveReSTIRCompatibility);
+        CHECK(read.lumenVariableRateBudget == 0.5f);
+    }
+
     // VSync round-trip and default.
     {
         GameSettings written;
@@ -138,6 +167,8 @@ int main() {
     {
         GameSettings written;
         written.dlssEnabled = true;
+        written.dlssFrameGeneration = true;
+        written.nvidiaReflex = 2;
         written.rayTracingQuality = GameSettings::kRayTracingUltra;
         written.dlssPreset = 2;
         written.extensionMotionVectors = true;
@@ -147,6 +178,8 @@ int main() {
         GameSettings read;
         CHECK(LoadGameSettings(read));
         CHECK(read.dlssEnabled);
+        CHECK(read.dlssFrameGeneration);
+        CHECK(read.nvidiaReflex == 2);
         CHECK(read.rayTracingQuality == GameSettings::kRayTracingUltra);
         CHECK(read.dlssPreset == 2);
         CHECK(read.extensionMotionVectors);
@@ -170,6 +203,28 @@ int main() {
 
         GameSettings defaults;
         CHECK(!defaults.dlssEnabled);
+        CHECK(!defaults.dlssFrameGeneration);
+        CHECK(defaults.nvidiaReflex == 0);
+        WriteSettingsFile("NVIDIAReflex=-2\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.nvidiaReflex == 0);
+        WriteSettingsFile("NVIDIAReflex=5\n");
+        CHECK(LoadGameSettings(read));
+        CHECK(read.nvidiaReflex == 2);
+        read.dlssFrameGeneration = true;
+        read.nvidiaReflex = 2;
+        read.ResetToDefaults();
+        CHECK(!read.dlssFrameGeneration);
+        CHECK(read.nvidiaReflex == 0);
+
+        CHECK(!defaults.maxFidelityLighting);
+        GameSettings lighting;
+        lighting.maxFidelityLighting = true;
+        CHECK(SaveGameSettings(lighting));
+        CHECK(LoadGameSettings(read));
+        CHECK(read.maxFidelityLighting);
+        read.ResetToDefaults();
+        CHECK(!read.maxFidelityLighting);
         CHECK(defaults.rayTracingQuality == GameSettings::kRayTracingOff);
         CHECK(defaults.dlssPreset == GameSettings::kDefaultDLSSPreset);
         CHECK(defaults.extensionMotionVectors ==
@@ -261,17 +316,19 @@ int main() {
               GameSettings::kDefaultLumenGIHalfResolution);
     }
 
-    // RR upscaling: off in older files, survives a round trip, resets.
+    // RR upscaling uses the current default in older files, persists and resets.
     {
         WriteSettingsFile("RayTracingQuality=1\n");
         GameSettings read;
         CHECK(LoadGameSettings(read));
-        CHECK(!read.rayReconstructionUpscale);
-        read.rayReconstructionUpscale = true;
+        CHECK(read.rayReconstructionUpscale ==
+              GameSettings::kDefaultRayReconstructionUpscale);
+        read.rayReconstructionUpscale = !GameSettings::kDefaultRayReconstructionUpscale;
         CHECK(SaveGameSettings(read));
         GameSettings restored;
         CHECK(LoadGameSettings(restored));
-        CHECK(restored.rayReconstructionUpscale);
+        CHECK(restored.rayReconstructionUpscale ==
+              !GameSettings::kDefaultRayReconstructionUpscale);
         restored.ResetToDefaults();
         CHECK(restored.rayReconstructionUpscale ==
               GameSettings::kDefaultRayReconstructionUpscale);

@@ -1352,7 +1352,7 @@ static void CommitDeployment(HWND hwnd, bool replayPaidPlan) {
             "Deploy conditions: %s, %s, fog %.6f, scatter seed %u, "
             "%u bandits, layout %016llx, replay %d",
             TimeOfDayName(g_selectedTimeOfDay), WeatherStateName(scene.weatherState),
-            VolumetricFogFor(g_selectedTimeOfDay).density, g_scatterEnemiesSeed,
+            LiveVolumetricFog(g_selectedTimeOfDay).density, g_scatterEnemiesSeed,
             live, static_cast<unsigned long long>(layout), replayPaidPlan ? 1 : 0);
         SGE_LOG("LogGameplay", EngineLog::Level::Display, line);
     }
@@ -4001,7 +4001,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                       TimeOfDayName(g_selectedTimeOfDay));
         ImGui::SeparatorText(fogHeader);
 
-        VolumetricFogSettings& fog = VolumetricFogFor(g_selectedTimeOfDay);
+        VolumetricFogSettings& fog = LiveVolumetricFog(g_selectedTimeOfDay);
         bool fogChanged =
             ImGui::Checkbox("Enable Volumetric Fog##TodFog", &fog.enabled);
         if (fog.enabled) {

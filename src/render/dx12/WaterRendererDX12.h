@@ -1208,9 +1208,12 @@ private:
         XMStoreFloat3(&lightDirection, light);
         // Water samples the raw HDRI rather than the exposed sky render. Match
         // the sky's below-horizon fade here so its reflection does not remain
-        // photographic-white after the visible sky has become night.
+        // photographic-white after the visible sky has become night. Keyed on
+        // the sky's sun: at night lightPos is the moon, which is up.
+        const XMVECTOR skySun = XMVector3Normalize(
+            XMLoadFloat3(&scene.SkySunDirection()));
         const float nightBlend = (std::max)(0.0f, (std::min)(1.0f,
-            (-lightDirection.y - 0.10f) / 0.18f));
+            (-XMVectorGetY(skySun) - 0.10f) / 0.18f));
         const float reflectionIntensity =
             1.0f + (0.006f - 1.0f) * nightBlend;
         const float waterIntensity =

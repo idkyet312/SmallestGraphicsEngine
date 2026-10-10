@@ -510,6 +510,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
     case WM_SIZE:
+        DLSS::SuspendFrameGeneration();
         if (g_dx12.device && g_dx12.initialized && wParam != SIZE_MINIMIZED) {
             unsigned w = LOWORD(lParam), h = HIWORD(lParam);
             if (w > 0 && h > 0 && (w != SCR_WIDTH || h != SCR_HEIGHT)) {
@@ -759,6 +760,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SGE_LOG("LogRender", EngineLog::Level::Display,
                 std::string("UI hidden for screenshot: ") +
                 (g_deploymentDebugHideUI ? "ON (F9 to restore)" : "OFF"));
+        }
+        // F3 debug UI while editing. Only the flag: the editor owns the cursor
+        // and camera, so none of the gameplay branch's capture juggling.
+        else if (wParam == VK_F3 && !(lParam & 0x40000000) && IsEditorEditing()) {
+            showUI = !showUI;
         }
         else if (IsEditorEditing()) {
             const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
