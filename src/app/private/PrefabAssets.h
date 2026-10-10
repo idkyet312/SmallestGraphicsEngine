@@ -134,9 +134,15 @@ static void ApplyPrefabMaterialOverrides(const PrefabAsset& prefab,
                     auto material = primitive.material
                         ? std::make_shared<SceneMaterial>(*primitive.material)
                         : std::make_shared<SceneMaterial>();
-                    material->baseColorTexture = GLBImporter::LoadTextureFromFile(
-                        overrideValue.texture.string(), g_dx12.device,
-                        g_dx12.commandList, material->uploadHeaps);
+                    if (!overrideValue.texture.empty())
+                        material->baseColorTexture = GLBImporter::LoadTextureFromFile(
+                            overrideValue.texture.string(), g_dx12.device,
+                            g_dx12.commandList, material->uploadHeaps);
+                    if (overrideValue.hasBaseColor) {
+                        material->baseColorFactor.x *= overrideValue.baseColor[0];
+                        material->baseColorFactor.y *= overrideValue.baseColor[1];
+                        material->baseColorFactor.z *= overrideValue.baseColor[2];
+                    }
                     // The copy inherits the source material's cached bindings,
                     // which point at the *old* albedo. Drop all of them.
                     material->InvalidateTextureBindings();
@@ -188,7 +194,22 @@ static void MarkBentNormalCutouts(const std::shared_ptr<SceneNode>& root,
         for (const auto& child : node->children) self(self, child);
     };
     walk(walk, root);
+    // Double-sided MASK alone also matches chain-link and grating (MI_Fence,
+    // MI_Metal_*, MI_MetalRope across the cooked set), which must not glow
+    // green when back-lit. Every cooked leaf material names itself as such.
+    const auto namesLeaf = [](std::string name) {
+        for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (const char* key : { "foliage", "leaf", "leaves", "hedge", "flower" })
+            if (name.find(key) != std::string::npos) return true;
+        return false;
+    };
+    const bool thinLeavesOff = std::getenv("SGE_NO_THIN_LEAF") != nullptr;
     for (auto& [material, tally] : tallies) {
+        material->thinLeaf = !thinLeavesOff && material->doubleSided &&
+            namesLeaf(material->name);
+        if (material->thinLeaf)
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                prefabId + ": " + material->name + " shades as thin leaf");
         if (tally.total == 0) continue;
         const float opposed = static_cast<float>(tally.opposed) / tally.total;
         material->bentNormals = opposed > 0.2f;
@@ -297,6 +318,25 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
             for (const auto& child : node->children) self(self, child);
         };
         tuneMaterials(tuneMaterials, model);
+    }
+    if (prefab.emissiveScale != 1.0f) {
+        // Materials are shared between primitives; scale each one once.
+        std::unordered_set<SceneMaterial*> scaled;
+        const auto scaleEmission = [&](const auto& self,
+                                       const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives) {
+                    SceneMaterial* material = primitive.material.get();
+                    if (!material || !scaled.insert(material).second) continue;
+                    material->emissiveFactor.x *= prefab.emissiveScale;
+                    material->emissiveFactor.y *= prefab.emissiveScale;
+                    material->emissiveFactor.z *= prefab.emissiveScale;
+                }
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        scaleEmission(scaleEmission, model);
     }
     model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
     model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);

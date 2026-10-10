@@ -138,7 +138,7 @@ struct alignas(256) ObjectBufferDX12 {
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
-    float alphaCut = 0.0f;  // -1: alpha blend, 1: foliage, 2: luminance, 3: hard cutout
+    float alphaCut = 0.0f;  // -1: alpha blend, 1: foliage, 2: luminance, 3: hard cutout, 4: 3 + bent normals, 5/6: 3/4 + thin leaf
     // Clip threshold for alphaCut modes 1 and 3.
     float alphaCutoff = 0.20f;
     float ambientScale = 1.0f;
@@ -2293,11 +2293,14 @@ public:
         // path. Foliage keeps mode 1 (edge bleed + dark-texel lift); anything
         // else alpha-tested is mode 3 and clips at its authored cutoff.
         const bool foliageShading = !cacheOwner || cacheOwner->foliageShading;
-        // Mode 4 is mode 3 that keeps bent normals unflipped.
+        // Mode 4 is mode 3 that keeps bent normals unflipped; thin leaves add
+        // 2 to either (5, 6).
         data.alphaCut = alphaFromLuminance ? 2.0f
                         : (alphaCut ? (foliageShading ? 1.0f
                                        : (cacheOwner && cacheOwner->bentNormals
-                                           ? 4.0f : 3.0f))
+                                           ? 4.0f : 3.0f) +
+                                         (cacheOwner && cacheOwner->thinLeaf
+                                           ? 2.0f : 0.0f))
                                     : (cacheOwner && cacheOwner->alphaBlend
                                         ? -1.0f : 0.0f));
         data.alphaCutoff = cacheOwner ? cacheOwner->alphaCutoff : 0.20f;

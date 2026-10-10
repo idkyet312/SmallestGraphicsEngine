@@ -52,6 +52,7 @@ int main() {
         crate.transparencyPass = "afterWater";
         crate.materialAmbientScale = 1.25f;
         crate.materialViewFillStrength = 0.1f;
+        crate.emissiveScale = 2.5f;
         crate.collision = "box";
         crate.light.enabled = true;
         crate.light.intensity = 3.5f;
@@ -80,6 +81,7 @@ int main() {
                 .at("transparencyPass") == "afterWater");
             CHECK(loaded->materialAmbientScale == 1.25f);
             CHECK(loaded->materialViewFillStrength == 0.1f);
+            CHECK(loaded->emissiveScale == 2.5f);
             CHECK(loaded->collision == "box");
             CHECK(loaded->schemaVersion == 2);
             CHECK(loaded->light.enabled);
@@ -347,6 +349,50 @@ int main() {
             }
         }
 
+        // Material overrides: a tint-only override needs no texture and must
+        // survive a save; an override with neither is rejected.
+        WriteText("prefabs/tinted.json", R"({
+          "schemaVersion":2,"id":"test/tinted","name":"Tinted",
+          "components":{"staticMesh":{"path":"models/crate.glb",
+            "materialOverrides":[{"mesh":"Leaves","baseColor":[0.3,0.3,0.55]},
+                                 {"mesh":"Bark","texture":"models/crate.png"}]}}
+        })");
+        WriteText("prefabs/emptyoverride.json", R"({
+          "schemaVersion":2,"id":"test/emptyoverride","name":"Empty Override",
+          "components":{"staticMesh":{"path":"models/crate.glb",
+            "materialOverrides":[{"mesh":"Leaves"}]}}
+        })");
+        CHECK(registry.Refresh());
+        const PrefabAsset* tinted = registry.Find("test/tinted");
+        CHECK(tinted != nullptr);
+        if (tinted) {
+            CHECK(tinted->error.empty());
+            CHECK(tinted->materialOverrides.size() == 2);
+            if (tinted->materialOverrides.size() == 2) {
+                const PrefabMaterialOverride& leaves = tinted->materialOverrides[0];
+                CHECK(leaves.hasBaseColor);
+                CHECK(leaves.texture.empty());
+                CHECK(leaves.baseColor[2] == 0.55f);
+                CHECK(!tinted->materialOverrides[1].hasBaseColor);
+            }
+            CHECK(PrefabRegistry::Save(*tinted, "prefabs/tinted.json").ok);
+            CHECK(registry.Refresh());
+            const PrefabAsset* reloaded = registry.Find("test/tinted");
+            CHECK(reloaded != nullptr);
+            if (reloaded && reloaded->materialOverrides.size() == 2) {
+                CHECK(reloaded->materialOverrides[0].hasBaseColor);
+                CHECK(reloaded->materialOverrides[0].baseColor[0] == 0.3f);
+                CHECK(reloaded->materialOverrides[1].texture ==
+                      std::filesystem::path("models/crate.png"));
+            }
+        }
+        bool sawEmptyOverrideError = false;
+        for (const PrefabAsset& asset : registry.Assets())
+            sawEmptyOverrideError = sawEmptyOverrideError ||
+                (!asset.error.empty() &&
+                 asset.definitionPath.filename() == "emptyoverride.json");
+        CHECK(sawEmptyOverrideError);
+
         WriteText("prefabs/variant.json", R"({
           "schemaVersion":2,"id":"test/variant","name":"Crate Variant",
           "extends":"test/crate","components":{"collision":{"shape":"mesh"}},
@@ -606,6 +652,21 @@ int main() {
             std::ifstream(savedPath) >> saved;
             CHECK(saved.at("components").at("shootingTarget") ==
                   target->components.at("shootingTarget"));
+        }
+
+        // Bistro's cypress albedo measures ~4x its hedges' luminance; the
+        // prefab darkens it with a tint-only override.
+        const PrefabAsset* bistro = shipped.Find("scenes/bistro-exterior");
+        CHECK(bistro != nullptr);
+        if (bistro) {
+            CHECK(bistro->error.empty());
+            bool cypressTinted = false;
+            for (const PrefabMaterialOverride& material : bistro->materialOverrides)
+                cypressTinted = cypressTinted ||
+                    (material.mesh == "Foliage_Leaves.DoubleSided" && material.hasBaseColor);
+            CHECK(cypressTinted);
+            // Its emitters (converted at 0.5) need 8x to light the street.
+            CHECK(bistro->emissiveScale == 8.0f);
         }
 
         const PrefabAsset* carpark = shipped.Find("props/carpark_asphalt");

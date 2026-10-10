@@ -38,7 +38,7 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float alphaCut;          // -1: alpha blend; 1: foliage; 2: luminance; 3: hard cutout; 4: 3 + bent normals
+    float alphaCut;          // -1: alpha blend; 1: foliage; 2: luminance; 3: hard cutout; 4: 3 + bent normals; 5/6: 3/4 + thin leaf
     float alphaCutoff;       // clip threshold for modes 1 and 3
     float ambientScale;
     float occlusionStrength;
@@ -855,6 +855,12 @@ float4 main(PS_INPUT input) : SV_TARGET
     const bool isAlphaBlended = alphaCut < -0.5;
     const bool isFoliage = alphaCut > 0.5 && alphaCut < 1.5;
     const bool matchGrassColor = isFoliage && materialType == 4.0;
+    // Cooked leaf cards: mode 3/4 clipping and texture handling, plus the
+    // thin-sheet lighting terms below at fixed strength.
+    const bool isThinLeaf = alphaCut > 4.5;
+    const bool keepsBentNormals =
+        (alphaCut > 3.5 && alphaCut < 4.5) || alphaCut > 5.5;
+    const bool thinSheet = isFoliage || isThinLeaf;
     float foliageCoverage = 1.0;
     float materialTextureAlpha = 1.0;
 
@@ -892,6 +898,7 @@ float4 main(PS_INPUT input) : SV_TARGET
         // (mode 3) clip at the threshold the asset authored instead, so
         // chain-link wire stays crisp rather than haloed by mip-blurred alpha.
         else if (alphaCut > 0.5) clip(texColor.a * opacity - alphaCutoff);
+        if (isThinLeaf) foliageCoverage = texColor.a;
         if (isFoliage) {
             foliageCoverage = texColor.a;
             uint texWidth, texHeight, texLevels;
@@ -1014,7 +1021,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     }
 #endif
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
-    if (isFoliage) {
+    if (thinSheet) {
         metal = 0.0;
     }
     
@@ -1078,7 +1085,7 @@ float4 main(PS_INPUT input) : SV_TARGET
         faceNormal = -faceNormal;
     // Mode 4 cutouts carry normals bent away from their faces (bush volume
     // normals); flipping those per card inverted about half of them.
-    if (alphaCut < 3.5 && dot(normal, faceNormal) < 0.0)
+    if (!keepsBentNormals && dot(normal, faceNormal) < 0.0)
         normal = -normal;
 
     const bool isWater = materialType > 0.5 && materialType < 2.5;
@@ -1293,7 +1300,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     float3 L = lightDir;
     float3 H = normalize(V + L);
     float signedNdotL = dot(normal, L);
-    float NdotL = isFoliage
+    float NdotL = thinSheet
         ? FoliageWrappedDiffuse(signedNdotL)
         : max(signedNdotL, 0.0);
     float NdotV = max(dot(normal, V), 0.0);
@@ -1366,12 +1373,14 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     // Thin-sheet vegetation BRDF: chlorophyll-tinted transmission plus diffuse
     // sky arriving at both leaf faces. Coverage suppresses bright cutout rims.
-    if (isFoliage)
+    if (thinSheet)
     {
+        // Mode 1 carries a per-material transmission scale in normalYSign;
+        // cooked leaves use it as a real normal-map sign, so they take 1.
         result += EvaluateFoliageTransmission(
             albedo, normal, viewDir, lightDir, lightColor,
             foliageCoverage, attenuation, shadowVisibility) *
-            max(normalYSign, 0.0);
+            (isFoliage ? max(normalYSign, 0.0) : 1.0);
         result += EvaluateFoliageSkyScatter(
             albedo, skyContribution, sampleSkyIrradiance(-normal),
             ambientLightingIntensity);

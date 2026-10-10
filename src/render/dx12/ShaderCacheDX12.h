@@ -101,6 +101,7 @@ inline uint64_t IncludeHash() {
             L"shaders/foliage_brdf.hlsli",
             L"shaders/gi_radiance_cache.hlsli",
             L"shaders/gi_restir.hlsli",
+            L"shaders/emissive_restir.hlsli",
             L"shaders/multiscatter_brdf.hlsli",
             L"shaders/palm_wind.hlsli",
             L"shaders/radiance_cascades.hlsli",

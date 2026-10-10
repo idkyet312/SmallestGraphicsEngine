@@ -139,7 +139,9 @@ public:
                      D3D12_GPU_DESCRIPTOR_HANDLE table,
                      D3D12_GPU_VIRTUAL_ADDRESS radianceCache,
                      D3D12_GPU_VIRTUAL_ADDRESS restirSamples,
-                     D3D12_GPU_VIRTUAL_ADDRESS restirWeights) {
+                     D3D12_GPU_VIRTUAL_ADDRESS restirWeights,
+                     D3D12_GPU_VIRTUAL_ADDRESS emissiveLights,
+                     D3D12_GPU_VIRTUAL_ADDRESS emissiveReservoirs) {
         cmd->SetDescriptorHeaps(1, &heap);
         cmd->SetComputeRootSignature(Root(bindless));
         cmd->SetComputeRootConstantBufferView(0, frameConstants);
@@ -154,6 +156,11 @@ public:
             cmd->SetComputeRootUnorderedAccessView(5, restirSamples);
             cmd->SetComputeRootUnorderedAccessView(6, restirWeights);
         }
+        // Emissive triangle lights, as on the enhanced resolve signature.
+        if (emissiveLights != 0)
+            cmd->SetComputeRootShaderResourceView(7, emissiveLights);
+        if (emissiveReservoirs != 0)
+            cmd->SetComputeRootUnorderedAccessView(8, emissiveReservoirs);
     }
 
     void Dispatch(ID3D12GraphicsCommandList* cmd, UINT slot, UINT64 frameConstants,
@@ -257,7 +264,7 @@ private:
         extra.BaseShaderRegister = 11;
         extra.OffsetInDescriptorsFromTableStart = BaseDescriptorCount + 7;
         ranges.push_back(extra);
-        D3D12_ROOT_PARAMETER params[7] = {};
+        D3D12_ROOT_PARAMETER params[9] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -276,8 +283,13 @@ private:
         params[5].Descriptor.ShaderRegister = 17;
         params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         params[6].Descriptor.ShaderRegister = 18;
+        // t100/u19 emissive triangle lights and their reservoirs, likewise.
+        params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[7].Descriptor.ShaderRegister = 100;
+        params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[8].Descriptor.ShaderRegister = 19;
         D3D12_ROOT_SIGNATURE_DESC root = {};
-        root.NumParameters = 7;
+        root.NumParameters = 9;
         root.pParameters = params;
         root.NumStaticSamplers = 3;
         root.pStaticSamplers = staticSamplers;

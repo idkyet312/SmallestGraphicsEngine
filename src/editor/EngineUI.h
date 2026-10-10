@@ -523,6 +523,19 @@ inline void RenderPlayerHUD(const Scene& scene) {
         draw->AddText(ImVec2(godX, godY), IM_COL32(255, 220, 65, 245), god);
     }
 
+    // Fly speed readout after a wheel change in free-fly (V).
+    if (scene.camera.FlySpeedHudSeconds > 0.0f) {
+        char flySpeed[32];
+        snprintf(flySpeed, sizeof(flySpeed), "FLY SPEED x%.2f",
+                 scene.camera.FlySpeedMultiplier);
+        const ImVec2 size = ImGui::CalcTextSize(flySpeed);
+        const float alpha = (std::min)(scene.camera.FlySpeedHudSeconds / 0.4f, 1.0f);
+        // One line under the GOD MODE label, which sits at y = 92.
+        draw->AddText(ImVec2((io.DisplaySize.x - size.x) * 0.5f, 110.0f),
+                      IM_COL32(235, 240, 245, static_cast<int>(235.0f * alpha)),
+                      flySpeed);
+    }
+
     if (scene.player.health > 0.0f) {
         ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         if (scene.camera.BodycamActive) {
@@ -1932,7 +1945,13 @@ inline bool DrawEditorLighting(Scene& scene, VisibilityBufferDX12& vb,
         changed |= ImGui::ColorEdit3("Sun color", &scene.lightColor.x);
         changed |= ImGui::SliderFloat("Ambient fill", &scene.editorAmbientFill, 0.0f, 2.0f, "%.3f");
         changed |= ImGui::SliderFloat("Environment / GI gain", &scene.ambientLightingIntensity, 0.0f, 2.0f, "%.3f");
-        changed |= ImGui::SliderFloat("Emission", &g_emissiveIntensity, 0.0f, 8.0f, "%.2fx");
+        changed |= ImGui::SliderFloat("Emission", &g_emissiveIntensity, 0.0f, 50.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+        // Post-process only: no lighting history to invalidate, so it stays
+        // out of `changed`.
+        ImGui::SliderFloat("Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.3f",
+            ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Glow around bright lights. 0 = off; default 0.16.");
         ImGui::Separator();
         ImGui::BeginDisabled(!g_inlineRaytracingSupported);
         changed |= ImGui::Checkbox("Ray-traced GI", &rayGI);
@@ -2497,7 +2516,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // shifts the whole set against the frame's exposure without flattening
         // the relative brightness between them.
         ImGui::SliderFloat("Emissive Intensity", &g_emissiveIntensity,
-                           0.0f, 8.0f, "%.2fx");
+                           0.0f, 50.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
         ImGui::Checkbox("Animate Light", &scene.animateLight);
     }
 

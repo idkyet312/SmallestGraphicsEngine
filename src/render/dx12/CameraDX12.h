@@ -17,6 +17,11 @@ public:
     float Yaw;
     float Pitch;
     float MovementSpeed;
+    // Free-fly (V) speed scale, set with the mouse wheel like Unreal's viewport
+    // camera. Walking ignores it. FlySpeedHudSeconds counts down the on-screen
+    // readout shown after each change.
+    float FlySpeedMultiplier = 1.0f;
+    float FlySpeedHudSeconds = 0.0f;
     float MouseSensitivity;
     bool BodycamAiming = false;
     bool BodycamActive = false;
@@ -400,9 +405,12 @@ public:
             const float scale = std::abs(input.strafe) * input.movementMultiplier;
             ProcessKeyboard(input.strafe > 0.0f ? 'A' : 'D', dt, scale);
         }
+        // Free-fly rises and drops at the scaled speed too; walking's jump
+        // and swim ignore the multiplier, so they keep 1.
+        const float verticalScale = FPSMode ? 1.0f : input.movementMultiplier;
         if (input.Held(PlayerInput::Jump) || input.Held(PlayerInput::Swim))
-            ProcessKeyboard(' ', dt);
-        if (input.Held(PlayerInput::SwimDown)) ProcessKeyboard('Q', dt);
+            ProcessKeyboard(' ', dt, verticalScale);
+        if (input.Held(PlayerInput::SwimDown)) ProcessKeyboard('Q', dt, verticalScale);
     }
 
     // Points the camera at an absolute orientation, for a remote player whose

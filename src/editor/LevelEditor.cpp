@@ -2534,8 +2534,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                 const PrefabMaterialOverride& material =
                     prefabDraft_.materialOverrides[overrideIndex];
                 ImGui::PushID(static_cast<int>(overrideIndex));
-                ImGui::Text("%s -> %s", material.mesh.c_str(),
-                    material.texture.generic_string().c_str());
+                if (material.hasBaseColor)
+                    ImGui::Text("%s -> %s x(%.2f, %.2f, %.2f)", material.mesh.c_str(),
+                        material.texture.generic_string().c_str(),
+                        material.baseColor[0], material.baseColor[1], material.baseColor[2]);
+                else
+                    ImGui::Text("%s -> %s", material.mesh.c_str(),
+                        material.texture.generic_string().c_str());
                 const bool remove = ImGui::SmallButton("Remove material");
                 ImGui::PopID();
                 if (remove) prefabDraft_.materialOverrides.erase(

@@ -13,7 +13,18 @@
       "targetSize": 0,
       "castShadow": true,
       "useMaterials": true,
-      "automaticLod": false
+      "automaticLod": false,
+      "emissiveScale": 8.0,
+      "materialOverrides": [
+        {
+          "mesh": "Foliage_Leaves.DoubleSided",
+          "baseColor": [
+            0.3,
+            0.3,
+            0.55
+          ]
+        }
+      ]
     },
     "collision": {
       "shape": "floor",

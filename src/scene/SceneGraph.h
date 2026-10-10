@@ -76,6 +76,11 @@ struct SceneMaterial {
     // inward and shades the bush as dark clumps; these keep authored normals.
     // Measured from the mesh at prefab load, see MarkBentNormalCutouts.
     bool bentNormals = false;
+    // Cooked leaf cards (Bistro hedges, linde, ivy, cypress). They stay out of
+    // foliageShading, whose cbuffer reuse needs per-material tuning, but get
+    // the thin-sheet terms: wrapped diffuse, back-lit transmission, back-face
+    // sky. Without them sun-facing leaves read flat and shaded ones go grey.
+    bool thinLeaf = false;
     // glTF alphaMode=BLEND. Kept separate from alphaCutout so texture-driven
     // glass can use blending even when baseColorFactor alpha itself is 1.
     bool alphaBlend = false;

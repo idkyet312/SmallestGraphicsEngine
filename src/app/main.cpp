@@ -4868,8 +4868,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 scene.enableFXAA = true;
             if (GetEnvironmentVariableA("SGE_CAPTURE_NORR", nullptr, 0) > 0)
                 DLSS::GetSettings().rayReconstruction = false;
+            // SGE_CAPTURE_TIME=<TimeOfDay index> (4 = Max fidelity), once:
+            // the level's default clock is not what the editor preview shows.
+            static bool captureTimeApplied = false;
+            char captureTime[8] = {};
+            if (!captureTimeApplied &&
+                GetEnvironmentVariableA("SGE_CAPTURE_TIME", captureTime,
+                                        sizeof(captureTime)) > 0) {
+                captureTimeApplied = true;
+                ApplyTimeOfDay(static_cast<TimeOfDay>(std::clamp(
+                    atoi(captureTime), 0, kTimeOfDayCount - 1)));
+            }
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOFOG", nullptr, 0) > 0)
                 scene.enableVolumetricFog = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOBLOOM", nullptr, 0) > 0)
+                visBuffer.bloomStrength = 0.0f;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_BLOOM_JITTERED", nullptr, 0) > 0)
+                visBuffer.bloomFromUpscaled = false;
+            if (GetEnvironmentVariableA("SGE_CAPTURE_NOLENS", nullptr, 0) > 0)
+                scene.enableSunLens = false;
+            // F9's clean shot: no ImGui, no viewmodel.
+            if (GetEnvironmentVariableA("SGE_CAPTURE_HIDEUI", nullptr, 0) > 0)
+                g_deploymentDebugHideUI = true;
             // World cloud volumes and the sky's cloud layer both off, so an
             // overview from above the cloud base sees the ground.
             if (GetEnvironmentVariableA("SGE_CAPTURE_NOCLOUDS", nullptr, 0) > 0) {
@@ -5273,8 +5293,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             SynchronizeEditorRuntimeVisual(true);
         }
         // The planning map is an overhead view, not the player's eyes: a
-        // pistol floating over the island reads as a stray render.
-        scene.drawViewmodel = !g_insertionChoicePending;
+        // pistol floating over the island reads as a stray render. F9's clean
+        // shot drops it too.
+        scene.drawViewmodel = !g_insertionChoicePending && !g_deploymentDebugHideUI;
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.

@@ -240,6 +240,9 @@ public:
     static constexpr UINT kEnhancedRadianceCacheRootParameter = 3;
     // Root UAVs u17/u18 (Lumen ReSTIR reservoirs), right after the cache.
     static constexpr UINT kEnhancedReSTIRRootParameter = 4;
+    // Root SRV t100 (emissive triangle lights) and root UAV u19 (their ReSTIR
+    // DI reservoirs), after the ReSTIR GI pair. emissive_restir.hlsli.
+    static constexpr UINT kEnhancedEmissiveRootParameter = 6;
     // Heap index of the spot shadow atlas (t92). Sits one past the terrain
     // splatmap, which was the previous last slot.
     static constexpr UINT kSpotShadowAtlasSlot = 91;
@@ -740,6 +743,17 @@ public:
     // is written in place rather than staged through a copy.
     ComPtr<ID3D12Resource> hitGeometryBuffer;
     UINT hitGeometryCount = 0;
+    // Emissive triangles as lights (emissive_restir.hlsli), written on
+    // acceleration rebuilds like hitGeometryBuffer. Entry 0 is always valid and
+    // carries the count, so an empty scene reads lightCount 0 and returns.
+    ComPtr<ID3D12Resource> emissiveTriangleBuffer;
+    UINT emissiveTriangleCount = 0;
+    // Two frames of per-pixel reservoirs, sized lazily to the render size. The
+    // placeholder keeps u19 bound to something valid until they exist.
+    ComPtr<ID3D12Resource> emissiveReservoirBuffer;
+    ComPtr<ID3D12Resource> emissiveReservoirPlaceholder;
+    UINT emissiveReservoirWidth = 0, emissiveReservoirHeight = 0;
+    bool emissiveReservoirAllocationFailed = false;
     ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
     ComPtr<ID3D12Resource> clusterDataUpload[FRAME_COUNT];
     ComPtr<ID3D12Resource> materialDataBuffer;
@@ -843,6 +857,8 @@ public:
     UINT postFrameIndex = 0;
     float exposure = 1.15f;
     float bloomStrength = 0.16f;
+    // Build bloom from the DLSS output rather than the jittered render frame.
+    bool bloomFromUpscaled = true;
     float vignetteStrength = 0.50f;
     float grainStrength = 0.0f;
     // Lens artefacts. Dirt, streaks and flare draw energy from bloom;
@@ -3597,6 +3613,8 @@ public:
             lumenReSTIRMode = restirHistoryValid ? 1u : 2u;
         else if (!ScopeSurfaceBound())
             restirHistoryValid = false;  // a gap in the reservoir chain
+        if (useEnhanced && !ScopeSurfaceBound())
+            EnsureEmissiveReservoirs(width, height);
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
         }
@@ -3879,7 +3897,8 @@ public:
                 constants, cascadeTables[RadianceCascadesDX12::ResolvePass],
                 giRadianceCache.Address(),
                 restirSampleBuffer ? restirSampleBuffer->GetGPUVirtualAddress() : 0,
-                restirWeightBuffer ? restirWeightBuffer->GetGPUVirtualAddress() : 0);
+                restirWeightBuffer ? restirWeightBuffer->GetGPUVirtualAddress() : 0,
+                EmissiveTriangleAddress(), EmissiveReservoirAddress());
             selectedPSO = radianceCascades.ResolvePSO(
                 useBindless, useTerrainResolve, false);
             terrainOnlyPSO = radianceCascades.ResolvePSO(useBindless, true, true);
@@ -4825,7 +4844,8 @@ public:
         const bool bloomChainRan = !validationMode && !preserveDebugOutput &&
             (bloomStrength > 0.0f || lensEffectsActive);
         if (bloomChainRan)
-            RenderBloom(cmdList);
+            RenderBloom(cmdList, dlssUpscaled && dlssUpscaledTexture &&
+                                     bloomFromUpscaled);
         // The flare consumes the bloom pyramid, so it has to follow it. Gated
         // on the flare strength alone: dirt and the anamorphic term in post do
         // not need this buffer, and skipping the four dispatches is the whole
@@ -5115,6 +5135,9 @@ public:
         restirSampleBuffer.Reset();
         restirWeightBuffer.Reset();
         restirWidth = restirHeight = 0;
+        emissiveReservoirBuffer.Reset();
+        emissiveReservoirWidth = emissiveReservoirHeight = 0;
+        emissiveReservoirAllocationFailed = false;
         restirAllocationFailed = false;
         restirHistoryValid = false;
         stableSurfaceWriteIndex = 0;
@@ -5783,6 +5806,25 @@ private:
                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                     IID_PPV_ARGS(&hitGeometryBuffer))))
                 return false;
+            bufDesc.Width = static_cast<UINT64>(kMaxEmissiveTriangles) *
+                            sizeof(EmissiveTriangleGPU);
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&emissiveTriangleBuffer))))
+                return false;
+            emissiveTriangleBuffer->SetName(L"Emissive triangle lights");
+            UploadEmissiveTriangles({});
+            D3D12_HEAP_PROPERTIES defaultHeap = {};
+            defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            bufDesc.Width = 16;
+            bufDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &defaultHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                    IID_PPV_ARGS(&emissiveReservoirPlaceholder))))
+                return false;
+            bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
         }
 
         D3D12_HEAP_PROPERTIES materialHeap = {};
@@ -6594,6 +6636,59 @@ private:
                 kEnhancedReSTIRRootParameter + 1,
                 restirWeightBuffer->GetGPUVirtualAddress());
         }
+        if (EmissiveTriangleAddress() != 0)
+            cmd->SetComputeRootShaderResourceView(
+                kEnhancedEmissiveRootParameter, EmissiveTriangleAddress());
+        if (EmissiveReservoirAddress() != 0)
+            cmd->SetComputeRootUnorderedAccessView(
+                kEnhancedEmissiveRootParameter + 1, EmissiveReservoirAddress());
+    }
+
+    // Light list as bound this frame: the real one only while reservoirs exist
+    // for it to write, else the reserved empty last entry (count 0).
+    D3D12_GPU_VIRTUAL_ADDRESS EmissiveTriangleAddress() const {
+        if (!emissiveTriangleBuffer) return 0;
+        return emissiveTriangleBuffer->GetGPUVirtualAddress() +
+            (emissiveReservoirBuffer ? 0ull
+                : static_cast<UINT64>(kMaxEmissiveTriangles - 1u) *
+                  sizeof(EmissiveTriangleGPU));
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS EmissiveReservoirAddress() const {
+        ID3D12Resource* buffer = emissiveReservoirBuffer
+            ? emissiveReservoirBuffer.Get() : emissiveReservoirPlaceholder.Get();
+        return buffer ? buffer->GetGPUVirtualAddress() : 0;
+    }
+
+    // Two frames of uint4 per pixel. Same lifetime rules as the ReSTIR GI
+    // buffers: created here, released only by Resize() after its GPU wait.
+    bool EnsureEmissiveReservoirs(UINT w, UINT h) {
+        if (emissiveReservoirBuffer)
+            return emissiveReservoirWidth == w && emissiveReservoirHeight == h;
+        if (emissiveReservoirAllocationFailed || w == 0 || h == 0 ||
+            emissiveTriangleCount == 0)
+            return false;
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = static_cast<UINT64>(w) * h * 2ull * 16ull;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&emissiveReservoirBuffer)))) {
+            emissiveReservoirAllocationFailed = true;
+            return false;
+        }
+        emissiveReservoirBuffer->SetName(L"Emissive ReSTIR DI reservoirs");
+        emissiveReservoirWidth = w;
+        emissiveReservoirHeight = h;
+        return true;
     }
 
     // Lazily sized to the render resolution; Resize() releases them after its
@@ -7032,7 +7127,7 @@ private:
         if (!bindless)
             radianceCascades.Configure(ranges, _countof(ranges), samplers);
 
-        D3D12_ROOT_PARAMETER params[6] = {};
+        D3D12_ROOT_PARAMETER params[8] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
         params[0].Descriptor.RegisterSpace = 0;
@@ -7063,10 +7158,22 @@ private:
             params[kEnhancedReSTIRRootParameter + i].ShaderVisibility =
                 D3D12_SHADER_VISIBILITY_ALL;
         }
+        // t100 emissive triangle lights, u19 their ReSTIR DI reservoirs.
+        params[kEnhancedEmissiveRootParameter].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[kEnhancedEmissiveRootParameter].Descriptor.ShaderRegister = 100;
+        params[kEnhancedEmissiveRootParameter].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_ALL;
+        params[kEnhancedEmissiveRootParameter + 1].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[kEnhancedEmissiveRootParameter + 1].Descriptor.ShaderRegister = 19;
+        params[kEnhancedEmissiveRootParameter + 1].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
         // The CBV, the descriptor table, the t90 tile-list root SRV, the u16
-        // radiance-cache root UAV and the u17/u18 ReSTIR root UAVs.
+        // radiance-cache root UAV, the u17/u18 ReSTIR root UAVs and the
+        // t100/u19 emissive-light pair.
         rootSigDesc.NumParameters = _countof(params);
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 3;  // s0 wrap, s1 shadow cmp, s2 clamp (terrain splat)
@@ -7925,6 +8032,84 @@ private:
     }
 
 public:
+    // One emissive triangle as a light. Mirrors EmissiveTriangle in
+    // emissive_restir.hlsli field for field (96 bytes).
+    struct EmissiveTriangleGPU {
+        float p0[3];
+        uint32_t materialID;
+        float e1[3];
+        uint32_t bindlessMaterialID;
+        float e2[3];
+        float area;
+        float uv0[2];
+        float uv1[2];
+        float uv2[2];
+        float pdf;
+        float aliasProb;
+        uint32_t alias;
+        uint32_t lightCount;
+        float pad[2];
+    };
+    static_assert(sizeof(EmissiveTriangleGPU) == 96,
+                  "EmissiveTriangleGPU must match the shader's 96-byte stride");
+    // The last entry is reserved as the always-empty list (lightCount 0) bound
+    // while no reservoirs exist.
+    static const UINT kMaxEmissiveTriangles = 65536;
+
+    // Builds the power-proportional alias table (Vose) over `triangles`, whose
+    // pdf field holds each triangle's unnormalised power on entry, and writes
+    // the list. Called on acceleration rebuilds, which drain every frame slot
+    // first, so the upload heap is written in place. An empty list disables
+    // emissive lighting.
+    void UploadEmissiveTriangles(std::vector<EmissiveTriangleGPU> triangles) {
+        if (!emissiveTriangleBuffer) return;
+        if (triangles.size() > kMaxEmissiveTriangles - 1u)
+            triangles.resize(kMaxEmissiveTriangles - 1u);
+        const UINT count = static_cast<UINT>(triangles.size());
+        double total = 0.0;
+        for (const EmissiveTriangleGPU& t : triangles) total += t.pdf;
+        if (count == 0 || total <= 0.0) {
+            triangles.clear();
+        } else {
+            std::vector<double> scaled(count);
+            std::vector<UINT> underfull, overfull;
+            for (UINT i = 0; i < count; ++i) {
+                triangles[i].pdf = static_cast<float>(triangles[i].pdf / total);
+                scaled[i] = triangles[i].pdf * static_cast<double>(count);
+                (scaled[i] < 1.0 ? underfull : overfull).push_back(i);
+            }
+            while (!underfull.empty() && !overfull.empty()) {
+                const UINT lo = underfull.back();
+                underfull.pop_back();
+                const UINT hi = overfull.back();
+                triangles[lo].aliasProb = static_cast<float>(scaled[lo]);
+                triangles[lo].alias = hi;
+                scaled[hi] -= 1.0 - scaled[lo];
+                if (scaled[hi] < 1.0) {
+                    overfull.pop_back();
+                    underfull.push_back(hi);
+                }
+            }
+            for (UINT i : overfull) { triangles[i].aliasProb = 1.0f; triangles[i].alias = i; }
+            for (UINT i : underfull) { triangles[i].aliasProb = 1.0f; triangles[i].alias = i; }
+            for (EmissiveTriangleGPU& t : triangles) t.lightCount = count;
+        }
+        const UINT written = static_cast<UINT>(triangles.size());
+        const EmissiveTriangleGPU empty{};
+        void* mapped = nullptr;
+        D3D12_RANGE readRange = { 0, 0 };
+        if (FAILED(emissiveTriangleBuffer->Map(0, &readRange, &mapped)) || !mapped)
+            return;
+        auto* entries = static_cast<EmissiveTriangleGPU*>(mapped);
+        if (written)
+            memcpy(entries, triangles.data(), written * sizeof(EmissiveTriangleGPU));
+        else
+            entries[0] = empty;
+        entries[kMaxEmissiveTriangles - 1u] = empty;
+        emissiveTriangleBuffer->Unmap(0, nullptr);
+        emissiveTriangleCount = written;
+    }
+
     // Maximum hit-geometry entries. One per BLAS geometry, not per instance,
     // matching how DXRScene emits hit records.
     static const UINT VB_MAX_HIT_GEOMETRY = 4096;
@@ -9232,7 +9417,8 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = (VB_BLOOM_MAX_MIPS * 2u - 1u) * 2u;
+        // Down + up passes, plus kBloomUpscaledSourcePass.
+        heap.NumDescriptors = VB_BLOOM_MAX_MIPS * 2u * 2u;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(
@@ -9282,6 +9468,9 @@ private:
                       static_cast<UINT>(mip + 1),
                       static_cast<UINT>(mip));
         }
+        if (dlssUpscaledTexture)
+            writePass(kBloomUpscaledSourcePass, dlssUpscaledTexture.Get(),
+                      0u, 0u);
     }
 
     // Four dispatches: features, streak, then a separable blur in both axes.
@@ -9419,7 +9608,17 @@ private:
                                             : flareTexture.Get();
     }
 
-    void RenderBloom(ID3D12GraphicsCommandList* cmdList) {
+    // Descriptor slot of the first downsample when it reads the DLSS output
+    // instead of the jittered render-resolution frame. Past the last
+    // down/up pass, so it never collides with them.
+    static constexpr UINT kBloomUpscaledSourcePass = VB_BLOOM_MAX_MIPS * 2u - 1u;
+
+    // fromUpscaled: build the pyramid from the DLSS output. The render-res
+    // frame is jittered, so sub-pixel bulbs land on different pixels each
+    // frame and every halo pulsed with it; the upscaled image has that jitter
+    // resolved. Bistro at night, still camera, mean frame-to-frame luma change:
+    // 0.170 jittered source, 0.056 upscaled, 0.059 with bloom off.
+    void RenderBloom(ID3D12GraphicsCommandList* cmdList, bool fromUpscaled) {
         if (!bloomTexture || !bloomDescHeap || !bloomRootSig ||
             bloomMipCount == 0) return;
         struct BloomDispatchConstants {
@@ -9474,16 +9673,18 @@ private:
         cmdList->SetDescriptorHeaps(1, heaps);
         for (UINT mip = 0; mip < bloomMipCount; ++mip) {
             BloomDispatchConstants constants = {};
-            constants.sourceWidth =
-                mip == 0 ? width : mipSize(bloomWidth, mip - 1u);
-            constants.sourceHeight =
-                mip == 0 ? height : mipSize(bloomHeight, mip - 1u);
+            const bool upscaledSource = mip == 0 && fromUpscaled;
+            constants.sourceWidth = mip != 0 ? mipSize(bloomWidth, mip - 1u)
+                : upscaledSource ? displayWidth : width;
+            constants.sourceHeight = mip != 0 ? mipSize(bloomHeight, mip - 1u)
+                : upscaledSource ? displayHeight : height;
             constants.destinationWidth = mipSize(bloomWidth, mip);
             constants.destinationHeight = mipSize(bloomHeight, mip);
             constants.threshold = mip == 0 ? 1.0f : 0.0f;
             constants.softKnee = 0.5f;
             constants.scatter = 0.72f;
-            dispatchPass(mip, mip, constants, bloomDownsamplePSO.Get());
+            dispatchPass(upscaledSource ? kBloomUpscaledSourcePass : mip, mip,
+                         constants, bloomDownsamplePSO.Get());
         }
         for (int mip = static_cast<int>(bloomMipCount) - 2;
              mip >= 0; --mip) {

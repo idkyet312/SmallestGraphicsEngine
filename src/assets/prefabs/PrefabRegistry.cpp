@@ -280,6 +280,9 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             prefab.materialAmbientScale = mesh.value("materialAmbientScale", 1.0f);
             prefab.materialViewFillStrength = mesh.value(
                 "materialViewFillStrength", 0.0f);
+            prefab.emissiveScale = mesh.value("emissiveScale", 1.0f);
+            if (prefab.emissiveScale < 0.0f || prefab.emissiveScale > 100.0f)
+                throw std::runtime_error("staticMesh.emissiveScale is out of range");
             if (prefab.targetSize < 0.0f || prefab.targetSize > 10000.0f)
                 throw std::runtime_error("staticMesh.targetSize is out of range");
             if (prefab.materialAmbientScale < 0.0f ||
@@ -293,9 +296,23 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             for (const json& item : mesh.value("materialOverrides", json::array())) {
                 PrefabMaterialOverride overrideValue;
                 overrideValue.mesh = item.at("mesh").get<std::string>();
-                overrideValue.texture = item.at("texture").get<std::string>();
-                if (overrideValue.mesh.empty() || !IsSafeRelative(overrideValue.texture) ||
-                    !std::filesystem::exists(overrideValue.texture))
+                overrideValue.texture = item.value("texture", std::string());
+                if (item.contains("baseColor")) {
+                    const json& color = item.at("baseColor");
+                    if (!color.is_array() || color.size() != 3)
+                        throw std::runtime_error("material override baseColor must be three numbers");
+                    for (int c = 0; c < 3; ++c) {
+                        overrideValue.baseColor[c] = color.at(c).get<float>();
+                        if (overrideValue.baseColor[c] < 0.0f || overrideValue.baseColor[c] > 4.0f)
+                            throw std::runtime_error("material override baseColor is out of range");
+                    }
+                    overrideValue.hasBaseColor = true;
+                }
+                const bool hasTexture = !overrideValue.texture.empty();
+                if (overrideValue.mesh.empty() ||
+                    (!hasTexture && !overrideValue.hasBaseColor) ||
+                    (hasTexture && (!IsSafeRelative(overrideValue.texture) ||
+                                    !std::filesystem::exists(overrideValue.texture))))
                     throw std::runtime_error("material override mesh/texture is invalid");
                 prefab.materialOverrides.push_back(std::move(overrideValue));
             }
@@ -600,6 +617,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 merged.targetSize = local.targetSize;
                 merged.materialAmbientScale = local.materialAmbientScale;
                 merged.materialViewFillStrength = local.materialViewFillStrength;
+                merged.emissiveScale = local.emissiveScale;
                 merged.materialOverrides = local.materialOverrides;
                 merged.lods = local.lods;
                 std::copy(std::begin(local.defaultScale), std::end(local.defaultScale),
@@ -778,13 +796,23 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
                 mesh.erase("transparencyPass");
             mesh["materialAmbientScale"] = prefab.materialAmbientScale;
             mesh["materialViewFillStrength"] = prefab.materialViewFillStrength;
+            if (prefab.emissiveScale != 1.0f)
+                mesh["emissiveScale"] = prefab.emissiveScale;
+            else
+                mesh.erase("emissiveScale");
         }
         else components.erase("staticMesh");
         if (components.contains("staticMesh")) {
             json materialOverrides = json::array();
-            for (const PrefabMaterialOverride& overrideValue : prefab.materialOverrides)
-                materialOverrides.push_back({ {"mesh", overrideValue.mesh},
-                    {"texture", Generic(overrideValue.texture)} });
+            for (const PrefabMaterialOverride& overrideValue : prefab.materialOverrides) {
+                json item = { {"mesh", overrideValue.mesh} };
+                if (!overrideValue.texture.empty())
+                    item["texture"] = Generic(overrideValue.texture);
+                if (overrideValue.hasBaseColor)
+                    item["baseColor"] = { overrideValue.baseColor[0],
+                        overrideValue.baseColor[1], overrideValue.baseColor[2] };
+                materialOverrides.push_back(std::move(item));
+            }
             if (!materialOverrides.empty())
                 components["staticMesh"]["materialOverrides"] = materialOverrides;
             else components["staticMesh"].erase("materialOverrides");

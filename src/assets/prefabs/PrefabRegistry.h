@@ -87,7 +87,12 @@ struct PrefabChildAsset {
 
 struct PrefabMaterialOverride {
     std::string mesh;
+    // Either or both: a replacement albedo, and/or a linear RGB multiplier on
+    // the material's base colour factor (Bistro's cypress albedo is authored
+    // about 4x brighter than its hedges).
     std::filesystem::path texture;
+    bool hasBaseColor = false;
+    float baseColor[3] = { 1.0f, 1.0f, 1.0f };
 };
 
 struct PrefabLodAsset {
@@ -128,6 +133,10 @@ struct PrefabAsset {
     std::string transparencyPass = "auto";
     float materialAmbientScale = 1.0f;
     float materialViewFillStrength = 0.0f;
+    // Multiplies every material's emissive factor. For assets whose emitters
+    // were authored in other light units: Bistro's converted at 0.5 read about
+    // 8x too dim to light its street at night.
+    float emissiveScale = 1.0f;
     std::string collision = "none";
     // "floor" only: per-triangle collision built from the primitives whose
     // material name starts with one of these prefixes. Lets a scene-sized

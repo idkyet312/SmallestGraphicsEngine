@@ -1077,6 +1077,8 @@ float3 RayHitAmbient(float3 hitPos, float3 n) {
 // reflection or radiance-cascade paths that share ShadeRayHit.
 static bool gLumenGIHitShading = false;
 
+#include "emissive_restir.hlsli"
+
 // Light arriving at a ray-hit surface: ambient (sky, or probes in Lumen mode)
 // plus the direct sun, shadowed by a second ray. Split from ShadeRayHit so the
 // GI radiance cache can relight a stored surface without re-reading its
@@ -1114,7 +1116,8 @@ float3 RayHitSunLight(float3 hitPos, float3 worldNormal) {
 
 float3 RayHitIncoming(float3 hitPos, float3 worldNormal) {
     return RayHitAmbient(hitPos, worldNormal) +
-           RayHitSunLight(hitPos, worldNormal);
+           RayHitSunLight(hitPos, worldNormal) +
+           EmissiveHitIncoming(hitPos, worldNormal);
 }
 
 // The surface a ray hit: position, facing normal, albedo and emissive. False
@@ -3342,6 +3345,10 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     }
     
 #if SGE_ENHANCED_VISUALS
+    // Emissive triangles (lamp glass, signs, string-light bulbs) as area lights.
+    result += EmissiveDirectLighting(pixel, surface.fragPos, surface.normal,
+        surface.viewDir, surface.albedo, surface.metal, surface.rough,
+        stableSurfaceID.x, commitTemporalHistory);
     // debugViewMode 8/9: Lumen GI. 8 = the irradiance the lighting consumed
     // (after temporal accumulation), 9 = its lit contribution. The specular
     // signal is zeroed so the SVGF composite adds nothing on top.
@@ -4133,7 +4140,8 @@ void GICacheRefreshMain(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
     // Direct light, as the resolve lights a hit, plus every local light. The
     // view vector only feeds the specular term, which roughness 1 zeroes.
-    float3 incoming = RayHitSunLight(position, normal);
+    float3 incoming = RayHitSunLight(position, normal) +
+                      EmissiveHitIncoming(position, normal);
     for (int light = 0; light < min(numPointLights, 64); ++light)
         incoming += calculatePointLight(light, position, normal, normal, 1.0);
 

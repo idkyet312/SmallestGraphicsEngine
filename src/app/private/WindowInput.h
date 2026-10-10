@@ -101,6 +101,8 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
+    scene.camera.FlySpeedHudSeconds =
+        (std::max)(scene.camera.FlySpeedHudSeconds - deltaTime, 0.0f);
     scene.camera.UpdateBodycamAim(deltaTime,
         IsGameplayScreen() && !g_insertionChoicePending && !PlayerInVehicle() &&
         !scene.ejected && scene.player.health > 0.0f);
@@ -323,8 +325,9 @@ static void ProcessInput(HWND) {
     // Sprint is 1.5x walk (7.5 m/s against a 5.0 m/s Camera::MovementSpeed).
     // Was 2.0x, which outran the traversal the island is built for.
     constexpr float kSprintMovementScale = 1.5f;
-    const float movementMultiplier = crouching ? 0.55f :
-        (sprinting ? kSprintMovementScale : 1.0f);
+    const float movementMultiplier = (crouching ? 0.55f :
+        (sprinting ? kSprintMovementScale : 1.0f)) *
+        (scene.camera.FPSMode ? 1.0f : scene.camera.FlySpeedMultiplier);
     // Only a sprint that is actually moving the player faster counts for the
     // viewmodel. Crouching wins over shift here (0.55x), so shift held while
     // crouched must NOT speed the legs up -- the multiplier above is the
@@ -551,6 +554,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_deploymentZoom = std::clamp(
                     g_deploymentZoom * std::pow(1.0f / 1.12f, notches),
                     kDeploymentZoomMin, kDeploymentZoomMax);
+            } else if (!scene.camera.FPSMode && !PlayerInVehicle()) {
+                // Free-fly (V): the wheel sets fly speed, Unreal style, in
+                // the editor camera's 1.15x steps.
+                const float notches =
+                    static_cast<float>(wheel) / static_cast<float>(WHEEL_DELTA);
+                scene.camera.FlySpeedMultiplier = std::clamp(
+                    scene.camera.FlySpeedMultiplier * std::pow(1.15f, notches),
+                    0.05f, 20.0f);
+                scene.camera.FlySpeedHudSeconds = 1.5f;
             } else {
                 GunModel::CycleWeapon(wheel);
                 scene.fireCooldown = 0.0f;

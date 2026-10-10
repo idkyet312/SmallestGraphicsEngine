@@ -120,6 +120,55 @@ static void AppendDXRDDGITerrain(std::vector<DXRProbeTriangle>& triangles,
     }
 }
 
+// Emissive triangles gathered by the acceleration rebuild, in world space, for
+// the resolve's ReSTIR DI light sampling (emissive_restir.hlsli). pdf holds the
+// unnormalised power until UploadEmissiveTriangles builds the alias table.
+static std::vector<VisibilityBufferDX12::EmissiveTriangleGPU> g_emissiveTriangleLights;
+
+static void AppendEmissiveTriangles(const MeshPrimitive& primitive,
+                                    UINT materialID, UINT bindlessMaterialID,
+                                    const XMMATRIX& world) {
+    const SceneMaterial& material = *primitive.material;
+    const float power = 0.2126f * material.emissiveFactor.x +
+                        0.7152f * material.emissiveFactor.y +
+                        0.0722f * material.emissiveFactor.z;
+    if (power <= 1e-4f) return;
+    const std::vector<float>& v = primitive.vertices;
+    const size_t vertexCount = v.size() / 12u;
+    const size_t triangleCount = primitive.indices.empty()
+        ? vertexCount / 3u : primitive.indices.size() / 3u;
+    for (size_t t = 0; t < triangleCount; ++t) {
+        size_t c[3];
+        for (int k = 0; k < 3; ++k)
+            c[k] = primitive.indices.empty() ? t * 3u + k
+                                             : primitive.indices[t * 3u + k];
+        if (c[0] >= vertexCount || c[1] >= vertexCount || c[2] >= vertexCount)
+            continue;
+        XMFLOAT3 p[3];
+        for (int k = 0; k < 3; ++k)
+            XMStoreFloat3(&p[k], XMVector3TransformCoord(XMVectorSet(
+                v[c[k] * 12], v[c[k] * 12 + 1], v[c[k] * 12 + 2], 1.0f), world));
+        VisibilityBufferDX12::EmissiveTriangleGPU light{};
+        light.p0[0] = p[0].x; light.p0[1] = p[0].y; light.p0[2] = p[0].z;
+        light.e1[0] = p[1].x - p[0].x; light.e1[1] = p[1].y - p[0].y;
+        light.e1[2] = p[1].z - p[0].z;
+        light.e2[0] = p[2].x - p[0].x; light.e2[1] = p[2].y - p[0].y;
+        light.e2[2] = p[2].z - p[0].z;
+        const XMVECTOR cross = XMVector3Cross(
+            XMVectorSet(light.e1[0], light.e1[1], light.e1[2], 0.0f),
+            XMVectorSet(light.e2[0], light.e2[1], light.e2[2], 0.0f));
+        light.area = 0.5f * XMVectorGetX(XMVector3Length(cross));
+        if (light.area < 1e-10f) continue;
+        light.uv0[0] = v[c[0] * 12 + 6]; light.uv0[1] = v[c[0] * 12 + 7];
+        light.uv1[0] = v[c[1] * 12 + 6]; light.uv1[1] = v[c[1] * 12 + 7];
+        light.uv2[0] = v[c[2] * 12 + 6]; light.uv2[1] = v[c[2] * 12 + 7];
+        light.materialID = materialID;
+        light.bindlessMaterialID = bindlessMaterialID;
+        light.pdf = light.area * power;
+        g_emissiveTriangleLights.push_back(light);
+    }
+}
+
 static void BuildDXRDDGINodeScene(
     const std::shared_ptr<SceneNode>& node, uint64_t meshNamespace,
     const std::vector<XMMATRIX>& worlds, const std::vector<uint64_t>& entityIds,
@@ -129,6 +178,11 @@ static void BuildDXRDDGINodeScene(
     const uint32_t ordinal = nodeOrdinal++;
     if (node->mesh) {
         std::vector<DXRScene::Geometry> geometries;
+        struct EmissivePrimitive {
+            const MeshPrimitive* primitive;
+            UINT materialID, bindlessMaterialID;
+        };
+        std::vector<EmissivePrimitive> emissive;
         uint64_t sourceHash = 1469598103934665603ull;
         for (const MeshPrimitive& primitive : node->mesh->primitives) {
             if (!primitive.vertexBuffer || primitive.vertices.size() < 36)
@@ -179,6 +233,10 @@ static void BuildDXRDDGINodeScene(
                         bindlessMaterialID);
                     geometry.vbMaterialID = materialID;
                     geometry.vbBindlessMaterialID = bindlessMaterialID;
+                    const XMFLOAT3& e = primitive.material->emissiveFactor;
+                    if (e.x > 0.0f || e.y > 0.0f || e.z > 0.0f)
+                        emissive.push_back({ &primitive, materialID,
+                                             bindlessMaterialID });
                 }
             }
             geometries.push_back(geometry);
@@ -203,6 +261,10 @@ static void BuildDXRDDGINodeScene(
                     XMStoreFloat4x4(&instance.transform,
                                     nodeWorld * worlds[i]);
                     instances.push_back(instance);
+                    for (const EmissivePrimitive& light : emissive)
+                        AppendEmissiveTriangles(*light.primitive,
+                            light.materialID, light.bindlessMaterialID,
+                            nodeWorld * worlds[i]);
                 }
             }
         }
@@ -323,6 +385,7 @@ static bool BuildDXRDDGIAccelerationScene() {
     // relative to a scene rebuild.
     WaitForGPUAllFrames();
     std::vector<DXRScene::Instance> instances;
+    g_emissiveTriangleLights.clear();
     for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
         uint32_t nodeOrdinal = 0;
         BuildDXRDDGINodeScene(batch.baseModel,
@@ -401,8 +464,22 @@ static bool BuildDXRDDGIAccelerationScene() {
     // Publish the per-geometry hit bindings the TLAS build just produced, so
     // the inline RayQuery path can shade a hit from the real triangle. Safe to
     // write in place here: WaitForGPUAllFrames above drained every frame slot.
-    if (updated)
+    if (updated) {
         visBuffer.UploadHitGeometry(g_dxrDDGI.Scene().HitGeometry());
+        // Static emitters only: the light list is rebuilt with the TLAS, not
+        // refit, so a moving emissive prop would light from where it was.
+        static const bool kNoEmissiveLights =
+            GetEnvironmentVariableA("SGE_NO_EMISSIVE_LIGHTS", nullptr, 0) > 0;
+        if (kNoEmissiveLights) g_emissiveTriangleLights.clear();
+        double area = 0.0;
+        for (const auto& light : g_emissiveTriangleLights) area += light.area;
+        SGE_LOG("LogRender", EngineLog::Level::Display,
+            "Emissive triangle lights: " +
+            std::to_string(g_emissiveTriangleLights.size()) + " triangles, " +
+            std::to_string(area) + " m2" +
+            (kNoEmissiveLights ? " (disabled by SGE_NO_EMISSIVE_LIGHTS)" : ""));
+        visBuffer.UploadEmissiveTriangles(g_emissiveTriangleLights);
+    }
     return updated;
 }
 
